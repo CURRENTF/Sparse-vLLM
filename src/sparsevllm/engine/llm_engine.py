@@ -477,6 +477,7 @@ class LLMEngine:
         prompt_offset = run_warmup(sampling_params, prompt_offset=0)
 
         if startup_plan:
+            self.model_runner.call("begin_decode_cuda_graph_capture")
             short_graphs = sum(not is_long for _, _, is_long in startup_plan)
             long_graphs = len(startup_plan) - short_graphs
             logger.info(
@@ -557,6 +558,8 @@ class LLMEngine:
                     "Startup decode CUDA Graph capture did not materialize its plan: "
                     f"missing={missing}."
                 )
+            self.model_runner.call("collect_decode_cuda_graph_metadata")
+            self.model_runner.call("exchange_decode_cuda_graph_metadata")
             self.model_runner.call("register_decode_cuda_graph_buffers")
             self.model_runner.call("seal_decode_cuda_graph_startup_plan")
             logger.info(

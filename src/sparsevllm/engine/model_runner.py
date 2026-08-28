@@ -18,7 +18,11 @@ from sparsevllm.configs.cuda_graph import (
     _decode_cuda_graph_max_real_batch_size,
     _resolve_decode_static_batch_capacity,
 )
-from sparsevllm.distributed import init_parallel_context, reset_parallel_context
+from sparsevllm.distributed import (
+    ParallelCollectiveRuntime,
+    init_parallel_context,
+    reset_parallel_context,
+)
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.models.qwen2 import Qwen2ForCausalLM
 from sparsevllm.models.llama import LlamaForCausalLM
@@ -138,6 +142,14 @@ PREFIX_CACHE_CONTROL_RPC_METHODS = {
     "prefix_cache_delete_subtree",
     "prefix_cache_set_eviction_priority",
 }
+DECODE_GRAPH_HOST_STATUS_SYNC_METHODS = {
+    "begin_decode_cuda_graph_capture",
+    "capture_decode_cuda_graph_warmup",
+    "collect_decode_cuda_graph_metadata",
+    "exchange_decode_cuda_graph_metadata",
+    "register_decode_cuda_graph_buffers",
+    "seal_decode_cuda_graph_startup_plan",
+}
 RECOVERABLE_TP_CONTROL_RPC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "chain_validate_admission_plan",
     "finish_slots_batch",
@@ -145,7 +157,7 @@ RECOVERABLE_TP_CONTROL_RPC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "free_slots",
     "free_slots_batch",
     "register_multimodal_shared",
-}
+} | DECODE_GRAPH_HOST_STATUS_SYNC_METHODS
 TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "chain_admission_plan",
     "chain_apply_admission",
@@ -163,9 +175,8 @@ TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "reset_after_warmup",
     "run",
     "register_multimodal_shared",
-    "register_decode_cuda_graph_buffers",
     "warmup_moe_workspace",
-}
+} | DECODE_GRAPH_HOST_STATUS_SYNC_METHODS
 
 
 def make_tp_shm_name() -> str:
@@ -279,18 +290,42 @@ class ModelRunner:
             config.decode_graph_capture_sizes,
             max_real_decode_batch_size,
         )
-        self.model = _create_model(
-            hf_config,
-            config.model_spec,
-            engine_config=config,
-            parallel_context=self.parallel_context,
-            device=self.device,
-            max_decode_tokens=_resolve_decode_static_batch_capacity(
-                decode_static_capture_sizes,
-                max_num_seqs_in_batch=config.max_num_seqs_in_batch,
-                max_decoding_seqs=config.max_decoding_seqs,
-            ),
+        self.collective_runtime = ParallelCollectiveRuntime(
+            self.parallel_context,
+            cuda_graph=config.decode_graph,
+            device_index=int(self.device.index or 0),
         )
+        try:
+            self.model = _create_model(
+                hf_config,
+                config.model_spec,
+                engine_config=config,
+                parallel_context=self.parallel_context,
+                collective_runtime=self.collective_runtime,
+                device=self.device,
+                max_decode_tokens=_resolve_decode_static_batch_capacity(
+                    decode_static_capture_sizes,
+                    max_num_seqs_in_batch=config.max_num_seqs_in_batch,
+                    max_decoding_seqs=config.max_decoding_seqs,
+                ),
+            )
+            self.collective_runtime.prepare()
+            if (
+                self.collective_runtime.has_graph_collectives
+                and not config.decode_graph_startup_capture
+            ):
+                raise ValueError(
+                    "Distributed decode CUDA Graph collectives require "
+                    "decode_graph_startup_capture=True so every graph buffer is "
+                    "registered before the first replay."
+                )
+        except BaseException:
+            model = getattr(self, "model", None)
+            close_runtime_operators = getattr(model, "close_runtime_operators", None)
+            if callable(close_runtime_operators):
+                close_runtime_operators()
+            self.collective_runtime.close()
+            raise
         if (
             self.config.decode_graph
             and self.config.decode_graph_shape_policy == "batch_only"
@@ -422,6 +457,7 @@ class ModelRunner:
             context_sizes=decode_static_context_sizes,
             shape_policy=self.config.decode_graph_shape_policy,
             graph_pool=self.cuda_graph_pool,
+            collective_runtime=self.collective_runtime,
         )
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
@@ -456,6 +492,8 @@ class ModelRunner:
         if callable(close_runtime_operators):
             close_runtime_operators()
             self.platform.synchronize()
+        self.collective_runtime.close()
+        self.platform.synchronize()
         if self.world_size > 1:
             self.shm.close()
             self.parallel_context.world_barrier(
@@ -539,6 +577,8 @@ class ModelRunner:
                 local_error = exc
             if method_name == "run" and self.config.decode_graph:
                 self._sync_tp_run_status(local_error)
+            elif method_name in DECODE_GRAPH_HOST_STATUS_SYNC_METHODS:
+                self._sync_tp_host_status(method_name, local_error)
             else:
                 self._sync_tp_rpc_status(method_name, local_error)
             if local_error is not None:
@@ -563,6 +603,13 @@ class ModelRunner:
             self.platform.synchronize()
 
     def _sync_tp_run_status(self, local_error: BaseException | None) -> None:
+        self._sync_tp_host_status("run", local_error)
+
+    def _sync_tp_host_status(
+        self,
+        method_name: str,
+        local_error: BaseException | None,
+    ) -> None:
         if self.world_size <= 1:
             return
 
@@ -595,7 +642,7 @@ class ModelRunner:
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not completion_event.wait(timeout=remaining):
                 raise TimeoutError(
-                    f"Timed out waiting for TP worker {rank} to complete 'run' "
+                    f"Timed out waiting for TP worker {rank} to complete {method_name!r} "
                     f"after {timeout_s:.1f}s."
                 )
             status = int(self.shm.buf[self._run_status_offset(rank)])
@@ -611,7 +658,9 @@ class ModelRunner:
             raise sync_error
         if failed_ranks and local_error is None:
             ranks = ", ".join(str(rank) for rank in failed_ranks)
-            raise RuntimeError(f"TP worker rank(s) {ranks} failed during run.")
+            raise RuntimeError(
+                f"TP worker rank(s) {ranks} failed during {method_name}."
+            )
 
     def _sync_tp_rpc_status(
         self,
@@ -1393,12 +1442,20 @@ class ModelRunner:
         self.decode_graph_runner.set_reuse_larger_context_graphs(enabled)
 
     def seal_decode_cuda_graph_startup_plan(self):
+        self.collective_runtime.mark_cuda_graph_replayable()
         self.decode_graph_runner.seal_startup_plan()
 
+    def begin_decode_cuda_graph_capture(self) -> None:
+        self.collective_runtime.begin_cuda_graph_capture()
+
+    def collect_decode_cuda_graph_metadata(self) -> None:
+        self.collective_runtime.collect_local_cuda_graph_metadata()
+
+    def exchange_decode_cuda_graph_metadata(self) -> None:
+        self.collective_runtime.exchange_cuda_graph_metadata()
+
     def register_decode_cuda_graph_buffers(self) -> None:
-        register = getattr(self.model, "register_decode_cuda_graph_buffers", None)
-        if callable(register):
-            register()
+        self.collective_runtime.register_cuda_graph_buffers()
 
     def capture_decode_cuda_graph_warmup(self, seqs: list[Sequence]) -> None:
         """Capture one planned graph without advancing scheduler sequence state."""

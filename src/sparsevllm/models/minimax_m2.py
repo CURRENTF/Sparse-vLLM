@@ -9,7 +9,9 @@ import torch.nn.functional as F
 from torch import nn
 
 from sparsevllm.distributed import (
+    DecodeParallelCollectives,
     ParallelContext,
+    ParallelCollectiveRuntime,
     get_parallel_context,
 )
 from sparsevllm.layers.attention import Attention
@@ -30,10 +32,6 @@ from sparsevllm.operators.moe import model_activation_dtype, resolve_moe_provide
 from sparsevllm.operators.moe_router import (
     MoeRouterOpSpec,
     resolve_moe_router_provider,
-)
-from sparsevllm.operators.all_reduce import (
-    PreparedAllReduceOp,
-    prepare_parallel_all_reduce,
 )
 from sparsevllm.operators.decode_attention import (
     DecodeAttentionLaunchSpec,
@@ -61,41 +59,21 @@ _EXPERT_TARGET_RE = re.compile(
 class MiniMaxM2RuntimeConfig:
     full_attention_provider: FullAttentionProvider
     decode_launch_op: PreparedDecodeAttentionLaunchOp
-    attention_decode_all_reduce: PreparedAllReduceOp
-    moe_decode_all_reduce: PreparedAllReduceOp
+    parallel_collectives: DecodeParallelCollectives
     cuda_graph: bool
     _closed: bool = False
-
-    def register_decode_cuda_graph_buffers(self) -> None:
-        seen: set[int] = set()
-        for op in (
-            self.attention_decode_all_reduce,
-            self.moe_decode_all_reduce,
-        ):
-            if id(op) in seen:
-                continue
-            seen.add(id(op))
-            op.register_cuda_graph_buffers()
 
     def close(self) -> None:
         if self._closed:
             return
         self.full_attention_provider.close()
-        seen: set[int] = set()
-        for op in (
-            self.attention_decode_all_reduce,
-            self.moe_decode_all_reduce,
-        ):
-            if id(op) in seen:
-                continue
-            seen.add(id(op))
-            op.close()
         self._closed = True
 
 
 def build_minimax_m2_runtime_config(
     config,
     parallel_context: ParallelContext,
+    collective_runtime: ParallelCollectiveRuntime,
     *,
     sparse_method: str | None,
     max_decode_tokens: int,
@@ -134,30 +112,16 @@ def build_minimax_m2_runtime_config(
         ),
         device_index=int(device.index or 0),
     )
-    moe_decode_all_reduce = prepare_parallel_all_reduce(
-        parallel_context.world,
-        max_rows=int(max_decode_tokens),
+    parallel_collectives = collective_runtime.request_decode_collectives(
+        attention_max_rows=int(max_decode_tokens),
+        moe_max_rows=int(max_decode_tokens),
         hidden_size=int(config.hidden_size),
         dtype=activation_dtype,
-        cuda_graph=bool(cuda_graph),
-        device_index=int(device.index or 0),
     )
-    if parallel_context.attention.ranks == parallel_context.world.ranks:
-        attention_decode_all_reduce = moe_decode_all_reduce
-    else:
-        attention_decode_all_reduce = prepare_parallel_all_reduce(
-            parallel_context.attention,
-            max_rows=int(max_decode_tokens),
-            hidden_size=int(config.hidden_size),
-            dtype=activation_dtype,
-            cuda_graph=bool(cuda_graph),
-            device_index=int(device.index or 0),
-        )
     return MiniMaxM2RuntimeConfig(
         full_attention_provider=full_attention_provider,
         decode_launch_op=decode_launch_op,
-        attention_decode_all_reduce=attention_decode_all_reduce,
-        moe_decode_all_reduce=moe_decode_all_reduce,
+        parallel_collectives=parallel_collectives,
         cuda_graph=bool(cuda_graph),
     )
 
@@ -278,9 +242,7 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
                 )
             local_output = torch.cat(local_output_chunks, dim=0)
         if self.runtime_config is not None:
-            context = get_context()
-            if not context.is_prefill:
-                return self.runtime_config.moe_decode_all_reduce.run(local_output)
+            return self.runtime_config.parallel_collectives.moe.run(local_output)
         return self.parallel_context.world_all_reduce(local_output)
 
 
@@ -370,9 +332,7 @@ class MiniMaxM2Attention(nn.Module):
         output = self.attn(q, k, v).flatten(1, -1)
         output = self.o_proj(output)
         if self.runtime_config is not None:
-            if context.is_prefill:
-                return self.parallel_context.attention_tp_all_reduce(output)
-            return self.runtime_config.attention_decode_all_reduce.run(output)
+            return self.runtime_config.parallel_collectives.attention.run(output)
         return output
 
 
@@ -447,6 +407,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
         *,
         engine_config,
         parallel_context: ParallelContext,
+        collective_runtime: ParallelCollectiveRuntime,
         device: torch.device,
         max_decode_tokens: int,
     ) -> dict:
@@ -454,6 +415,7 @@ class MiniMaxM2ForCausalLM(nn.Module):
             "runtime_config": build_minimax_m2_runtime_config(
                 config,
                 parallel_context,
+                collective_runtime,
                 sparse_method=engine_config.sparse_method,
                 max_decode_tokens=max_decode_tokens,
                 cuda_graph=engine_config.decode_graph,
@@ -484,10 +446,6 @@ class MiniMaxM2ForCausalLM(nn.Module):
     def close_runtime_operators(self) -> None:
         if self.runtime_config is not None:
             self.runtime_config.close()
-
-    def register_decode_cuda_graph_buffers(self) -> None:
-        if self.runtime_config is not None:
-            self.runtime_config.register_decode_cuda_graph_buffers()
 
     @torch.inference_mode()
     def warmup_moe(self, num_tokens: int = 1) -> None:
@@ -709,9 +667,9 @@ class MiniMaxM2ForCausalLM(nn.Module):
         else:
             all_reduce_providers = (
                 "attention="
-                f"{self.runtime_config.attention_decode_all_reduce.name},"
+                f"{self.runtime_config.parallel_collectives.attention.name},"
                 "moe="
-                f"{self.runtime_config.moe_decode_all_reduce.name}"
+                f"{self.runtime_config.parallel_collectives.moe.name}"
             )
         logger.info(
             "Loaded MiniMax M2 rank {} provider={} prefill_provider={} "

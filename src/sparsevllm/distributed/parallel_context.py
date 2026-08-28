@@ -6,6 +6,8 @@ import torch
 import torch.distributed as dist
 
 from sparsevllm.distributed.topology import ParallelTopology, parallel_group_ranks
+
+
 @dataclass(frozen=True)
 class ParallelGroup:
     process_group: dist.ProcessGroup | None
@@ -51,6 +53,14 @@ class ParallelContext:
     @property
     def attention(self) -> ParallelGroup:
         return self.tensor
+
+    @property
+    def attention_output_group(self) -> ParallelGroup:
+        return self.attention
+
+    @property
+    def moe_output_group(self) -> ParallelGroup:
+        return self.world
 
     @property
     def attention_tp_rank(self) -> int:

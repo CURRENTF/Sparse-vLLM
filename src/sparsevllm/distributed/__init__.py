@@ -5,6 +5,12 @@ from sparsevllm.distributed.parallel_context import (
     init_parallel_context,
     reset_parallel_context,
 )
+from sparsevllm.distributed.collective_runtime import (
+    DecodeParallelCollectives,
+    ParallelAllReduceHandle,
+    ParallelCollectiveRuntime,
+    ParallelCollectiveState,
+)
 from sparsevllm.distributed.topology import (
     ParallelMode,
     ParallelTopology,
@@ -16,7 +22,11 @@ from sparsevllm.distributed.sharding import validate_model_sharding, validate_to
 
 __all__ = [
     "ParallelContext",
+    "DecodeParallelCollectives",
     "ParallelGroup",
+    "ParallelAllReduceHandle",
+    "ParallelCollectiveRuntime",
+    "ParallelCollectiveState",
     "ParallelMode",
     "ParallelTopology",
     "get_parallel_context",

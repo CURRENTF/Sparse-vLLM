@@ -100,6 +100,7 @@ class DecodeCudaGraphRunner:
         context_sizes: list[int] | tuple[int, ...] | str | int | None = None,
         shape_policy: str = "batch_only",
         graph_pool=None,
+        collective_runtime=None,
     ):
         self.runtime_state = runtime_state
         self.cache_manager = cache_manager
@@ -122,6 +123,7 @@ class DecodeCudaGraphRunner:
         self.last_state_key: DecodeCudaGraphKey | None = None
         self.last_real_batch_size: int | None = None
         self.graph_pool = graph_pool
+        self.collective_runtime = collective_runtime
         self.capture_count = 0
         self.replay_count = 0
         self.eager_static_count = 0
@@ -527,6 +529,8 @@ class DecodeCudaGraphRunner:
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> DecodeCudaGraphState:
+        if self.collective_runtime is not None:
+            self.collective_runtime.assert_can_capture()
         if not self.platform.supports_graph_capture():
             raise RuntimeError(f"Platform {self.platform.name!r} does not support decode CUDA graph capture.")
         graph_state = state.decode_state
@@ -662,6 +666,8 @@ class DecodeCudaGraphRunner:
             self._restore_sparse_state_refs(state)
             if not replay_after_capture:
                 return None, None
+            if self.collective_runtime is not None:
+                self.collective_runtime.assert_cuda_graph_replayable()
             with profiler.record("decode_graph_replay_after_capture"):
                 state.graph.replay()
             self.replay_count += 1
@@ -676,6 +682,8 @@ class DecodeCudaGraphRunner:
             )
 
         self._restore_sparse_state_refs(state)
+        if self.collective_runtime is not None:
+            self.collective_runtime.assert_cuda_graph_replayable()
         with profiler.record("decode_graph_replay"):
             state.graph.replay()
         self.replay_count += 1

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -10,7 +9,9 @@ from torch import nn
 from transformers import Glm4MoeLiteConfig
 
 from sparsevllm.distributed import (
+    DecodeParallelCollectives,
     ParallelContext,
+    ParallelCollectiveRuntime,
     get_parallel_context,
 )
 from sparsevllm.models.layout import resolve_attention_qk_head_dim
@@ -32,10 +33,6 @@ from sparsevllm.method_registry import sparse_decode_attention_score_kind
 from sparsevllm.operators.attention_capabilities import AttentionScoreKind
 from sparsevllm.models.qwen3 import Qwen3MLP
 from sparsevllm.operators.mla_attention import MlaAttentionOpSpec
-from sparsevllm.operators.all_reduce import (
-    PreparedAllReduceOp,
-    prepare_parallel_all_reduce,
-)
 from sparsevllm.operators.activation import resolve_silu_and_mul_provider
 from sparsevllm.operators.moe import (
     MoeOpSpec,
@@ -66,58 +63,6 @@ _SHARED_EXPERT_SOURCE_RE = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.shared_experts\."
     r"(gate_proj|up_proj|down_proj)\.weight$"
 )
-
-
-@dataclass
-class Glm4MoeLiteRuntimeConfig:
-    attention_decode_all_reduce: PreparedAllReduceOp
-    moe_decode_all_reduce: PreparedAllReduceOp
-    _closed: bool = False
-
-    def register_decode_cuda_graph_buffers(self) -> None:
-        ops = (self.attention_decode_all_reduce, self.moe_decode_all_reduce)
-        for op in {id(op): op for op in ops}.values():
-            op.register_cuda_graph_buffers()
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        ops = (self.attention_decode_all_reduce, self.moe_decode_all_reduce)
-        for op in {id(op): op for op in ops}.values():
-            op.close()
-        self._closed = True
-
-
-def build_glm4_moe_lite_runtime_config(
-    config: Glm4MoeLiteConfig,
-    parallel_context: ParallelContext,
-    *,
-    max_decode_tokens: int,
-    cuda_graph: bool,
-    device_index: int,
-) -> Glm4MoeLiteRuntimeConfig:
-    max_decode_tokens = int(max_decode_tokens)
-    moe_op = prepare_parallel_all_reduce(
-        parallel_context.world,
-        max_rows=2 * max_decode_tokens,
-        hidden_size=int(config.hidden_size),
-        dtype=model_activation_dtype(config),
-        cuda_graph=cuda_graph,
-        device_index=device_index,
-    )
-    attention_op = (
-        moe_op
-        if parallel_context.attention.ranks == parallel_context.world.ranks
-        else prepare_parallel_all_reduce(
-            parallel_context.attention,
-            max_rows=max_decode_tokens,
-            hidden_size=int(config.hidden_size),
-            dtype=model_activation_dtype(config),
-            cuda_graph=cuda_graph,
-            device_index=device_index,
-        )
-    )
-    return Glm4MoeLiteRuntimeConfig(attention_op, moe_op)
 
 
 def build_glm4_moe_lite_mla_attention(
@@ -178,12 +123,12 @@ class Glm4MoeLiteAttention(nn.Module):
         mla_attention: MLAAttention,
         *,
         projection_chunk_size: int,
-        runtime_config: Glm4MoeLiteRuntimeConfig | None = None,
+        parallel_collectives: DecodeParallelCollectives | None = None,
     ) -> None:
         super().__init__()
         self.mla_attention = mla_attention
         self.parallel_context = get_parallel_context()
-        self.runtime_config = runtime_config
+        self.parallel_collectives = parallel_collectives
         self.num_heads = int(config.num_attention_heads)
         self.local_heads = int(mla_attention.spec.local_q_heads)
         self.q_lora_rank = int(config.q_lora_rank)
@@ -239,7 +184,7 @@ class Glm4MoeLiteAttention(nn.Module):
             self.num_heads * self.v_head_dim,
             int(config.hidden_size),
             bias=bool(config.attention_bias),
-            reduce_results=runtime_config is None,
+            reduce_results=parallel_collectives is None,
         )
 
     def _project_kv_history(self, latent: torch.Tensor) -> torch.Tensor:
@@ -331,11 +276,9 @@ class Glm4MoeLiteAttention(nn.Module):
             reconstruct_values=self._reconstruct_decode_values,
         )
         output = self._project_output(value_output, hidden_states)
-        if self.runtime_config is None:
+        if self.parallel_collectives is None:
             return output
-        if get_context().is_prefill:
-            return self.parallel_context.attention_tp_all_reduce(output)
-        return self.runtime_config.attention_decode_all_reduce.run(output)
+        return self.parallel_collectives.attention.run(output)
 
 
 class Glm4MoeLiteRouter(nn.Module):
@@ -513,11 +456,11 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         *,
         mlp_chunk_size: int,
         decode_graph: bool,
-        runtime_config: Glm4MoeLiteRuntimeConfig | None = None,
+        parallel_collectives: DecodeParallelCollectives | None = None,
     ) -> None:
         super().__init__()
         self.parallel_context = get_parallel_context()
-        self.runtime_config = runtime_config
+        self.parallel_collectives = parallel_collectives
         self.mlp_chunk_size = int(mlp_chunk_size)
         if self.mlp_chunk_size <= 0:
             raise ValueError(
@@ -602,8 +545,8 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 )
             if context.is_prefill:
                 return self.parallel_context.world_all_reduce(local_output)
-            if self.runtime_config is not None:
-                return self.runtime_config.moe_decode_all_reduce.run(local_output)
+            if self.parallel_collectives is not None:
+                return self.parallel_collectives.moe.run(local_output)
             return self.parallel_context.world_all_reduce(local_output)
         if not debug_enabled:
             if int(hidden_states.shape[0]) <= self.mlp_chunk_size:
@@ -670,16 +613,16 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 # routed experts and the TP-sharded shared expert together.
                 local_output = routed + shared_local
                 output = (
-                    self.runtime_config.moe_decode_all_reduce.run(local_output)
-                    if self.runtime_config is not None and not context.is_prefill
+                    self.parallel_collectives.moe.run(local_output)
+                    if self.parallel_collectives is not None
                     else self.parallel_context.world_all_reduce(local_output)
                 )
             else:
                 # Retain the pure-EP semantic path for direct module use: the
                 # shared expert is replicated rather than TP-sharded.
                 routed = (
-                    self.runtime_config.moe_decode_all_reduce.run(routed)
-                    if self.runtime_config is not None and not context.is_prefill
+                    self.parallel_collectives.moe.run(routed)
+                    if self.parallel_collectives is not None
                     else self.parallel_context.world_all_reduce(routed)
                 )
                 output = routed + shared_local
@@ -696,8 +639,8 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 # preserves the original BF16 reduction/addition order.
                 partials = torch.stack((routed, shared_local), dim=0)
                 partials = (
-                    self.runtime_config.moe_decode_all_reduce.run(partials)
-                    if self.runtime_config is not None
+                    self.parallel_collectives.moe.run(partials)
+                    if self.parallel_collectives is not None
                     else self.parallel_context.world_all_reduce(partials)
                 )
                 output = partials[0] + partials[1]
@@ -718,16 +661,16 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         *,
         mlp_chunk_size: int,
         decode_graph: bool,
-        runtime_config: Glm4MoeLiteRuntimeConfig | None = None,
+        parallel_collectives: DecodeParallelCollectives | None = None,
     ) -> None:
         super().__init__()
         self.parallel_context = get_parallel_context()
-        self.runtime_config = runtime_config
+        self.parallel_collectives = parallel_collectives
         self.self_attn = Glm4MoeLiteAttention(
             config,
             mla_attention,
             projection_chunk_size=mlp_chunk_size,
-            runtime_config=runtime_config,
+            parallel_collectives=parallel_collectives,
         )
         layer_types = list(config.mlp_layer_types)
         if len(layer_types) != int(config.num_hidden_layers):
@@ -743,7 +686,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
                 hidden_act=str(config.hidden_act),
                 mlp_chunk_size=int(mlp_chunk_size),
                 quantization=None,
-                reduce_results=runtime_config is None,
+                reduce_results=parallel_collectives is None,
                 activation_provider=resolve_silu_and_mul_provider(
                     activation_dtype=model_activation_dtype(config),
                 ),
@@ -753,7 +696,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
                 config,
                 mlp_chunk_size=mlp_chunk_size,
                 decode_graph=decode_graph,
-                runtime_config=runtime_config,
+                parallel_collectives=parallel_collectives,
             )
         else:
             raise ValueError(
@@ -786,12 +729,8 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
             residual,
         )
         hidden_states = self.mlp(hidden_states)
-        if self.runtime_config is not None and isinstance(self.mlp, Qwen3MLP):
-            hidden_states = (
-                self.parallel_context.attention_tp_all_reduce(hidden_states)
-                if get_context().is_prefill
-                else self.runtime_config.attention_decode_all_reduce.run(hidden_states)
-            )
+        if self.parallel_collectives is not None and isinstance(self.mlp, Qwen3MLP):
+            hidden_states = self.parallel_collectives.attention.run(hidden_states)
         return hidden_states, residual
 
 
@@ -803,17 +742,17 @@ class Glm4MoeLiteModel(nn.Module):
         *,
         mlp_chunk_size: int,
         decode_graph: bool,
-        runtime_config: Glm4MoeLiteRuntimeConfig | None = None,
+        parallel_collectives: DecodeParallelCollectives | None = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.mla_attention = mla_attention
         self.parallel_context = get_parallel_context()
-        self.runtime_config = runtime_config
+        self.parallel_collectives = parallel_collectives
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            reduce_results=runtime_config is None,
+            reduce_results=parallel_collectives is None,
         )
         rope_parameters = getattr(config, "rope_parameters", None) or {}
         self.rotary_emb = get_rope(
@@ -833,7 +772,7 @@ class Glm4MoeLiteModel(nn.Module):
                     mla_attention,
                     mlp_chunk_size=mlp_chunk_size,
                     decode_graph=decode_graph,
-                    runtime_config=runtime_config,
+                    parallel_collectives=parallel_collectives,
                 )
                 for layer_idx in range(int(config.num_hidden_layers))
             ]
@@ -848,12 +787,8 @@ class Glm4MoeLiteModel(nn.Module):
     ) -> torch.Tensor:
         context = get_context()
         hidden_states = self.embed_tokens(input_ids)
-        if self.runtime_config is not None:
-            hidden_states = (
-                self.parallel_context.attention_tp_all_reduce(hidden_states)
-                if context.is_prefill
-                else self.runtime_config.attention_decode_all_reduce.run(hidden_states)
-            )
+        if self.parallel_collectives is not None:
+            hidden_states = self.parallel_collectives.attention.run(hidden_states)
         residual = None
         debug_layers_env = os.getenv("SPARSEVLLM_DEBUG_HIDDEN_LAYERS")
         debug_layers = None
@@ -913,6 +848,7 @@ class Glm4MoeLiteForCausalLM(nn.Module):
         *,
         engine_config,
         parallel_context: ParallelContext,
+        collective_runtime: ParallelCollectiveRuntime,
         device: torch.device,
         max_decode_tokens: int,
     ) -> dict:
@@ -937,12 +873,13 @@ class Glm4MoeLiteForCausalLM(nn.Module):
             "decode_graph": decode_graph,
         }
         if parallel_context.world_size > 1:
-            kwargs["runtime_config"] = build_glm4_moe_lite_runtime_config(
-                config,
-                parallel_context,
-                max_decode_tokens=max_decode_tokens,
-                cuda_graph=decode_graph,
-                device_index=int(device.index or 0),
+            kwargs["parallel_collectives"] = (
+                collective_runtime.request_decode_collectives(
+                    attention_max_rows=int(max_decode_tokens),
+                    moe_max_rows=2 * int(max_decode_tokens),
+                    hidden_size=int(config.hidden_size),
+                    dtype=model_activation_dtype(config),
+                )
             )
         return kwargs
 
@@ -953,18 +890,18 @@ class Glm4MoeLiteForCausalLM(nn.Module):
         mla_attention: MLAAttention,
         mlp_chunk_size: int,
         decode_graph: bool,
-        runtime_config: Glm4MoeLiteRuntimeConfig | None = None,
+        parallel_collectives: DecodeParallelCollectives | None = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.parallel_context = get_parallel_context()
-        self.runtime_config = runtime_config
+        self.parallel_collectives = parallel_collectives
         self.model = Glm4MoeLiteModel(
             config,
             mla_attention,
             mlp_chunk_size=mlp_chunk_size,
             decode_graph=decode_graph,
-            runtime_config=runtime_config,
+            parallel_collectives=parallel_collectives,
         )
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
@@ -977,14 +914,6 @@ class Glm4MoeLiteForCausalLM(nn.Module):
                 + int(getattr(config, "num_nextn_predict_layers", 0)),
             )
         )
-
-    def close_runtime_operators(self) -> None:
-        if self.runtime_config is not None:
-            self.runtime_config.close()
-
-    def register_decode_cuda_graph_buffers(self) -> None:
-        if self.runtime_config is not None:
-            self.runtime_config.register_decode_cuda_graph_buffers()
 
     def _sparse_block(self, layer_idx: int) -> Glm4MoeLiteSparseMoeBlock:
         if not 0 <= int(layer_idx) < len(self.model.layers):

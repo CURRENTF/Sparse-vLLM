@@ -58,6 +58,12 @@ class AllReduceOpSpec:
             )
 
 
+@dataclass(frozen=True)
+class AllReduceGraphBufferMetadata:
+    handles: tuple[int, ...]
+    offsets: tuple[int, ...]
+
+
 class AllReduceProvider:
     name = ""
 
@@ -74,13 +80,33 @@ class AllReduceProvider:
     def close(self) -> None:
         pass
 
-    def register_cuda_graph_buffers(
+    def collect_local_cuda_graph_metadata(
         self,
         spec: AllReduceOpSpec,
         *,
         group: dist.ProcessGroup | None,
-    ) -> None:
+    ) -> AllReduceGraphBufferMetadata | None:
         del spec, group
+        return None
+
+    def graph_metadata_summary(
+        self,
+        metadata: AllReduceGraphBufferMetadata | None,
+    ) -> tuple[int, int]:
+        if metadata is not None:
+            raise TypeError(
+                f"All-reduce provider {self.name} returned unexpected graph metadata."
+            )
+        return (0, 0)
+
+    def register_cuda_graph_buffers(
+        self,
+        spec: AllReduceOpSpec,
+        gathered_metadata: list[AllReduceGraphBufferMetadata | None],
+        *,
+        group: dist.ProcessGroup | None,
+    ) -> None:
+        del spec, gathered_metadata, group
 
     def run(
         self,
@@ -432,7 +458,43 @@ class FlashInferVllmAllReduceProvider(AllReduceProvider):
         )
         return output
 
-    def register_cuda_graph_buffers(self, spec, *, group) -> None:
+    def collect_local_cuda_graph_metadata(self, spec, *, group):
+        if not spec.cuda_graph:
+            return None
+        if self._handle is None or self._group is None:
+            raise RuntimeError("FlashInfer all-reduce provider was not prepared.")
+        if group is not self._group:
+            raise RuntimeError("FlashInfer all-reduce graph registration group changed.")
+        if self._graph_buffers_registered:
+            raise RuntimeError(
+                "FlashInfer all-reduce CUDA Graph buffers are already registered."
+            )
+        from flashinfer.comm import vllm_get_graph_buffer_ipc_meta
+
+        local_handles, local_offsets = vllm_get_graph_buffer_ipc_meta(self._handle)
+        local_handles = list(local_handles)
+        local_offsets = list(local_offsets)
+        if not local_handles or not local_offsets:
+            raise RuntimeError(
+                "FlashInfer all-reduce captured no CUDA Graph buffer addresses."
+            )
+        return AllReduceGraphBufferMetadata(
+            handles=tuple(local_handles),
+            offsets=tuple(local_offsets),
+        )
+
+    def graph_metadata_summary(self, metadata):
+        if not isinstance(metadata, AllReduceGraphBufferMetadata):
+            raise TypeError("FlashInfer all-reduce graph metadata is missing.")
+        count = len(metadata.offsets)
+        if count <= 0 or len(metadata.handles) % count:
+            raise RuntimeError(
+                "FlashInfer all-reduce graph metadata has incompatible handles and "
+                f"offsets: handles={len(metadata.handles)} offsets={count}."
+            )
+        return (count, len(metadata.handles) // count)
+
+    def register_cuda_graph_buffers(self, spec, gathered_metadata, *, group) -> None:
         if not spec.cuda_graph:
             return
         if self._handle is None or self._group is None:
@@ -443,37 +505,24 @@ class FlashInferVllmAllReduceProvider(AllReduceProvider):
             raise RuntimeError(
                 "FlashInfer all-reduce CUDA Graph buffers are already registered."
             )
-        from flashinfer.comm import (
-            vllm_get_graph_buffer_ipc_meta,
-            vllm_register_graph_buffers,
-        )
-
-        local_handles, local_offsets = vllm_get_graph_buffer_ipc_meta(self._handle)
-        local_handles = list(local_handles)
-        local_offsets = list(local_offsets)
-        if not local_handles or not local_offsets:
-            raise RuntimeError(
-                "FlashInfer all-reduce captured no CUDA Graph buffer addresses."
-            )
-        gathered: list[tuple[list[int], list[int]] | None] = [
-            None for _ in range(spec.world_size)
+        if len(gathered_metadata) != spec.world_size or any(
+            not isinstance(item, AllReduceGraphBufferMetadata)
+            for item in gathered_metadata
+        ):
+            raise RuntimeError("FlashInfer all-reduce graph metadata is incomplete.")
+        metadata = [
+            item for item in gathered_metadata
+            if isinstance(item, AllReduceGraphBufferMetadata)
         ]
-        dist.all_gather_object(
-            gathered,
-            (local_handles, local_offsets),
-            group=self._group,
-        )
-        if any(item is None for item in gathered):
-            raise RuntimeError(
-                "FlashInfer all-reduce CUDA Graph buffer metadata is incomplete."
-            )
-        handles = [item[0] for item in gathered if item is not None]
-        offsets = [item[1] for item in gathered if item is not None]
+        offsets = [list(item.offsets) for item in metadata]
         if len({len(item) for item in offsets}) != 1:
             raise RuntimeError(
                 "FlashInfer all-reduce ranks captured different graph buffer counts: "
                 f"{[len(item) for item in offsets]}."
             )
+        from flashinfer.comm import vllm_register_graph_buffers
+
+        handles = [list(item.handles) for item in metadata]
         vllm_register_graph_buffers(self._handle, handles, offsets)
         self._graph_buffers_registered = True
 
@@ -666,10 +715,33 @@ class PreparedAllReduceOp:
             )
         return output
 
-    def register_cuda_graph_buffers(self) -> None:
+    def collect_local_cuda_graph_metadata(
+        self,
+    ) -> AllReduceGraphBufferMetadata | None:
         if self._closed:
             raise RuntimeError("All-reduce operator is closed.")
-        self.provider.register_cuda_graph_buffers(self.spec, group=self.group)
+        return self.provider.collect_local_cuda_graph_metadata(
+            self.spec,
+            group=self.group,
+        )
+
+    def graph_metadata_summary(
+        self,
+        metadata: AllReduceGraphBufferMetadata | None,
+    ) -> tuple[int, int]:
+        return self.provider.graph_metadata_summary(metadata)
+
+    def register_cuda_graph_buffers(
+        self,
+        gathered_metadata: list[AllReduceGraphBufferMetadata | None],
+    ) -> None:
+        if self._closed:
+            raise RuntimeError("All-reduce operator is closed.")
+        self.provider.register_cuda_graph_buffers(
+            self.spec,
+            gathered_metadata,
+            group=self.group,
+        )
 
     def close(self) -> None:
         if self._closed:
