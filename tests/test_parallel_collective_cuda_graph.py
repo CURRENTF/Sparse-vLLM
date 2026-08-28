@@ -30,6 +30,7 @@ def _cuda_graph_collective_worker(
     )
     runtime = None
     graph = None
+    graphs = None
     outputs = None
     try:
         context = init_parallel_context(
@@ -41,8 +42,8 @@ def _cuda_graph_collective_worker(
             device_index=rank,
         )
         collectives = runtime.request_decode_collectives(
-            attention_max_rows=1,
-            moe_max_rows=1,
+            attention_max_rows=2,
+            moe_max_rows=2,
             hidden_size=2048,
             dtype=torch.bfloat16,
         )
@@ -58,33 +59,38 @@ def _cuda_graph_collective_worker(
             )
 
         set_context(False)
-        static_input = torch.full(
-            (1, 2048),
-            float(rank + 1),
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        collectives.attention.run(static_input.clone())
-        collectives.moe.run(static_input.clone())
+        static_inputs = {
+            rows: torch.full(
+                (rows, 2048),
+                float(rank + 1),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            for rows in (1, 2)
+        }
+        for static_input in static_inputs.values():
+            collectives.attention.run(static_input.clone())
+            collectives.moe.run(static_input.clone())
         torch.cuda.synchronize()
         dist.barrier(device_ids=[rank])
 
         runtime.begin_cuda_graph_capture()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            outputs = (
-                collectives.attention.run(static_input),
-                collectives.moe.run(static_input),
-            )
+        graphs = {}
+        outputs = {}
+        for rows, static_input in static_inputs.items():
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = (
+                    collectives.attention.run(static_input),
+                    collectives.moe.run(static_input),
+                )
+            graphs[rows] = graph
+            outputs[rows] = output
 
         runtime.collect_local_cuda_graph_metadata()
         runtime.exchange_cuda_graph_metadata()
         runtime.register_cuda_graph_buffers()
         runtime.mark_cuda_graph_replayable()
-
-        static_input.fill_(rank + 1)
-        graph.replay()
-        torch.cuda.synchronize()
 
         attention_expected = (
             3.0
@@ -93,17 +99,18 @@ def _cuda_graph_collective_worker(
             if tp_size == 2
             else float(rank + 1)
         )
-        assert torch.all(outputs[0] == attention_expected)
-        assert torch.all(outputs[1] == sum(range(1, world_size + 1)))
-
-        static_input.fill_(2 * (rank + 1))
-        graph.replay()
-        torch.cuda.synchronize()
-        assert torch.all(outputs[0] == 2 * attention_expected)
-        assert torch.all(outputs[1] == 2 * sum(range(1, world_size + 1)))
+        for rows, scale in ((1, 1), (2, 2), (1, 3)):
+            static_inputs[rows].fill_(scale * (rank + 1))
+            graphs[rows].replay()
+            torch.cuda.synchronize()
+            assert torch.all(outputs[rows][0] == scale * attention_expected)
+            assert torch.all(
+                outputs[rows][1] == scale * sum(range(1, world_size + 1))
+            )
     finally:
         torch.cuda.synchronize()
         outputs = None
+        graphs = None
         graph = None
         gc.collect()
         if runtime is not None:
