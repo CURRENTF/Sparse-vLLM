@@ -163,6 +163,39 @@ class AttentionViewMeta:
     max_context_len: int | None = None
     attn_score: torch.Tensor | None = None
     temp_slots: torch.Tensor | None = None
+    is_sparse: bool = False
+
+    @property
+    def slot_table_token_capacity(self) -> int:
+        if self.active_slots.ndim != 2:
+            raise ValueError("Attention slot-table capacity requires a rank-2 view.")
+        return int(self.active_slots.shape[1])
+
+
+@dataclass(frozen=True)
+class PagedDecodeViewMeta:
+    """Canonical physical-page coordinates for a paged decode provider."""
+
+    page_table: torch.Tensor
+    req_indices: torch.Tensor
+    context_lens: torch.Tensor
+    page_counts: torch.Tensor
+    last_page_lens: torch.Tensor
+    page_size: int
+    is_sparse: bool = False
+    max_context_len: int | None = None
+    attn_score: torch.Tensor | None = None
+    temp_slots: torch.Tensor | None = None
+
+    @property
+    def active_slots(self) -> torch.Tensor:
+        """Compatibility name used by method-agnostic attention execution."""
+
+        return self.page_table
+
+    @property
+    def slot_table_token_capacity(self) -> int:
+        return int(self.page_table.shape[1]) * int(self.page_size)
 
 
 @dataclass(frozen=True)
@@ -243,7 +276,7 @@ AttentionCacheWrite = ExplicitKVWrite | MlaLatentWrite
 class DecodeComputeView:
     """Decode metadata paired with exactly one physical payload layout."""
 
-    meta: AttentionViewMeta
+    meta: AttentionViewMeta | PagedDecodeViewMeta
     payload: AttentionPayload
 
 

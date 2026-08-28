@@ -165,7 +165,7 @@ class Attention(nn.Module):
                         and torch.cuda.is_current_stream_capturing()
                     )
                 ):
-                    slot_table_len = int(decode_meta.active_slots.shape[1])
+                    slot_table_len = decode_meta.slot_table_token_capacity
                     actual_max_len = (
                         int(decode_meta.context_lens.max().item())
                         if decode_meta.context_lens.numel() > 0
@@ -206,7 +206,7 @@ class Attention(nn.Module):
                         )
                     max_len_in_batch = int(max_context_len)
                     if decode_meta.active_slots.dim() == 2:
-                        slot_table_len = int(decode_meta.active_slots.shape[1])
+                        slot_table_len = decode_meta.slot_table_token_capacity
                         if max_len_in_batch > slot_table_len:
                             max_len_in_batch = slot_table_len
                         if max_len_in_batch <= 0:

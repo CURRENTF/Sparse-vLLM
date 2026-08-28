@@ -4,6 +4,7 @@ import torch
 
 from sparsevllm.kernels.triton.store_kvcache import (
     store_kvcache,
+    store_prefill_kvcache_with_quest_metadata,
     store_kvcache_with_quest_metadata,
 )
 
@@ -183,6 +184,31 @@ class ExplicitKVStorage:
             destination.k_cache,
             destination.v_cache,
             slot_mapping,
+            page_max,
+            page_min,
+            page_size=page_size,
+        )
+
+    def store_prefill_with_quest_metadata(
+        self,
+        layer_idx: int,
+        slot_mapping: torch.Tensor,
+        payload: AttentionCacheWrite,
+        page_segments: torch.Tensor,
+        page_max: torch.Tensor,
+        page_min: torch.Tensor,
+        *,
+        page_size: int,
+    ) -> None:
+        destination = self._validate_store(layer_idx, slot_mapping, payload)
+        assert isinstance(payload, ExplicitKVWrite)
+        store_prefill_kvcache_with_quest_metadata(
+            payload.key,
+            payload.value,
+            destination.k_cache,
+            destination.v_cache,
+            slot_mapping,
+            page_segments,
             page_max,
             page_min,
             page_size=page_size,

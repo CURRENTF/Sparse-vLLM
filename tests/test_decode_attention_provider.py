@@ -112,6 +112,31 @@ def test_batch_only_decode_spec_carries_static_context_capacity():
     assert spec.context_capacity == runtime_config.max_model_len
 
 
+def test_quest_decode_spec_uses_physical_cache_page_size():
+    config = SimpleNamespace(
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        head_dim=128,
+        torch_dtype=torch.bfloat16,
+    )
+    runtime_config = SimpleNamespace(
+        decode_graph_shape_policy="batch_only",
+        max_model_len=40960,
+        quest_chunk_size=16,
+    )
+
+    spec = build_mha_decode_attention_spec(
+        config,
+        sparse_method="quest",
+        attention_tp_size=1,
+        max_batch_size=8,
+        cuda_graph=True,
+        runtime_config=runtime_config,
+    )
+
+    assert spec.page_size == runtime_config.quest_chunk_size
+
+
 def test_deltakv_kivi_decode_spec_carries_mixed_storage_contract():
     config = SimpleNamespace(
         num_attention_heads=32,
@@ -474,6 +499,7 @@ def test_flashinfer_decode_reuses_plan_across_layers_in_one_step():
 def test_flashinfer_graph_page_pack_reuses_identical_layer_metadata():
     state = object.__new__(_FlashInferPagedDecodeGraphState)
     state.planned = True
+    state.spec = SimpleNamespace(page_size=1)
     state.contract = SimpleNamespace(context_capacity=8)
     state.indices = torch.empty(32, dtype=torch.int32)
     state._eager_page_pack_key = None
@@ -485,7 +511,7 @@ def test_flashinfer_graph_page_pack_reuses_identical_layer_metadata():
 
     with (
         patch(
-            "sparsevllm.kernels.triton.flashinfer_decode_metadata."
+            "sparsevllm.operators.flashinfer_decode_state."
             "pack_flashinfer_page_indices"
         ) as pack,
         patch("torch.cuda.is_current_stream_capturing", return_value=False),
@@ -530,6 +556,7 @@ def test_flashinfer_graph_in_starts_one_page_pack_scope():
 def test_flashinfer_graph_page_pack_keeps_capture_separate_from_warmup():
     state = object.__new__(_FlashInferPagedDecodeGraphState)
     state.planned = True
+    state.spec = SimpleNamespace(page_size=1)
     state.contract = SimpleNamespace(context_capacity=8)
     state.indices = torch.empty(32, dtype=torch.int32)
     state._eager_page_pack_key = None
@@ -546,7 +573,7 @@ def test_flashinfer_graph_page_pack_keeps_capture_separate_from_warmup():
 
     with (
         patch(
-            "sparsevllm.kernels.triton.flashinfer_decode_metadata."
+            "sparsevllm.operators.flashinfer_decode_state."
             "pack_flashinfer_page_indices"
         ) as pack,
         patch(
@@ -733,21 +760,103 @@ def test_sgl_decode_provider_uses_prepared_explicit_kv_adapter():
 
     assert output.shape == q.shape
     call = kernel.run_explicit.call_args
-    expected_inputs = (
-        q,
-        k_cache,
-        v_cache,
-        active_slots,
-        req_indices,
-        context_lens,
-    )
-    assert all(actual is expected for actual, expected in zip(call.args[:6], expected_inputs))
+    assert call.args[0] is q
+    assert call.args[1].shape == (16, 1, 8, 128)
+    assert call.args[2].shape == (16, 1, 8, 128)
+    assert call.args[1].data_ptr() == k_cache.data_ptr()
+    assert call.args[2].data_ptr() == v_cache.data_ptr()
+    assert call.args[3] is active_slots
+    assert call.args[4] is req_indices
+    assert call.args[5] is context_lens
     assert call.args[6] is output
     assert call.kwargs == {
         "validation_scope": scope,
         "return_softmax_lse": False,
     }
     decode_launch_op.launch_config.assert_not_called()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "provider_type",
+    [SglFa3PagedDecodeAttentionProvider, FlashInferPagedDecodeAttentionProvider],
+)
+def test_external_decode_page_size_16_matches_paged_torch_oracle(provider_type):
+    torch.manual_seed(20260828)
+    batch, page_size, logical_pages, physical_pages = 2, 16, 7, 19
+    query_heads, kv_heads, head_dim = 32, 8, 128
+    q = torch.randn(
+        batch, query_heads, head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    k_cache = torch.randn(
+        physical_pages * page_size,
+        kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.stack(
+        [
+            torch.randperm(physical_pages, device="cuda")[:logical_pages],
+            torch.randperm(physical_pages, device="cuda")[:logical_pages],
+        ]
+    ).to(torch.int32)
+    req_indices = torch.arange(batch, dtype=torch.int32, device="cuda")
+    context_lens = torch.tensor([103, 91], dtype=torch.int32, device="cuda")
+    view = SimpleNamespace(
+        payload=SimpleNamespace(k_cache=k_cache, v_cache=v_cache),
+        meta=SimpleNamespace(
+            active_slots=page_table,
+            req_indices=req_indices,
+            context_lens=context_lens,
+            max_context_len=logical_pages * page_size,
+            attn_score=None,
+        ),
+    )
+    spec = _spec(
+        num_query_heads=query_heads,
+        num_kv_heads=kv_heads,
+        head_dim=head_dim,
+        activation_dtype=torch.bfloat16,
+        softmax_scale=head_dim**-0.5,
+        page_size=page_size,
+        layer_varying_page_table=True,
+        cuda_graph=(provider_type is SglFa3PagedDecodeAttentionProvider),
+    )
+    provider = provider_type()
+    provider.prepare(spec, device_index=torch.cuda.current_device())
+    try:
+        with patch(
+            "sparsevllm.operators.decode_attention.get_context",
+            return_value=SimpleNamespace(attention_validation_scope=object()),
+        ):
+            output = provider.run(spec, q, view)
+    finally:
+        provider.close()
+
+    expected = []
+    group_size = query_heads // kv_heads
+    cache_pages_k = k_cache.view(physical_pages, page_size, kv_heads, head_dim)
+    cache_pages_v = v_cache.view_as(cache_pages_k)
+    for row in range(batch):
+        length = int(context_lens[row])
+        keys = cache_pages_k.index_select(0, page_table[row].long()).reshape(
+            -1, kv_heads, head_dim
+        )[:length]
+        values = cache_pages_v.index_select(0, page_table[row].long()).reshape(
+            -1, kv_heads, head_dim
+        )[:length]
+        keys = keys.repeat_interleave(group_size, dim=1)
+        values = values.repeat_interleave(group_size, dim=1)
+        logits = torch.einsum("hd,lhd->hl", q[row].float(), keys.float())
+        probabilities = torch.softmax(logits * spec.softmax_scale, dim=-1)
+        expected.append(
+            torch.einsum("hl,lhd->hd", probabilities, values.float()).to(q.dtype)
+        )
+    torch.testing.assert_close(
+        output, torch.stack(expected), rtol=3e-2, atol=3e-2
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -859,6 +968,190 @@ def test_flashinfer_graph_decode_replans_and_replays_new_metadata():
         torch.testing.assert_close(
             graph_output,
             expected,
+            rtol=3e-2,
+            atol=3e-2,
+        )
+    finally:
+        provider.close_decode_graph_state(state)
+        provider.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_flashinfer_graph_page_size_16_replans_and_replays():
+    flashinfer_paged_decode_support()
+    torch.manual_seed(20260828)
+    device = torch.device("cuda")
+    batch, page_size, query_heads, kv_heads, head_dim = 2, 16, 8, 2, 128
+    context_capacity = 96
+    page_capacity = context_capacity // page_size
+    physical_pages = 20
+    spec = _spec(
+        num_query_heads=query_heads,
+        num_kv_heads=kv_heads,
+        head_dim=head_dim,
+        activation_dtype=torch.bfloat16,
+        softmax_scale=head_dim**-0.5,
+        max_batch_size=batch,
+        page_size=page_size,
+        cuda_graph=True,
+        batch_only_cuda_graph=True,
+        context_capacity=context_capacity,
+        sparse_context_budget=48,
+    )
+    contract = DecodeGraphContract(
+        method="quest",
+        shape_policy="batch_only",
+        topology_path_id="long",
+        batch_capacity=batch,
+        context_capacity=context_capacity,
+    )
+    inputs = DecodeGraphInputs.allocate(contract, device=device, pin_memory=False)
+    q = torch.randn(
+        batch, query_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k_cache = torch.randn(
+        physical_pages * page_size,
+        kv_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.stack(
+        [
+            torch.randperm(physical_pages, device=device)[:page_capacity]
+            for _ in range(3)
+        ]
+    ).to(torch.int32)
+    view = SimpleNamespace(
+        payload=SimpleNamespace(k_cache=k_cache, v_cache=v_cache),
+        meta=SimpleNamespace(
+            active_slots=page_table,
+            req_indices=inputs.request_indices,
+            context_lens=inputs.context_lens,
+            attn_score=None,
+        ),
+    )
+    provider = FlashInferPagedDecodeAttentionProvider()
+    provider.prepare(spec, device_index=torch.cuda.current_device())
+    state = provider.init_decode_graph_state(spec, contract, inputs)
+
+    def update_metadata(lengths, rows) -> None:
+        inputs.host.context_lens.copy_(torch.tensor(lengths, dtype=torch.int32))
+        inputs.host.request_indices.copy_(torch.tensor(rows, dtype=torch.int32))
+        inputs.context_lens.copy_(inputs.host.context_lens)
+        inputs.request_indices.copy_(inputs.host.request_indices)
+        provider.prepare_decode_graph_out(state)
+        provider.prepare_decode_graph_in(state)
+
+    def reference() -> torch.Tensor:
+        expected = []
+        group_size = query_heads // kv_heads
+        pages_k = k_cache.view(physical_pages, page_size, kv_heads, head_dim)
+        pages_v = v_cache.view_as(pages_k)
+        for batch_idx in range(batch):
+            length = int(inputs.host.context_lens[batch_idx])
+            row = int(inputs.host.request_indices[batch_idx])
+            keys = pages_k.index_select(0, page_table[row].long()).reshape(
+                -1, kv_heads, head_dim
+            )[:length]
+            values = pages_v.index_select(0, page_table[row].long()).reshape(
+                -1, kv_heads, head_dim
+            )[:length]
+            keys = keys.repeat_interleave(group_size, dim=1)
+            values = values.repeat_interleave(group_size, dim=1)
+            logits = torch.einsum(
+                "hd,lhd->hl", q[batch_idx].float(), keys.float()
+            ) * spec.softmax_scale
+            expected.append(
+                torch.einsum(
+                    "hl,lhd->hd",
+                    torch.softmax(logits, dim=-1),
+                    values.float(),
+                ).to(q.dtype)
+            )
+        return torch.stack(expected)
+
+    try:
+        update_metadata([91, 75], [2, 0])
+        provider.run(spec, q, view)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = provider.run(spec, q, view)
+        update_metadata([65, 94], [1, 2])
+        expected = reference()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            graph_output, expected, rtol=3e-2, atol=3e-2
+        )
+
+        sparse_page_table = page_table[:batch, :3].contiguous()
+        sparse_context_lens = torch.empty(
+            batch, dtype=torch.int32, device=device
+        )
+        sparse_view = SimpleNamespace(
+            payload=view.payload,
+            meta=SimpleNamespace(
+                active_slots=sparse_page_table,
+                req_indices=torch.arange(
+                    batch, dtype=torch.int32, device=device
+                ),
+                context_lens=sparse_context_lens,
+                attn_score=None,
+                is_sparse=True,
+            ),
+        )
+
+        def update_sparse_metadata(lengths) -> None:
+            update_metadata(lengths, list(range(batch)))
+            dense_lens = torch.tensor(lengths, dtype=torch.int32)
+            last_page_lens = torch.remainder(dense_lens - 1, page_size) + 1
+            sparse_context_lens.copy_(2 * page_size + last_page_lens)
+
+        def sparse_reference() -> torch.Tensor:
+            expected_rows = []
+            group_size = query_heads // kv_heads
+            pages_k = k_cache.view(
+                physical_pages, page_size, kv_heads, head_dim
+            )
+            pages_v = v_cache.view_as(pages_k)
+            for batch_idx in range(batch):
+                length = int(sparse_context_lens[batch_idx])
+                keys = pages_k.index_select(
+                    0, sparse_page_table[batch_idx].long()
+                ).reshape(-1, kv_heads, head_dim)[:length]
+                values = pages_v.index_select(
+                    0, sparse_page_table[batch_idx].long()
+                ).reshape(-1, kv_heads, head_dim)[:length]
+                keys = keys.repeat_interleave(group_size, dim=1)
+                values = values.repeat_interleave(group_size, dim=1)
+                logits = torch.einsum(
+                    "hd,lhd->hl", q[batch_idx].float(), keys.float()
+                ) * spec.softmax_scale
+                expected_rows.append(
+                    torch.einsum(
+                        "hl,lhd->hd",
+                        torch.softmax(logits, dim=-1),
+                        values.float(),
+                    ).to(q.dtype)
+                )
+            return torch.stack(expected_rows)
+
+        update_sparse_metadata([91, 75])
+        provider.run(spec, q, sparse_view)
+        torch.cuda.synchronize()
+        sparse_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(sparse_graph):
+            sparse_graph_output = provider.run(spec, q, sparse_view)
+        update_sparse_metadata([65, 94])
+        sparse_expected = sparse_reference()
+        sparse_graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            sparse_graph_output,
+            sparse_expected,
             rtol=3e-2,
             atol=3e-2,
         )

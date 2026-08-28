@@ -155,7 +155,11 @@ def build_mha_decode_attention_spec(
         softmax_scale=head_dim**-0.5,
         max_batch_size=int(max_batch_size),
         causal=True,
-        page_size=1,
+        page_size=(
+            int(getattr(runtime_config, "quest_chunk_size", 16))
+            if normalized_method == "quest"
+            else 1
+        ),
         # Score demand can change between decode steps for sparse methods.
         # Bind the score-capable implementation up front instead of
         # switching providers in the runtime path.
@@ -178,6 +182,11 @@ def build_mha_decode_attention_spec(
         ),
         context_capacity=int(getattr(runtime_config, "max_model_len", 0) or 0)
         or None,
+        sparse_context_budget=(
+            int(getattr(runtime_config, "quest_token_budget", 2080))
+            if normalized_method == "quest"
+            else None
+        ),
         may_use_full_layer_kivi_int4=(
             normalized_method == "deltakv"
             and int(

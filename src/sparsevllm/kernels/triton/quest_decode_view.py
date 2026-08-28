@@ -373,4 +373,219 @@ def finalize_quest_decode_view(
     return packed_slots, local_req_indices, local_context_lens
 
 
-__all__ = ["finalize_quest_decode_view", "score_quest_pages"]
+@triton.jit
+def _finalize_quest_paged_decode_view_kernel(
+    selected_prev_page_slots,
+    row_page_slots,
+    num_pages,
+    context_lens,
+    output_page_table,
+    output_req_indices,
+    output_context_lens,
+    output_page_counts,
+    output_last_page_lens,
+    selected_stride,
+    row_page_stride,
+    output_stride,
+    WIDTH: tl.constexpr,
+    PREV_BUDGET: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    TOKEN_BUDGET: tl.constexpr,
+    USE_DENSE_FALLBACK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    output_mask = offsets < WIDTH
+    row_num_pages = tl.maximum(tl.load(num_pages + row), 1)
+    context_len = tl.load(context_lens + row)
+    last_page_len = context_len - (row_num_pages - 1) * PAGE_SIZE
+    use_dense = False
+    if USE_DENSE_FALLBACK:
+        use_dense = (context_len <= TOKEN_BUDGET) | (
+            row_num_pages <= PREV_BUDGET + 1
+        )
+
+    previous_indices = tl.minimum(offsets, PREV_BUDGET - 1)
+    previous_pages = tl.load(
+        selected_prev_page_slots + row * selected_stride + previous_indices,
+        mask=output_mask & (offsets < PREV_BUDGET),
+        other=0,
+    )
+    last_page = tl.load(
+        row_page_slots + row * row_page_stride + row_num_pages - 1
+    )
+    sparse_pages = tl.where(offsets < PREV_BUDGET, previous_pages, last_page)
+    sparse_valid = offsets < PREV_BUDGET + 1
+    if USE_DENSE_FALLBACK:
+        dense_pages = tl.load(
+            row_page_slots + row * row_page_stride + offsets,
+            mask=output_mask & (offsets < row_num_pages),
+            other=0,
+        )
+        output_pages = tl.where(use_dense, dense_pages, sparse_pages)
+        valid_pages = tl.where(use_dense, offsets < row_num_pages, sparse_valid)
+        output_len = tl.where(
+            use_dense,
+            context_len,
+            PREV_BUDGET * PAGE_SIZE + last_page_len,
+        )
+        output_page_count = tl.where(
+            use_dense, row_num_pages, PREV_BUDGET + 1
+        )
+    else:
+        output_pages = sparse_pages
+        valid_pages = sparse_valid
+        output_len = PREV_BUDGET * PAGE_SIZE + last_page_len
+        output_page_count = PREV_BUDGET + 1
+
+    tl.store(
+        output_page_table + row * output_stride + offsets,
+        tl.where(valid_pages, output_pages, 0),
+        mask=output_mask,
+    )
+    tl.store(output_req_indices + row, row)
+    tl.store(output_context_lens + row, output_len)
+    tl.store(output_page_counts + row, output_page_count)
+    tl.store(output_last_page_lens + row, last_page_len)
+
+
+def finalize_quest_paged_decode_view(
+    selected_prev_page_slots: torch.Tensor,
+    row_page_slots: torch.Tensor,
+    num_pages: torch.Tensor,
+    context_lens: torch.Tensor,
+    *,
+    page_size: int,
+    token_budget: int,
+    output_page_table: torch.Tensor,
+    output_req_indices: torch.Tensor,
+    output_context_lens: torch.Tensor,
+    output_page_counts: torch.Tensor,
+    output_last_page_lens: torch.Tensor,
+    use_dense_fallback: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Finalize selected QuEST pages directly into a caller-owned paged view."""
+
+    batch_size, prev_budget = map(int, selected_prev_page_slots.shape)
+    width = int(output_page_table.shape[1])
+    tensors = {
+        "selected_prev_page_slots": selected_prev_page_slots,
+        "row_page_slots": row_page_slots,
+        "num_pages": num_pages,
+        "context_lens": context_lens,
+        "output_page_table": output_page_table,
+        "output_req_indices": output_req_indices,
+        "output_context_lens": output_context_lens,
+        "output_page_counts": output_page_counts,
+        "output_last_page_lens": output_last_page_lens,
+    }
+    if selected_prev_page_slots.ndim != 2 or row_page_slots.ndim != 2:
+        raise ValueError("QuEST paged finalizer requires rank-2 page tables")
+    if int(row_page_slots.shape[0]) != batch_size:
+        raise ValueError("QuEST paged finalizer page tables must share a batch size")
+    if output_page_table.shape != (batch_size, width) or width < prev_budget + 1:
+        raise ValueError("QuEST paged output table has insufficient capacity")
+    for name, tensor in tensors.items():
+        if tensor.dtype != torch.int32:
+            raise TypeError(f"{name} must use torch.int32, got {tensor.dtype}")
+        if tensor.device != selected_prev_page_slots.device:
+            raise ValueError(f"{name} must share the selection device")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+    for name, tensor in {
+        "num_pages": num_pages,
+        "context_lens": context_lens,
+        "output_req_indices": output_req_indices,
+        "output_context_lens": output_context_lens,
+        "output_page_counts": output_page_counts,
+        "output_last_page_lens": output_last_page_lens,
+    }.items():
+        if tensor.shape != (batch_size,):
+            raise ValueError(f"{name} must have shape [{batch_size}]")
+    page_size = int(page_size)
+    token_budget = int(token_budget)
+    if page_size <= 0 or token_budget <= 0:
+        raise ValueError("page_size and token_budget must be positive")
+
+    if not selected_prev_page_slots.is_cuda:
+        safe_num_pages = num_pages.to(torch.long).clamp_min(1)
+        last_pages = row_page_slots.gather(1, (safe_num_pages - 1)[:, None])
+        sparse_pages = torch.cat((selected_prev_page_slots, last_pages), dim=1)
+        last_page_lens = context_lens - (num_pages - 1) * page_size
+        sparse_lens = prev_budget * page_size + last_page_lens
+        if use_dense_fallback:
+            use_dense = (context_lens <= token_budget) | (
+                num_pages <= prev_budget + 1
+            )
+            positions = torch.arange(
+                width, dtype=torch.int32, device=context_lens.device
+            )
+            dense_pages = torch.where(
+                positions[None, :] < num_pages[:, None],
+                row_page_slots[:, :width],
+                0,
+            )
+            sparse_padded = torch.zeros_like(output_page_table)
+            sparse_padded[:, : prev_budget + 1].copy_(sparse_pages)
+            output_page_table.copy_(
+                torch.where(use_dense[:, None], dense_pages, sparse_padded)
+            )
+            output_context_lens.copy_(torch.where(use_dense, context_lens, sparse_lens))
+            output_page_counts.copy_(
+                torch.where(use_dense, num_pages, prev_budget + 1)
+            )
+        else:
+            output_page_table.zero_()
+            output_page_table[:, : prev_budget + 1].copy_(sparse_pages)
+            output_context_lens.copy_(sparse_lens)
+            output_page_counts.fill_(prev_budget + 1)
+        output_req_indices.copy_(
+            torch.arange(batch_size, dtype=torch.int32, device=context_lens.device)
+        )
+        output_last_page_lens.copy_(last_page_lens)
+        return (
+            output_page_table,
+            output_req_indices,
+            output_context_lens,
+            output_page_counts,
+            output_last_page_lens,
+        )
+
+    block_size = triton.next_power_of_2(width)
+    _finalize_quest_paged_decode_view_kernel[(batch_size,)](
+        selected_prev_page_slots,
+        row_page_slots,
+        num_pages,
+        context_lens,
+        output_page_table,
+        output_req_indices,
+        output_context_lens,
+        output_page_counts,
+        output_last_page_lens,
+        selected_prev_page_slots.stride(0),
+        row_page_slots.stride(0),
+        output_page_table.stride(0),
+        WIDTH=width,
+        PREV_BUDGET=prev_budget,
+        PAGE_SIZE=page_size,
+        TOKEN_BUDGET=token_budget,
+        USE_DENSE_FALLBACK=bool(use_dense_fallback),
+        BLOCK_SIZE=block_size,
+        num_warps=min(max(block_size // 32, 1), 8),
+        num_stages=1,
+    )
+    return (
+        output_page_table,
+        output_req_indices,
+        output_context_lens,
+        output_page_counts,
+        output_last_page_lens,
+    )
+
+
+__all__ = [
+    "finalize_quest_decode_view",
+    "finalize_quest_paged_decode_view",
+    "score_quest_pages",
+]

@@ -244,9 +244,10 @@ class SglFa3DecodeKernel:
             return None, int(num_splits)
         batch_size = int(context_lens.numel())
         total_q = int(q.shape[0])
-        max_seqlen_k = int(page_table.shape[1])
+        page_size = int(k_cache.shape[1]) if k_cache.ndim == 4 else 1
+        max_seqlen_k = int(page_table.shape[1]) * page_size
         num_heads = int(q.shape[1])
-        num_heads_k = int(k_cache.shape[1])
+        num_heads_k = int(k_cache.shape[-2])
         headdim = int(q.shape[-1])
         headdim_v = int(headdim_v)
         is_capturing = torch.cuda.is_current_stream_capturing()
@@ -482,7 +483,13 @@ class SglFa3DecodeKernel:
         validation_scope: object | None = None,
         return_softmax_lse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Run causal varlen attention over page-size-one explicit KV."""
+        """Run causal varlen attention over paged explicit KV."""
+
+        if k_cache.ndim not in {3, 4} or v_cache.shape != k_cache.shape:
+            raise ValueError(
+                "FA3 explicit KV must use matched [slots, heads, dim] or "
+                "[pages, page_size, heads, dim] tensors."
+            )
 
         scheduler_metadata, split_count = self._scheduler_metadata(
             q,
@@ -498,8 +505,8 @@ class SglFa3DecodeKernel:
 
         args: list[object] = [
             q,
-            k_cache.unsqueeze(1),
-            v_cache.unsqueeze(1),
+            k_cache.unsqueeze(1) if k_cache.ndim == 3 else k_cache,
+            v_cache.unsqueeze(1) if v_cache.ndim == 3 else v_cache,
             None,
             None,
             None,
@@ -571,7 +578,7 @@ class SglFa3DecodeKernel:
         validation_scope: object | None = None,
         return_softmax_lse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Run one-token decode over page-size-one explicit KV storage."""
+        """Run one-token decode over explicit paged KV storage."""
 
         batch_size = int(q.shape[0])
         if batch_size > int(self._cu_seqlens_q.numel()) - 1:

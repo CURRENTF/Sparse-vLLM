@@ -11,9 +11,11 @@ from sparsevllm.kernels.triton.mla.copy_latent import (
 )
 from sparsevllm.kernels.triton.quest_decode_view import (
     finalize_quest_decode_view,
+    finalize_quest_paged_decode_view,
     score_quest_pages,
 )
 from sparsevllm.kernels.triton.store_kvcache import (
+    store_prefill_kvcache_with_quest_metadata,
     store_kvcache_with_quest_metadata,
 )
 from sparsevllm.operators.quest_selection import (
@@ -259,6 +261,87 @@ def test_quest_decode_view_finalizer_matches_reference(
 
 
 @CUDA_REQUIRED
+@pytest.mark.parametrize("use_dense_fallback", [False, True])
+def test_quest_paged_finalizer_matches_token_view(
+    use_dense_fallback: bool,
+) -> None:
+    page_size, prev_budget = 4, 3
+    selected = torch.tensor(
+        [[7, 2, 5], [4, 1, 6]], dtype=torch.int32, device="cuda"
+    )
+    page_table = torch.tensor(
+        [[7, 2, 5, 9, 8], [4, 1, 6, 3, 0]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    num_pages = torch.tensor([5, 3], dtype=torch.int32, device="cuda")
+    context_lens = torch.tensor([18, 10], dtype=torch.int32, device="cuda")
+    width = prev_budget + 2
+    outputs = (
+        torch.empty(2, width, dtype=torch.int32, device="cuda"),
+        *[
+            torch.empty(2, dtype=torch.int32, device="cuda")
+            for _ in range(4)
+        ],
+    )
+
+    actual = finalize_quest_paged_decode_view(
+        selected,
+        page_table,
+        num_pages,
+        context_lens,
+        page_size=page_size,
+        token_budget=12,
+        output_page_table=outputs[0],
+        output_req_indices=outputs[1],
+        output_context_lens=outputs[2],
+        output_page_counts=outputs[3],
+        output_last_page_lens=outputs[4],
+        use_dense_fallback=use_dense_fallback,
+    )
+    expected_outputs = tuple(torch.empty_like(tensor, device="cpu") for tensor in outputs)
+    expected = finalize_quest_paged_decode_view(
+        selected.cpu(),
+        page_table.cpu(),
+        num_pages.cpu(),
+        context_lens.cpu(),
+        page_size=page_size,
+        token_budget=12,
+        output_page_table=expected_outputs[0],
+        output_req_indices=expected_outputs[1],
+        output_context_lens=expected_outputs[2],
+        output_page_counts=expected_outputs[3],
+        output_last_page_lens=expected_outputs[4],
+        use_dense_fallback=use_dense_fallback,
+    )
+    for actual_tensor, expected_tensor in zip(actual, expected):
+        torch.testing.assert_close(actual_tensor.cpu(), expected_tensor, rtol=0, atol=0)
+
+    pointers = tuple(tensor.data_ptr() for tensor in outputs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = finalize_quest_paged_decode_view(
+            selected,
+            page_table,
+            num_pages,
+            context_lens,
+            page_size=page_size,
+            token_budget=12,
+            output_page_table=outputs[0],
+            output_req_indices=outputs[1],
+            output_context_lens=outputs[2],
+            output_page_counts=outputs[3],
+            output_last_page_lens=outputs[4],
+            use_dense_fallback=use_dense_fallback,
+        )
+    graph.replay()
+    assert tuple(tensor.data_ptr() for tensor in captured) == pointers
+    for captured_tensor, expected_tensor in zip(captured, expected):
+        torch.testing.assert_close(
+            captured_tensor.cpu(), expected_tensor, rtol=0, atol=0
+        )
+
+@CUDA_REQUIRED
 def test_explicit_kv_store_updates_quest_bounds_incrementally() -> None:
     page_size, num_pages, num_heads, head_dim = 4, 3, 2, 8
     k_cache = torch.full(
@@ -359,6 +442,119 @@ def test_explicit_quest_metadata_store_is_cuda_graph_replay_safe() -> None:
         page_min[0],
         torch.minimum(first_key[0], second_key[0]),
     )
+
+
+@CUDA_REQUIRED
+def test_explicit_prefill_fused_store_matches_page_reduction_oracle() -> None:
+    torch.manual_seed(20260828)
+    page_size, num_pages, num_heads, head_dim = 4, 6, 2, 8
+    k_cache = torch.full(
+        (page_size * num_pages, num_heads, head_dim),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    v_cache = torch.full_like(k_cache, float("nan"))
+    page_max = torch.full(
+        (num_pages, num_heads, head_dim),
+        99,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    page_min = torch.full_like(page_max, -99)
+
+    old_key = torch.randn(
+        1, num_heads, head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    k_cache[page_size * 3 + 0].copy_(old_key[0])
+    page_max[3].copy_(old_key[0])
+    page_min[3].copy_(old_key[0])
+
+    # Continue physical page 3, then fill fresh pages 1 and 5. The packed input
+    # contains two requests and deliberately non-monotonic physical page ids.
+    slots = torch.tensor(
+        [13, 14, 15, 4, 5, 6, 7, 20, 21],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    segments = torch.tensor(
+        [[0, 3], [3, 4], [7, 2]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    key = torch.randn(
+        slots.numel(), num_heads, head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    value = torch.randn_like(key)
+
+    store_prefill_kvcache_with_quest_metadata(
+        key,
+        value,
+        k_cache,
+        v_cache,
+        slots,
+        segments,
+        page_max,
+        page_min,
+        page_size=page_size,
+    )
+
+    torch.testing.assert_close(k_cache.index_select(0, slots.long()), key)
+    torch.testing.assert_close(v_cache.index_select(0, slots.long()), value)
+    continued = torch.cat((old_key, key[:3]), dim=0)
+    torch.testing.assert_close(page_max[3], continued.amax(dim=0))
+    torch.testing.assert_close(page_min[3], continued.amin(dim=0))
+    torch.testing.assert_close(page_max[1], key[3:7].amax(dim=0))
+    torch.testing.assert_close(page_min[1], key[3:7].amin(dim=0))
+    # A fresh partial page must overwrite stale metadata rather than merge it.
+    torch.testing.assert_close(page_max[5], key[7:].amax(dim=0))
+    torch.testing.assert_close(page_min[5], key[7:].amin(dim=0))
+    torch.testing.assert_close(page_max[0], torch.full_like(page_max[0], 99))
+
+
+@CUDA_REQUIRED
+def test_explicit_prefill_fused_store_is_cuda_graph_replay_safe() -> None:
+    page_size = 4
+    key = torch.randn(4, 1, 8, dtype=torch.bfloat16, device="cuda")
+    value = torch.randn_like(key)
+    k_cache = torch.empty(8, 1, 8, dtype=torch.bfloat16, device="cuda")
+    v_cache = torch.empty_like(k_cache)
+    slots = torch.arange(4, dtype=torch.int32, device="cuda")
+    segments = torch.tensor([[0, 4]], dtype=torch.int32, device="cuda")
+    page_max = torch.empty(2, 1, 8, dtype=torch.bfloat16, device="cuda")
+    page_min = torch.empty_like(page_max)
+
+    store_prefill_kvcache_with_quest_metadata(
+        key,
+        value,
+        k_cache,
+        v_cache,
+        slots,
+        segments,
+        page_max,
+        page_min,
+        page_size=page_size,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        store_prefill_kvcache_with_quest_metadata(
+            key,
+            value,
+            k_cache,
+            v_cache,
+            slots,
+            segments,
+            page_max,
+            page_min,
+            page_size=page_size,
+        )
+    replacement = torch.randn_like(key)
+    key.copy_(replacement)
+    slots.add_(4)
+    graph.replay()
+    torch.testing.assert_close(k_cache[4:], replacement)
+    torch.testing.assert_close(page_max[1], replacement.amax(dim=0))
+    torch.testing.assert_close(page_min[1], replacement.amin(dim=0))
 
 
 @CUDA_REQUIRED

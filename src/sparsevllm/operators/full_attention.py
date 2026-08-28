@@ -33,7 +33,6 @@ class FullAttentionOpSpec:
             "activation_dtype",
             "softmax_scale",
             "causal",
-            "page_size",
             "layer_varying_page_table",
         )
         mismatches = [
