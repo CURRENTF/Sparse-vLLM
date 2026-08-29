@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "description": "SM120 decode component sweep with one Qwen3 decision matrix and representative portable attention/MoE shapes",
+  "timing": {
+    "graph": true,
+    "warmup": 2,
+    "samples": 5,
+    "iterations": 10,
+    "seed": 20260829
+  },
+  "attention_profiles": [
+    {
+      "name": "qwen3_30b_a3b_d128_q32_kv4",
+      "provenance": "Qwen3-30B-A3B-Instruct-2507",
+      "shape": {"head_dim": 128, "num_query_heads": 32, "num_kv_heads": 4},
+      "matrices": [
+        {
+          "context_lengths": [1024, 4096, 8192, 16384, 32768],
+          "batch_sizes": [1, 2, 4, 8, 16, 32]
+        },
+        {"context_lengths": [65536], "batch_sizes": [1, 2, 4, 8, 16]},
+        {"context_lengths": [131072], "batch_sizes": [1, 2, 4, 8]}
+      ]
+    },
+    {
+      "name": "gqa_d64_q32_kv8",
+      "provenance": "representative GQA 4:1 D64",
+      "shape": {"head_dim": 64, "num_query_heads": 32, "num_kv_heads": 8},
+      "cases": [[1024, 1], [8192, 8], [32768, 16], [65536, 4]]
+    },
+    {
+      "name": "mha_d128_q32_kv32",
+      "provenance": "representative MHA D128",
+      "shape": {"head_dim": 128, "num_query_heads": 32, "num_kv_heads": 32},
+      "cases": [[1024, 1], [8192, 8], [32768, 16], [65536, 4]]
+    },
+    {
+      "name": "gqa_d128_q32_kv8",
+      "provenance": "representative Llama-style GQA 4:1 D128",
+      "shape": {"head_dim": 128, "num_query_heads": 32, "num_kv_heads": 8},
+      "cases": [[1024, 1], [8192, 8], [32768, 16], [65536, 4]]
+    },
+    {
+      "name": "gqa_d128_q64_kv8",
+      "provenance": "representative large-head GQA 8:1 D128",
+      "shape": {"head_dim": 128, "num_query_heads": 64, "num_kv_heads": 8},
+      "cases": [[1024, 1], [8192, 8], [32768, 16], [65536, 4]]
+    },
+    {
+      "name": "qwen35_attention_d256_q24_kv4",
+      "provenance": "Qwen3.5 attention-layer shape represented in repository runtime tests",
+      "shape": {"head_dim": 256, "num_query_heads": 24, "num_kv_heads": 4},
+      "cases": [[1024, 1], [8192, 8], [32768, 16], [65536, 4]]
+    }
+  ],
+  "moe_profiles": [
+    {
+      "name": "qwen3_30b_a3b_fp8",
+      "provenance": "Qwen3-30B-A3B-Instruct-2507",
+      "shape": {
+        "hidden_size": 2048,
+        "intermediate_size": 768,
+        "num_experts": 128,
+        "top_k": 8
+      },
+      "batch_sizes": [1, 2, 4, 8, 16, 32, 64],
+      "probe_flashinfer_on_first_case": true
+    },
+    {
+      "name": "qwen3_235b_a22b_fp8",
+      "provenance": "representative large Qwen3-MoE expert shape",
+      "shape": {
+        "hidden_size": 4096,
+        "intermediate_size": 1536,
+        "num_experts": 128,
+        "top_k": 8
+      },
+      "batch_sizes": [1, 2, 4, 8, 16, 32],
+      "probe_flashinfer_on_first_case": false
+    }
+  ]
+}
