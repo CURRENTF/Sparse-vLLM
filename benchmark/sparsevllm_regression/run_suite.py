@@ -477,6 +477,8 @@ def _quality_command(
     ]
     if "max_model_len" in quality:
         cmd.extend(["--max_model_len", str(int(quality["max_model_len"]))])
+    if bool(cfg.get("enable_prefix_caching", False)):
+        cmd.append("--allow_prefix_caching")
     cmd.extend(
         [
             "--hyper_param",

@@ -20,7 +20,7 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
             allow_single_omnikv_full_layer=False,
         )
 
-    def test_longbench_forces_prefix_caching_off(self):
+    def test_longbench_requires_explicit_prefix_caching_opt_in(self):
         args = self._omnikv_args(
             resolve_method_config(
                 load_manifest()["methods"]["omnikv"],
@@ -36,6 +36,10 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
         args.hyper_param = json.dumps(requested)
         with self.assertRaisesRegex(ValueError, "enable_prefix_caching=False"):
             longbench_pred._build_infer_config(args)
+
+        args.allow_prefix_caching = True
+        config = longbench_pred._build_infer_config(args)
+        self.assertIs(config["enable_prefix_caching"], True)
 
     def test_longbench_records_requested_and_effective_omnikv_config(self):
         config = resolve_method_config(
@@ -75,6 +79,35 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
         self.assertEqual(
             recorded["requested"]["config"]["full_attention_layers"],
             recorded["effective_runtime"]["full_attention_layers"],
+        )
+
+    def test_longbench_records_final_prefix_cache_statistics(self):
+        generate_fn = SimpleNamespace(
+            _sparsevllm_llm=SimpleNamespace(
+                worker_load=lambda: {
+                    "active_requests": 0,
+                    "cache": {
+                        "prefix_cache_hit_requests": 3,
+                        "prefix_cache_hit_tokens": 48,
+                    },
+                }
+            )
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            longbench_pred._write_worker_load_stats(
+                generate_fn=generate_fn,
+                out_root=tmp,
+                rank=0,
+            )
+            recorded = json.loads(
+                (Path(tmp) / "worker_load_stats_rank0.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(
+            recorded["worker_load"]["cache"]["prefix_cache_hit_tokens"],
+            48,
         )
 
     def test_chat_template_policy_matches_regular_prompt_paths(self):

@@ -40,6 +40,7 @@ from sparsevllm.engine.cache_manager import CacheManager
 from sparsevllm.engine.cache_manager.base import _debug_tensor_summary
 from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphRunner
 from sparsevllm.engine.prefix_cache_coordinator import PrefixCacheCoordinator
+from sparsevllm.engine.prefix_prune import select_global_keep_indices
 from sparsevllm.engine.chain_cache import ChainAdmissionPlan, ChainCacheCoordinator
 from sparsevllm.engine.recurrent_state_manager import RecurrentStateManager, RecurrentStateSpec
 from sparsevllm.engine.runtime_state import RuntimeState
@@ -141,6 +142,7 @@ PREFIX_CACHE_CONTROL_RPC_METHODS = {
     "prefix_cache_match",
     "prefix_cache_delete_subtree",
     "prefix_cache_set_eviction_priority",
+    "prefix_cache_prune",
 }
 DECODE_GRAPH_HOST_STATUS_SYNC_METHODS = {
     "begin_decode_cuda_graph_capture",
@@ -941,6 +943,204 @@ class ModelRunner:
         return self.runtime_state.prefix_cache_set_eviction_priority(
             [int(token_id) for token_id in token_ids],
             priority=int(priority),
+        )
+
+    def _prefix_prune_score_forward(
+        self,
+        *,
+        token_ids: list[int],
+        prefix_hit_len: int,
+        protected_prefix_len: int,
+        candidate_start: int,
+        temp_seq_id: int,
+    ) -> torch.Tensor:
+        manager = self.cache_manager
+        begin = getattr(manager, "begin_prefix_prune_scoring", None)
+        finish = getattr(manager, "finish_prefix_prune_scoring", None)
+        abort = getattr(manager, "abort_prefix_prune_scoring", None)
+        prefix_cache = getattr(manager, "prefix_cache", None)
+        block_size = int(getattr(manager, "prefix_cache_block_size", 0) or 0)
+        if not callable(begin) or not callable(finish) or not callable(abort):
+            raise RuntimeError(
+                "physical prefix-cache pruning is unsupported by this cache manager; "
+                "QuEST remains supported without pruning."
+            )
+        if prefix_cache is None or block_size <= 0:
+            raise RuntimeError("prefix cache is not enabled on this model worker.")
+        query_end = len(token_ids)
+        if query_end > int(self.config.max_model_len):
+            raise ValueError(
+                "prefix-prune scoring context exceeds max_model_len: "
+                f"context={query_end} max_model_len={self.config.max_model_len}. "
+                "Reduce observation_tokens, score_chunk_size, or prev_postfix_size."
+            )
+        if prefix_hit_len <= candidate_start or prefix_hit_len >= query_end:
+            raise ValueError(
+                "prefix-prune score forward requires candidate tokens followed by queries: "
+                f"candidate_start={candidate_start} hit={prefix_hit_len} end={query_end}."
+            )
+        block_ids = prefix_cache.block_ids_for_tokens(
+            token_ids[:prefix_hit_len], max_tokens=prefix_hit_len
+        )
+        hit_len, last_block_id, hit_blocks = prefix_cache.match_longest_block_ids(
+            block_ids
+        )
+        if hit_len != prefix_hit_len or last_block_id is None:
+            raise RuntimeError(
+                "prefix-prune score forward cannot attach the requested cached prefix: "
+                f"requested={prefix_hit_len} matched={hit_len}."
+            )
+        protected_block_ids = prefix_cache.block_ids_for_tokens(
+            token_ids[:protected_prefix_len], max_tokens=protected_prefix_len
+        )
+        protected_hit, protected_last, protected_count = (
+            prefix_cache.match_longest_block_ids(protected_block_ids)
+        )
+        if protected_hit != protected_prefix_len or protected_last is None:
+            raise RuntimeError(
+                "prefix-prune target changed before its scoring forward: "
+                f"protected={protected_prefix_len} matched={protected_hit}."
+            )
+        protected_blocks = prefix_cache.get_chain(
+            protected_last, protected_count
+        )
+        seq = Sequence([int(token_id) for token_id in token_ids])
+        seq.seq_id = int(temp_seq_id)
+        seq.num_prefilled_tokens = int(prefix_hit_len)
+        seq.current_chunk_size = query_end - prefix_hit_len
+        seq.prefix_cache_enabled = True
+        seq.prefix_cache_hit_len = int(prefix_hit_len)
+        seq.prefix_cache_hit_block_count = int(hit_blocks)
+        seq.prefix_cache_hit_last_block_id = last_block_id
+        seq.prefix_cache_block_size = block_size
+        seq.prefix_cache_method = str(getattr(self.config, "sparse_method", "") or "")
+        begin(
+            seq_id=seq.seq_id,
+            candidate_start=int(candidate_start),
+            query_start=int(prefix_hit_len),
+            query_end=int(query_end),
+        )
+        row_created = False
+        protected_acquired = []
+        try:
+            for block in protected_blocks:
+                prefix_cache.acquire_block_ref(block)
+                protected_acquired.append(block)
+            input_ids, positions = self.prepare_step([seq], True)
+            row_created = True
+            ctx = get_context()
+            ctx.sparse_controller = self.sparse_controller
+            self.sparse_controller.prepare_forward([seq], True)
+            self.model(input_ids, positions)
+            self.sparse_controller.post_forward([seq], True)
+            return finish()
+        except Exception:
+            abort()
+            raise
+        finally:
+            reset_context()
+            if row_created or seq.seq_id in getattr(manager, "seq_id_to_row", {}):
+                self.runtime_state.free_seq(seq.seq_id)
+            for block in protected_acquired:
+                prefix_cache.release_block_ref(block)
+
+    @torch.no_grad()
+    def prefix_cache_prune(
+        self,
+        token_ids: list[int],
+        range_start: int,
+        range_end: int,
+        keep_tokens: int,
+        policy: str,
+        prune_id: str,
+        allow_recompress: bool = False,
+        observation_tokens: int = 64,
+        score_chunk_size: int = 2048,
+        prev_postfix_size: int = 64,
+        kvzip_replay_prefix_ids: list[int] | None = None,
+        temp_seq_id: int = -1,
+    ) -> dict[str, object]:
+        token_ids = [int(token_id) for token_id in token_ids]
+        range_start = int(range_start)
+        range_end = int(range_end)
+        keep_tokens = int(keep_tokens)
+        if allow_recompress:
+            raise RuntimeError(
+                "allow_recompress is reserved but not implemented because dropped KV cannot "
+                "be rescored without rebuilding the original dense prefix."
+            )
+        self.cache_manager.validate_prefix_cache_prune_target(
+            token_ids,
+            range_start=range_start,
+            range_end=range_end,
+            allow_recompress=allow_recompress,
+        )
+        if policy == "snapkv_global":
+            block_size = int(getattr(self.cache_manager, "prefix_cache_block_size", 0) or 0)
+            observation_tokens = max(1, int(observation_tokens))
+            query_start = max(range_start + block_size, range_end - observation_tokens)
+            query_start = (query_start // block_size) * block_size
+            protected_count = range_end - query_start
+            if protected_count > keep_tokens:
+                raise ValueError(
+                    "SnapKV observation window exceeds the global keep budget: "
+                    f"observation={protected_count} keep_tokens={keep_tokens}."
+                )
+            score = self._prefix_prune_score_forward(
+                token_ids=token_ids[:range_end],
+                prefix_hit_len=query_start,
+                protected_prefix_len=range_end,
+                candidate_start=range_start,
+                temp_seq_id=temp_seq_id,
+            )
+            self.parallel_context.world_all_reduce(score, op=dist.ReduceOp.MAX)
+            candidate_scores = score[range_start:query_start]
+            selected_candidates = select_global_keep_indices(
+                candidate_scores,
+                keep_tokens=keep_tokens - protected_count,
+            ) + range_start
+            protected = torch.arange(
+                query_start, range_end, dtype=torch.long, device=score.device
+            )
+            keep_indices = torch.cat((selected_candidates, protected)) - range_start
+        elif policy == "kvzip_global":
+            replay_prefix = [int(token_id) for token_id in (kvzip_replay_prefix_ids or [])]
+            if not replay_prefix:
+                raise ValueError("KVzip prefix pruning requires non-empty replay prompt token ids.")
+            score_chunk_size = max(1, int(score_chunk_size))
+            prev_postfix_size = max(0, int(prev_postfix_size))
+            aggregate = torch.zeros(
+                (range_end,), dtype=torch.float32, device=self.device
+            )
+            chunk_number = 0
+            for start in range(range_start, range_end, score_chunk_size):
+                end = min(range_end, start + score_chunk_size)
+                previous = token_ids[max(range_start, start - prev_postfix_size) : start]
+                replay_ids = replay_prefix + previous + token_ids[start:end]
+                step_score = self._prefix_prune_score_forward(
+                    token_ids=token_ids[:range_end] + replay_ids,
+                    prefix_hit_len=range_end,
+                    protected_prefix_len=range_end,
+                    candidate_start=range_start,
+                    temp_seq_id=temp_seq_id - chunk_number,
+                )
+                torch.maximum(aggregate, step_score[:range_end], out=aggregate)
+                chunk_number += 1
+            self.parallel_context.world_all_reduce(aggregate, op=dist.ReduceOp.MAX)
+            keep_indices = select_global_keep_indices(
+                aggregate[range_start:range_end], keep_tokens=keep_tokens
+            )
+        else:
+            raise ValueError(f"unsupported prefix prune policy: {policy!r}.")
+
+        return self.cache_manager.prefix_cache_prune(
+            token_ids,
+            range_start=range_start,
+            range_end=range_end,
+            keep_indices=keep_indices,
+            policy=policy,
+            prune_id=prune_id,
+            allow_recompress=allow_recompress,
         )
 
     def debug_sparse_state_summary(self) -> dict[str, object]:

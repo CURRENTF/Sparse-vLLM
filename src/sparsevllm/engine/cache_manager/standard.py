@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -22,7 +23,9 @@ from sparsevllm.engine.prefix_cache import (
     select_write_through_candidates,
     usable_prefix_cache_tokens,
 )
+from sparsevllm.engine.prefix_prune import PrefixPruneRecord
 from sparsevllm.engine.sequence import Sequence
+from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
 from sparsevllm.utils.log import logger, log_level
 from sparsevllm.utils.profiler import profiler
 from sparsevllm.platforms import device_runtime
@@ -31,7 +34,9 @@ from .base import (
     AttentionCacheWrite,
     AttentionPayload,
     CacheManager,
+    ExplicitKVPayload,
     LayerBatchStates,
+    PrefillComputeView,
     SparseSelection,
 )
 from .prefix_cache_mixin import PrefixCacheMixin
@@ -53,6 +58,12 @@ class StandardPrefixBlockPayload:
     block_start: int = 0
     block_end: int = 0
     host_block_index: int | None = None
+    retained_offsets: tuple[int, ...] | None = None
+
+    def resident_tokens(self, block_size: int) -> int:
+        if self.retained_offsets is None:
+            return int(block_size)
+        return len(self.retained_offsets)
 
 
 def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -101,6 +112,9 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         self.seq_id_to_row: dict[int, int] = {}
         self.free_rows = deque(range(self.max_buffer_rows))
         self.row_seq_lens = np.zeros((self.max_buffer_rows,), dtype=np.int32)
+        # Physical KV slots may be shorter than logical positions after an
+        # idle prefix tree has been pruned.
+        self.row_logical_lens = np.zeros((self.max_buffer_rows,), dtype=np.int32)
         self.layer_batch_state = LayerBatchStates()
 
         self.enable_prefix_caching = bool(
@@ -119,10 +133,12 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         self.seq_id_to_cached_ranges: dict[int, list[tuple[int, int]]] = {}
         self._scheduler_capacity_snapshot_depth = 0
         self._scheduler_freeable_block_ids: frozenset[bytes] | None = None
+        self._scheduler_reclaimable_slots: int | None = None
         self._init_prefix_cache_runtime()
         self.prefix_offload_controller: StandardPrefixOffloadController | None = None
         self._prefix_offload_step_h2d_operations: list[PrefixH2DOperation] = []
         self._prefix_write_through_candidates: dict[bytes, PrefixCacheBlock] = {}
+        self._prefix_prune_scoring: dict[str, object] | None = None
         has_linear_layers = bool(
             getattr(getattr(config, "runtime_layout", None), "linear_attention_layer_indices", ())
         )
@@ -403,6 +419,14 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             token_ids,
             max_usable_tokens=usable_tokens,
         )
+        resident_kv_tokens = 0
+        if hit_last_block_id is not None and hit_blocks > 0:
+            resident_kv_tokens = sum(
+                self._block_resident_tokens_or_full(block)
+                for block in self.prefix_cache.get_chain(
+                    hit_last_block_id, hit_blocks
+                )
+            )
         return {
             "supported": True,
             "enabled": True,
@@ -412,6 +436,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             "usable_tokens": int(usable_tokens),
             "matched_tokens": int(hit_len),
             "matched_blocks": int(hit_blocks),
+            "resident_kv_tokens": int(resident_kv_tokens),
             "match_ratio": 0.0 if usable_tokens <= 0 else float(hit_len) / float(usable_tokens),
             "last_block_id": None if hit_last_block_id is None else hit_last_block_id.hex(),
             "live_blocks": int(len(self.prefix_cache)),
@@ -443,12 +468,23 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
     def _prefix_evictable_slots(self) -> int:
         if getattr(self, "prefix_cache", None) is None:
             return 0
-        freeable_blocks = (
-            self.prefix_cache.device_freeable_blocks()
+        block_ids = (
+            self.prefix_cache.device_freeable_block_ids()
             if self._prefix_offload_enabled()
-            else len(self._prefix_freeable_block_ids_for_capacity())
+            else self._prefix_freeable_block_ids_for_capacity()
         )
-        return int(freeable_blocks * self.prefix_cache_block_size)
+        return self._prefix_resident_slots_for_ids(block_ids)
+
+    def _prefix_resident_slots_for_ids(self, block_ids) -> int:
+        if self.prefix_cache is None:
+            return 0
+        total = 0
+        for block_id in block_ids:
+            block = self.prefix_cache.get_block(block_id)
+            if block is None or not block.residency.device_present:
+                continue
+            total += self._block_resident_tokens_or_full(block)
+        return int(total)
 
     def _prefix_freeable_block_ids_for_capacity(self) -> frozenset[bytes]:
         if self.prefix_cache is None:
@@ -467,22 +503,32 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         self._scheduler_capacity_snapshot_depth += 1
         if self._scheduler_capacity_snapshot_depth == 1:
             self._scheduler_freeable_block_ids = None
+            self._scheduler_reclaimable_slots = None
         try:
             yield
         finally:
             self._scheduler_capacity_snapshot_depth -= 1
             if self._scheduler_capacity_snapshot_depth == 0:
                 self._scheduler_freeable_block_ids = None
+                self._scheduler_reclaimable_slots = None
 
     def _prefix_step_reclaimable_slots(self) -> int:
         if getattr(self, "prefix_cache", None) is None:
             return 0
-        reclaimable_blocks = (
-            self.prefix_cache.device_reclaimable_blocks()
+        if (
+            self._scheduler_capacity_snapshot_depth > 0
+            and self._scheduler_reclaimable_slots is not None
+        ):
+            return self._scheduler_reclaimable_slots
+        block_ids = (
+            self.prefix_cache.device_reclaimable_block_ids()
             if self._prefix_offload_enabled()
-            else len(self._prefix_freeable_block_ids_for_capacity())
+            else self._prefix_freeable_block_ids_for_capacity()
         )
-        return int(reclaimable_blocks * self.prefix_cache_block_size)
+        reclaimable_slots = self._prefix_resident_slots_for_ids(block_ids)
+        if self._scheduler_capacity_snapshot_depth > 0:
+            self._scheduler_reclaimable_slots = reclaimable_slots
+        return reclaimable_slots
 
     def _prefix_immediately_evictable_slots(self) -> int:
         if (
@@ -490,9 +536,8 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             or self._prefix_offload_enabled()
         ):
             return 0
-        return int(
-            self.prefix_cache.evictable_blocks()
-            * self.prefix_cache_block_size
+        return self._prefix_resident_slots_for_ids(
+            self.prefix_cache.evictable_block_ids()
         )
 
     def prefill_step_free_slots(self) -> int:
@@ -520,32 +565,68 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         return int(self.num_free_slots + self._prefix_step_reclaimable_slots())
 
     def prompt_admission_free_slots(self) -> int:
-        reclaimable_slots = 0
-        if getattr(self, "prefix_cache", None) is not None:
-            reclaimable_blocks = (
-                self.prefix_cache.device_reclaimable_blocks()
-                if self._prefix_offload_enabled()
-                else len(self._prefix_freeable_block_ids_for_capacity())
-            )
-            reclaimable_slots = reclaimable_blocks * self.prefix_cache_block_size
-        return int(self.num_free_slots + reclaimable_slots)
+        return int(self.num_free_slots + self._prefix_step_reclaimable_slots())
 
     def _prefix_hit_evictable_slots(self, seq: Sequence) -> int:
         if getattr(self, "prefix_cache", None) is None or int(getattr(seq, "prefix_cache_hit_len", 0) or 0) <= 0:
             return 0
-        reclaimable_blocks, _ = self._prefix_hit_capacity_counts(seq)
-        return int(reclaimable_blocks * self.prefix_cache_block_size)
+        reclaimable_slots, _ = self._prefix_hit_capacity_slots(seq)
+        return reclaimable_slots
 
     def prompt_admission_cost(self, seq: Sequence) -> int:
         hit_len = int(getattr(seq, "prefix_cache_hit_len", 0) or 0)
         suffix_len = int(seq.num_prompt_tokens - hit_len)
         if hit_len <= 0:
             return suffix_len
-        reclaimable_blocks, promotion_blocks = self._prefix_hit_capacity_counts(seq)
-        return (
-            suffix_len
-            + (promotion_blocks + reclaimable_blocks)
-            * self.prefix_cache_block_size
+        reclaimable_slots, promotion_slots = self._prefix_hit_capacity_slots(seq)
+        return suffix_len + reclaimable_slots + promotion_slots
+
+    def _block_resident_tokens_or_full(self, block: PrefixCacheBlock) -> int:
+        payload = block.payload
+        if isinstance(payload, StandardPrefixBlockPayload):
+            return payload.resident_tokens(self.prefix_cache_block_size)
+        # Tests and external index-only users may intentionally use metadata-only payloads.
+        return int(self.prefix_cache_block_size)
+
+    def _prefix_hit_capacity_slots(self, seq: Sequence) -> tuple[int, int]:
+        if self.prefix_cache is None:
+            return 0, 0
+        self._prefix_hit_capacity_counts(seq)
+        entry = self.prefix_hit_capacity_cache.get(seq)
+        chain = tuple(self._prefix_hit_chain(seq)) if entry is None else entry.chain
+        freeable_ids = (
+            self.prefix_cache.device_reclaimable_block_ids()
+            if self._prefix_offload_enabled()
+            else self.prefix_cache.freeable_block_ids()
+        )
+        reclaimable = sum(
+            self._block_resident_tokens_or_full(block)
+            for block in chain
+            if block.stable_block_id in freeable_ids
+        )
+        promotion = (
+            sum(
+                self._block_resident_tokens_or_full(block)
+                for block in chain
+                if not block.residency.device_present
+            )
+            if self._prefix_offload_enabled()
+            else 0
+        )
+        return int(reclaimable), int(promotion)
+
+    def _standard_payload(self, block: PrefixCacheBlock) -> StandardPrefixBlockPayload:
+        payload = block.payload
+        if not isinstance(payload, StandardPrefixBlockPayload):
+            raise RuntimeError("Standard prefix cache block has an invalid payload.")
+        return payload
+
+    def _prefix_hit_chain(self, seq: Sequence) -> list[PrefixCacheBlock]:
+        if self.prefix_cache is None or seq.prefix_cache_hit_last_block_id is None:
+            return []
+        return self.prefix_cache.get_chain(
+            seq.prefix_cache_hit_last_block_id,
+            int(seq.prefix_cache_hit_block_count),
         )
 
     def prompt_logical_reservation_cost(self, seq: Sequence) -> int:
@@ -609,7 +690,8 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         if not isinstance(payload, StandardPrefixBlockPayload):
             raise RuntimeError("Standard prefix cache block is missing its device payload.")
         slots = payload.token_slots
-        if not isinstance(slots, torch.Tensor) or int(slots.numel()) != self.prefix_cache_block_size:
+        expected = payload.resident_tokens(self.prefix_cache_block_size)
+        if not isinstance(slots, torch.Tensor) or int(slots.numel()) != expected:
             raise RuntimeError(
                 "Standard prefix cache block has invalid device slots: "
                 f"block={block.stable_block_id.hex()[:16]}."
@@ -626,11 +708,30 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             token_slots=slots,
             block_start=0,
             block_end=int(slots.numel()),
+            retained_offsets=None,
         )
 
     def _mark_materialized_prefix_block(self, seq: Sequence, block: PrefixCacheBlock) -> None:
         cached_ranges = self.seq_id_to_cached_ranges.setdefault(seq.seq_id, [])
-        start = int(block.logical_block_idx) * self.prefix_cache_block_size
+        attached = self.seq_id_to_prefix_blocks.get(seq.seq_id, [])
+        attached_resident = sum(
+            self._standard_payload(prefix_block).resident_tokens(
+                self.prefix_cache_block_size
+            )
+            for prefix_block in attached
+        )
+        hit_len = int(getattr(seq, "prefix_cache_hit_len", 0) or 0)
+        start = (
+            attached_resident
+            + int(block.logical_block_idx) * self.prefix_cache_block_size
+            - hit_len
+        )
+        if start < 0:
+            raise RuntimeError(
+                "materialized prefix block resolved to a negative physical row offset: "
+                f"seq_id={seq.seq_id} logical_block={block.logical_block_idx} "
+                f"attached_resident={attached_resident} hit_len={hit_len}."
+            )
         cached_ranges.append((start, start + self.prefix_cache_block_size))
 
     def build_prefix_kv_payload(self, seq: Sequence, block_start: int, block_end: int) -> StandardPrefixBlockPayload:
@@ -690,6 +791,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             )
         self.buffer_req_to_token_slots[row_idx, start:end] = slots
         self.row_seq_lens[row_idx] = end
+        self.row_logical_lens[row_idx] = end
         cached_ranges = self.seq_id_to_cached_ranges.setdefault(int(seq.seq_id), [])
         cached_ranges.append((start, end))
 
@@ -750,6 +852,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
         self.buffer_req_to_token_slots[row_idx, :expected_start] = 0
         self.row_seq_lens[row_idx] = 0
+        self.row_logical_lens[row_idx] = 0
         self.seq_id_to_cached_ranges.pop(seq_id, None)
         if not row_preexisted:
             owner = self.seq_id_to_row.pop(seq_id, None)
@@ -821,6 +924,269 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             * dtype_size
         )
 
+    def validate_prefix_cache_prune_target(
+        self,
+        token_ids: list[int],
+        *,
+        range_start: int,
+        range_end: int,
+        allow_recompress: bool = False,
+    ) -> list[PrefixCacheBlock]:
+        controller = getattr(self, "prefix_offload_controller", None)
+        if controller is not None:
+            controller.synchronize_all()
+        prefix_cache = self._require_prefix_cache()
+        block_size = int(self.prefix_cache_block_size)
+        range_start = int(range_start)
+        range_end = int(range_end)
+        block_ids = prefix_cache.block_ids_for_tokens(
+            [int(token_id) for token_id in token_ids[:range_end]],
+            max_tokens=range_end,
+        )
+        expected_blocks = range_end // block_size
+        if len(block_ids) != expected_blocks:
+            raise RuntimeError(
+                "prefix prune selector does not cover a complete block-aligned range."
+            )
+        hit_len, last_block_id, hit_blocks = prefix_cache.match_longest_block_ids(
+            block_ids
+        )
+        if hit_len != range_end or hit_blocks != expected_blocks or last_block_id is None:
+            raise RuntimeError(
+                "prefix prune target is not fully present in the radix tree: "
+                f"requested_end={range_end} matched_tokens={hit_len}."
+            )
+        chain = prefix_cache.get_chain(last_block_id, expected_blocks)
+        affected = chain[range_start // block_size : range_end // block_size]
+        if not affected:
+            raise RuntimeError("prefix prune interval contains no blocks.")
+        blocked = [
+            block.stable_block_id.hex()[:16]
+            for block in affected
+            if int(block.ref_count) != 0 or block.residency.transfer is not None
+        ]
+        if blocked:
+            raise RuntimeError(
+                "prefix prune requires an idle, transfer-free subtree interval: "
+                f"blocked_blocks={blocked}."
+            )
+        existing_records = [
+            block
+            for block in chain[: range_end // block_size]
+            if block.prune_record is not None
+        ]
+        if existing_records and not allow_recompress:
+            raise RuntimeError(
+                "prefix prune target already inherits a quality-degraded prune record; "
+                "set allow_recompress=true to prune only its remaining KV tokens."
+            )
+        return affected
+
+    @torch.no_grad()
+    def prefix_cache_prune(
+        self,
+        token_ids: list[int],
+        *,
+        range_start: int,
+        range_end: int,
+        keep_indices: torch.Tensor,
+        policy: str,
+        prune_id: str,
+        allow_recompress: bool = False,
+    ) -> dict[str, object]:
+        """Commit one cross-layer token mask to an idle radix-tree interval."""
+        range_start = int(range_start)
+        range_end = int(range_end)
+        affected = self.validate_prefix_cache_prune_target(
+            token_ids,
+            range_start=range_start,
+            range_end=range_end,
+            allow_recompress=allow_recompress,
+        )
+        prefix_cache = self._require_prefix_cache()
+        block_size = int(self.prefix_cache_block_size)
+
+        width = range_end - range_start
+        selected = sorted({int(index) for index in keep_indices.detach().cpu().tolist()})
+        if any(index < 0 or index >= width for index in selected):
+            raise ValueError("prefix prune keep mask contains an out-of-range token index.")
+        if len(selected) != int(keep_indices.numel()):
+            raise ValueError("prefix prune keep mask contains duplicate token indices.")
+        selected_set = set(selected)
+
+        plans: list[tuple[PrefixCacheBlock, tuple[int, ...], torch.Tensor | None, torch.Tensor | None]] = []
+        freed_slots = 0
+        for relative_block_idx, block in enumerate(affected):
+            payload = self._standard_payload(block)
+            old_offsets = (
+                tuple(range(block_size))
+                if payload.retained_offsets is None
+                else tuple(int(offset) for offset in payload.retained_offsets)
+            )
+            block_base = relative_block_idx * block_size
+            new_offsets = tuple(
+                offset
+                for offset in old_offsets
+                if block_base + offset in selected_set
+            )
+            old_slots = payload.token_slots
+            kept_slots = None
+            dropped_slots = None
+            if block.residency.device_present:
+                if not isinstance(old_slots, torch.Tensor) or int(old_slots.numel()) != len(old_offsets):
+                    raise RuntimeError(
+                        "prefix prune found inconsistent Standard device payload: "
+                        f"block={block.stable_block_id.hex()[:16]} "
+                        f"slots={None if old_slots is None else int(old_slots.numel())} "
+                        f"offsets={len(old_offsets)}."
+                    )
+                keep_positions = [
+                    position
+                    for position, offset in enumerate(old_offsets)
+                    if offset in set(new_offsets)
+                ]
+                drop_positions = [
+                    position
+                    for position, offset in enumerate(old_offsets)
+                    if offset not in set(new_offsets)
+                ]
+                kept_slots = old_slots[
+                    torch.tensor(keep_positions, dtype=torch.long, device=old_slots.device)
+                ].clone()
+                dropped_slots = old_slots[
+                    torch.tensor(drop_positions, dtype=torch.long, device=old_slots.device)
+                ].clone()
+                freed_slots += len(drop_positions)
+            plans.append((block, new_offsets, kept_slots, dropped_slots))
+
+        # All validation and survivor tensors are prepared before allocator state mutates.
+        for block, new_offsets, kept_slots, dropped_slots in plans:
+            payload = self._standard_payload(block)
+            payload.retained_offsets = new_offsets
+            if block.residency.device_present:
+                assert kept_slots is not None and dropped_slots is not None
+                payload.token_slots = kept_slots
+                self._return_prefix_device_slots(dropped_slots)
+
+        record = PrefixPruneRecord(
+            prune_id=str(prune_id),
+            policy=policy,  # type: ignore[arg-type]
+            range_start=range_start,
+            range_end=range_end,
+            original_tokens=width,
+            retained_tokens=len(selected),
+            created_at=time.time(),
+        )
+        affected[0].prune_record = record
+        prefix_cache.mark_payload_compacted(affected)
+        return {
+            "prune_id": str(prune_id),
+            "policy": str(policy),
+            "range": [range_start, range_end],
+            "logical_tokens": width,
+            "retained_tokens": len(selected),
+            "freed_device_slots": int(freed_slots),
+            "affected_blocks": len(affected),
+            "quality_degraded": True,
+        }
+
+    def begin_prefix_prune_scoring(
+        self,
+        *,
+        seq_id: int,
+        candidate_start: int,
+        query_start: int,
+        query_end: int,
+    ) -> None:
+        if self._prefix_prune_scoring is not None:
+            raise RuntimeError("another prefix-prune scoring forward is already active.")
+        if not (0 <= candidate_start < query_start < query_end):
+            raise ValueError(
+                "invalid prefix-prune scoring ranges: "
+                f"candidate_start={candidate_start} query=[{query_start}, {query_end})."
+            )
+        self._prefix_prune_scoring = {
+            "seq_id": int(seq_id),
+            "candidate_start": int(candidate_start),
+            "query_start": int(query_start),
+            "query_end": int(query_end),
+            "score": None,
+        }
+
+    def abort_prefix_prune_scoring(self) -> None:
+        self._prefix_prune_scoring = None
+
+    def finish_prefix_prune_scoring(self) -> torch.Tensor:
+        state = self._prefix_prune_scoring
+        self._prefix_prune_scoring = None
+        if state is None or not isinstance(state.get("score"), torch.Tensor):
+            raise RuntimeError("prefix-prune scoring forward produced no attention scores.")
+        return state["score"]  # type: ignore[return-value]
+
+    @torch.no_grad()
+    def collect_prefill_attention_score(
+        self,
+        layer_idx: int,
+        q: torch.Tensor,
+        view: PrefillComputeView,
+        *,
+        b_start_loc: torch.Tensor,
+        chunk_lens: torch.Tensor,
+        attention_lse: torch.Tensor | None = None,
+    ):
+        del layer_idx, attention_lse
+        state = self._prefix_prune_scoring
+        if state is None:
+            return None
+        if int(chunk_lens.numel()) != 1:
+            raise RuntimeError("prefix-prune scoring requires a single maintenance request.")
+        query_start = int(state["query_start"])
+        query_end = int(state["query_end"])
+        candidate_start = int(state["candidate_start"])
+        if int(q.shape[0]) != query_end - query_start:
+            raise RuntimeError(
+                "prefix-prune query window length mismatch: "
+                f"expected={query_end - query_start} actual={int(q.shape[0])}."
+            )
+        if not isinstance(view.payload, ExplicitKVPayload):
+            raise TypeError(
+                "prefix-prune scoring requires explicit KV storage, got "
+                f"{type(view.payload).__name__}."
+            )
+        context_len = int(view.meta.context_lens[0].item())
+        if context_len != query_end:
+            raise RuntimeError(
+                "prefix-prune scoring currently requires an unpruned dense target path: "
+                f"physical_context={context_len} logical_context={query_end}."
+            )
+        step_score = torch.zeros(
+            (1, context_len), dtype=torch.float32, device=q.device
+        )
+        prefill_score_fwd(
+            q,
+            view.payload.k_cache,
+            step_score,
+            view.meta.req_indices,
+            b_start_loc,
+            view.meta.context_lens,
+            torch.tensor([query_start], dtype=torch.int32, device=q.device),
+            query_end - query_start,
+            view.meta.active_slots,
+            torch.tensor([query_start], dtype=torch.int32, device=q.device),
+            torch.tensor([query_end], dtype=torch.int32, device=q.device),
+            candidate_start=candidate_start,
+            recent_keep_tokens=query_end - query_start,
+            score_mode="probability",
+        )
+        score = step_score[0]
+        accumulated = state.get("score")
+        state["score"] = (
+            score.clone()
+            if accumulated is None
+            else torch.maximum(accumulated, score)  # type: ignore[arg-type]
+        )
+        return None
+
     def mark_materialized_prefix_kv_payload(self, seq: Sequence, payload: object) -> None:
         if not isinstance(payload, StandardPrefixBlockPayload):
             raise RuntimeError("Standard mixed prefix KV payload is missing token slots.")
@@ -891,11 +1257,11 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             while self._num_free_slots < needed_slots:
                 self._poll_prefix_offload()
                 missing_slots = needed_slots - int(self._num_free_slots)
-                needed_blocks = (
-                    missing_slots + self.prefix_cache_block_size - 1
-                ) // self.prefix_cache_block_size
                 with profiler.record("prefix_cache_device_demote"):
-                    demoted = self.prefix_cache.demote_device_until_freeable(needed_blocks)
+                    demoted = self.prefix_cache.demote_device_until_weight(
+                        missing_slots,
+                        self._block_resident_tokens_or_full,
+                    )
                 for block in demoted:
                     self._free_device_prefix_block(block)
                 if self._num_free_slots >= needed_slots:
@@ -905,9 +1271,11 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             return
 
         missing_slots = needed_slots - int(self._num_free_slots)
-        needed_blocks = (missing_slots + self.prefix_cache_block_size - 1) // self.prefix_cache_block_size
         with profiler.record("prefix_cache_evict"):
-            evicted = self.prefix_cache.evict_until_freeable(needed_blocks)
+            evicted = self.prefix_cache.evict_until_weight(
+                missing_slots,
+                self._block_resident_tokens_or_full,
+            )
         self._free_prefix_cache_blocks(evicted)
 
     def _evict_prefix_cache_for_insert(self, needed_blocks: int = 1) -> None:
@@ -1086,9 +1454,10 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                         "Prefix device residency is not root-contiguous: "
                         f"seq_id={seq.seq_id} block={block.stable_block_id.hex()[:16]}."
                     )
+                expected_slots = payload.resident_tokens(self.prefix_cache_block_size)
                 if (
                     not isinstance(payload.token_slots, torch.Tensor)
-                    or int(payload.token_slots.numel()) != self.prefix_cache_block_size
+                    or int(payload.token_slots.numel()) != expected_slots
                 ):
                     raise RuntimeError(
                         f"Invalid Standard prefix cache block slots for seq_id={seq.seq_id}: "
@@ -1128,16 +1497,25 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                         )
                     if device_runtime.is_stream_capturing():
                         raise RuntimeError("Prefix H2D promotion is forbidden during graph capture.")
-                    promotion_slot_count = len(cpu_only_blocks) * self.prefix_cache_block_size
+                    promotion_slot_count = sum(
+                        self._standard_payload(block).resident_tokens(
+                            self.prefix_cache_block_size
+                        )
+                        for block in cpu_only_blocks
+                    )
                     allocated_promotion_slots = self._take_prefix_device_slots(
                         promotion_slot_count
                     )
-                    for offset, block in enumerate(cpu_only_blocks):
+                    offset = 0
+                    for block in cpu_only_blocks:
                         payload = block.payload
                         assert isinstance(payload, StandardPrefixBlockPayload)
-                        start = offset * self.prefix_cache_block_size
-                        end = start + self.prefix_cache_block_size
+                        start = offset
+                        end = start + payload.resident_tokens(
+                            self.prefix_cache_block_size
+                        )
                         payload.token_slots = allocated_promotion_slots[start:end]
+                        offset = end
                     controller = self.prefix_offload_controller
                     assert controller is not None
                     with profiler.record("prefix_cache_h2d_submit"):
@@ -1166,6 +1544,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                     self._prefix_offload_step_h2d_operations.append(operation)
 
             cached_ranges = self.seq_id_to_cached_ranges.setdefault(seq.seq_id, [])
+            resident_cursor = 0
             for block in chain:
                 payload = block.payload
                 assert isinstance(payload, StandardPrefixBlockPayload)
@@ -1174,12 +1553,17 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                         "Prefix attach reached a block without device slots after promotion: "
                         f"block={block.stable_block_id.hex()[:16]}."
                     )
-                start = int(block.logical_block_idx) * self.prefix_cache_block_size
-                end = start + self.prefix_cache_block_size
-                self.buffer_req_to_token_slots[row_idx, start:end] = payload.token_slots
-                cached_ranges.append((start, end))
+                count = int(payload.token_slots.numel())
+                if count:
+                    end = resident_cursor + count
+                    self.buffer_req_to_token_slots[
+                        row_idx, resident_cursor:end
+                    ] = payload.token_slots
+                    cached_ranges.append((resident_cursor, end))
+                    resident_cursor = end
 
-            self.row_seq_lens[row_idx] = hit_len
+            self.row_seq_lens[row_idx] = resident_cursor
+            self.row_logical_lens[row_idx] = hit_len
             self.seq_id_to_prefix_blocks[seq.seq_id] = chain
             self.prefix_cache.touch_chain(chain)
 
@@ -1204,6 +1588,8 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         self._num_free_slots += count
 
     def _get_free_row(self, seq_id: int) -> int:
+        if not hasattr(self, "row_logical_lens"):
+            self.row_logical_lens = self.row_seq_lens.copy()
         if seq_id in self.seq_id_to_row:
             return self.seq_id_to_row[seq_id]
         if not self.free_rows:
@@ -1229,6 +1615,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
             self.buffer_req_to_token_slots[row_idx, cur_len: cur_len + size] = select_index
             self.row_seq_lens[row_idx] += size
+            self.row_logical_lens[row_idx] += size
 
             return select_index
 
@@ -1272,6 +1659,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         cols_gpu.copy_(torch.as_tensor(cur_lens, dtype=torch.long), non_blocking=True)
         self.buffer_req_to_token_slots[rows_gpu, cols_gpu] = select_indices
         self.row_seq_lens[row_indices] += 1
+        self.row_logical_lens[row_indices] += 1
 
         return select_indices
 
@@ -1328,6 +1716,8 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         pending_rows: tuple[tuple[int, int], ...],
     ) -> tuple[torch.Tensor, np.ndarray, np.ndarray]:
         batch_size = len(seq_ids)
+        if not hasattr(self, "row_logical_lens"):
+            self.row_logical_lens = self.row_seq_lens.copy()
         self._evict_prefix_cache_until_free(batch_size)
         if self._num_free_slots < batch_size:
             raise RuntimeError(
@@ -1345,6 +1735,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         select_indices = self.free_slots_stack[ptr - batch_size: ptr]
         self._num_free_slots -= batch_size
         self.row_seq_lens[row_indices] += 1
+        self.row_logical_lens[row_indices] += 1
 
         return select_indices, self.row_seq_lens[row_indices], row_indices
 
@@ -1359,7 +1750,10 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             cur_len = self.row_seq_lens[row_idx]
             cached_ranges = _merge_ranges(self.seq_id_to_cached_ranges.pop(seq_id, []))
 
-            assert cur_len > 0
+            if cur_len < 0:
+                raise RuntimeError(
+                    f"KV cache row length became negative for seq_id={seq_id}: {cur_len}."
+                )
             before_free = self._num_free_slots
             freed_tokens = 0
             for start, end in _complement_ranges(0, int(cur_len), cached_ranges):
@@ -1381,6 +1775,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
             self.buffer_req_to_token_slots[row_idx, :] = 0
             self.row_seq_lens[row_idx] = 0
+            self.row_logical_lens[row_idx] = 0
             self.free_rows.append(row_idx)
 
             if debug_slots:
@@ -1429,17 +1824,25 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
                 if seq.seq_id in self.seq_id_to_row:
                     row_idx = self.seq_id_to_row[seq.seq_id]
-                    if self.row_seq_lens[row_idx] != start_idx:
+                    if self.row_logical_lens[row_idx] != start_idx:
                         raise ValueError(
-                            "KV cache row length mismatch in prefill: "
-                            f"seq_id={seq.seq_id} row_seq_len={self.row_seq_lens[row_idx]} "
+                            "KV cache logical row length mismatch in prefill: "
+                            f"seq_id={seq.seq_id} row_logical_len={self.row_logical_lens[row_idx]} "
                             f"start_idx={start_idx}"
                         )
 
+                resident_start = (
+                    0
+                    if seq.seq_id not in self.seq_id_to_row
+                    else int(self.row_seq_lens[self.seq_id_to_row[seq.seq_id]])
+                )
                 allocated_slots = self._allocate(seq.seq_id, chunk_size)
                 row_idx = self.seq_id_to_row[seq.seq_id]
-                slot_mapping[token_offset: token_offset + chunk_size] = self.buffer_req_to_token_slots[row_idx, start_idx:end_idx]
-                context_lens_list.append(end_idx)
+                resident_end = resident_start + chunk_size
+                slot_mapping[token_offset: token_offset + chunk_size] = self.buffer_req_to_token_slots[
+                    row_idx, resident_start:resident_end
+                ]
+                context_lens_list.append(resident_end)
                 req_indices.append(row_idx)
 
                 chunk_tokens = seq.token_ids

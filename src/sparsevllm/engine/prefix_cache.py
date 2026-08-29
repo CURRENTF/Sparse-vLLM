@@ -6,7 +6,7 @@ import json
 import struct
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 
 def usable_prefix_cache_tokens(prompt_len: int, block_size: int) -> int:
@@ -465,6 +465,7 @@ class PrefixCacheBlock:
     last_access: int = 0
     eviction_priority: int = 0
     residency: PrefixBlockResidency = field(default_factory=PrefixBlockResidency)
+    prune_record: object | None = None
 
 
 def select_write_through_candidates(
@@ -819,7 +820,7 @@ class RadixPrefixIndex:
         self._freeable_cache_epoch = -1
         self._freeable_block_ids_cache: frozenset[bytes] = frozenset()
         self._evictable_cache_epoch = -1
-        self._evictable_blocks_cache = 0
+        self._evictable_block_ids_cache: frozenset[bytes] = frozenset()
         self._device_freeable_cache_epoch = -1
         self._device_freeable_block_ids_cache: frozenset[bytes] = frozenset()
         self._device_reclaimable_cache_epoch = -1
@@ -887,6 +888,14 @@ class RadixPrefixIndex:
     def _mark_capacity_mutated(self) -> None:
         self._capacity_epoch += 1
         self._mark_mutated()
+
+    def mark_payload_compacted(self, blocks: list[PrefixCacheBlock]) -> None:
+        """Invalidate capacity views after an in-place physical payload change."""
+        if not blocks:
+            return
+        for block in blocks:
+            self._validate_indexed_block(block)
+        self._mark_capacity_mutated()
 
     def _mark_inserted(self, *, capacity_changed: bool) -> None:
         self._insert_epoch += 1
@@ -1346,30 +1355,52 @@ class RadixPrefixIndex:
         return result
 
     def demote_device_until_freeable(self, needed_blocks: int) -> list[PrefixCacheBlock]:
+        return self.demote_device_until_weight(
+            needed_blocks,
+            lambda _block: 1,
+        )
+
+    def demote_device_until_weight(
+        self,
+        needed_weight: int,
+        block_weight: Callable[[PrefixCacheBlock], int],
+    ) -> list[PrefixCacheBlock]:
+        """Demote device leaves in priority order with one candidate-tree scan."""
         demoted: list[PrefixCacheBlock] = []
-        needed_blocks = int(needed_blocks)
-        if needed_blocks <= 0:
+        needed_weight = int(needed_weight)
+        if needed_weight <= 0:
             return demoted
+        demoted_weight = 0
         candidate_heap: list[tuple[int, int, bytes]] = []
         queued: set[bytes] = set()
 
-        def queue_if_demotable(block_id: bytes | None) -> None:
+        def queue_if_demotable(
+            block_id: bytes | None,
+            *,
+            heap_ready: bool = True,
+        ) -> None:
             if block_id is None or block_id in queued:
                 return
             block = self.blocks.get(block_id)
             if block is None or not self.can_demote_device(block):
                 return
-            heapq.heappush(
-                candidate_heap,
-                (-int(block.eviction_priority), int(block.last_access), block_id),
+            candidate = (
+                -int(block.eviction_priority),
+                int(block.last_access),
+                block_id,
             )
+            if heap_ready:
+                heapq.heappush(candidate_heap, candidate)
+            else:
+                candidate_heap.append(candidate)
             queued.add(block_id)
 
         for block_id, block in self.blocks.items():
             if block.residency.device_present and self.device_child_count(block_id) == 0:
-                queue_if_demotable(block_id)
+                queue_if_demotable(block_id, heap_ready=False)
+        heapq.heapify(candidate_heap)
 
-        while len(demoted) < needed_blocks:
+        while demoted_weight < needed_weight:
             while candidate_heap:
                 _, _, block_id = heapq.heappop(candidate_heap)
                 queued.discard(block_id)
@@ -1378,9 +1409,16 @@ class RadixPrefixIndex:
                     break
             else:
                 break
+            weight = int(block_weight(block))
+            if weight < 0:
+                raise ValueError(
+                    "Prefix cache demotion weight must be non-negative: "
+                    f"block={block.stable_block_id.hex()[:16]} weight={weight}."
+                )
             block.residency.device_present = False
             block.residency.validate()
             demoted.append(block)
+            demoted_weight += weight
             self.device_demoted_blocks += 1
             self._mark_capacity_mutated()
             queue_if_demotable(block.parent_block_id)
@@ -1435,12 +1473,15 @@ class RadixPrefixIndex:
         return evicted
 
     def evictable_blocks(self) -> int:
+        return len(self.evictable_block_ids())
+
+    def evictable_block_ids(self) -> frozenset[bytes]:
         if self._evictable_cache_epoch == self._capacity_epoch:
             self.evictable_cache_hits += 1
-            return self._evictable_blocks_cache
+            return self._evictable_block_ids_cache
         self.evictable_scans += 1
-        self._evictable_blocks_cache = sum(
-            1
+        self._evictable_block_ids_cache = frozenset(
+            block_id
             for block_id in self.backend.leaf_block_ids()
             if (block := self.blocks.get(block_id)) is not None
             and int(block.ref_count) == 0
@@ -1448,7 +1489,7 @@ class RadixPrefixIndex:
             and block.residency.transfer is None
         )
         self._evictable_cache_epoch = self._capacity_epoch
-        return self._evictable_blocks_cache
+        return self._evictable_block_ids_cache
 
     def freeable_block_ids(self) -> frozenset[bytes]:
         """Return blocks removable by repeated leaf eviction without mutating the tree."""
@@ -1533,27 +1574,51 @@ class RadixPrefixIndex:
         self.committed_blocks -= 1
 
     def evict_until_freeable(self, needed_blocks: int) -> list[PrefixCacheBlock]:
+        return self.evict_until_weight(
+            needed_blocks,
+            lambda _block: 1,
+        )
+
+    def evict_until_weight(
+        self,
+        needed_weight: int,
+        block_weight: Callable[[PrefixCacheBlock], int],
+    ) -> list[PrefixCacheBlock]:
+        """Evict leaves in priority order with one candidate-tree scan."""
         evicted: list[PrefixCacheBlock] = []
-        needed_blocks = int(needed_blocks)
+        needed_weight = int(needed_weight)
+        if needed_weight <= 0:
+            return evicted
+        evicted_weight = 0
         candidate_heap: list[tuple[int, int, bytes]] = []
         queued: set[bytes] = set()
 
-        def queue_if_evictable(block_id: bytes | None) -> None:
+        def queue_if_evictable(
+            block_id: bytes | None,
+            *,
+            heap_ready: bool = True,
+        ) -> None:
             if block_id is None or block_id in queued:
                 return
             block = self.blocks.get(block_id)
             if block is None or not self.can_evict(block):
                 return
-            heapq.heappush(
-                candidate_heap,
-                (-int(block.eviction_priority), int(block.last_access), block_id),
+            candidate = (
+                -int(block.eviction_priority),
+                int(block.last_access),
+                block_id,
             )
+            if heap_ready:
+                heapq.heappush(candidate_heap, candidate)
+            else:
+                candidate_heap.append(candidate)
             queued.add(block_id)
 
         for block_id in self.backend.leaf_block_ids():
-            queue_if_evictable(block_id)
+            queue_if_evictable(block_id, heap_ready=False)
+        heapq.heapify(candidate_heap)
 
-        while len(evicted) < needed_blocks:
+        while evicted_weight < needed_weight:
             while candidate_heap:
                 _, _, block_id = heapq.heappop(candidate_heap)
                 queued.discard(block_id)
@@ -1562,8 +1627,15 @@ class RadixPrefixIndex:
                     break
             else:
                 break
+            weight = int(block_weight(block))
+            if weight < 0:
+                raise ValueError(
+                    "Prefix cache eviction weight must be non-negative: "
+                    f"block={block.stable_block_id.hex()[:16]} weight={weight}."
+                )
             parent_block_id = block.parent_block_id
             evicted.append(self._remove_block_from_index(block.stable_block_id))
+            evicted_weight += weight
             self.evicted_blocks += 1
             queue_if_evictable(parent_block_id)
         return evicted
@@ -1604,9 +1676,23 @@ class RadixPrefixIndex:
 
     def _block_status_dict(self, block_id: bytes) -> dict[str, Any]:
         block = self.blocks[block_id]
-        return {
+        payload = getattr(block.payload, "kv_payload", block.payload)
+        retained_offsets = getattr(payload, "retained_offsets", None)
+        effective_prune = None
+        for path_block_id in self.backend.path_to_block(block_id):
+            path_block = self.blocks.get(path_block_id)
+            record = None if path_block is None else path_block.prune_record
+            if record is not None:
+                effective_prune = record
+        status = {
             "block_id": block_id.hex(),
             "logical_block_idx": int(block.logical_block_idx),
+            "logical_tokens": int(block.block_size),
+            "resident_kv_tokens": int(
+                block.block_size
+                if retained_offsets is None
+                else len(retained_offsets)
+            ),
             "ref_count": int(block.ref_count),
             "eviction_priority": int(block.eviction_priority),
             "child_count": int(self.child_count(block_id)),
@@ -1620,6 +1706,10 @@ class RadixPrefixIndex:
             ),
             "last_access": int(block.last_access),
         }
+        if effective_prune is not None:
+            to_dict = getattr(effective_prune, "to_dict", None)
+            status["prune"] = to_dict() if callable(to_dict) else effective_prune
+        return status
 
     def _subtree_summary(self, block_ids: tuple[bytes, ...]) -> dict[str, int]:
         existing = [self.blocks[block_id] for block_id in block_ids if block_id in self.blocks]

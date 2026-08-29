@@ -1942,6 +1942,72 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["include_subtree"])
         self.assertEqual(payload["thread"], "sparsevllm-openai-dispatcher")
 
+    async def test_prefix_cache_prune_route_returns_async_job_and_status(self):
+        from sparsevllm.entrypoints.openai import api_server
+
+        class Tokenizer:
+            bos_token = None
+            chat_template = "template"
+
+            def encode(self, text, add_special_tokens=False):
+                del text, add_special_tokens
+                return [1, 2, 3, 4]
+
+            def apply_chat_template(self, chat, **_kwargs):
+                return "|".join(
+                    f"{item['role']}:{item['content']}" for item in chat
+                )
+
+        class Engine:
+            tokenizer = Tokenizer()
+            config = type("Config", (), {"sparse_method": ""})()
+
+            def __init__(self):
+                self.status = "queued"
+
+            def prefix_cache_prune_start(self, **kwargs):
+                self.kwargs = kwargs
+                return {"prune_id": "job-1", "status": "queued"}
+
+            def run_pending_prefix_prune(self):
+                self.status = "completed"
+                return True
+
+            def prefix_cache_prune_status(self, prune_id):
+                return {"prune_id": prune_id, "status": self.status}
+
+            def exit(self):
+                pass
+
+        engine = Engine()
+        app = api_server.create_app("/tmp/model", served_model_name="model", engine=engine)
+        start_endpoint = _route_endpoint(app, "/v1/prefix_cache/prune")
+        status_endpoint = _route_endpoint(app, "/v1/prefix_cache/prune/{prune_id}")
+        try:
+            response = await start_endpoint(
+                api_server.PrefixCachePruneRequest(
+                    chat={
+                        "model": "model",
+                        "messages": [{"role": "user", "content": "prune me"}],
+                    },
+                    range_start=0,
+                    range_end=4,
+                    keep_tokens=2,
+                    policy="kvzip_global",
+                ),
+                _TestRequest(app),
+            )
+            status_response = await status_endpoint("job-1", _TestRequest(app))
+        finally:
+            app.state.dispatcher.close()
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(json.loads(response.body)["status"], "queued")
+        self.assertEqual(json.loads(status_response.body)["status"], "completed")
+        self.assertEqual(engine.kwargs["range_start"], 0)
+        self.assertEqual(engine.kwargs["range_end"], 4)
+        self.assertEqual(engine.kwargs["policy"], "kvzip_global")
+
     async def test_prefix_cache_match_accepts_chat_messages(self):
         from sparsevllm.entrypoints.openai import api_server
 

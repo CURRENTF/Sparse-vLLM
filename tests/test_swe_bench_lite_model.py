@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -48,7 +49,11 @@ def _load_model_module(monkeypatch, responses):
         def __init__(self, **kwargs):
             del kwargs
             self.config = SimpleNamespace(
-                model_kwargs={"extra_body": {"thinking": {"type": "disabled"}}}
+                model_name="openai/test-model",
+                model_kwargs={
+                    "api_base": "http://127.0.0.1:18000/v1",
+                    "extra_body": {"thinking": {"type": "disabled"}},
+                },
             )
             self.calls = []
 
@@ -78,6 +83,10 @@ def _load_model_module(monkeypatch, responses):
     exceptions = ModuleType("minisweagent.exceptions")
     litellm_model = ModuleType("minisweagent.models.litellm_model")
     exceptions.FormatError = FakeFormatError
+    litellm_model.BASH_TOOL = {
+        "type": "function",
+        "function": {"name": "bash", "parameters": {"type": "object"}},
+    }
     litellm_model.LitellmModel = FakeLitellmModel
     monkeypatch.setitem(sys.modules, "minisweagent", minisweagent)
     monkeypatch.setitem(sys.modules, "minisweagent.models", models)
@@ -190,6 +199,59 @@ def test_non_chain_model_does_not_send_chain_id(monkeypatch):
     model.query([{"role": "user", "content": "first"}])
 
     assert "extra_body" not in model.calls[0][1]
+
+
+def test_non_chain_model_prunes_once_and_verifies_next_turn_reuse(
+    monkeypatch,
+    tmp_path,
+):
+    module = _load_model_module(
+        monkeypatch,
+        [SimpleNamespace(chain_id=None, choices=[]), SimpleNamespace(chain_id=None, choices=[])],
+    )
+    events = tmp_path / "prune.jsonl"
+    monkeypatch.setenv("SPARSEVLLM_PREFIX_PRUNE_POLICY", "snapkv_global")
+    monkeypatch.setenv("SPARSEVLLM_PREFIX_PRUNE_TRIGGER_TOKENS", "4096")
+    monkeypatch.setenv("SPARSEVLLM_PREFIX_PRUNE_RANGE_START", "512")
+    monkeypatch.setenv("SPARSEVLLM_PREFIX_PRUNE_RANGE_END", "4096")
+    monkeypatch.setenv("SPARSEVLLM_PREFIX_PRUNE_KEEP_TOKENS", "1792")
+    monkeypatch.setenv("SPARSEVLLM_PREFIX_PRUNE_EVENTS", str(events))
+    model = module.SparseVLLMLitellmModel()
+    matches = iter(
+        [
+            {"usable_tokens": 4096, "matched_tokens": 4096, "resident_kv_tokens": 4096},
+            {"usable_tokens": 4096, "matched_tokens": 4096, "resident_kv_tokens": 2304},
+            {"usable_tokens": 4200, "matched_tokens": 4096, "resident_kv_tokens": 2304},
+        ]
+    )
+    monkeypatch.setattr(model, "_match_prefix", lambda _chat: next(matches))
+
+    def request(method, path, body=None):
+        if method == "POST":
+            assert path == "/prefix_cache/prune"
+            assert body["chat"]["model"] == "test-model"
+            return {"prune_id": "job-1", "status": "queued"}
+        assert path == "/prefix_cache/prune/job-1"
+        return {
+            "prune_id": "job-1",
+            "status": "completed",
+            "result": {"freed_device_slots": 1792, "quality_degraded": True},
+        }
+
+    monkeypatch.setattr(model, "_prefix_cache_request", request)
+    first = [{"role": "user", "content": "first"}]
+    model.query(first)
+    model.query(
+        [
+            *first,
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "next"},
+        ]
+    )
+
+    rows = [json.loads(line) for line in events.read_text().splitlines()]
+    assert [row["event"] for row in rows] == ["prune_completed", "reuse_verified"]
+    assert all(row["freed_device_slots"] == 1792 for row in rows)
 
 
 def test_chain_model_rejects_rewritten_history(monkeypatch):

@@ -9,6 +9,7 @@ from sparsevllm.entrypoints.openai.protocol.chat import ChatCompletionRequest
 from sparsevllm.entrypoints.openai.protocol.prefix_cache import PrefixCacheDeleteSubtreeRequest
 from sparsevllm.entrypoints.openai.protocol.prefix_cache import PrefixCacheInspectRequest
 from sparsevllm.entrypoints.openai.protocol.prefix_cache import PrefixCacheMatchRequest
+from sparsevllm.entrypoints.openai.protocol.prefix_cache import PrefixCachePruneRequest
 from sparsevllm.entrypoints.openai.protocol.prefix_cache import PrefixCacheSetEvictionPriorityRequest
 from sparsevllm.entrypoints.openai.protocol.responses import ResponseRequest
 from sparsevllm.entrypoints.openai.reasoning import ReasoningCapabilities
@@ -98,16 +99,74 @@ async def serve_prefix_cache_set_eviction_priority(
     return JSONResponse(result)
 
 
-def _prefix_cache_token_ids_from_request(
-    request: PrefixCacheInspectRequest | PrefixCacheDeleteSubtreeRequest | PrefixCacheSetEvictionPriorityRequest,
+async def serve_prefix_cache_prune(
+    request: PrefixCachePruneRequest,
+    dispatcher: AsyncEngineDispatcher,
     tokenizer: Any,
+    reasoning_capabilities: ReasoningCapabilities | None = None,
+):
+    token_ids = _prefix_cache_token_ids_from_request(
+        request,
+        tokenizer,
+        reasoning_capabilities,
+    )
+    result = await _run_prefix_cache_control(
+        dispatcher,
+        "prefix_cache_prune_start",
+        token_ids=token_ids,
+        range_start=int(request.range_start),
+        range_end=int(request.range_end),
+        keep_tokens=int(request.keep_tokens),
+        policy=str(request.policy),
+        allow_recompress=bool(request.allow_recompress),
+        observation_tokens=int(request.observation_tokens),
+        score_chunk_size=int(request.score_chunk_size),
+        prev_postfix_size=int(request.prev_postfix_size),
+    )
+    return JSONResponse(result, status_code=202)
+
+
+async def serve_prefix_cache_prune_status(
+    prune_id: str,
+    dispatcher: AsyncEngineDispatcher,
+):
+    result = await _run_prefix_cache_control(
+        dispatcher,
+        "prefix_cache_prune_status",
+        prune_id=str(prune_id),
+    )
+    return JSONResponse(result)
+
+
+def _prefix_cache_token_ids_from_request(
+    request: PrefixCacheInspectRequest | PrefixCacheDeleteSubtreeRequest | PrefixCacheSetEvictionPriorityRequest | PrefixCachePruneRequest,
+    tokenizer: Any,
+    reasoning_capabilities: ReasoningCapabilities | None = None,
 ) -> list[int]:
     has_token_ids = request.token_ids is not None
     has_text = request.text is not None
-    if has_token_ids == has_text:
-        raise HTTPException(status_code=400, detail="Set exactly one of token_ids or text.")
+    chat = getattr(request, "chat", None)
+    has_chat = chat is not None
+    if sum((has_token_ids, has_text, has_chat)) != 1:
+        selectors = (
+            "token_ids, text, or chat"
+            if isinstance(request, PrefixCachePruneRequest)
+            else "token_ids or text"
+        )
+        raise HTTPException(status_code=400, detail=f"Set exactly one of {selectors}.")
     if request.token_ids is not None:
         return [int(token_id) for token_id in request.token_ids]
+    if chat is not None:
+        try:
+            chat_request = ChatCompletionRequest.model_validate(chat)
+            prompt = _chat_request_prompt(
+                tokenizer,
+                chat_request,
+                reasoning_capabilities,
+            )
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _encode_prefix_cache_text(tokenizer, prompt)
     return _encode_prefix_cache_text(tokenizer, str(request.text))
 
 

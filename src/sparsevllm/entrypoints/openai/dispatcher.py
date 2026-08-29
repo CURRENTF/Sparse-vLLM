@@ -461,6 +461,11 @@ class AsyncEngineDispatcher:
         try:
             while not stopping:
                 self._drain_controls()
+                run_prefix_prune = getattr(
+                    self.engine, "run_pending_prefix_prune", None
+                )
+                if callable(run_prefix_prune):
+                    run_prefix_prune()
                 if self._drain_aborts(active):
                     self._refresh_routing_snapshots()
                 if not active:

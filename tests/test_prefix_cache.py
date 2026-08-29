@@ -35,6 +35,7 @@ from sparsevllm.engine.prefix_cache import (
     resolve_prefix_cache_block_size,
     usable_prefix_cache_tokens,
 )
+from sparsevllm.engine.prefix_prune import select_global_keep_indices
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.platforms import device_runtime
 
@@ -122,10 +123,128 @@ def _make_standard_manager_for_prefix(block_size=2, method=""):
     manager.seq_id_to_cached_ranges = {}
     manager._scheduler_capacity_snapshot_depth = 0
     manager._scheduler_freeable_block_ids = None
+    manager._scheduler_reclaimable_slots = None
     manager.prefix_offload_controller = None
     manager._prefix_offload_step_h2d_operations = []
     manager._init_prefix_cache_runtime()
     return manager
+
+
+def test_prefix_prune_selects_one_stable_global_token_mask():
+    scores = torch.tensor([0.5, 0.9, 0.9, 0.1])
+    keep = select_global_keep_indices(
+        scores,
+        keep_tokens=3,
+        protected_indices=torch.tensor([3]),
+    )
+    assert keep.tolist() == [1, 2, 3]
+
+
+def test_standard_prefix_prune_compacts_payload_and_preserves_logical_positions():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    manager.row_logical_lens = np.zeros((2,), dtype=np.int32)
+    manager._seq_prefix_cached_cursor = {}
+    parent = None
+    blocks = []
+    for logical_idx, (tokens, slots) in enumerate(
+        [([1, 2], [10, 11]), ([3, 4], [12, 13])]
+    ):
+        block_id = manager.prefix_cache.stable_block_id(tokens, parent)
+        block = PrefixCacheBlock(
+            stable_block_id=block_id,
+            parent_block_id=parent,
+            block_size=2,
+            logical_block_idx=logical_idx,
+            payload=StandardPrefixBlockPayload(
+                token_slots=torch.tensor(slots, dtype=torch.int32)
+            ),
+            token_ids=tuple(tokens),
+        )
+        manager.prefix_cache.insert_block(block)
+        blocks.append(block)
+        parent = block_id
+    _remove_free_slots(manager, [10, 11, 12, 13])
+    free_before = manager.num_free_slots
+
+    result = manager.prefix_cache_prune(
+        [1, 2, 3, 4],
+        range_start=0,
+        range_end=4,
+        keep_indices=torch.tensor([0, 3]),
+        policy="snapkv_global",
+        prune_id="prune-test",
+    )
+
+    assert result["freed_device_slots"] == 2
+    assert manager.num_free_slots == free_before + 2
+    assert blocks[0].payload.retained_offsets == (0,)
+    assert blocks[1].payload.retained_offsets == (1,)
+    assert blocks[0].payload.token_slots.tolist() == [10]
+    assert blocks[1].payload.token_slots.tolist() == [13]
+    inspected = manager.prefix_cache.inspect_prefix([1, 2, 3, 4])
+    assert inspected["path_blocks"][-1]["prune"]["quality_degraded"] is True
+
+    seq = Sequence([1, 2, 3, 4, 5])
+    seq.prefix_cache_enabled = True
+    seq.prefix_cache_hit_len = 4
+    seq.prefix_cache_hit_block_count = 2
+    seq.prefix_cache_hit_last_block_id = parent
+    seq.prefix_cache_block_size = 2
+    manager._attach_prefix_cache_if_needed(seq)
+    row = manager.seq_id_to_row[seq.seq_id]
+    assert manager.row_seq_lens[row] == 2
+    assert manager.row_logical_lens[row] == 4
+    assert manager.buffer_req_to_token_slots[row, :2].tolist() == [10, 13]
+
+    seq.num_prefilled_tokens = 4
+    seq.current_chunk_size = 1
+    input_ids, positions, _ = manager._prepare_prefill([seq])
+    assert input_ids.tolist() == [5]
+    assert positions.tolist() == [4]
+    assert manager.layer_batch_state.context_lens.tolist() == [3]
+    assert manager.row_logical_lens[row] == 5
+
+
+def test_standard_prefix_prune_rejects_referenced_blocks_without_mutation():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    block_id = manager.prefix_cache.stable_block_id([1, 2], None)
+    block = PrefixCacheBlock(
+        stable_block_id=block_id,
+        parent_block_id=None,
+        block_size=2,
+        logical_block_idx=0,
+        payload=StandardPrefixBlockPayload(
+            token_slots=torch.tensor([10, 11], dtype=torch.int32)
+        ),
+        token_ids=(1, 2),
+    )
+    manager.prefix_cache.insert_block(block)
+    manager.prefix_cache.acquire_block_ref(block)
+
+    with pytest.raises(RuntimeError, match="idle"):
+        manager.prefix_cache_prune(
+            [1, 2],
+            range_start=0,
+            range_end=2,
+            keep_indices=torch.tensor([0]),
+            policy="kvzip_global",
+            prune_id="blocked",
+        )
+    assert block.payload.retained_offsets is None
+    assert block.payload.token_slots.tolist() == [10, 11]
+
+
+def test_quest_explicitly_rejects_physical_prefix_pruning():
+    manager = object.__new__(QuestCacheManager)
+    with pytest.raises(RuntimeError, match="QuEST.*without pruning"):
+        manager.prefix_cache_prune(
+            [1, 2, 3, 4],
+            range_start=0,
+            range_end=4,
+            keep_indices=torch.tensor([0, 1]),
+            policy="snapkv_global",
+            prune_id="quest-unsupported",
+        )
 
 
 class _FakeHostPool:
@@ -1583,6 +1702,57 @@ def test_standard_latent_prefix_full_lifecycle_restores_and_reuses_slots():
     _assert_standard_latent_prefix_full_lifecycle("")
 
 
+def test_standard_gpu_pressure_batches_partial_block_eviction_in_one_tree_scan(
+    monkeypatch,
+):
+    manager = _make_standard_manager_for_prefix(block_size=4)
+    blocks = []
+    for logical_idx, (slots, priority) in enumerate(
+        [([10], 30), ([11, 12, 13, 14], 20), ([15, 16, 17, 18], 0)]
+    ):
+        tokens = [logical_idx * 4 + offset for offset in range(4)]
+        block_id = manager.prefix_cache.stable_block_id(tokens, None)
+        retained_offsets = None if len(slots) == 4 else tuple(range(len(slots)))
+        block = PrefixCacheBlock(
+            stable_block_id=block_id,
+            parent_block_id=None,
+            block_size=4,
+            logical_block_idx=logical_idx,
+            payload=StandardPrefixBlockPayload(
+                token_slots=torch.tensor(slots, dtype=torch.int32),
+                retained_offsets=retained_offsets,
+            ),
+            token_ids=tuple(tokens),
+            eviction_priority=priority,
+        )
+        manager.prefix_cache.insert_block(block)
+        _remove_free_slots(manager, slots)
+        blocks.append(block)
+
+    leaf_scans = 0
+    original_leaf_block_ids = manager.prefix_cache.backend.leaf_block_ids
+
+    def counted_leaf_block_ids():
+        nonlocal leaf_scans
+        leaf_scans += 1
+        return original_leaf_block_ids()
+
+    monkeypatch.setattr(
+        manager.prefix_cache.backend,
+        "leaf_block_ids",
+        counted_leaf_block_ids,
+    )
+    free_before = manager.num_free_slots
+
+    manager._evict_prefix_cache_until_free(free_before + 5)
+
+    assert manager.num_free_slots == free_before + 5
+    assert leaf_scans == 1
+    assert blocks[0].stable_block_id not in manager.prefix_cache.blocks
+    assert blocks[1].stable_block_id not in manager.prefix_cache.blocks
+    assert blocks[2].stable_block_id in manager.prefix_cache.blocks
+
+
 def test_standard_offload_gpu_pressure_only_demotes_dual_resident_blocks():
     manager = _make_standard_manager_for_prefix(block_size=2)
     controller = _FakePrefixOffloadController(manager.prefix_cache)
@@ -1623,6 +1793,52 @@ def test_standard_offload_gpu_pressure_only_demotes_dual_resident_blocks():
     assert blocks[1].residency.host_present is True
     assert blocks[1].payload.token_slots is None
     assert manager._num_free_slots == 88
+
+
+def test_standard_offload_gpu_pressure_batches_partial_block_demotions():
+    manager = _make_standard_manager_for_prefix(block_size=4)
+    controller = _FakePrefixOffloadController(manager.prefix_cache)
+    manager.prefix_offload_controller = controller
+    blocks = []
+    parent_id = None
+    for logical_idx, (slots, retained_offsets) in enumerate(
+        [([10, 11, 12, 13], None), ([14], (0,))]
+    ):
+        tokens = [logical_idx * 4 + offset for offset in range(4)]
+        block_id = manager.prefix_cache.stable_block_id(tokens, parent_id)
+        block = PrefixCacheBlock(
+            stable_block_id=block_id,
+            parent_block_id=parent_id,
+            block_size=4,
+            logical_block_idx=logical_idx,
+            payload=StandardPrefixBlockPayload(
+                token_slots=torch.tensor(slots, dtype=torch.int32),
+                host_block_index=logical_idx,
+                retained_offsets=retained_offsets,
+            ),
+            token_ids=tuple(tokens),
+        )
+        manager.prefix_cache.insert_block(block)
+        manager.prefix_cache.begin_d2h(block)
+        manager.prefix_cache.finish_d2h(block)
+        _remove_free_slots(manager, slots)
+        blocks.append(block)
+        parent_id = block_id
+
+    free_before = manager.num_free_slots
+    with patch.object(
+        manager.prefix_cache,
+        "demote_device_until_weight",
+        wraps=manager.prefix_cache.demote_device_until_weight,
+    ) as demote_device_until_weight:
+        manager._evict_prefix_cache_until_free(free_before + 5)
+
+    assert demote_device_until_weight.call_count == 1
+    assert manager.num_free_slots == free_before + 5
+    assert all(not block.residency.device_present for block in blocks)
+    assert all(block.residency.host_present for block in blocks)
+    assert all(block.payload.token_slots is None for block in blocks)
+    assert len(manager.prefix_cache) == 2
 
 
 def test_standard_write_through_batches_only_unreferenced_root_contiguous_blocks():
@@ -2046,13 +2262,18 @@ def test_standard_scheduler_capacity_snapshot_reuses_freeable_tree_scan():
         manager.prefix_cache,
         "freeable_block_ids",
         wraps=manager.prefix_cache.freeable_block_ids,
-    ) as freeable_block_ids:
+    ) as freeable_block_ids, patch.object(
+        manager,
+        "_prefix_resident_slots_for_ids",
+        wraps=manager._prefix_resident_slots_for_ids,
+    ) as resident_slots_for_ids:
         with manager.scheduler_capacity_snapshot():
             assert manager.prompt_admission_free_slots() == 92
             assert manager.prefill_step_free_slots() == 92
             assert manager.decode_step_free_slots() == 92
             assert manager.prompt_admission_budgets(deque(), 2)["slots"] == 92
         assert freeable_block_ids.call_count == 1
+        assert resident_slots_for_ids.call_count == 2
 
         assert manager.decode_step_free_slots() == 92
         assert freeable_block_ids.call_count == 2

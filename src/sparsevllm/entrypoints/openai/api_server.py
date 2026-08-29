@@ -17,6 +17,7 @@ from sparsevllm.entrypoints.openai.protocol.completion import CompletionRequest
 from sparsevllm.entrypoints.openai.protocol.prefix_cache import PrefixCacheDeleteSubtreeRequest
 from sparsevllm.entrypoints.openai.protocol.prefix_cache import PrefixCacheInspectRequest
 from sparsevllm.entrypoints.openai.protocol.prefix_cache import PrefixCacheMatchRequest
+from sparsevllm.entrypoints.openai.protocol.prefix_cache import PrefixCachePruneRequest
 from sparsevllm.entrypoints.openai.protocol.prefix_cache import PrefixCacheSetEvictionPriorityRequest
 from sparsevllm.entrypoints.openai.protocol.responses import ResponseReasoning
 from sparsevllm.entrypoints.openai.protocol.responses import ResponseRequest

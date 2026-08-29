@@ -829,6 +829,25 @@ class SweBenchLiteRunner:
                 "A positive --cost-limit is not reliable with --cost-tracking=ignore_errors; "
                 "set --cost-limit=0 or provide model cost metadata and use default tracking"
             )
+        prune_policy = getattr(args, "prefix_prune_policy", None)
+        if prune_policy:
+            if bool(args.chain_cache):
+                raise RunnerError("--prefix-prune-policy requires --no-chain-cache")
+            range_start = int(args.prefix_prune_range_start)
+            range_end = int(args.prefix_prune_range_end)
+            keep_tokens = int(args.prefix_prune_keep_tokens)
+            trigger_tokens = int(args.prefix_prune_trigger_tokens)
+            if (
+                range_start < 0
+                or range_end <= range_start
+                or range_start % 16
+                or range_end % 16
+            ):
+                raise RunnerError("prefix-prune range must be non-empty and 16-token aligned")
+            if not 0 <= keep_tokens < range_end - range_start:
+                raise RunnerError("prefix-prune keep tokens must be in [0, R-L)")
+            if trigger_tokens < range_end:
+                raise RunnerError("prefix-prune trigger must be at least range end")
         _reject_secrets(
             {"api_base": args.api_base, "mini_command": args.mini_command},
             source=Path("<command-line arguments>"),
@@ -933,6 +952,35 @@ class SweBenchLiteRunner:
             env["SPARSEVLLM_CHAIN_CACHE"] = "1"
         else:
             env.pop("SPARSEVLLM_CHAIN_CACHE", None)
+        prune_env_vars = (
+            "SPARSEVLLM_PREFIX_PRUNE_POLICY",
+            "SPARSEVLLM_PREFIX_PRUNE_TRIGGER_TOKENS",
+            "SPARSEVLLM_PREFIX_PRUNE_RANGE_START",
+            "SPARSEVLLM_PREFIX_PRUNE_RANGE_END",
+            "SPARSEVLLM_PREFIX_PRUNE_KEEP_TOKENS",
+            "SPARSEVLLM_PREFIX_PRUNE_EVENTS",
+        )
+        prune_policy = getattr(self.args, "prefix_prune_policy", None)
+        if prune_policy:
+            env["SPARSEVLLM_PREFIX_PRUNE_POLICY"] = str(prune_policy)
+            env["SPARSEVLLM_PREFIX_PRUNE_TRIGGER_TOKENS"] = str(
+                self.args.prefix_prune_trigger_tokens
+            )
+            env["SPARSEVLLM_PREFIX_PRUNE_RANGE_START"] = str(
+                self.args.prefix_prune_range_start
+            )
+            env["SPARSEVLLM_PREFIX_PRUNE_RANGE_END"] = str(
+                self.args.prefix_prune_range_end
+            )
+            env["SPARSEVLLM_PREFIX_PRUNE_KEEP_TOKENS"] = str(
+                self.args.prefix_prune_keep_tokens
+            )
+            env["SPARSEVLLM_PREFIX_PRUNE_EVENTS"] = str(
+                self.run_dir / "prefix_prune_events.jsonl"
+            )
+        else:
+            for key in prune_env_vars:
+                env.pop(key, None)
         guard_env_vars = (
             "SPARSEVLLM_DOCKER_WRITABLE_LAYER_LIMIT_BYTES",
             "SPARSEVLLM_DOCKER_WRITABLE_LAYER_POLL_SECONDS",
@@ -1029,6 +1077,19 @@ class SweBenchLiteRunner:
             "temperature": self.args.temperature,
             "top_p": self.args.top_p,
             "chain_cache": bool(self.args.chain_cache),
+            "prefix_prune": (
+                {
+                    "policy": self.args.prefix_prune_policy,
+                    "trigger_tokens": self.args.prefix_prune_trigger_tokens,
+                    "range": [
+                        self.args.prefix_prune_range_start,
+                        self.args.prefix_prune_range_end,
+                    ],
+                    "keep_tokens": self.args.prefix_prune_keep_tokens,
+                }
+                if getattr(self.args, "prefix_prune_policy", None)
+                else None
+            ),
             "docker_writable_layer_limit_gib": self.args.docker_writable_layer_limit_gib,
             "docker_writable_layer_poll_seconds": self.args.docker_writable_layer_poll_seconds,
             "seed": None,
@@ -1677,6 +1738,16 @@ def build_parser() -> argparse.ArgumentParser:
             "the resolved value is persisted in run_config.json."
         ),
     )
+    parser.add_argument(
+        "--prefix-prune-policy",
+        choices=("snapkv_global", "kvzip_global"),
+        default=None,
+        help="Prune each MiniSWE radix-tree path once and verify reuse on its next turn.",
+    )
+    parser.add_argument("--prefix-prune-trigger-tokens", type=int, default=4096)
+    parser.add_argument("--prefix-prune-range-start", type=int, default=512)
+    parser.add_argument("--prefix-prune-range-end", type=int, default=4096)
+    parser.add_argument("--prefix-prune-keep-tokens", type=int, default=1792)
     parser.add_argument(
         "--docker-writable-layer-limit-gib",
         type=float,

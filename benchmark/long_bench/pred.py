@@ -177,9 +177,11 @@ def _build_infer_config(args: argparse.Namespace) -> dict[str, Any]:
             f"--max_model_len={args.max_model_len}, "
             f"--hyper_param max_model_len={configured_max_model_len}."
         )
-    if bool(extra_config.get("enable_prefix_caching", False)):
+    prefix_caching = bool(extra_config.get("enable_prefix_caching", False))
+    if prefix_caching and not bool(getattr(args, "allow_prefix_caching", False)):
         raise ValueError(
-            "LongBench quality regression requires enable_prefix_caching=False."
+            "LongBench quality regression requires enable_prefix_caching=False "
+            "unless --allow_prefix_caching is passed explicitly."
         )
 
     if args.sparse_method == "omnikv":
@@ -190,7 +192,7 @@ def _build_infer_config(args: argparse.Namespace) -> dict[str, Any]:
 
     infer_config = dict(extra_config)
     infer_config["max_model_len"] = int(args.max_model_len)
-    infer_config["enable_prefix_caching"] = False
+    infer_config["enable_prefix_caching"] = prefix_caching
     return infer_config
 
 
@@ -372,6 +374,23 @@ def _write_operator_runtime_stats(*, generate_fn, out_root: str, rank: int) -> N
             "status": "success",
             "launcher_rank": int(rank),
             "world_ranks": llm.operator_runtime_stats(),
+        },
+    )
+
+
+def _write_worker_load_stats(*, generate_fn, out_root: str, rank: int) -> None:
+    llm = getattr(generate_fn, "_sparsevllm_llm", None)
+    if llm is None:
+        raise RuntimeError(
+            "SparseVLLM LongBench generation did not expose _sparsevllm_llm; "
+            "cannot record final cache statistics."
+        )
+    _write_json(
+        Path(out_root) / f"worker_load_stats_rank{rank}.json",
+        {
+            "status": "success",
+            "launcher_rank": int(rank),
+            "worker_load": llm.worker_load(),
         },
     )
 
@@ -904,6 +923,11 @@ def worker(
         out_root=out_root,
         rank=rank,
     )
+    _write_worker_load_stats(
+        generate_fn=model,
+        out_root=out_root,
+        rank=rank,
+    )
 
 
 def launch_single_gpu_workers(args, out_root):
@@ -980,6 +1004,14 @@ def parse_args():
         "--allow_single_omnikv_full_layer",
         action="store_true",
         help="Allow an explicit single-full-layer OmniKV ablation.",
+    )
+    parser.add_argument(
+        "--allow_prefix_caching",
+        action="store_true",
+        help=(
+            "Explicitly opt into prefix caching for a targeted LongBench A/B. "
+            "The default quality protocol keeps prefix caching disabled."
+        ),
     )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)

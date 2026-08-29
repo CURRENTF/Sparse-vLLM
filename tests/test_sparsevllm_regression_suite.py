@@ -17,6 +17,36 @@ from benchmark.sparsevllm_regression.manifest import (
 
 
 class SparseVLLMRegressionSuiteTest(unittest.TestCase):
+    def test_quality_command_explicitly_opts_into_prefix_caching(self):
+        command = run_suite._quality_command(
+            model_id="qwen3_4b",
+            method_id="vanilla",
+            model={"model_path": "/model", "tokenizer_path": "/tokenizer"},
+            method={
+                "sparse_method": "vanilla",
+                "requires_compressor": False,
+                "config": {"sparse_method": "vanilla"},
+            },
+            quality={
+                "tasks": ["qasper"],
+                "worker_world_size": 1,
+                "batch_size": 1,
+                "min_prompt_tokens": 0,
+                "samples_per_task": 1,
+                "min_required_samples": 1,
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "top_k": 1,
+                "enable_prefix_caching": True,
+                "prefix_cache_block_size": 16,
+            },
+            output_root=Path("/output"),
+        )
+
+        self.assertIn("--allow_prefix_caching", command)
+        hyper_params = json.loads(command[command.index("--hyper_param") + 1])
+        self.assertIs(hyper_params["enable_prefix_caching"], True)
+
     def test_deltakv_checkpoint_uses_canonical_manifest_field(self):
         with patch.dict(
             "os.environ",

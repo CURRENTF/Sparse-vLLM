@@ -28,12 +28,25 @@ def _load_kvcache_transfer_ops():
 def _payload_device_slots(block: PrefixCacheBlock, block_size: int) -> torch.Tensor:
     payload = getattr(block.payload, "kv_payload", block.payload)
     slots = getattr(payload, "token_slots", None)
-    if not isinstance(slots, torch.Tensor) or int(slots.numel()) != int(block_size):
+    retained_offsets = getattr(payload, "retained_offsets", None)
+    expected = int(block_size) if retained_offsets is None else len(retained_offsets)
+    if not isinstance(slots, torch.Tensor) or int(slots.numel()) != expected:
         raise RuntimeError(
-            "Prefix offload block is missing a full device-slot payload: "
-            f"block={block.stable_block_id.hex()[:16]} block_size={block_size}."
+            "Prefix offload block has inconsistent device-slot payload: "
+            f"block={block.stable_block_id.hex()[:16]} expected_slots={expected}."
         )
     return slots.reshape(-1)
+
+
+def _payload_retained_offsets(block: PrefixCacheBlock, block_size: int) -> tuple[int, ...]:
+    payload = getattr(block.payload, "kv_payload", block.payload)
+    offsets = getattr(payload, "retained_offsets", None)
+    if offsets is None:
+        return tuple(range(int(block_size)))
+    normalized = tuple(int(offset) for offset in offsets)
+    if any(offset < 0 or offset >= int(block_size) for offset in normalized):
+        raise RuntimeError("Prefix block contains invalid retained token offsets.")
+    return normalized
 
 
 def _payload_host_index(block: PrefixCacheBlock) -> int:
@@ -135,6 +148,21 @@ class PinnedPrefixKVPool:
             int(block_index) * self.block_size + offset
             for block_index in block_indices
             for offset in range(self.block_size)
+        ]
+        return torch.tensor(indices, dtype=torch.long, device=device)
+
+    def retained_token_indices(
+        self,
+        block_indices: list[int],
+        retained_offsets: list[tuple[int, ...]],
+        device: torch.device,
+    ) -> torch.Tensor:
+        if len(block_indices) != len(retained_offsets):
+            raise ValueError("Host block indices and retained offsets must have equal length.")
+        indices = [
+            int(block_index) * self.block_size + int(offset)
+            for block_index, offsets in zip(block_indices, retained_offsets)
+            for offset in offsets
         ]
         return torch.tensor(indices, dtype=torch.long, device=device)
 
@@ -281,12 +309,44 @@ class StandardPrefixOffloadController:
             )
         return event
 
+    def _host_token_indices(
+        self,
+        blocks: list[PrefixCacheBlock],
+        host_indices: list[int],
+    ) -> torch.Tensor:
+        offsets = [
+            _payload_retained_offsets(block, self.block_size) for block in blocks
+        ]
+        retained = getattr(self.host_pool, "retained_token_indices", None)
+        if callable(retained):
+            return retained(host_indices, offsets, self.device)
+        if any(value != tuple(range(self.block_size)) for value in offsets):
+            raise RuntimeError(
+                "Prefix host pool does not support retained token offsets."
+            )
+        return self.host_pool.token_indices(host_indices, self.device)
+
     @torch.no_grad()
     def submit_d2h(self, blocks: list[PrefixCacheBlock]) -> None:
         if not blocks:
             return
         if device_runtime.is_stream_capturing():
             raise RuntimeError("Prefix D2H submission is forbidden during graph capture.")
+        empty_blocks = [
+            block
+            for block in blocks
+            if int(_payload_device_slots(block, self.block_size).numel()) == 0
+        ]
+        if empty_blocks:
+            empty_ids = {block.stable_block_id for block in empty_blocks}
+            empty_host_indices = self.host_pool.allocate(len(empty_blocks))
+            for block, host_index in zip(empty_blocks, empty_host_indices):
+                self.prefix_cache.begin_d2h(block)
+                setattr(block.payload, "host_block_index", int(host_index))
+                self.prefix_cache.finish_d2h(block)
+            blocks = [block for block in blocks if block.stable_block_id not in empty_ids]
+            if not blocks:
+                return
         host_indices = self.host_pool.allocate(len(blocks))
         begun: list[PrefixCacheBlock] = []
         try:
@@ -294,7 +354,7 @@ class StandardPrefixOffloadController:
                 [_payload_device_slots(block, self.block_size) for block in blocks],
                 dim=0,
             ).to(device=self.device, dtype=torch.long)
-            host_token_indices = self.host_pool.token_indices(host_indices, self.device)
+            host_token_indices = self._host_token_indices(blocks, host_indices)
             auxiliary_tensors = self._prepare_d2h_auxiliary(blocks, host_indices)
             producer_event = self._new_event(self.device, "D2H producer")
             completion_event = self._new_event(self.device, "D2H completion")
@@ -318,7 +378,7 @@ class StandardPrefixOffloadController:
             self.host_pool.free(host_indices)
             raise
 
-        byte_count = self._transfer_byte_count(len(blocks))
+        byte_count = self._transfer_token_byte_count(int(device_slots.numel()))
         self.d2h_operations.append(
             PrefixD2HOperation(
                 blocks=list(blocks),
@@ -360,13 +420,25 @@ class StandardPrefixOffloadController:
         return True
 
     @torch.no_grad()
-    def submit_h2d(self, blocks: list[PrefixCacheBlock]) -> PrefixH2DOperation:
+    def submit_h2d(self, blocks: list[PrefixCacheBlock]) -> PrefixH2DOperation | None:
         if not blocks:
             raise ValueError("Prefix H2D submission requires at least one block.")
         if device_runtime.is_stream_capturing():
             raise RuntimeError("Prefix H2D submission is forbidden during graph capture.")
+        empty_blocks = [
+            block
+            for block in blocks
+            if int(_payload_device_slots(block, self.block_size).numel()) == 0
+        ]
+        empty_ids = {block.stable_block_id for block in empty_blocks}
+        for block in empty_blocks:
+            self.prefix_cache.begin_h2d(block)
+            self.prefix_cache.finish_h2d(block)
+        blocks = [block for block in blocks if block.stable_block_id not in empty_ids]
+        if not blocks:
+            return None
         host_indices = [_payload_host_index(block) for block in blocks]
-        host_token_indices = self.host_pool.token_indices(host_indices, self.device)
+        host_token_indices = self._host_token_indices(blocks, host_indices)
         device_slots = torch.cat(
             [_payload_device_slots(block, self.block_size) for block in blocks],
             dim=0,
@@ -415,7 +487,7 @@ class StandardPrefixOffloadController:
                 self.prefix_cache.abort_h2d(block)
             raise
 
-        byte_count = self._transfer_byte_count(len(blocks))
+        byte_count = self._transfer_token_byte_count(int(device_slots.numel()))
         operation = PrefixH2DOperation(
             blocks=list(blocks),
             host_token_indices=host_token_indices,
@@ -500,9 +572,11 @@ class StandardPrefixOffloadController:
         raise RuntimeError("This prefix offload controller has no auxiliary layers.")
 
     def _transfer_byte_count(self, block_count: int) -> int:
+        return self._transfer_token_byte_count(int(block_count) * self.block_size)
+
+    def _transfer_token_byte_count(self, token_count: int) -> int:
         return int(
-            int(block_count)
-            * self.block_size
+            int(token_count)
             * self.host_pool.num_layers
             * 2
             * self.item_size

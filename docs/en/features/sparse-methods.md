@@ -76,6 +76,9 @@ chain for SnapKV/H2O/PyramidKV/R-KV/SkipKV. `radix` and `chain` can be
 requested explicitly, but incompatible method/mode pairs fail fast.
 GLM-4.7-Flash QuEST is a storage-specific exception: its latent QuEST path does
 not yet support prefix caching or prefix offload, and configuration rejects both.
+Existing vanilla/OmniKV radix trees can be physically compacted with the
+SnapKV- or KVzip-scored maintenance API described in
+[Prefix cache pruning](prefix-cache-pruning.md); QuEST trees reject pruning.
 
 The chain layout keeps one resident `seq_id` across turns and never branches.
 Callers send the complete logical context plus the returned `chain_id`; only

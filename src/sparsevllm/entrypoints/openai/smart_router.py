@@ -184,6 +184,44 @@ def create_app(
     async def prefix_cache_set_eviction_priority(request: Request):
         return JSONResponse(await router.broadcast_json("/v1/prefix_cache/set_eviction_priority", await request.json()))
 
+    @app.post("/v1/prefix_cache/prune")
+    async def prefix_cache_prune(request: Request):
+        payload = await request.json()
+        worker, payload, route = await router.select_worker(
+            "/v1/prefix_cache/prune", payload
+        )
+        response = await router.forward_json(
+            worker, "/v1/prefix_cache/prune", payload
+        )
+        if response.status_code < 300:
+            decoded = json.loads(bytes(response.body).decode("utf-8"))
+            prune_id = str(decoded.get("prune_id") or "")
+            if not prune_id:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Prefix prune worker returned no prune_id.",
+                )
+            router.prefix_prune_workers[prune_id] = worker
+        return _with_route_headers(response, route)
+
+    @app.get("/v1/prefix_cache/prune/{prune_id}")
+    async def prefix_cache_prune_status(prune_id: str):
+        worker = router.prefix_prune_workers.get(str(prune_id))
+        if worker is None:
+            raise HTTPException(status_code=404, detail="Unknown prefix prune id.")
+        status, headers, body = await asyncio.to_thread(
+            _request_bytes,
+            f"{worker.url}/v1/prefix_cache/prune/{prune_id}",
+            "GET",
+            None,
+            router.control_timeout_s,
+        )
+        return Response(
+            content=body,
+            status_code=status,
+            headers=_content_headers(headers),
+        )
+
     return app
 
 
@@ -235,6 +273,7 @@ class SmartRouter:
         self.load_abs_threshold = int(load_abs_threshold)
         self.profiles = profiles
         self.route_log_dir = route_log_dir
+        self.prefix_prune_workers: dict[str, WorkerState] = {}
         if self.route_log_dir is not None:
             self.route_log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -787,7 +826,11 @@ def match_payload_for_request(endpoint: str, payload: dict[str, Any]) -> dict[st
         messages = payload.get("messages")
         if isinstance(messages, list) and messages:
             return {"chat": payload}
-    if endpoint in {"/v1/completions", "/v1/prefix_cache/inspect"}:
+    if endpoint in {
+        "/v1/completions",
+        "/v1/prefix_cache/inspect",
+        "/v1/prefix_cache/prune",
+    }:
         prompt = payload.get("prompt")
         if "token_ids" in payload or "text" in payload:
             return {key: payload[key] for key in ("token_ids", "text") if key in payload}

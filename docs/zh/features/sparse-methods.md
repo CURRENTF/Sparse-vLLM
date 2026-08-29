@@ -59,6 +59,9 @@ SnapKV/H2O/PyramidKV/R-KV/SkipKV 选择线性 chain。也可以显式请求 `rad
 或 `chain`，但不兼容的方法/模式组合会快速失败。
 GLM-4.7-Flash QuEST 是 storage-specific 例外：当前 latent QuEST 路径不支持
 Prefix Cache 或 Prefix offload，配置会明确拒绝这两种组合。
+已有 vanilla/OmniKV radix tree 可通过
+[Prefix cache 修剪](prefix-cache-pruning.md)中的 SnapKV 或 KVzip 打分维护接口
+进行物理压紧；QuEST tree 会明确拒绝修剪。
 
 Chain 布局跨 turn 保留同一个驻留 `seq_id`，且永不分支。调用方发送完整逻辑
 上下文和服务端返回的 `chain_id`；服务端验证 processed boundary 后只转发新增

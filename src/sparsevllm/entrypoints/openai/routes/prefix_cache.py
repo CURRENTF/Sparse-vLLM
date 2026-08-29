@@ -4,10 +4,13 @@ from fastapi import Request
 from sparsevllm.entrypoints.openai.protocol.prefix_cache import PrefixCacheDeleteSubtreeRequest
 from sparsevllm.entrypoints.openai.protocol.prefix_cache import PrefixCacheInspectRequest
 from sparsevllm.entrypoints.openai.protocol.prefix_cache import PrefixCacheMatchRequest
+from sparsevllm.entrypoints.openai.protocol.prefix_cache import PrefixCachePruneRequest
 from sparsevllm.entrypoints.openai.protocol.prefix_cache import PrefixCacheSetEvictionPriorityRequest
 from sparsevllm.entrypoints.openai.serving.prefix_cache import serve_prefix_cache_delete_subtree
 from sparsevllm.entrypoints.openai.serving.prefix_cache import serve_prefix_cache_inspect
 from sparsevllm.entrypoints.openai.serving.prefix_cache import serve_prefix_cache_match
+from sparsevllm.entrypoints.openai.serving.prefix_cache import serve_prefix_cache_prune
+from sparsevllm.entrypoints.openai.serving.prefix_cache import serve_prefix_cache_prune_status
 from sparsevllm.entrypoints.openai.serving.prefix_cache import serve_prefix_cache_routing_match
 from sparsevllm.entrypoints.openai.serving.prefix_cache import serve_prefix_cache_set_eviction_priority
 
@@ -59,4 +62,22 @@ async def prefix_cache_set_eviction_priority(body: PrefixCacheSetEvictionPriorit
         body,
         request.app.state.dispatcher,
         request.app.state.engine.tokenizer,
+    )
+
+
+@router.post("/v1/prefix_cache/prune")
+async def prefix_cache_prune(body: PrefixCachePruneRequest, request: Request):
+    return await serve_prefix_cache_prune(
+        body,
+        request.app.state.dispatcher,
+        request.app.state.engine.tokenizer,
+        request.app.state.reasoning_capabilities,
+    )
+
+
+@router.get("/v1/prefix_cache/prune/{prune_id}")
+async def prefix_cache_prune_status(prune_id: str, request: Request):
+    return await serve_prefix_cache_prune_status(
+        prune_id,
+        request.app.state.dispatcher,
     )

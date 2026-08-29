@@ -1242,6 +1242,45 @@ class CacheManager(ABC):
         del token_ids, priority
         raise RuntimeError("prefix cache is not enabled or not supported by this cache manager.")
 
+    def prefix_cache_prune(
+        self,
+        token_ids: list[int],
+        *,
+        range_start: int,
+        range_end: int,
+        keep_indices: torch.Tensor,
+        policy: str,
+        prune_id: str,
+        allow_recompress: bool = False,
+    ) -> dict[str, object]:
+        del (
+            token_ids,
+            range_start,
+            range_end,
+            keep_indices,
+            policy,
+            prune_id,
+            allow_recompress,
+        )
+        raise RuntimeError(
+            "physical prefix-cache pruning is unsupported by this cache manager; "
+            "QuEST prefix cache remains available without pruning."
+        )
+
+    def validate_prefix_cache_prune_target(
+        self,
+        token_ids: list[int],
+        *,
+        range_start: int,
+        range_end: int,
+        allow_recompress: bool = False,
+    ) -> list[object]:
+        del token_ids, range_start, range_end, allow_recompress
+        raise RuntimeError(
+            "physical prefix-cache pruning is unsupported by this cache manager; "
+            "QuEST prefix cache remains available without pruning."
+        )
+
     def has_prefill_staging_view(self, layer_idx: int) -> bool:
         """Whether the current prefill layer should read from a temporary staging KV view."""
         return False

@@ -2,6 +2,8 @@ import atexit
 import gc
 import os
 import pickle
+import uuid
+from collections import deque
 from dataclasses import fields
 from multiprocessing.shared_memory import SharedMemory
 from time import perf_counter
@@ -13,6 +15,7 @@ import torch.multiprocessing as mp
 from sparsevllm.utils.code_revision import code_revision_info
 from sparsevllm.utils.log import logger
 import sys
+import time
 
 from sparsevllm.configs.cuda_graph import (
     build_decode_cuda_graph_startup_family_plan,
@@ -30,6 +33,10 @@ from sparsevllm.multimodal.inputs import (
     is_multimodal_prompt,
 )
 from sparsevllm.engine.prefix_cache import PrefixCacheRoutingSnapshot
+from sparsevllm.engine.prefix_prune import (
+    PrefixPruneJob,
+    validate_prefix_prune_request,
+)
 from sparsevllm.engine.chain_cache import (
     ChainCacheIndex,
     ChainRoutingSnapshot,
@@ -295,6 +302,8 @@ class LLMEngine:
             tuple[int, list[float | None], list[dict[int, float] | None]]
         ] = []
         self._active_chain_sequences: dict[int, Sequence] = {}
+        self._prefix_prune_jobs: dict[str, PrefixPruneJob] = {}
+        self._pending_prefix_prune_ids: deque[str] = deque()
         # 注册退出钩子，确保程序崩溃或结束时能正确释放多进程资源
         self._atexit_callback = self.exit
         atexit.register(self._atexit_callback)
@@ -1078,6 +1087,113 @@ class LLMEngine:
             [int(token_id) for token_id in token_ids],
             int(priority),
         )
+
+    def prefix_cache_prune_start(
+        self,
+        token_ids: list[int],
+        range_start: int,
+        range_end: int,
+        keep_tokens: int,
+        policy: str,
+        allow_recompress: bool = False,
+        observation_tokens: int = 64,
+        score_chunk_size: int = 2048,
+        prev_postfix_size: int = 64,
+    ) -> dict[str, object]:
+        token_ids = [int(token_id) for token_id in token_ids]
+        if str(self.config.sparse_method or "") == "quest":
+            raise RuntimeError(
+                "QuEST prefix cache/offload remains supported, but physical prefix "
+                "pruning is intentionally unsupported."
+            )
+        normalized_policy = validate_prefix_prune_request(
+            token_count=len(token_ids),
+            range_start=int(range_start),
+            range_end=int(range_end),
+            keep_tokens=int(keep_tokens),
+            block_size=int(self.config.prefix_cache_block_size),
+            policy=str(policy),
+        )
+        if not bool(self.config.enable_prefix_caching):
+            raise RuntimeError("prefix cache must be enabled before a prune job can start.")
+        if int(observation_tokens) <= 0:
+            raise ValueError("observation_tokens must be positive.")
+        if int(score_chunk_size) <= 0:
+            raise ValueError("score_chunk_size must be positive.")
+        if int(prev_postfix_size) < 0:
+            raise ValueError("prev_postfix_size must be non-negative.")
+        prune_id = uuid.uuid4().hex
+        job = PrefixPruneJob(
+            prune_id=prune_id,
+            token_ids=token_ids,
+            range_start=int(range_start),
+            range_end=int(range_end),
+            keep_tokens=int(keep_tokens),
+            policy=normalized_policy,
+            allow_recompress=bool(allow_recompress),
+            observation_tokens=int(observation_tokens),
+            score_chunk_size=int(score_chunk_size),
+            prev_postfix_size=int(prev_postfix_size),
+        )
+        self._prefix_prune_jobs[prune_id] = job
+        self._pending_prefix_prune_ids.append(prune_id)
+        return job.to_dict()
+
+    def prefix_cache_prune_status(self, prune_id: str) -> dict[str, object]:
+        job = self._prefix_prune_jobs.get(str(prune_id))
+        if job is None:
+            raise RuntimeError(f"unknown prefix prune id: {prune_id!r}.")
+        return job.to_dict()
+
+    def run_pending_prefix_prune(self) -> bool:
+        if not self._pending_prefix_prune_ids:
+            return False
+        prune_id = self._pending_prefix_prune_ids.popleft()
+        job = self._prefix_prune_jobs[prune_id]
+        job.status = "running"
+        job.started_at = time.time()
+        try:
+            replay_prefix_ids = None
+            if job.policy == "kvzip_global":
+                replay_prefix_ids = [
+                    int(token_id)
+                    for token_id in self.tokenizer.encode(
+                        "\nReconstruct the following context span exactly:\n",
+                        add_special_tokens=False,
+                    )
+                ]
+                if not replay_prefix_ids:
+                    raise RuntimeError(
+                        "KVzip reconstruction prompt tokenized to an empty sequence."
+                    )
+            job.result = self.model_runner.call(
+                "prefix_cache_prune",
+                job.token_ids,
+                job.range_start,
+                job.range_end,
+                job.keep_tokens,
+                job.policy,
+                job.prune_id,
+                job.allow_recompress,
+                job.observation_tokens,
+                job.score_chunk_size,
+                job.prev_postfix_size,
+                replay_prefix_ids,
+                -1_000_000_000 - len(self._prefix_prune_jobs) * 100_000,
+            )
+            job.status = "completed"
+        except Exception as exc:
+            job.error = f"{type(exc).__name__}: {exc}"
+            message = str(exc).lower()
+            job.status = (
+                "blocked"
+                if "idle" in message or "referenced" in message or "in-flight" in message
+                else "failed"
+            )
+            logger.error("Prefix prune job {} {}: {}", prune_id, job.status, job.error)
+        finally:
+            job.finished_at = time.time()
+        return True
 
     def debug_sparse_state_summaries(self) -> list[dict[str, object]]:
         summaries = self.model_runner.call("debug_sparse_state_summaries")

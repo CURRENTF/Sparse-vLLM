@@ -240,6 +240,45 @@ class SweBenchLiteRunnerTest(unittest.TestCase):
         self.assertFalse(runner.args.chain_cache)
         self.assertNotIn("SPARSEVLLM_CHAIN_CACHE", env)
 
+    def test_prefix_prune_environment_is_explicit_and_chain_cache_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = build_parser().parse_args(
+                [
+                    "--stage",
+                    "summarize",
+                    "--run-dir",
+                    tmp,
+                    "--no-chain-cache",
+                    "--prefix-prune-policy",
+                    "kvzip_global",
+                ]
+            )
+            runner = SweBenchLiteRunner(args)
+            env = runner._model_env()
+
+            self.assertEqual(env["SPARSEVLLM_PREFIX_PRUNE_POLICY"], "kvzip_global")
+            self.assertEqual(env["SPARSEVLLM_PREFIX_PRUNE_RANGE_START"], "512")
+            self.assertEqual(env["SPARSEVLLM_PREFIX_PRUNE_RANGE_END"], "4096")
+            self.assertEqual(env["SPARSEVLLM_PREFIX_PRUNE_KEEP_TOKENS"], "1792")
+            self.assertEqual(
+                env["SPARSEVLLM_PREFIX_PRUNE_EVENTS"],
+                str(runner.run_dir / "prefix_prune_events.jsonl"),
+            )
+
+            args = build_parser().parse_args(
+                [
+                    "--stage",
+                    "summarize",
+                    "--run-dir",
+                    tmp,
+                    "--chain-cache",
+                    "--prefix-prune-policy",
+                    "kvzip_global",
+                ]
+            )
+            with self.assertRaisesRegex(RunnerError, "requires --no-chain-cache"):
+                SweBenchLiteRunner(args)
+
     def test_docker_writable_layer_guard_environment_is_explicit(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
