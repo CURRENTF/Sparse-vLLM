@@ -9,7 +9,7 @@ cd "${REPO_ROOT}"
 MODE="${1:-full}" # smoke | full
 MODEL_NAME="${2:-qwen3_30b}" # qwen3_30b | qwen3_8b | qwen25_7b
 GPUS="${3:-2,3}"
-SPARSE_PREFILL_SCORE_MODE="${SPARSE_PREFILL_SCORE_MODE:-probability}"
+SPARSE_PREFILL_SCORE_MODE="${SPARSE_PREFILL_SCORE_MODE:-logits}"
 case "${SPARSE_PREFILL_SCORE_MODE}" in
   probability|logits) ;;
   *)

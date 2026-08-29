@@ -5,6 +5,7 @@ from torch import nn
 
 from sparsevllm.method_registry import (
     normalize_sparse_method,
+    resolve_sparse_prefill_score_mode,
     sparse_decode_attention_requires_scores,
     sparse_prefill_attention_contract,
 )
@@ -78,11 +79,13 @@ def build_mha_prefill_attention_spec(
     )
     normalized_method = normalize_sparse_method(sparse_method)
     score_config = config if runtime_config is None else runtime_config
+    score_mode = resolve_sparse_prefill_score_mode(
+        normalized_method,
+        getattr(score_config, "sparse_prefill_score_mode", None),
+    )
     contract = sparse_prefill_attention_contract(
         normalized_method,
-        sparse_prefill_score_mode=getattr(
-            score_config, "sparse_prefill_score_mode", "probability"
-        ),
+        sparse_prefill_score_mode=score_mode,
         h2o_prefill_score_window=getattr(
             score_config, "h2o_prefill_score_window", 0
         ),
@@ -99,13 +102,11 @@ def build_mha_prefill_attention_spec(
         layer_varying_page_table=bool(normalized_method),
         return_softmax_lse=(
             normalized_method == "h2o"
-            and getattr(score_config, "sparse_prefill_score_mode", "probability")
-            == "probability"
+            and score_mode == "probability"
         ),
         allow_softmax_lse_fallback=(
             normalized_method == "h2o"
-            and getattr(score_config, "sparse_prefill_score_mode", "probability")
-            == "probability"
+            and score_mode == "probability"
         ),
     )
 

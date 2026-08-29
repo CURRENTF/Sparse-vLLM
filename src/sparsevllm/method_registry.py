@@ -105,10 +105,23 @@ _DECODE_ATTENTION_SCORE_KINDS = {
     "deltakv": AttentionScoreKind.RAW_QK_PER_HEAD,
 }
 
+
+def resolve_sparse_prefill_score_mode(
+    method: str | None,
+    configured_mode: str | None,
+) -> str:
+    """Resolve the method-owned prefill score mode before provider binding."""
+
+    normalized = normalize_sparse_method(method)
+    if configured_mode is None:
+        return "logits" if normalized == "snapkv" else "probability"
+    return str(configured_mode).strip().lower()
+
+
 def sparse_prefill_attention_contract(
     method: str | None,
     *,
-    sparse_prefill_score_mode: str = "probability",
+    sparse_prefill_score_mode: str | None = None,
     h2o_prefill_score_window: int = 0,
 ) -> SparsePrefillAttentionContract:
     normalized = normalize_sparse_method(method)
@@ -116,7 +129,11 @@ def sparse_prefill_attention_contract(
         raise ValueError(f"Unknown sparse method {normalized!r}.")
     fused_h2o_score = (
         normalized == "h2o"
-        and str(sparse_prefill_score_mode).strip().lower() == "logits"
+        and resolve_sparse_prefill_score_mode(
+            normalized,
+            sparse_prefill_score_mode,
+        )
+        == "logits"
         and int(h2o_prefill_score_window) == 0
     )
     if fused_h2o_score:
@@ -138,7 +155,10 @@ def sparse_prefill_attention_contract(
 def h2o_uses_fused_prefill_score(config) -> bool:
     return (
         normalize_sparse_method(getattr(config, "sparse_method", None)) == "h2o"
-        and str(getattr(config, "sparse_prefill_score_mode", "probability")).strip().lower()
+        and resolve_sparse_prefill_score_mode(
+            "h2o",
+            getattr(config, "sparse_prefill_score_mode", None),
+        )
         == "logits"
         and int(getattr(config, "h2o_prefill_score_window", 0)) == 0
     )

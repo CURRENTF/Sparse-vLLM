@@ -26,8 +26,10 @@ Sparse-vLLM 在 public command、`LLM(...)`、runtime config 与内部消费者�
 > score-producing eager/CUDA Graph 路径和淘汰生命周期完成实现与验证之前，
 > 文档与容量核算都必须明确保持这一语义。
 
-SnapKV、PyramidKV 和 H2O 的 `sparse_prefill_score_mode` 默认值为
-`probability`。对 H2O 而言这是 canonical 路径：每个 KV layer 都独立地对
+SnapKV 的 `sparse_prefill_score_mode` 默认值改为 `logits`；`probability`
+仍可显式启用以复现实验，但它需要额外执行归一化 QK sweep，在已测长上下文
+prefill 中开销明显更高。PyramidKV 和 H2O 继续默认使用 `probability`。对 H2O
+而言这是 canonical 路径：每个 KV layer 都独立地对
 完整当前 query chunk 的归一化 softmax attention probability 求和，并在
 prefill chunk 之间累计 attention mass。当前明确关闭 decode score 收集与
 淘汰。Sparse-vLLM 复用 FA3 的

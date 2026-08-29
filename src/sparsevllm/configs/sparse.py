@@ -9,6 +9,7 @@ from sparsevllm.method_registry import (
     SKIPKV_ASSET_MODEL_NAMES,
     SUPPORTED_SPARSE_METHODS,
     normalize_sparse_method,
+    resolve_sparse_prefill_score_mode,
 )
 from sparsevllm.utils.log import logger, log_once
 
@@ -95,7 +96,10 @@ def _normalize_h2o(config) -> None:
 
 
 def _normalize_sparse_prefill_score(config) -> None:
-    mode = str(config.sparse_prefill_score_mode).strip().lower()
+    mode = resolve_sparse_prefill_score_mode(
+        config.sparse_method,
+        config.sparse_prefill_score_mode,
+    )
     allowed = {"probability", "logits"}
     if mode not in allowed:
         raise ValueError(

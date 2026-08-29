@@ -30,8 +30,11 @@ runtime config, and internal consumers.
 > score-producing eager/CUDA Graph paths and eviction lifecycle are implemented
 > and validated.
 
-SnapKV, PyramidKV, and H2O default `sparse_prefill_score_mode` to `probability`.
-For H2O this is the canonical path: every KV layer independently sums its
+SnapKV defaults `sparse_prefill_score_mode` to `logits`; `probability` remains
+an explicit reproducibility option because its additional normalized QK sweep
+is substantially more expensive in measured long-context prefill. PyramidKV
+and H2O continue to default to `probability`. For H2O this is the canonical
+path: every KV layer independently sums its
 normalized softmax attention probabilities over the full current query chunk,
 then accumulates that attention mass across prefill chunks. Decode score
 collection and eviction are intentionally disabled. Sparse-vLLM
