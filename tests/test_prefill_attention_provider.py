@@ -261,7 +261,12 @@ def test_flashinfer_provider_rejects_unsupported_contracts(spec, caps, reason):
     ("spec", "caps", "reason"),
     [
         (
-            _spec(num_query_heads=24, num_kv_heads=4),
+            _spec(
+                num_query_heads=24,
+                num_kv_heads=4,
+                head_dim=192,
+                softmax_scale=192**-0.5,
+            ),
             _sm120_caps(),
             "head_dim",
         ),
@@ -816,15 +821,30 @@ def test_flashinfer_page_size_one_matches_noncontiguous_torch_oracle():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_flashinfer_fa2_sm120_matches_noncontiguous_torch_oracle():
+@pytest.mark.parametrize(
+    ("num_query_heads", "num_kv_heads", "head_dim"),
+    [
+        (32, 4, 128),
+        (24, 4, 256),
+    ],
+)
+def test_flashinfer_fa2_sm120_matches_noncontiguous_torch_oracle(
+    num_query_heads,
+    num_kv_heads,
+    head_dim,
+):
     if torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("The specialized provider requires SM120.")
     pytest.importorskip("flashinfer")
     torch.manual_seed(20260822)
     q_lens = [3, 2]
     kv_lens = [5, 6]
-    q = torch.randn(5, 24, 256, device="cuda", dtype=torch.bfloat16)
-    k_cache = torch.randn(23, 4, 256, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(
+        5, num_query_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    k_cache = torch.randn(
+        23, num_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
     v_cache = torch.randn_like(k_cache)
     pages = torch.randperm(23, device="cuda")[:11]
     rows = torch.zeros(2, 6, device="cuda", dtype=torch.int32)
@@ -842,10 +862,10 @@ def test_flashinfer_fa2_sm120_matches_noncontiguous_torch_oracle():
     )
     provider = FlashInferFa2Sm120PagedPrefillAttentionProvider()
     spec = _spec(
-        num_query_heads=24,
-        num_kv_heads=4,
-        head_dim=256,
-        softmax_scale=256**-0.5,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        softmax_scale=head_dim**-0.5,
     )
     provider.prepare(spec)
     actual = provider.run(
