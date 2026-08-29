@@ -37,6 +37,30 @@ Follow the runbook's matched-trace, idle-GPU, artifact-validation, and metric-
 interpretation rules. Do not treat sampled GPU activity as theoretical MFU/MBU;
 use the documented Nsight diagnostic for kernel-timeline attribution.
 
+# Kernel Provider Policy
+
+1. Separate atomic correctness eligibility, the default portfolio, exact
+   performance-profile overlays, and validation evidence. Do not use local
+   benchmark coverage or performance confidence as an atomic support condition.
+2. For standard operations, use a mature upstream public provider as the
+   default across its declared compatible domain. Keep repository-owned Triton
+   or other portable implementations as correctness baselines and fallbacks for
+   unsupported contracts or absent optional dependencies; an installed but
+   broken compatible dependency must fail explicitly.
+3. A matched local performance profile may override the upstream default only
+   for its exact recorded device, contract, shape or runtime bucket, topology,
+   graph mode, and toolchain. A profile miss returns to the upstream-first
+   default; it must not select Triton merely because that setting was unmeasured
+   or because FlashInfer or SGL did not win every benchmarked setting.
+4. Do not narrow an upstream provider's correctness domain because local
+   hardware or shape coverage is incomplete. Validate the adapter and the
+   Sparse-vLLM-specific boundary, and record upstream-declared support separately
+   from locally validated correctness and performance evidence.
+5. Resolve and prepare providers before execution. Unsupported candidates may
+   be rejected during resolution, but a prepare, JIT, warmup, or execution
+   failure must preserve the actionable error and must not silently reselect a
+   different provider.
+
 
 # Research Code Skill
 
