@@ -24,7 +24,6 @@ from sparsevllm.operators.attention_capabilities import (
 from sparsevllm.operators.registry import (
     OpRegistry,
     OpResolver,
-    NoProviderError,
     PortfolioPolicy,
     ProviderRole,
     SupportResult,
@@ -629,6 +628,7 @@ class TritonPagedPrefillAttentionProvider(PrefillAttentionProvider):
         head_dims=frozenset({16, 32, 64, 128, 256}),
         page_sizes=frozenset({1}),
         score_outputs=frozenset(AttentionScoreKind),
+        returns_softmax_lse=True,
         layer_varying_page_table=True,
         varlen=True,
         requires_triton=True,
@@ -653,6 +653,13 @@ class TritonPagedPrefillAttentionProvider(PrefillAttentionProvider):
             return common
         if not spec.causal:
             return SupportResult.unsupported("Triton prefill requires causal attention")
+        if (
+            spec.return_softmax_lse
+            and spec.score_output is not AttentionScoreKind.NONE
+        ):
+            return SupportResult.unsupported(
+                "Triton prefill cannot return scores and softmax LSE together"
+            )
         expected_scale = spec.head_dim**-0.5
         if not math.isclose(
             spec.softmax_scale,
@@ -677,7 +684,7 @@ class TritonPagedPrefillAttentionProvider(PrefillAttentionProvider):
         max_context_len,
         layer_idx,
     ):
-        del spec, max_context_len, layer_idx
+        del layer_idx
         payload, meta = _view_parts(view)
         _validate_token_page_table(meta)
         from sparsevllm.kernels.triton.context_flashattention_nopad import (
@@ -691,6 +698,13 @@ class TritonPagedPrefillAttentionProvider(PrefillAttentionProvider):
             self._max_query_len = int(chunk_lens.max().item())
             self._query_plan_scope = validation_scope
         output = torch.empty_like(q)
+        softmax_lse = None
+        if spec.return_softmax_lse:
+            softmax_lse = torch.empty(
+                (int(q.shape[1]), int(q.shape[0])),
+                dtype=torch.float32,
+                device=q.device,
+            )
         context_attention_fwd(
             q,
             payload.k_cache,
@@ -703,8 +717,12 @@ class TritonPagedPrefillAttentionProvider(PrefillAttentionProvider):
             self._max_query_len,
             meta.active_slots,
             attn_score=meta.attn_score,
+            softmax_lse=softmax_lse,
+            max_context_len=max_context_len,
         )
-        return output
+        if softmax_lse is None:
+            return output
+        return PrefillAttentionRunResult(output=output, softmax_lse=softmax_lse)
 
 
 def _resolve_prefill_attention_provider(
@@ -716,23 +734,24 @@ def _resolve_prefill_attention_provider(
     if device_index is None:
         device_index = torch.cuda.current_device() if platform.is_cuda_alike() else 0
     caps = platform.get_device_caps(int(device_index))
+    resolver = OpResolver(PREFILL_ATTENTION_REGISTRY)
     execution_spec = spec
-    try:
-        resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
-            execution_spec, caps
-        )
-    except NoProviderError:
-        if not (spec.return_softmax_lse and spec.allow_softmax_lse_fallback):
-            raise
-        execution_spec = replace(spec, return_softmax_lse=False)
-        resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
-            execution_spec, caps
-        )
-        logger.info(
-            "No provider can return optional prefill softmax LSE; "
-            "resolved provider={} with method-owned posthoc scoring",
-            resolved.provider.name,
-        )
+    if spec.return_softmax_lse and spec.allow_softmax_lse_fallback:
+        fallback_spec = replace(spec, return_softmax_lse=False)
+        fallback = resolver.resolve(fallback_spec, caps)
+        fallback_support = type(fallback.provider).supports(spec, caps)
+        if fallback_support.supported:
+            resolved = resolver.resolve(spec, caps)
+        else:
+            execution_spec = fallback_spec
+            resolved = fallback
+            logger.info(
+                "The upstream-first prefill provider={} cannot return optional "
+                "softmax LSE; using method-owned posthoc scoring",
+                resolved.provider.name,
+            )
+    else:
+        resolved = resolver.resolve(execution_spec, caps)
     logger.info(
         "Resolved MHA prefill provider={} rejected={}",
         resolved.provider.name,

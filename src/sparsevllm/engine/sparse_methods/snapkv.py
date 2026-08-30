@@ -26,7 +26,10 @@ class ScoredCompactionRuntime(PassThroughRuntime):
         self._snapkv_decode_reduced_attn_score_buffers.clear()
 
     def decode_graph_keepalive_tensors(self) -> list[torch.Tensor]:
-        return list(self._snapkv_decode_reduced_attn_score_buffers.values())
+        return [
+            *super().decode_graph_keepalive_tensors(),
+            *self._snapkv_decode_reduced_attn_score_buffers.values(),
+        ]
 
     def _prepare_decode_attention_score(
         self,

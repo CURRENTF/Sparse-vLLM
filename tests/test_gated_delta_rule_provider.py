@@ -48,11 +48,13 @@ def test_flashinfer_prefill_adapter_converts_log_gate_and_state_contract():
     cu_seqlens = torch.tensor([0, 1, 3], dtype=torch.int32)
     output = torch.randn(3, 4, 128, dtype=torch.bfloat16)
     final_state = torch.randn(2, 4, 128, 128, dtype=torch.float32)
+    normalized_q = q.squeeze(0).contiguous()
+    normalized_k = k.squeeze(0).contiguous()
 
     with (
         patch(
-            "sparsevllm.operators.gated_delta_rule.l2norm_fwd",
-            side_effect=lambda tensor: tensor,
+            "sparsevllm.operators.gated_delta_rule.fused_qk_l2norm_fwd",
+            return_value=(normalized_q, normalized_k),
         ) as normalize,
         patch(
             "sparsevllm.operators.gated_delta_rule.flashinfer_chunk_gated_delta_rule_sm90",
@@ -73,8 +75,10 @@ def test_flashinfer_prefill_adapter_converts_log_gate_and_state_contract():
     assert actual_output.shape == (1, 3, 4, 128)
     torch.testing.assert_close(actual_state, final_state.transpose(-1, -2))
     assert actual_state.is_contiguous()
-    assert all(call.args[0].is_contiguous() for call in normalize.call_args_list)
+    normalize.assert_called_once_with(q, k)
     call = kernel.call_args
+    assert call.args[0] is normalized_q
+    assert call.args[1] is normalized_k
     torch.testing.assert_close(call.args[3], torch.exp(g.squeeze(0)))
     assert call.args[5].dtype == torch.float32
     torch.testing.assert_close(
@@ -230,11 +234,19 @@ def test_triton_prefill_provider_expands_qk_to_value_heads():
     state = torch.randn(1, 6, 3, 3)
     cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
     output = torch.randn_like(v)
+    normalized_q = q.squeeze(0) / 10
+    normalized_k = k.squeeze(0) / 10
 
-    with patch(
-        "sparsevllm.operators.gated_delta_rule.chunk_gated_delta_rule",
-        return_value=(output, state),
-    ) as kernel:
+    with (
+        patch(
+            "sparsevllm.operators.gated_delta_rule.fused_qk_l2norm_fwd",
+            return_value=(normalized_q, normalized_k),
+        ) as normalize,
+        patch(
+            "sparsevllm.operators.gated_delta_rule.chunk_gated_delta_rule",
+            return_value=(output, state),
+        ) as kernel,
+    ):
         actual = provider.run_prefill(
             _spec(
                 num_key_heads=2,
@@ -253,15 +265,17 @@ def test_triton_prefill_provider_expands_qk_to_value_heads():
 
     assert actual[0] is output
     assert actual[1] is state
+    normalize.assert_called_once_with(q, k)
     repeated_q = kernel.call_args.kwargs["q"]
     repeated_k = kernel.call_args.kwargs["k"]
     assert repeated_q.shape == (1, 4, 6, 3)
     assert repeated_k.shape == (1, 4, 6, 3)
-    assert torch.equal(repeated_q[:, :, 0], q[:, :, 0])
-    assert torch.equal(repeated_q[:, :, 1], q[:, :, 0])
-    assert torch.equal(repeated_q[:, :, 2], q[:, :, 0])
-    assert torch.equal(repeated_q[:, :, 3], q[:, :, 1])
-    assert torch.equal(repeated_k[:, :, 5], k[:, :, 1])
+    assert torch.equal(repeated_q[:, :, 0], normalized_q[None, :, 0])
+    assert torch.equal(repeated_q[:, :, 1], normalized_q[None, :, 0])
+    assert torch.equal(repeated_q[:, :, 2], normalized_q[None, :, 0])
+    assert torch.equal(repeated_q[:, :, 3], normalized_q[None, :, 1])
+    assert torch.equal(repeated_k[:, :, 5], normalized_k[None, :, 1])
+    assert kernel.call_args.kwargs["use_qk_l2norm_in_kernel"] is False
 
 
 def test_prepared_gdn_operator_rejects_calls_after_close():

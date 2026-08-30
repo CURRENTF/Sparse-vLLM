@@ -127,6 +127,8 @@ class SparseMethodRuntime(ABC):
             for layer_idx in range(self.num_layers)
         }
         self._decode_attn_score_buffers: dict[int, torch.Tensor] = {}
+        self._decode_score_lse_workspace: torch.Tensor | None = None
+        self._decode_score_output_workspace: torch.Tensor | None = None
         self.debug_dynamic_selection: dict[str, object] = {}
         self.debug_dynamic_selection_detail = os.environ.get(
             "SPARSEVLLM_DEBUG_DYNAMIC_SELECTION_DETAIL", ""
@@ -167,9 +169,18 @@ class SparseMethodRuntime(ABC):
 
     def clear_decode_attn_score_buffers(self) -> None:
         self._decode_attn_score_buffers.clear()
+        self._decode_score_lse_workspace = None
+        self._decode_score_output_workspace = None
 
     def decode_graph_keepalive_tensors(self) -> list[torch.Tensor]:
-        return []
+        return [
+            tensor
+            for tensor in (
+                self._decode_score_lse_workspace,
+                self._decode_score_output_workspace,
+            )
+            if tensor is not None
+        ]
 
     def reset_decode_attn_scores_for_graph(
         self,
@@ -252,6 +263,77 @@ class SparseMethodRuntime(ABC):
                 "candidate_start must be within score length; got "
                 f"{candidate_start} for L={scores.shape[-1]}."
             )
+        model_dtype = getattr(self.config.hf_config, "torch_dtype", None)
+        if isinstance(model_dtype, str):
+            model_dtype = {
+                "float16": torch.float16,
+                "torch.float16": torch.float16,
+                "bfloat16": torch.bfloat16,
+                "torch.bfloat16": torch.bfloat16,
+            }.get(model_dtype.lower())
+        output_dtype = (
+            model_dtype
+            if model_dtype in (torch.float16, torch.bfloat16)
+            else torch.float32
+        )
+        if scores.device.type == "cuda":
+            from sparsevllm.kernels.triton.decode_score import (
+                decode_softmax_token_scores,
+            )
+
+            candidate_lens = candidate_lens.to(
+                device=scores.device,
+                dtype=torch.int32,
+            ).contiguous()
+            batch, heads = map(int, scores.shape[:2])
+            lse_workspace = self._decode_score_lse_workspace
+            if (
+                lse_workspace is None
+                or lse_workspace.device != scores.device
+                or int(lse_workspace.shape[0]) < batch
+                or int(lse_workspace.shape[1]) < heads
+            ):
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "Decode score normalization workspace was not allocated "
+                        "during the eager CUDA Graph warmup."
+                    )
+                lse_workspace = torch.empty(
+                    (batch, heads),
+                    dtype=torch.float32,
+                    device=scores.device,
+                )
+                self._decode_score_lse_workspace = lse_workspace
+            output_workspace = self._decode_score_output_workspace
+            score_width = int(scores.shape[2])
+            if (
+                output_workspace is None
+                or output_workspace.dtype != output_dtype
+                or output_workspace.device != scores.device
+                or int(output_workspace.shape[0]) < batch
+                or int(output_workspace.shape[1]) < score_width
+            ):
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "Decode score output workspace was not allocated "
+                        "during the eager CUDA Graph warmup."
+                    )
+                output_workspace = torch.empty(
+                    (batch, score_width),
+                    dtype=output_dtype,
+                    device=scores.device,
+                )
+                self._decode_score_output_workspace = output_workspace
+            return decode_softmax_token_scores(
+                scores,
+                candidate_lens,
+                candidate_start=candidate_start,
+                softmax_scale=float(self.attn_softmax_scale),
+                output_dtype=output_dtype,
+                lse_workspace=lse_workspace[:batch, :heads],
+                output=output_workspace[:batch, :score_width],
+            )
+
         candidate_scores = scores[:, :, candidate_start:]
         candidate_lens = (
             candidate_lens.to(device=scores.device, dtype=torch.long)
@@ -271,16 +353,7 @@ class SparseMethodRuntime(ABC):
         )
         candidate_token_scores = torch.softmax(logits, dim=-1).max(dim=1).values
 
-        model_dtype = getattr(self.config.hf_config, "torch_dtype", None)
-        if isinstance(model_dtype, str):
-            model_dtype = {
-                "float16": torch.float16,
-                "torch.float16": torch.float16,
-                "bfloat16": torch.bfloat16,
-                "torch.bfloat16": torch.bfloat16,
-            }.get(model_dtype.lower())
-        if model_dtype in (torch.float16, torch.bfloat16):
-            candidate_token_scores = candidate_token_scores.to(model_dtype)
+        candidate_token_scores = candidate_token_scores.to(output_dtype)
         min_score = torch.finfo(candidate_token_scores.dtype).min
         candidate_token_scores = candidate_token_scores.masked_fill(
             ~candidate_mask,

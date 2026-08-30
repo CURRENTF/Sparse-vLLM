@@ -769,6 +769,7 @@ class TritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
 
     def __init__(self) -> None:
         self._backend = None
+        self._launch_op = None
 
     @classmethod
     def supports(
@@ -790,13 +791,23 @@ class TritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
         *,
         device_index: int | None = None,
     ) -> None:
-        del spec, device_index
         from sparsevllm.layers.attention_backend import TritonAttentionBackend
 
         self._backend = TritonAttentionBackend()
+        self._launch_op = prepare_decode_attention_launch_op(
+            DecodeAttentionLaunchSpec(
+                num_query_heads=spec.num_query_heads,
+                num_kv_heads=spec.num_kv_heads,
+                head_dim=spec.head_dim,
+                activation_dtype=spec.activation_dtype,
+                page_size=spec.page_size,
+            ),
+            device_index=device_index,
+        )
 
     def close(self) -> None:
         self._backend = None
+        self._launch_op = None
 
     def binding_metadata(self) -> dict[str, object]:
         return {
@@ -820,6 +831,8 @@ class TritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
                 "Triton decode received unsupported runtime arguments: "
                 f"{sorted(kwargs)}."
             )
+        if decode_launch_op is None:
+            decode_launch_op = self._launch_op
 
         context = get_context()
         cache_manager = context.cache_manager
@@ -855,6 +868,7 @@ class TritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
             block_seq, gqa_block_n, gqa_num_warps = (
                 decode_launch_op.launch_config(
                     block_seq=block_seq,
+                    batch_size=int(q.shape[0]),
                     max_context_len=max_len_in_batch,
                     requires_attention_scores=meta.attn_score is not None,
                 )
@@ -1649,6 +1663,7 @@ class DecodeAttentionLaunchProvider:
         self,
         *,
         block_seq: int,
+        batch_size: int,
         max_context_len: int,
         requires_attention_scores: bool,
     ) -> tuple[int, int, int]:
@@ -1697,9 +1712,11 @@ class H100LongGqaDecodeLaunchProvider(DecodeAttentionLaunchProvider):
         self,
         *,
         block_seq: int,
+        batch_size: int,
         max_context_len: int,
         requires_attention_scores: bool,
     ) -> tuple[int, int, int]:
+        del batch_size
         if (
             int(block_seq) == 256
             and int(max_context_len) > 32768
@@ -1772,10 +1789,11 @@ class DefaultGqaDecodeLaunchProvider(DecodeAttentionLaunchProvider):
         self,
         *,
         block_seq: int,
+        batch_size: int,
         max_context_len: int,
         requires_attention_scores: bool,
     ) -> tuple[int, int, int]:
-        del max_context_len, requires_attention_scores
+        del batch_size, max_context_len, requires_attention_scores
         return int(block_seq), 16, 2
 
 

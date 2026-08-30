@@ -76,6 +76,53 @@ def l2norm_fwd_kernel2(X, Y, eps, M, N: tl.constexpr, MBLOCK: tl.constexpr):
     tl.store(Y + (rindex + N * row_idx), xs * rsqrt, xmask)
 
 
+@triton.jit
+def fused_qk_l2norm_fwd_kernel(
+    Q,
+    K,
+    Q_Out,
+    K_Out,
+    eps,
+    NUM_ROWS,
+    stride_qt: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_kt: tl.constexpr,
+    stride_kh: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    dims = tl.arange(0, BLOCK_DIM)
+    tokens = rows // NUM_HEADS
+    heads = rows % NUM_HEADS
+    mask = (rows[:, None] < NUM_ROWS) & (dims[None, :] < HEAD_DIM)
+    output_offsets = rows[:, None] * HEAD_DIM + dims[None, :]
+
+    q = tl.load(
+        Q
+        + tokens[:, None] * stride_qt
+        + heads[:, None] * stride_qh
+        + dims[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    q_rstd = tl.rsqrt(tl.sum(q * q, axis=1) + eps)
+    tl.store(Q_Out + output_offsets, q * q_rstd[:, None], mask=mask)
+
+    k = tl.load(
+        K
+        + tokens[:, None] * stride_kt
+        + heads[:, None] * stride_kh
+        + dims[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    k_rstd = tl.rsqrt(tl.sum(k * k, axis=1) + eps)
+    tl.store(K_Out + output_offsets, k * k_rstd[:, None], mask=mask)
+
+
 def _get_l2norm_kernel1_configs():
     return [{"num_warps": num_warps} for num_warps in [1, 2, 4, 8, 16, 32]]
 
@@ -171,3 +218,56 @@ def l2norm_fwd(x: torch.Tensor, eps: float = 1e-6, output_dtype: torch.dtype | N
             _l2norm_fwd_kernel1_wrapper(x, y, eps, D, BD)
 
     return y.view(x_shape_og)
+
+
+def fused_qk_l2norm_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if q.ndim != 4 or q.shape[0] != 1 or q.shape != k.shape:
+        raise ValueError(
+            "fused Q/K L2Norm expects matching [1, tokens, heads, dim] tensors, "
+            f"got {tuple(q.shape)} and {tuple(k.shape)}."
+        )
+    if q.dtype != k.dtype or q.device != k.device:
+        raise TypeError(
+            "fused Q/K L2Norm requires matching dtypes and devices, got "
+            f"{q.dtype}/{k.dtype} on {q.device}/{k.device}."
+        )
+    if q.stride(-1) != 1 or k.stride(-1) != 1:
+        raise ValueError("fused Q/K L2Norm requires a contiguous head dimension.")
+    tokens, heads, head_dim = map(int, q.shape[1:])
+    if tokens == 0:
+        empty = torch.empty(
+            (tokens, heads, head_dim), dtype=q.dtype, device=q.device
+        )
+        return empty, torch.empty_like(empty)
+    block_dim = triton.next_power_of_2(head_dim)
+    max_fused_size = 65536 // q.element_size()
+    if head_dim > min(max_fused_size, block_dim):
+        raise RuntimeError("fused Q/K L2Norm does not support a head >= 64KB.")
+    block_rows = 16 if block_dim >= 128 else 32
+    q_out = torch.empty(
+        (tokens, heads, head_dim), dtype=q.dtype, device=q.device
+    )
+    k_out = torch.empty_like(q_out)
+    num_rows = tokens * heads
+    fused_qk_l2norm_fwd_kernel[(triton.cdiv(num_rows, block_rows),)](
+        q,
+        k,
+        q_out,
+        k_out,
+        float(eps),
+        num_rows,
+        q.stride(1),
+        q.stride(2),
+        k.stride(1),
+        k.stride(2),
+        NUM_HEADS=heads,
+        HEAD_DIM=head_dim,
+        BLOCK_ROWS=block_rows,
+        BLOCK_DIM=block_dim,
+        num_warps=4,
+    )
+    return q_out, k_out

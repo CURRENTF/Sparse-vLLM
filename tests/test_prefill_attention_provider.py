@@ -39,7 +39,7 @@ from sparsevllm.operators.prefill_attention import (
     _resolve_prefill_attention_provider,
 )
 from sparsevllm.operators.attention_capabilities import AttentionScoreKind
-from sparsevllm.operators.registry import NoProviderError, OpResolver
+from sparsevllm.operators.registry import OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
 
 
@@ -59,8 +59,11 @@ def _spec(**overrides) -> PrefillAttentionOpSpec:
     return PrefillAttentionOpSpec(**values)
 
 
-def test_prefill_softmax_lse_requirement_is_part_of_kernel_contract():
-    spec = _spec(return_softmax_lse=True)
+def test_triton_prefill_rejects_scores_and_softmax_lse_together():
+    spec = _spec(
+        score_output=AttentionScoreKind.RAW_QK_REDUCED,
+        return_softmax_lse=True,
+    )
 
     assert spec.kernel_request.requires_softmax_lse
     assert not TritonPagedPrefillAttentionProvider.supports(
@@ -69,25 +72,9 @@ def test_prefill_softmax_lse_requirement_is_part_of_kernel_contract():
     ).supported
 
 
-@pytest.mark.parametrize(
-    ("device_kind", "head_dim", "activation_dtype"),
-    [
-        ("sm120", 128, torch.bfloat16),
-        ("sm120", 256, torch.bfloat16),
-        ("h100", 128, torch.float16),
-    ],
-)
-def test_optional_h2o_lse_falls_back_during_provider_resolution(
-    device_kind,
-    head_dim,
-    activation_dtype,
-):
-    caps = _sm120_caps() if device_kind == "sm120" else _h100_caps()
+def test_optional_lse_does_not_replace_upstream_default():
+    caps = _sm120_caps()
     spec = _spec(
-        head_dim=head_dim,
-        softmax_scale=head_dim**-0.5,
-        activation_dtype=activation_dtype,
-        layer_varying_page_table=True,
         return_softmax_lse=True,
         allow_softmax_lse_fallback=True,
     )
@@ -101,12 +88,32 @@ def test_optional_h2o_lse_falls_back_during_provider_resolution(
             spec, device_index=0
         )
 
-    assert provider.name == "triton_paged_prefill"
+    assert provider.name == "flashinfer_paged_prefill_fa2_sm120"
     assert spec.return_softmax_lse
     assert not execution_spec.return_softmax_lse
 
 
-def test_hard_prefill_lse_requirement_does_not_fall_back():
+def test_optional_h2o_lse_is_preserved_for_required_layer_varying_table():
+    spec = _spec(
+        layer_varying_page_table=True,
+        return_softmax_lse=True,
+        allow_softmax_lse_fallback=True,
+    )
+    platform = SimpleNamespace(get_device_caps=lambda _index: _sm120_caps())
+
+    with patch(
+        "sparsevllm.platforms.get_current_platform",
+        return_value=platform,
+    ):
+        provider, execution_spec = _resolve_prefill_attention_provider(
+            spec, device_index=0
+        )
+
+    assert provider.name == "triton_paged_prefill"
+    assert execution_spec.return_softmax_lse
+
+
+def test_hard_prefill_lse_requirement_resolves_without_fallback():
     spec = _spec(
         head_dim=256,
         softmax_scale=256**-0.5,
@@ -115,14 +122,16 @@ def test_hard_prefill_lse_requirement_does_not_fall_back():
     )
     platform = SimpleNamespace(get_device_caps=lambda _index: _sm120_caps())
 
-    with (
-        patch(
-            "sparsevllm.platforms.get_current_platform",
-            return_value=platform,
-        ),
-        pytest.raises(NoProviderError),
+    with patch(
+        "sparsevllm.platforms.get_current_platform",
+        return_value=platform,
     ):
-        _resolve_prefill_attention_provider(spec, device_index=0)
+        provider, execution_spec = _resolve_prefill_attention_provider(
+            spec, device_index=0
+        )
+
+    assert provider.capabilities.returns_softmax_lse
+    assert execution_spec.return_softmax_lse
 
 
 def _h100_caps(**overrides) -> DeviceCaps:
@@ -776,6 +785,23 @@ def _torch_prefill_oracle(q, logical_k, logical_v, q_lens, kv_lens):
     return torch.cat(outputs)
 
 
+def _torch_prefill_lse_oracle(q, logical_k, q_lens, kv_lens):
+    lse_chunks = []
+    q_cursor = 0
+    for q_len, kv_len, k in zip(q_lens, kv_lens, logical_k):
+        q_seq = q[q_cursor : q_cursor + q_len].transpose(0, 1).float()
+        q_cursor += q_len
+        query_groups = q.shape[1] // k.shape[1]
+        k = k.transpose(0, 1).float().repeat_interleave(query_groups, dim=0)
+        q_positions = kv_len - q_len + torch.arange(q_len, device=q.device)
+        k_positions = torch.arange(kv_len, device=q.device)
+        allowed = k_positions.unsqueeze(0) <= q_positions.unsqueeze(1)
+        logits = torch.matmul(q_seq, k.transpose(-1, -2)) * (q.shape[2] ** -0.5)
+        logits.masked_fill_(~allowed.unsqueeze(0), -torch.inf)
+        lse_chunks.append(torch.logsumexp(logits, dim=-1))
+    return torch.cat(lse_chunks, dim=1)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_flashinfer_page_size_one_matches_noncontiguous_torch_oracle():
     if torch.cuda.get_device_capability() != (9, 0):
@@ -907,8 +933,9 @@ def test_triton_page_size_one_matches_noncontiguous_torch_oracle():
     )
     provider = TritonPagedPrefillAttentionProvider()
 
-    actual = provider.run(
-        _spec(),
+    spec = _spec(return_softmax_lse=True)
+    result = provider.run(
+        spec,
         q,
         view,
         qo_indptr=torch.tensor([0, 3, 5], device="cuda", dtype=torch.int32),
@@ -923,4 +950,11 @@ def test_triton_page_size_one_matches_noncontiguous_torch_oracle():
         q_lens,
         kv_lens,
     )
-    torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.03)
+    expected_lse = _torch_prefill_lse_oracle(q, logical_k, q_lens, kv_lens)
+    torch.testing.assert_close(result.output, expected, rtol=0.03, atol=0.03)
+    torch.testing.assert_close(
+        result.softmax_lse,
+        expected_lse,
+        rtol=2e-4,
+        atol=2e-4,
+    )

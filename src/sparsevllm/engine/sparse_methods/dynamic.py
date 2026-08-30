@@ -146,7 +146,7 @@ class OmniKVRuntime(DynamicSelectionRuntime):
         self._omnikv_decode_attn_score_buffer = None
 
     def decode_graph_keepalive_tensors(self) -> list[torch.Tensor]:
-        tensors = []
+        tensors = super().decode_graph_keepalive_tensors()
         if self._omnikv_decode_attn_score_buffer is not None:
             tensors.append(self._omnikv_decode_attn_score_buffer)
         for buffers in self._omnikv_decode_selection_buffers.values():

@@ -61,6 +61,25 @@ def _causal_conv1d_varlen_fwd_kernel(
     else:
         state_index = sequence_id
     if state_index == pad_slot_id:
+        block_start = 0
+        while block_start < sequence_length:
+            token_offsets = block_start + tl.arange(0, BLOCK_TOKENS)
+            token_mask = token_offsets < sequence_length
+            values = tl.load(
+                x_ptr
+                + dim_offsets[None, :] * stride_x_dim
+                + (sequence_start + token_offsets)[:, None] * stride_x_token,
+                mask=token_mask[:, None] & dim_mask[None, :],
+                other=0.0,
+            )
+            tl.store(
+                output_ptr
+                + dim_offsets[None, :] * stride_output_dim
+                + (sequence_start + token_offsets)[:, None] * stride_output_token,
+                values,
+                mask=token_mask[:, None] & dim_mask[None, :],
+            )
+            block_start += BLOCK_TOKENS
         return
 
     use_initial_state = False
@@ -318,9 +337,10 @@ def causal_conv1d_fn(
     if activation not in (None, "silu", "swish"):
         raise NotImplementedError("activation must be None, silu, or swish.")
 
-    # Padded sequences are intentionally skipped and retain their input values,
-    # matching the SGLang kernel contract.
-    output = x.clone()
+    # Padded rows are copied by the Triton kernel. Avoiding x.clone() removes a
+    # full packed-input copy from every normal prefill while preserving the pad
+    # contract without a separate launch.
+    output = torch.empty_like(x)
     placeholder = x
     grid = (batch_size, triton.cdiv(int(x.shape[0]), 128))
     _causal_conv1d_varlen_fwd_kernel[grid](

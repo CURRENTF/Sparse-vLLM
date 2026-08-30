@@ -221,6 +221,7 @@ class Attention(nn.Module):
                         block_seq, gqa_block_n, gqa_num_warps = (
                             self.decode_launch_op.launch_config(
                                 block_seq=block_seq,
+                                batch_size=batch_size,
                                 max_context_len=max_len_in_batch,
                                 requires_attention_scores=(
                                     decode_meta.attn_score is not None

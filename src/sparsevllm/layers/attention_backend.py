@@ -149,6 +149,7 @@ class TritonAttentionBackend:
             max_input_len,
             meta.active_slots,
             attn_score=meta.attn_score,
+            max_context_len=meta.max_context_len,
         )
         return o
 

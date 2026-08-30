@@ -1235,6 +1235,7 @@ def test_triton_provider_owns_launch_config_and_workspace_preparation():
     assert actual is output
     decode_launch_op.launch_config.assert_called_once_with(
         block_seq=4,
+        batch_size=2,
         max_context_len=8,
         requires_attention_scores=True,
     )

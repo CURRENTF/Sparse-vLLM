@@ -13,7 +13,9 @@ from sparsevllm.kernels.triton.qwen3_5.fla.ops import (
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule,
 )
-from sparsevllm.kernels.triton.qwen3_5.fla.ops.l2norm import l2norm_fwd
+from sparsevllm.kernels.triton.qwen3_5.fla.ops.l2norm import (
+    fused_qk_l2norm_fwd,
+)
 from sparsevllm.operators.registry import (
     OpRegistry,
     OpResolver,
@@ -249,6 +251,7 @@ class FlashInferSm90GatedDeltaRuleProvider(GatedDeltaRuleProvider):
             "auxiliary_kernel_paths": [
                 "triton.qwen3_5.fused_gdn_gating",
                 "triton.qwen3_5.causal_conv1d",
+                "triton.qwen3_5.fused_qk_l2norm",
                 "triton.qwen3_5.gdn_decode_pack",
                 "triton.qwen3_5.gated_rmsnorm",
             ],
@@ -267,11 +270,10 @@ class FlashInferSm90GatedDeltaRuleProvider(GatedDeltaRuleProvider):
         cu_seqlens: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         del spec
-        # Q/K are column views of the packed Conv1D output. The repo L2-norm
-        # kernel requires a packed token/head tail, and FlashInfer requires
-        # contiguous 3D inputs, so the adapter owns this materialization.
-        normalized_q = l2norm_fwd(q.contiguous()).squeeze(0)
-        normalized_k = l2norm_fwd(k.contiguous()).squeeze(0)
+        # Q/K are column views of the packed Conv1D output. Normalize both
+        # strided views in one launch and materialize the contiguous 3D layout
+        # required by FlashInfer without intermediate q.contiguous() copies.
+        normalized_q, normalized_k = fused_qk_l2norm_fwd(q, k)
         # Sparse-vLLM keeps recurrent state in the repo decode kernel's
         # K-major [N, H, K, V] layout. FlashInfer's public prefill contract is
         # V-major [N, H, V, K], so this adapter owns both conversions. Qwen's
@@ -331,6 +333,7 @@ class TritonGatedDeltaRuleProvider(GatedDeltaRuleProvider):
             "auxiliary_kernel_paths": [
                 "triton.qwen3_5.fused_gdn_gating",
                 "triton.qwen3_5.causal_conv1d",
+                "triton.qwen3_5.fused_qk_l2norm",
                 "triton.qwen3_5.gdn_decode_pack",
                 "triton.qwen3_5.gated_rmsnorm",
             ],
@@ -348,6 +351,9 @@ class TritonGatedDeltaRuleProvider(GatedDeltaRuleProvider):
         initial_state: torch.Tensor,
         cu_seqlens: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        normalized_q, normalized_k = fused_qk_l2norm_fwd(q, k)
+        q = normalized_q.unsqueeze(0)
+        k = normalized_k.unsqueeze(0)
         repeats = spec.num_value_heads // spec.num_key_heads
         if repeats > 1:
             q = q.repeat_interleave(repeats, dim=2)
@@ -362,7 +368,7 @@ class TritonGatedDeltaRuleProvider(GatedDeltaRuleProvider):
             output_final_state=True,
             cu_seqlens=cu_seqlens,
             head_first=False,
-            use_qk_l2norm_in_kernel=True,
+            use_qk_l2norm_in_kernel=False,
         )
 
 

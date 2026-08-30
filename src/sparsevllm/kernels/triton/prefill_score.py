@@ -951,6 +951,10 @@ def prefill_score_from_lse_fwd(
     score_q_end: torch.Tensor,
     *,
     workspace: PrefillScoreWorkspace | None = None,
+    _block_m: int | None = None,
+    _block_n: int | None = None,
+    _num_warps: int | None = None,
+    _num_stages: int | None = None,
 ) -> None:
     """Reduce exact FA3 probabilities into one token vector per layer row."""
 
@@ -1000,13 +1004,28 @@ def prefill_score_from_lse_fwd(
             f"Query heads must be divisible by KV heads: {query_heads}/{kv_heads}."
         )
     heads_per_kv = query_heads // kv_heads
-    if max_score_len <= 128:
-        block_m = max(16, triton.next_power_of_2(max_score_len))
-        query_blocks = 1
+    if _block_m is None:
+        # Long H2O chunks need one FP32 accumulation per query block. Keep the
+        # existing 256-row dot tile but give those rows to longer query spans,
+        # reducing query blocks and atomics without a device-specific profile.
+        block_m = (
+            max(16, triton.next_power_of_2(max_score_len))
+            if max_score_len <= 128
+            else min(256, triton.next_power_of_2(max_score_len))
+        )
     else:
-        block_m = min(32, max(16, triton.next_power_of_2(max_score_len)))
-        query_blocks = triton.cdiv(max_score_len, block_m)
-    block_n = 64 if head_dim >= 128 else 128
+        block_m = int(_block_m)
+    if block_m < 16 or block_m > 256 or block_m & (block_m - 1):
+        raise ValueError(
+            "from-LSE BLOCK_M must be a power of two in [16, 256], "
+            f"got {block_m}."
+        )
+    query_blocks = triton.cdiv(max_score_len, block_m)
+    block_n = (
+        64 if head_dim > 128 else 128
+    ) if _block_n is None else int(_block_n)
+    if block_n not in (32, 64, 128):
+        raise ValueError(f"from-LSE BLOCK_N must be one of 32/64/128, got {block_n}.")
     candidate_blocks = triton.cdiv(int(attn_score.shape[1]), block_n)
     max_rows = 256
     block_h = min(
@@ -1016,6 +1035,10 @@ def prefill_score_from_lse_fwd(
     head_blocks = triton.cdiv(heads_per_kv, block_h)
     block_rows = block_h * block_m
     group_count = batch * kv_heads * head_blocks * query_blocks
+    num_warps = (
+        8 if block_rows >= 128 else 4
+    ) if _num_warps is None else int(_num_warps)
+    num_stages = 3 if _num_stages is None else int(_num_stages)
     workspace = PrefillScoreWorkspace() if workspace is None else workspace
     write_per_head = query_blocks > 1
     if write_per_head:
@@ -1073,8 +1096,8 @@ def prefill_score_from_lse_fwd(
         BLOCK_DMODEL=head_dim,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
-        num_warps=8 if block_rows >= 128 else 4,
-        num_stages=3,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     if write_per_head:
         reduce_heads = triton.next_power_of_2(query_heads)

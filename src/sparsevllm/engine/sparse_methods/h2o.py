@@ -27,7 +27,10 @@ class H2ORuntime(PassThroughRuntime):
         self._active_h2o_decode_score_view = None
 
     def decode_graph_keepalive_tensors(self) -> list[torch.Tensor]:
-        return list(self._h2o_decode_attn_score_buffers.values())
+        return [
+            *super().decode_graph_keepalive_tensors(),
+            *self._h2o_decode_attn_score_buffers.values(),
+        ]
 
     def needs_attention_score(
         self,
