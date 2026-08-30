@@ -8,7 +8,8 @@ from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphRunner
 from sparsevllm.engine.llm_engine import LLMEngine
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.sparse_controller import SparseController
-from sparsevllm.utils.context import reset_context, set_context
+from sparsevllm.engine.sparse_methods import SparseStepContext
+from sparsevllm.utils.context import get_context, reset_context, set_context
 
 
 class WorkerInfoTest(unittest.TestCase):
@@ -155,7 +156,16 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
                 )
                 states = controller.layer_batch_sparse_states
                 self.assertTrue(all(state.attn_score is None for state in states.values()))
-                self.assertFalse(controller._needs_attn_score(0, False, seqs))
+                self.assertFalse(
+                    controller.runtime.needs_attention_score(
+                        0,
+                        SparseStepContext(
+                            seqs=seqs,
+                            is_prefill=False,
+                            forward_context=get_context(),
+                        ),
+                    )
+                )
                 controller.post_forward(seqs, is_prefill=False)
                 self.assertEqual(manager.compactions, [])
 
@@ -190,10 +200,13 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
                         0,
                         torch.empty((1, 2, 4)),
                     ).attn_score
-                    self.assertEqual(controller.attn_score_dtype, configured_dtype)
+                    self.assertEqual(
+                        controller.runtime.attn_score_dtype,
+                        configured_dtype,
+                    )
                     self.assertEqual(score.dtype, torch.float32)
                     self.assertEqual(
-                        controller._snapkv_decode_reduced_attn_score_buffers[0].dtype,
+                        controller.runtime._snapkv_decode_reduced_attn_score_buffers[0].dtype,
                         torch.float32,
                     )
                     score.copy_(torch.arange(6, dtype=torch.float32).reshape(1, 6))
@@ -210,8 +223,17 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
             graph_capacity=16,
             keep=4,
         )
-        self.assertEqual(controller._snapkv_decode_trigger_len(6), 10)
-        self.assertTrue(controller._needs_attn_score(0, False, seqs))
+        self.assertEqual(controller.runtime._snapkv_decode_trigger_len(6), 10)
+        self.assertTrue(
+            controller.runtime.needs_attention_score(
+                0,
+                SparseStepContext(
+                    seqs=seqs,
+                    is_prefill=False,
+                    forward_context=get_context(),
+                ),
+            )
+        )
         score = controller.get_decode_selection(
             0,
             torch.empty((1, 2, 4)),
@@ -246,7 +268,16 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
         self.assertIs(controller.layer_batch_sparse_states[0].attn_score, refs[0]["attn_score"])
 
         controller.config.decode_graph = False
-        self.assertFalse(controller._needs_attn_score(0, False, seqs))
+        self.assertFalse(
+            controller.runtime.needs_attention_score(
+                0,
+                SparseStepContext(
+                    seqs=seqs,
+                    is_prefill=False,
+                    forward_context=get_context(),
+                ),
+            )
+        )
 
     def test_pyramid_short_graph_uses_layer_trigger_and_graph_capacity(self):
         common = {
@@ -264,9 +295,12 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
             kv_len=700,
             graph_capacity=1_024,
         )
-        low_budget = controller._get_layer_budget(1, is_prefill=False)
+        low_budget = controller.runtime._get_layer_budget(1, is_prefill=False)
         self.assertEqual(low_budget, 644)
-        self.assertEqual(controller._snapkv_decode_trigger_len(low_budget), 712)
+        self.assertEqual(
+            controller.runtime._snapkv_decode_trigger_len(low_budget),
+            712,
+        )
         self.assertIsNone(controller.layer_batch_sparse_states[0].attn_score)
         self.assertEqual(
             tuple(controller.layer_batch_sparse_states[1].attn_score.shape),
@@ -292,8 +326,8 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
             is_long_text=False,
         )
         self.assertEqual(
-            snap_short._snapkv_decode_trigger_len(
-                snap_short._get_layer_budget(0, is_prefill=False)
+            snap_short.runtime._snapkv_decode_trigger_len(
+                snap_short.runtime._get_layer_budget(0, is_prefill=False)
             ),
             8,
         )
@@ -327,7 +361,7 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
             self.assertEqual((kv_len, budget), (6, 4))
             return torch.tensor([0, 2, 3, 5])
 
-        controller._snapkv_select_indices = select
+        controller.runtime._snapkv_select_indices = select
         controller.post_forward(seqs, is_prefill=False)
         self.assertEqual(shapes, [(6,)])
         self.assertEqual(manager.compactions[0][2].tolist(), [0, 2, 3, 5])

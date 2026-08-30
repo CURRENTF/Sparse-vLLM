@@ -7,7 +7,8 @@ import torch
 from sparsevllm.engine.cache_manager.base import _debug_tensor_summary
 from sparsevllm.distributed import ParallelContext, ParallelGroup
 from sparsevllm.engine.model_runner import ModelRunner
-from sparsevllm.engine.sparse_controller import LayerBatchSparseState, SparseController
+from sparsevllm.engine.sparse_controller import LayerBatchSparseState
+from sparsevllm.engine.sparse_methods.passthrough import PassThroughRuntime
 
 
 def test_debug_tensor_summary_is_order_sensitive_and_deterministic():
@@ -31,9 +32,9 @@ def test_debug_tensor_summary_supports_bfloat16_scalars():
 
 
 def test_sparse_controller_summary_captures_selection_and_cache_state():
-    controller = object.__new__(SparseController)
-    controller.sparse_method = "quest"
-    controller.layer_batch_sparse_states = {
+    runtime = object.__new__(PassThroughRuntime)
+    runtime.sparse_method = "quest"
+    runtime.layer_batch_sparse_states = {
         0: LayerBatchSparseState(
             active_indices=torch.tensor([[0, 2]], dtype=torch.int64),
             active_slots=torch.tensor([[7, 9]], dtype=torch.int32),
@@ -42,15 +43,15 @@ def test_sparse_controller_summary_captures_selection_and_cache_state():
         ),
         1: LayerBatchSparseState(),
     }
-    controller.debug_dynamic_selection = {"quest": {"0": {"calls": 1}}}
-    controller.cache_manager = SimpleNamespace(
+    runtime.debug_dynamic_selection = {"quest": {"0": {"calls": 1}}}
+    runtime.cache_manager = SimpleNamespace(
         debug_state_summary=lambda: {
             "cache_manager_class": "FakeCacheManager",
             "free_slot_stats": {"free_slots": 12},
         }
     )
 
-    summary = controller.debug_state_summary()
+    summary = runtime.debug_state_summary()
 
     assert summary["sparse_method"] == "quest"
     assert list(summary["layers"]) == ["0"]

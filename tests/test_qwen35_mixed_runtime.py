@@ -38,6 +38,7 @@ from sparsevllm.engine.runtime_state import RuntimeState
 from sparsevllm.engine.scheduler import Scheduler
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.sparse_controller import LayerBatchSparseState, SparseController
+from sparsevllm.engine.sparse_methods.dynamic import OmniKVRuntime
 from sparsevllm.models.qwen3_5 import (
     Qwen35ForCausalLM,
     Qwen35LinearAttention,
@@ -1091,8 +1092,14 @@ def test_qwen35_pyramidkv_ratios_follow_compact_kv_order(tmp_path):
     controller = SparseController(cfg, SimpleNamespace())
     first_kv_layer = cfg.runtime_layout.kv_idx_to_layer_idx[0]
     last_kv_layer = cfg.runtime_layout.kv_idx_to_layer_idx[-1]
-    assert controller._get_layer_budget(first_kv_layer, is_prefill=True) == 4672
-    assert controller._get_layer_budget(last_kv_layer, is_prefill=True) == 1395
+    assert (
+        controller.runtime._get_layer_budget(first_kv_layer, is_prefill=True)
+        == 4672
+    )
+    assert (
+        controller.runtime._get_layer_budget(last_kv_layer, is_prefill=True)
+        == 1395
+    )
 
 
 def test_qwen35_pyramidkv_allocates_slots_only_for_kv_layers(tmp_path):
@@ -1480,22 +1487,22 @@ def test_omnikv_uses_first_target_kv_layer_for_slot_table_in_mixed_layout():
             self.requested_layers.append(int(layer_idx))
             return torch.arange(20, dtype=torch.int32).reshape(1, 20)
 
-    controller = object.__new__(SparseController)
-    controller.sparse_method = "omnikv"
-    controller.is_deltakv_family = False
-    controller.debug_dynamic_selection = {}
-    controller.debug_dynamic_selection_detail = False
-    controller.dynamic_deltakv_topk_tiebreak = False
-    controller.device = torch.device("cpu")
-    controller.cache_manager = FakeCacheManager()
-    controller.num_sink = 0
-    controller.num_recent = 1
-    controller.decode_keep_tokens = 2
-    controller.layer_batch_sparse_states = {
+    runtime = object.__new__(OmniKVRuntime)
+    runtime.sparse_method = "omnikv"
+    runtime.debug_dynamic_selection = {}
+    runtime.debug_dynamic_selection_detail = False
+    runtime.dynamic_deltakv_topk_tiebreak = False
+    runtime.device = torch.device("cpu")
+    runtime.cache_manager = FakeCacheManager()
+    runtime.num_sink = 0
+    runtime.num_recent = 1
+    runtime.decode_keep_tokens = 2
+    runtime.config = SimpleNamespace(decode_graph=False)
+    runtime.layer_batch_sparse_states = {
         3: LayerBatchSparseState(),
         7: LayerBatchSparseState(),
     }
-    obs_state = controller.layer_batch_sparse_states[3]
+    obs_state = runtime.layer_batch_sparse_states[3]
     obs_state.attn_score = torch.arange(10, dtype=torch.float32).reshape(1, 10)
     obs_state.context_lens = torch.tensor([10], dtype=torch.int32)
     obs_state.req_indices = torch.tensor([0], dtype=torch.int32)
@@ -1507,12 +1514,15 @@ def test_omnikv_uses_first_target_kv_layer_for_slot_table_in_mixed_layout():
         lens = torch.tensor([max_s], dtype=torch.int32)
         return keep, slots, lens
 
-    with patch("sparsevllm.engine.sparse_controller.get_context", return_value=SimpleNamespace(is_long_text=True, is_prefill=False)):
-        with patch("sparsevllm.engine.sparse_controller.build_omnikv_keep_and_slots", side_effect=fake_build):
-            SparseController._update_dynamic_omnikv_indices(controller, 3, [7])
+    context = SimpleNamespace(is_long_text=True, is_prefill=False)
+    with patch(
+        "sparsevllm.engine.sparse_methods.dynamic.build_omnikv_keep_and_slots",
+        side_effect=fake_build,
+    ):
+        runtime._update_dynamic_indices(3, [7], context)
 
-    assert controller.cache_manager.requested_layers == [7]
-    assert controller.layer_batch_sparse_states[7].active_slots is not None
+    assert runtime.cache_manager.requested_layers == [7]
+    assert runtime.layer_batch_sparse_states[7].active_slots is not None
 
 
 def test_standard_mixed_prefix_payload_preserves_block_range():

@@ -527,7 +527,7 @@ def test_snapkv_final_prefill_compacts_unique_length_across_layers():
     manager = _RecordingPrefillManager(scores)
     controller = SparseController(_controller_config("snapkv", 2), manager)
 
-    controller._snapkv_prefill_eviction(seqs)
+    controller.runtime._snapkv_prefill_eviction(seqs)
 
     assert len(manager.layer_calls) == 2
     layer_indices, grouped_seqs, keep_indices = manager.layer_calls[0]
@@ -550,7 +550,7 @@ def test_snapkv_final_prefill_single_layer_singleton_uses_scalar_fallback():
     )
     controller = SparseController(_controller_config("snapkv", 1), manager)
 
-    controller._snapkv_prefill_eviction([seq])
+    controller.runtime._snapkv_prefill_eviction([seq])
 
     assert [(layer, seq_id) for layer, seq_id, _keep in manager.scalar_calls] == [
         (0, 14)
@@ -574,7 +574,7 @@ def test_pyramidkv_final_prefill_groups_layers_by_effective_budget():
         manager,
     )
 
-    controller._snapkv_prefill_eviction(seqs)
+    controller.runtime._snapkv_prefill_eviction(seqs)
 
     assert len(manager.layer_calls) == 1
     layer_indices, grouped_seqs, keep_indices = manager.layer_calls[0]

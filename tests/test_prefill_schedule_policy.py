@@ -40,6 +40,8 @@ from sparsevllm.engine.sequence import Sequence
 from sparsevllm.layers.sampler import Sampler
 from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.engine.sparse_controller import SparseController
+from sparsevllm.engine.sparse_methods import AttentionEndEvent
+from sparsevllm.engine.sparse_methods.snapkv import PyramidKVRuntime
 from sparsevllm.method_registry import (
     PREFILL_POLICY_ALL_CHUNKED,
     PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
@@ -323,7 +325,7 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
         with patch.dict(os.environ, {"SPARSEVLLM_DELTAKV_DETERMINISTIC_TOPK_TIEBREAK": "1"}, clear=True):
             controller = SparseController(make_sparse_controller_config(), SimpleNamespace())
 
-        self.assertTrue(controller.dynamic_deltakv_topk_tiebreak)
+        self.assertTrue(controller.runtime.dynamic_deltakv_topk_tiebreak)
         self.assertTrue(controller.sparse_config["dynamic_deltakv_topk_tiebreak"])
 
     def test_deltakv_topk_tiebreak_env_rejects_invalid_value(self):
@@ -340,7 +342,10 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
         controller = SparseController(cfg, SimpleNamespace())
 
         low_layer_budget = 64 + 68 + 512
-        self.assertEqual(controller._snapkv_decode_trigger_len(low_layer_budget), low_layer_budget + 68)
+        self.assertEqual(
+            controller.runtime._snapkv_decode_trigger_len(low_layer_budget),
+            low_layer_budget + 68,
+        )
 
     def test_snapkv_decode_trigger_preserves_top_budget_rule(self):
         cfg = make_sparse_controller_config()
@@ -351,7 +356,10 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
         controller = SparseController(cfg, SimpleNamespace())
 
         budget = 64 + 4096 + 512
-        self.assertEqual(controller._snapkv_decode_trigger_len(budget), 8192)
+        self.assertEqual(
+            controller.runtime._snapkv_decode_trigger_len(budget),
+            8192,
+        )
 
     def test_streamingllm_decode_eviction_batches_layer_compaction(self):
         class FakeStreamingManager:
@@ -383,7 +391,7 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
             state.context_lens = torch.tensor([12, 12], dtype=torch.int32)
             state.max_context_len = 12
 
-        controller._streamingllm_decode_eviction([seq_a, seq_b])
+        controller.runtime._streamingllm_decode_eviction([seq_a, seq_b])
 
         self.assertEqual(len(manager.layer_calls), 1)
         layer_indices, seqs, keep_indices = manager.layer_calls[0]
@@ -424,7 +432,7 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
             state.context_lens = torch.tensor([12, 12], dtype=torch.int32)
             state.max_context_len = 12
 
-        controller._streamingllm_prefill_eviction([seq_a, seq_b])
+        controller.runtime._streamingllm_prefill_eviction([seq_a, seq_b])
 
         self.assertEqual(len(manager.layer_calls), 1)
         layer_indices, seqs, keep_indices = manager.layer_calls[0]
@@ -463,7 +471,9 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
             [12, 12], dtype=torch.int32
         )
 
-        controller._streamingllm_prefill_eviction([final_seq, partial_seq])
+        controller.runtime._streamingllm_prefill_eviction(
+            [final_seq, partial_seq]
+        )
 
         self.assertEqual(len(manager.calls), 1)
         self.assertEqual(manager.calls[0][1], [final_seq])
@@ -500,7 +510,7 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
         partial_seq.current_chunk_size = 4
         partial_seq.num_prefilled_tokens = 4
 
-        controller._snapkv_prefill_eviction([final_seq, partial_seq])
+        controller.runtime._snapkv_prefill_eviction([final_seq, partial_seq])
 
         self.assertEqual(manager.popped, [(0, final_seq.seq_id)])
         self.assertEqual(len(manager.freed), 1)
@@ -512,7 +522,7 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
             ExplicitKVPayload,
             PrefillComputeView,
         )
-        from sparsevllm.utils.context import reset_context, set_context
+        from sparsevllm.utils.context import get_context, reset_context, set_context
 
         manager = object.__new__(SnapKVCacheManager)
         manager.config = SimpleNamespace(
@@ -601,7 +611,7 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
         )
 
     def test_pyramid_materialization_uses_cpu_context_lengths_once_per_layer(self):
-        from sparsevllm.utils.context import reset_context, set_context
+        from sparsevllm.utils.context import get_context, reset_context, set_context
 
         class FakePyramidManager:
             def __init__(self):
@@ -629,13 +639,13 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
                 self.materialized.append((layer_idx, values))
 
         manager = FakePyramidManager()
-        controller = object.__new__(SparseController)
-        controller.sparse_method = "pyramidkv"
-        controller.cache_manager = manager
-        controller.device = torch.device("cpu")
-        controller.config = SimpleNamespace()
-        controller._is_kv_layer = lambda layer_idx: layer_idx == 0
-        controller._get_layer_budget = lambda layer_idx, is_prefill: None
+        runtime = object.__new__(PyramidKVRuntime)
+        runtime.sparse_method = "pyramidkv"
+        runtime.cache_manager = manager
+        runtime.device = torch.device("cpu")
+        runtime.config = SimpleNamespace()
+        runtime._is_kv_layer = lambda layer_idx: layer_idx == 0
+        runtime._get_layer_budget = lambda layer_idx, is_prefill: None
         seq_a = seq_with_len(7)
         seq_b = seq_with_len(5)
         seq_a.current_chunk_size = 2
@@ -646,7 +656,12 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
         reset_context()
         set_context(is_prefill=True, cache_manager=manager, seqs=[seq_a, seq_b])
         try:
-            controller.on_layer_attention_end(0)
+            runtime.on_attention_end(
+                AttentionEndEvent(
+                    layer_idx=0,
+                    forward_context=get_context(),
+                )
+            )
         finally:
             reset_context()
 

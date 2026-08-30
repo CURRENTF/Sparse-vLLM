@@ -5,7 +5,7 @@ import torch
 
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.sparse_controller import SparseController
-from sparsevllm.utils.context import reset_context, set_context
+from sparsevllm.utils.context import get_context, reset_context, set_context
 
 
 class _Manager:
@@ -78,13 +78,13 @@ def test_omnikv_observation_layers_share_one_decode_score_workspace():
     assert score0.data_ptr() == score2.data_ptr()
     assert controller.layer_batch_sparse_states[1].attn_score is None
     assert controller.layer_batch_sparse_states[3].attn_score is None
-    assert controller._decode_attn_score_buffers == {}
-    assert controller._omnikv_decode_attn_score_buffer is not None
+    assert controller.runtime._decode_attn_score_buffers == {}
+    assert controller.runtime._omnikv_decode_attn_score_buffer is not None
 
 
 def test_omnikv_consumes_shared_raw_scores_before_the_next_observation_layer():
     controller = _make_controller()
-    controller._update_dynamic_omnikv_indices = MagicMock()
+    controller.runtime._update_dynamic_indices = MagicMock()
     states = controller.layer_batch_sparse_states
     raw0 = states[0].attn_score
     raw2 = states[2].attn_score
@@ -107,12 +107,12 @@ def test_omnikv_consumes_shared_raw_scores_before_the_next_observation_layer():
     torch.testing.assert_close(states[0].attn_score, expected)
     controller.on_layer_end(2, SimpleNamespace(is_prefill=False))
     assert states[2].attn_score is not None and states[2].attn_score.dim() == 2
-    assert controller._update_dynamic_omnikv_indices.call_count == 2
+    assert controller.runtime._update_dynamic_indices.call_count == 2
 
 
 def test_omnikv_graph_reset_and_keepalive_cover_the_shared_workspace():
     controller = _make_controller()
-    shared = controller._omnikv_decode_attn_score_buffer
+    shared = controller.runtime._omnikv_decode_attn_score_buffer
     assert shared is not None
     refs = {
         layer_idx: {"attn_score": state.attn_score}
@@ -128,7 +128,7 @@ def test_omnikv_graph_reset_and_keepalive_cover_the_shared_workspace():
     )
 
     controller.clear_decode_attn_score_buffers()
-    assert controller._omnikv_decode_attn_score_buffer is None
+    assert controller.runtime._omnikv_decode_attn_score_buffer is None
 
 
 def test_omnikv_decode_graph_reuses_selection_output_buffers():
@@ -147,12 +147,12 @@ def test_omnikv_decode_graph_reuses_selection_output_buffers():
 
     pointers = []
     with patch(
-        "sparsevllm.engine.sparse_controller.build_omnikv_keep_and_slots",
+        "sparsevllm.engine.sparse_methods.dynamic.build_omnikv_keep_and_slots",
         side_effect=fake_build,
     ):
         for _ in range(2):
             states[0].attn_score = torch.arange(6, dtype=torch.float32).reshape(1, 6)
-            controller._update_dynamic_omnikv_indices(0, [1])
+            controller.runtime._update_dynamic_indices(0, [1], get_context())
             pointers.append(
                 tuple(
                     int(tensor.data_ptr())

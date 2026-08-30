@@ -25,6 +25,7 @@ from sparsevllm.engine.sparse_controller import (
     LayerBatchSparseState,
     SparseController,
 )
+from sparsevllm.engine.sparse_methods.joint import RKVRuntime
 
 
 class RKVSkipKVMethodTest(unittest.TestCase):
@@ -778,23 +779,23 @@ class RKVSkipKVMethodTest(unittest.TestCase):
         manager.register_attention_key_materializer(0, materialize)
         seq = Sequence(list(range(row_len)))
         seq.seq_id = 0
-        controller = object.__new__(SparseController)
-        controller.cache_manager = manager
-        controller.device = torch.device("cpu")
-        controller.sparse_method = "rkv"
-        controller.num_layers = 1
-        controller.num_sink = 1
-        controller.num_recent = 1
-        controller.decode_keep_tokens = 2
-        controller.config = manager.config
-        controller.layer_batch_sparse_states = {
+        runtime = object.__new__(RKVRuntime)
+        runtime.cache_manager = manager
+        runtime.device = torch.device("cpu")
+        runtime.sparse_method = "rkv"
+        runtime.num_layers = 1
+        runtime.num_sink = 1
+        runtime.num_recent = 1
+        runtime.decode_keep_tokens = 2
+        runtime.config = manager.config
+        runtime.layer_batch_sparse_states = {
             0: LayerBatchSparseState(
                 context_lens=torch.tensor([row_len], dtype=torch.int32)
             )
         }
-        controller._is_kv_layer = lambda layer_idx: int(layer_idx) == 0
+        runtime._is_kv_layer = lambda layer_idx: int(layer_idx) == 0
 
-        controller._rkv_decode_eviction([seq])
+        runtime._joint_decode_eviction([seq])
 
         active_slots = manager.buffer_req_to_token_slots[0][0, :4].long()
         self.assertEqual(active_slots.tolist(), [0, 2, 4, 5])

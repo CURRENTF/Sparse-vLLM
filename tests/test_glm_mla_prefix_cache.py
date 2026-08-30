@@ -19,6 +19,7 @@ from sparsevllm.engine.cache_manager.storage import MlaLatentStorage
 from sparsevllm.engine.chain_cache import ChainCacheCoordinator
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.sparse_controller import SparseController
+from sparsevllm.engine.sparse_methods.snapkv import SnapKVRuntime
 
 
 def _latent_chain_manager(manager_type, method: str):
@@ -172,18 +173,18 @@ def test_snapkv_chain_resume_preserves_latent_payload_and_resets_prefill_scores(
     manager._prefill_attn_score_accumulators[(0, owner.seq_id)] = torch.tensor(
         [0.0, 1.0, 2.0, 9.0, 3.0, 8.0, 4.0, 0.0]
     )
-    controller = object.__new__(SparseController)
-    controller.cache_manager = manager
-    controller.device = torch.device("cpu")
-    controller.sparse_method = "snapkv"
-    controller.num_layers = 1
-    controller.num_sink = 1
-    controller.num_recent = 1
-    controller.decode_keep_tokens = 2
-    controller.config = config
-    controller._is_kv_layer = lambda layer_idx: int(layer_idx) == 0
-    controller._kv_layer_index = lambda layer_idx: int(layer_idx)
-    controller._snapkv_prefill_eviction([owner])
+    runtime = object.__new__(SnapKVRuntime)
+    runtime.cache_manager = manager
+    runtime.device = torch.device("cpu")
+    runtime.sparse_method = "snapkv"
+    runtime.num_layers = 1
+    runtime.num_sink = 1
+    runtime.num_recent = 1
+    runtime.decode_keep_tokens = 2
+    runtime.config = config
+    runtime._is_kv_layer = lambda layer_idx: int(layer_idx) == 0
+    runtime._kv_layer_index = lambda layer_idx: int(layer_idx)
+    runtime._snapkv_prefill_eviction([owner])
     assert manager._prefill_attn_score_accumulators == {}
     resident_slots = manager.buffer_req_to_token_slots[0][0, :4].clone().long()
     assert resident_slots.tolist() == owner_slots[[0, 3, 5, 7]].tolist()

@@ -26,6 +26,8 @@ from sparsevllm.engine.decode_graph_contract import (
 from sparsevllm.engine.scheduler import Scheduler
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.sparse_controller import SparseController
+from sparsevllm.engine.sparse_methods import SparseStepContext
+from sparsevllm.engine.sparse_methods.h2o import H2ORuntime
 from sparsevllm.method_registry import (
     PREFILL_POLICY_ALL_CHUNKED,
 )
@@ -258,27 +260,32 @@ def _seq(seq_id: int, prompt_len: int, *, prefilled: int, chunk: int) -> Sequenc
 
 
 def test_h2o_decode_does_not_request_scores_or_run_eviction():
-    controller = object.__new__(SparseController)
-    controller.sparse_method = "h2o"
-    controller.is_deltakv_family = False
-    controller.config = SimpleNamespace(
+    runtime = object.__new__(H2ORuntime)
+    runtime.config = SimpleNamespace(
         sparse_method="h2o",
         sparse_prefill_score_mode="logits",
         h2o_prefill_score_window=0,
     )
-    controller.activation_controller = Mock()
-    controller.layer_batch_sparse_states = {
+    runtime.cache_manager = Mock()
+    runtime.layer_batch_sparse_states = {
         0: SimpleNamespace(attn_score=None),
     }
-    controller._h2o_decode_eviction = Mock()
-    set_context(is_prefill=False, is_long_text=True)
+    decode = SparseStepContext(
+        seqs=[],
+        is_prefill=False,
+        forward_context=SimpleNamespace(is_prefill=False, is_long_text=True),
+    )
+    prefill = SparseStepContext(
+        seqs=[],
+        is_prefill=True,
+        forward_context=SimpleNamespace(is_prefill=True, is_long_text=True),
+    )
 
-    assert controller._needs_attn_score(0, False, []) is False
-    assert controller._needs_attn_score(0, True, []) is True
-    controller.post_forward([], is_prefill=False)
+    assert runtime.needs_attention_score(0, decode) is False
+    assert runtime.needs_attention_score(0, prefill) is True
+    runtime.finish_step(decode)
 
-    controller.activation_controller.post_forward.assert_called_once_with([], False)
-    controller._h2o_decode_eviction.assert_not_called()
+    runtime.cache_manager.evict_after_decode.assert_not_called()
 
 
 def test_h2o_cache_manager_factory_routes_first_class_method():
@@ -1444,12 +1451,14 @@ def test_h2o_controller_batches_raw_decode_logits_for_cache_manager():
         sparse_attn_score_dtype="float32",
     )
     controller = SparseController(config, manager)
-    reduced_scores = controller._get_h2o_decode_score_buffer(1, 1, 3)
+    reduced_scores = controller.runtime._get_h2o_decode_score_buffer(1, 1, 3)
     reduced_scores[0].copy_(torch.tensor([[0.2, 0.3, 0.5]]))
     controller.layer_batch_sparse_states[0].attn_score = reduced_scores[0]
     controller.layer_batch_sparse_states[0].context_lens = torch.tensor([3])
 
-    controller._h2o_decode_eviction([_seq(0, 3, prefilled=3, chunk=1)])
+    controller.runtime._h2o_decode_eviction(
+        [_seq(0, 3, prefilled=3, chunk=1)]
+    )
 
     assert manager.layer_indices == [0]
     assert manager.raw_logits.shape == (1, 1, 3)
@@ -1488,18 +1497,20 @@ def test_h2o_prepare_uses_one_contiguous_snapkv_style_buffer_for_all_kv_layers()
         _seq(0, 4, prefilled=4, chunk=1),
         _seq(1, 3, prefilled=3, chunk=1),
     ]
-    original = controller._get_h2o_decode_score_buffer
+    original = controller.runtime._get_h2o_decode_score_buffer
 
     with patch.object(
-        controller,
+        controller.runtime,
         "_get_h2o_decode_score_buffer",
         wraps=original,
     ) as allocate:
-        controller._prepare_h2o_decode_attn_score_buffer(seqs)
+        controller.runtime._prepare_h2o_decode_attn_score_buffer(seqs)
 
     allocate.assert_called_once()
-    assert len(controller._h2o_decode_attn_score_buffers) == 1
-    backing = next(iter(controller._h2o_decode_attn_score_buffers.values()))
+    assert len(controller.runtime._h2o_decode_attn_score_buffers) == 1
+    backing = next(
+        iter(controller.runtime._h2o_decode_attn_score_buffers.values())
+    )
     assert backing.shape == (2, 2, 4)
     assert torch.all(backing == -1e20)
     for layer_idx in range(2):
@@ -1507,11 +1518,15 @@ def test_h2o_prepare_uses_one_contiguous_snapkv_style_buffer_for_all_kv_layers()
             controller.layer_batch_sparse_states[layer_idx].attn_score.data_ptr()
             == backing[layer_idx].data_ptr()
         )
-    resolved_layers, resolved = controller._resolve_h2o_decode_attn_score_buffer(
-        {
-            layer_idx: controller.layer_batch_sparse_states[layer_idx].attn_score
-            for layer_idx in range(2)
-        }
+    resolved_layers, resolved = (
+        controller.runtime._resolve_h2o_decode_attn_score_buffer(
+            {
+                layer_idx: controller.layer_batch_sparse_states[
+                    layer_idx
+                ].attn_score
+                for layer_idx in range(2)
+            }
+        )
     )
     assert resolved_layers == [0, 1]
     assert resolved.data_ptr() == backing.data_ptr()
@@ -1539,7 +1554,7 @@ def test_h2o_layer_end_keeps_fused_2d_logits_for_batched_normalization():
         decode_graph=False,
     )
     controller = SparseController(config, manager)
-    score = controller._get_h2o_decode_score_buffer(1, 1, 3)[0]
+    score = controller.runtime._get_h2o_decode_score_buffer(1, 1, 3)[0]
     score.copy_(torch.tensor([[0.0, 1.0, 2.0]]))
     controller.layer_batch_sparse_states[0].attn_score = score
 
@@ -1850,7 +1865,7 @@ def test_h2o_multilayer_reduced_decode_context_bounds_are_checked_together():
         validate_runtime_invariants=True,
     )
     controller = SparseController(config, manager)
-    reduced_scores = controller._get_h2o_decode_score_buffer(2, 1, 3)
+    reduced_scores = controller.runtime._get_h2o_decode_score_buffer(2, 1, 3)
     reduced_scores.zero_()
     controller.layer_batch_sparse_states[0].attn_score = reduced_scores[0]
     controller.layer_batch_sparse_states[1].attn_score = reduced_scores[1]
@@ -1858,30 +1873,30 @@ def test_h2o_multilayer_reduced_decode_context_bounds_are_checked_together():
     controller.layer_batch_sparse_states[1].context_lens = torch.tensor([2])
     seqs = [_seq(0, 3, prefilled=3, chunk=1)]
 
-    controller._h2o_decode_eviction(seqs)
+    controller.runtime._h2o_decode_eviction(seqs)
     assert manager.updates == 1
     assert manager.evictions == 1
 
     reduced_scores.zero_()
     controller.layer_batch_sparse_states[1].context_lens = torch.tensor([4])
     with pytest.raises(RuntimeError, match="exceed the reduced score width"):
-        controller._h2o_decode_eviction(seqs)
+        controller.runtime._h2o_decode_eviction(seqs)
     assert manager.updates == 1
     assert manager.evictions == 1
 
     config.validate_runtime_invariants = False
     fast_controller = SparseController(config, manager)
     config.validate_runtime_invariants = True
-    fast_scores = fast_controller._get_h2o_decode_score_buffer(2, 1, 3)
+    fast_scores = fast_controller.runtime._get_h2o_decode_score_buffer(2, 1, 3)
     fast_scores.zero_()
     fast_controller.layer_batch_sparse_states[0].attn_score = fast_scores[0]
     fast_controller.layer_batch_sparse_states[1].attn_score = fast_scores[1]
     fast_controller.layer_batch_sparse_states[0].context_lens = torch.tensor([3])
     fast_controller.layer_batch_sparse_states[1].context_lens = torch.tensor([4])
 
-    fast_controller._h2o_decode_eviction(seqs)
+    fast_controller.runtime._h2o_decode_eviction(seqs)
 
-    assert fast_controller.validate_runtime_invariants is False
+    assert fast_controller.runtime.validate_runtime_invariants is False
     assert manager.updates == 2
     assert manager.evictions == 2
 
@@ -1931,10 +1946,10 @@ def test_h2o_contiguous_decode_buffer_handles_padded_graph_batch_and_low_dtype()
         decode_graph=True,
     )
     controller = SparseController(config, manager)
-    reduced_scores = controller._get_h2o_decode_score_buffer(2, 4, 4)
+    reduced_scores = controller.runtime._get_h2o_decode_score_buffer(2, 4, 4)
     original_ptr = reduced_scores.data_ptr()
     reduced_scores.fill_(7.0)
-    same_scores = controller._get_h2o_decode_score_buffer(2, 4, 4)
+    same_scores = controller.runtime._get_h2o_decode_score_buffer(2, 4, 4)
     assert same_scores.data_ptr() == original_ptr
     assert same_scores.dtype == torch.float32
     assert torch.all(same_scores == 7.0)
@@ -1954,7 +1969,7 @@ def test_h2o_contiguous_decode_buffer_handles_padded_graph_batch_and_low_dtype()
         state.context_lens = valid_lens
     expected = same_scores[:, :3].clone()
 
-    controller._h2o_decode_eviction(
+    controller.runtime._h2o_decode_eviction(
         [_seq(seq_id, 4, prefilled=4, chunk=1) for seq_id in range(3)]
     )
 
@@ -1977,7 +1992,7 @@ def test_h2o_contiguous_decode_buffer_handles_padded_graph_batch_and_low_dtype()
     assert controller.reset_decode_attn_scores_for_graph(refs)
     assert torch.all(same_scores == -1e20)
     controller.clear_decode_attn_score_buffers()
-    assert controller._h2o_decode_attn_score_buffers == {}
+    assert controller.runtime._h2o_decode_attn_score_buffers == {}
 
 
 def test_h2o_free_seq_cleans_score_vectors():

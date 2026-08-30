@@ -22,6 +22,8 @@ from sparsevllm.engine.sparse_controller import (
     LayerBatchSparseState,
     SparseController,
 )
+from sparsevllm.engine.sparse_methods.snapkv import SnapKVRuntime
+from sparsevllm.engine.sparse_methods.streamingllm import StreamingLLMRuntime
 from sparsevllm.utils.context import reset_context, set_context
 
 from glm_test_helpers import _single_rank_parallel_context
@@ -52,8 +54,8 @@ def test_glm_sparse_controller_uses_full_mla_qk_softmax_scale():
     controller = SparseController(config, manager)
 
     assert hf_config.head_dim == 64
-    assert controller.attn_softmax_scale == pytest.approx(256**-0.5)
-    assert controller.attn_softmax_scale != pytest.approx(64**-0.5)
+    assert controller.runtime.attn_softmax_scale == pytest.approx(256**-0.5)
+    assert controller.runtime.attn_softmax_scale != pytest.approx(64**-0.5)
 
 
 def test_glm_rkv_query_cache_allocates_and_records_full_qk_head_width():
@@ -160,21 +162,21 @@ def test_streamingllm_budget_trigger_preserves_mla_latent_slot_payloads():
     seq.seq_id = 0
     seq.num_prefilled_tokens = 0
     seq.current_chunk_size = 8
-    controller = object.__new__(SparseController)
-    controller.cache_manager = manager
-    controller.device = torch.device("cpu")
-    controller.num_layers = 1
-    controller.num_sink = 2
-    controller.num_recent = 3
-    controller.layer_batch_sparse_states = {
+    runtime = object.__new__(StreamingLLMRuntime)
+    runtime.cache_manager = manager
+    runtime.device = torch.device("cpu")
+    runtime.num_layers = 1
+    runtime.num_sink = 2
+    runtime.num_recent = 3
+    runtime.layer_batch_sparse_states = {
         0: SimpleNamespace(
             context_lens=torch.tensor([8], dtype=torch.int32),
             max_context_len=8,
         )
     }
-    controller._is_kv_layer = lambda layer_idx: int(layer_idx) == 0
+    runtime._is_kv_layer = lambda layer_idx: int(layer_idx) == 0
 
-    controller._streamingllm_prefill_eviction([seq])
+    runtime._streamingllm_prefill_eviction([seq])
 
     active_slots = manager.buffer_req_to_token_slots[0][0, :5].long()
     assert active_slots.tolist() == [0, 1, 5, 6, 7]
@@ -203,23 +205,23 @@ def test_snapkv_score_budget_trigger_preserves_mla_latent_slot_payloads():
     seq.seq_id = 0
     seq.num_prefilled_tokens = 0
     seq.current_chunk_size = 8
-    controller = object.__new__(SparseController)
-    controller.cache_manager = manager
-    controller.device = torch.device("cpu")
-    controller.sparse_method = "snapkv"
-    controller.num_layers = 1
-    controller.num_sink = 1
-    controller.num_recent = 1
-    controller.decode_keep_tokens = 2
-    controller.config = SimpleNamespace(
+    runtime = object.__new__(SnapKVRuntime)
+    runtime.cache_manager = manager
+    runtime.device = torch.device("cpu")
+    runtime.sparse_method = "snapkv"
+    runtime.num_layers = 1
+    runtime.num_sink = 1
+    runtime.num_recent = 1
+    runtime.decode_keep_tokens = 2
+    runtime.config = SimpleNamespace(
         snapkv_num_full_layers=0,
         pyramid_layer_ratios=None,
         pool_kernel_size=1,
     )
-    controller._is_kv_layer = lambda layer_idx: int(layer_idx) == 0
-    controller._kv_layer_index = lambda layer_idx: int(layer_idx)
+    runtime._is_kv_layer = lambda layer_idx: int(layer_idx) == 0
+    runtime._kv_layer_index = lambda layer_idx: int(layer_idx)
 
-    controller._snapkv_prefill_eviction([seq])
+    runtime._snapkv_prefill_eviction([seq])
 
     active_slots = manager.buffer_req_to_token_slots[0][0, :4].long()
     assert active_slots.tolist() == [0, 3, 5, 7]
@@ -286,8 +288,8 @@ def test_omnikv_observation_selects_mla_latent_active_slots():
         ),
         manager,
     )
-    assert controller.attn_softmax_scale == pytest.approx(256**-0.5)
-    controller.layer_batch_sparse_states = {
+    assert controller.runtime.attn_softmax_scale == pytest.approx(256**-0.5)
+    controller.runtime.layer_batch_sparse_states = {
         0: LayerBatchSparseState(
             attn_score=torch.tensor(
                 [
@@ -305,7 +307,7 @@ def test_omnikv_observation_selects_mla_latent_active_slots():
         ),
         1: LayerBatchSparseState(),
     }
-    controller._is_kv_layer = lambda layer_idx: 0 <= int(layer_idx) < 2
+    controller.runtime._is_kv_layer = lambda layer_idx: 0 <= int(layer_idx) < 2
 
     set_context(
         False,
