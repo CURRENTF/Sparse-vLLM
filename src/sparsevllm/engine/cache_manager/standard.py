@@ -567,12 +567,6 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
     def prompt_admission_free_slots(self) -> int:
         return int(self.num_free_slots + self._prefix_step_reclaimable_slots())
 
-    def _prefix_hit_evictable_slots(self, seq: Sequence) -> int:
-        if getattr(self, "prefix_cache", None) is None or int(getattr(seq, "prefix_cache_hit_len", 0) or 0) <= 0:
-            return 0
-        reclaimable_slots, _ = self._prefix_hit_capacity_slots(seq)
-        return reclaimable_slots
-
     def prompt_admission_cost(self, seq: Sequence) -> int:
         hit_len = int(getattr(seq, "prefix_cache_hit_len", 0) or 0)
         suffix_len = int(seq.num_prompt_tokens - hit_len)
@@ -975,10 +969,15 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             for block in chain[: range_end // block_size]
             if block.prune_record is not None
         ]
-        if existing_records and not allow_recompress:
+        if existing_records:
+            if allow_recompress:
+                raise RuntimeError(
+                    "allow_recompress is not implemented because dropped KV cannot be "
+                    "rescored without rebuilding the original dense prefix."
+                )
             raise RuntimeError(
                 "prefix prune target already inherits a quality-degraded prune record; "
-                "set allow_recompress=true to prune only its remaining KV tokens."
+                "repeated prefix compression is not implemented."
             )
         return affected
 

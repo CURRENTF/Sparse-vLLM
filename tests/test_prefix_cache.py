@@ -234,6 +234,47 @@ def test_standard_prefix_prune_rejects_referenced_blocks_without_mutation():
     assert block.payload.token_slots.tolist() == [10, 11]
 
 
+def test_standard_prefix_prune_rejects_unimplemented_recompression_without_mutation():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    block_id = manager.prefix_cache.stable_block_id([1, 2], None)
+    block = PrefixCacheBlock(
+        stable_block_id=block_id,
+        parent_block_id=None,
+        block_size=2,
+        logical_block_idx=0,
+        payload=StandardPrefixBlockPayload(
+            token_slots=torch.tensor([10, 11], dtype=torch.int32)
+        ),
+        token_ids=(1, 2),
+    )
+    manager.prefix_cache.insert_block(block)
+    _remove_free_slots(manager, [10, 11])
+    manager.prefix_cache_prune(
+        [1, 2],
+        range_start=0,
+        range_end=2,
+        keep_indices=torch.tensor([0]),
+        policy="snapkv_global",
+        prune_id="first-prune",
+    )
+    free_before = manager.num_free_slots
+
+    with pytest.raises(RuntimeError, match="allow_recompress is not implemented"):
+        manager.prefix_cache_prune(
+            [1, 2],
+            range_start=0,
+            range_end=2,
+            keep_indices=torch.tensor([], dtype=torch.long),
+            policy="snapkv_global",
+            prune_id="second-prune",
+            allow_recompress=True,
+        )
+
+    assert manager.num_free_slots == free_before
+    assert block.payload.retained_offsets == (0,)
+    assert block.payload.token_slots.tolist() == [10]
+
+
 def test_quest_explicitly_rejects_physical_prefix_pruning():
     manager = object.__new__(QuestCacheManager)
     with pytest.raises(RuntimeError, match="QuEST.*without pruning"):
@@ -2014,7 +2055,7 @@ def test_h2d_transfer_stream_waits_for_index_producer_event(monkeypatch):
     controller.host_pool = SimpleNamespace(
         cache=torch.zeros((2, 2, 1, 2, 1, 4), dtype=torch.float16),
         num_layers=2,
-        token_indices=lambda block_indices, device: torch.tensor(
+        retained_token_indices=lambda _block_indices, _offsets, device: torch.tensor(
             [0, 1], dtype=torch.long, device=device
         ),
     )

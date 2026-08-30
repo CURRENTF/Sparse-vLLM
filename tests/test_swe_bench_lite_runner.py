@@ -251,15 +251,24 @@ class SweBenchLiteRunnerTest(unittest.TestCase):
                     "--no-chain-cache",
                     "--prefix-prune-policy",
                     "kvzip_global",
+                    "--prefix-prune-trigger-tokens",
+                    "6144",
+                    "--prefix-prune-range-start",
+                    "1024",
+                    "--prefix-prune-range-end",
+                    "6144",
+                    "--prefix-prune-keep-tokens",
+                    "2304",
                 ]
             )
             runner = SweBenchLiteRunner(args)
             env = runner._model_env()
 
             self.assertEqual(env["SPARSEVLLM_PREFIX_PRUNE_POLICY"], "kvzip_global")
-            self.assertEqual(env["SPARSEVLLM_PREFIX_PRUNE_RANGE_START"], "512")
-            self.assertEqual(env["SPARSEVLLM_PREFIX_PRUNE_RANGE_END"], "4096")
-            self.assertEqual(env["SPARSEVLLM_PREFIX_PRUNE_KEEP_TOKENS"], "1792")
+            self.assertEqual(env["SPARSEVLLM_PREFIX_PRUNE_TRIGGER_TOKENS"], "6144")
+            self.assertEqual(env["SPARSEVLLM_PREFIX_PRUNE_RANGE_START"], "1024")
+            self.assertEqual(env["SPARSEVLLM_PREFIX_PRUNE_RANGE_END"], "6144")
+            self.assertEqual(env["SPARSEVLLM_PREFIX_PRUNE_KEEP_TOKENS"], "2304")
             self.assertEqual(
                 env["SPARSEVLLM_PREFIX_PRUNE_EVENTS"],
                 str(runner.run_dir / "prefix_prune_events.jsonl"),

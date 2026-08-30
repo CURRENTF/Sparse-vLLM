@@ -317,14 +317,11 @@ class StandardPrefixOffloadController:
         offsets = [
             _payload_retained_offsets(block, self.block_size) for block in blocks
         ]
-        retained = getattr(self.host_pool, "retained_token_indices", None)
-        if callable(retained):
-            return retained(host_indices, offsets, self.device)
-        if any(value != tuple(range(self.block_size)) for value in offsets):
-            raise RuntimeError(
-                "Prefix host pool does not support retained token offsets."
-            )
-        return self.host_pool.token_indices(host_indices, self.device)
+        return self.host_pool.retained_token_indices(
+            host_indices,
+            offsets,
+            self.device,
+        )
 
     @torch.no_grad()
     def submit_d2h(self, blocks: list[PrefixCacheBlock]) -> None:
