@@ -1,6 +1,6 @@
 ---
 name: add-sparse-method
-description: Add or refactor a first-class Sparse-vLLM sparse method across configuration, capability registration, cache and SparseMethodRuntime ownership, scheduler admission, typed attention views, model and storage compatibility, CUDA Graph and prefix-cache lifecycles, operators, and reproducible validation. Use for a new canonical sparse_method or an integration whose sparse runtime semantics change; do not use for a kernel/provider optimization that leaves method semantics unchanged.
+description: Add or refactor a first-class Sparse-vLLM sparse method across configuration, capability registration, cache and controller ownership, scheduler admission, typed attention views, model and storage compatibility, CUDA Graph and prefix-cache lifecycles, operators, and reproducible validation. Use for a new canonical sparse_method or an integration whose sparse runtime semantics change; do not use for a kernel/provider optimization that leaves method semantics unchanged.
 ---
 
 # Add Sparse Method
@@ -8,8 +8,7 @@ description: Add or refactor a first-class Sparse-vLLM sparse method across conf
 Treat a sparse method as a runtime capability contract, not as a file template. Start from the method's semantics, route each responsibility to its existing owner, and add only the narrow contracts the method actually needs.
 
 Always read the
-[official runtime architecture](../../../docs/en/design/sparse-method-runtime.md)
-(or its [Chinese mirror](../../../docs/zh/design/sparse-method-runtime.md)) and
+[official runtime architecture](../../../docs/en/design/sparse-method-runtime.md) and
 [references/file-map.md](references/file-map.md) before editing. The official
 document defines the stable runtime boundary; the file map distinguishes files
 to inspect from files that usually need modification.

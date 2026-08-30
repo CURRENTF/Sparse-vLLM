@@ -9,10 +9,6 @@ Map the method to both axes independently:
 - physical storage and persistent lifecycle through a CacheManager under
   `engine/cache_manager/`.
 
-The current runtime bases are deliberate, shallow mechanism reuse points. They
-are not a complete method taxonomy, and they do not imply a matching
-CacheManager inheritance tree.
-
 ## Logical View Methods
 
 Examples include standard/vanilla-like and OmniKV-like paths where physical cache ownership remains stable and the method primarily changes the logical tokens visible to attention.
@@ -34,13 +30,10 @@ Audit the prefill score contract, observation window, per-head/per-layer budgets
 ## Cumulative Importance Scoring
 
 H2O-like methods maintain scores or statistics across cache mutations and use
-them for retention decisions. The current H2O runtime collects and applies this
-contract during prefill; decode scoring/eviction remains disabled until its
-separate lifecycle is implemented and validated.
+them for retention decisions.
 
 Audit score update order, new-token protection, numerical accumulation,
-deterministic ties, graph-safe mutation, and rollback/fork behavior. Do not infer
-decode scoring support from the presence of reusable score-buffer helpers.
+deterministic ties, graph-safe mutation, and rollback/fork behavior.
 
 ## Query-State Reuse
 

@@ -29,12 +29,6 @@ The registry describes static capabilities. Do not put mutable runtime state or 
 
 ## Runtime Construction And Control Plane
 
-Read the
-[official runtime architecture](../../../../docs/en/design/sparse-method-runtime.md)
-(or its [Chinese mirror](../../../../docs/zh/design/sparse-method-runtime.md))
-before choosing an owner. `SparseController` is the stable facade; method-owned
-logical behavior lives behind the `SparseMethodRuntime` interface.
-
 | Owner | Typical responsibilities |
 | --- | --- |
 | `src/sparsevllm/engine/model_runner.py` | Construct and connect generic runtime components. Inspect wiring; avoid method-name branches. |
