@@ -355,6 +355,7 @@ MOE_REGISTRY: OpRegistry[MoeOpSpec, MoeProvider] = OpRegistry(
         "triton_minimax_m2_profile",
         "qwen3_fp8_dispatch_plan",
         "sgl_triton_glm_tp1_bf16_profile",
+        "glm_h100_bf16_decode_dispatch_plan",
         "sgl_aligned_triton_glm_bf16_profile",
         "h20_qwen36_fused_bf16_profile",
         "hopper_fused_bf16_profile",
@@ -470,6 +471,7 @@ def _sgl_moe_align_block_size(
 class SglAlignedTritonGlmMoeProvider(MoeProvider):
     name = "sgl_aligned_triton_glm"
     gate_up_order = "gate_up"
+    fuse_gate_up_swiglu = False
 
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
@@ -528,7 +530,77 @@ class SglAlignedTritonGlmMoeProvider(MoeProvider):
             topk_weights,
             num_experts=spec.num_experts,
             local_expert_start=local_expert_start,
+            _fuse_gate_up_swiglu=self.fuse_gate_up_swiglu,
             alignment_impl=alignment_impl,
+        )
+
+
+@MOE_REGISTRY.register_atomic(
+    ProviderRole.REPO_PORTABLE,
+    profile_only=True,
+)
+class SglAlignedTritonGlmFusedMoeProvider(SglAlignedTritonGlmMoeProvider):
+    name = "sgl_aligned_triton_glm_fused"
+    fuse_gate_up_swiglu = True
+
+
+@MOE_REGISTRY.register_profile
+class GlmH100Bf16DecodeMoeDispatchPlan(MoeDispatchPlan):
+    """Prepared H100 GLM decode fusion with the established prefill path."""
+
+    name = "glm_h100_bf16_decode_dispatch_plan"
+    gate_up_order = "gate_up"
+    MAX_FUSED_TOKENS = 32
+    PROFILED_SHAPES = frozenset(
+        {
+            (64, 64, 2048, 768, 4, 2, 1, "biased_sigmoid"),
+            (65, 65, 2048, 768, 5, 2, 1, "biased_sigmoid"),
+        }
+    )
+
+    @classmethod
+    def atomic_provider_names(cls, spec: MoeOpSpec) -> tuple[str, ...]:
+        del spec
+        return (
+            "sgl_aligned_triton_glm_fused",
+            "sgl_aligned_triton_glm",
+        )
+
+    @classmethod
+    def matches(cls, spec: MoeOpSpec, caps: DeviceCaps) -> ProfileMatch:
+        actual = (
+            spec.num_experts,
+            spec.num_local_experts,
+            spec.hidden_size,
+            spec.intermediate_size,
+            spec.top_k,
+            spec.tp_size,
+            spec.ep_size,
+            spec.routing_method,
+        )
+        if caps.device_name != "NVIDIA H100 80GB HBM3":
+            return ProfileMatch.no("requires profiled NVIDIA H100 80GB HBM3")
+        if actual not in cls.PROFILED_SHAPES:
+            return ProfileMatch.no(
+                f"requires a profiled GLM H100 BF16 shape, got {actual}"
+            )
+        return ProfileMatch.yes("matched GLM H100 BF16 decode fusion profile")
+
+    def _build_routes(self, spec: MoeOpSpec) -> tuple[MoeDispatchRoute, ...]:
+        del spec
+        return (
+            MoeDispatchRoute(
+                min_tokens=0,
+                max_tokens=self.MAX_FUSED_TOKENS,
+                provider=SglAlignedTritonGlmFusedMoeProvider(),
+                kernel_path="triton_routed_gate_up_swiglu",
+            ),
+            MoeDispatchRoute(
+                min_tokens=self.MAX_FUSED_TOKENS + 1,
+                max_tokens=None,
+                provider=SglAlignedTritonGlmMoeProvider(),
+                kernel_path="triton_routed_gemm_silu",
+            ),
         )
 
 

@@ -96,7 +96,7 @@ _H = MoeGemmConfig(16, 32, 64, 8, 4, 3)
 _I = MoeGemmConfig(16, 64, 64, 8, 4, 4)
 _J = MoeGemmConfig(16, 64, 64, 8, 4, 2)
 _K = MoeGemmConfig(16, 128, 64, 8, 4, 2)
-_GLM_DECODE_32 = MoeGemmConfig(16, 64, 128, 16, 4, 3)
+_GLM_DECODE_32 = MoeGemmConfig(4, 32, 128, 8, 4, 3)
 _GLM_DECODE_64 = MoeGemmConfig(64, 128, 64, 8, 8, 3)
 _GLM_MID_BATCH = MoeGemmConfig(64, 128, 64, 1, 8, 3)
 _GLM_LARGE_BATCH = MoeGemmConfig(128, 128, 64, 1, 8, 3)
@@ -132,7 +132,10 @@ def _glm_h100_tp2_config(
             768,
         ),
     }
-    if stage not in {"w13", "w2"} or shape not in profiled_shapes:
+    if (
+        stage not in {"w13", "w2", "gate_up_swiglu"}
+        or shape not in profiled_shapes
+    ):
         return None
     if num_tokens <= 32:
         return _GLM_DECODE_32
