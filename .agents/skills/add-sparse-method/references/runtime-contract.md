@@ -9,8 +9,8 @@ Write this contract before implementation. It can be a short design note, issue 
 | Identity | What is the public name? Canonical internal name? Aliases? Defaults? Required assets? | Runtime params and method registry |
 | Semantic delta | How does behavior differ from the nearest existing method? What is kept, selected, evicted, compressed, or reused? | Design note and method implementation |
 | Persistent state | Which tensors/objects survive a step? Are they per sequence, layer, head, page, token, or pool? | CacheManager or ActivationController |
-| Score contract | Is scoring required in prefill or decode? What are its shape, dtype, indexing domain, and producer/consumer? | Registry and SparseController |
-| Selection contract | Is selection posthoc, query-aware, cross-layer, or cumulative? Is it logical or physically mutating? | SparseController and CacheManager |
+| Score contract | Is scoring required in prefill or decode? What are its shape, dtype, indexing domain, and producer/consumer? | Registry and SparseMethodRuntime; CacheManager/provider when score production is physical-view owned |
+| Selection contract | Is selection posthoc, query-aware, cross-layer, or cumulative? Is it logical or physically mutating? | SparseMethodRuntime for logical orchestration; CacheManager for physical resolution/mutation |
 | Storage | Does it support explicit, heterogeneous explicit, or MLA latent cache? Are actual keys required? | Model/runtime layout and storage protocol |
 | Attention view | Can it use a logical view, or must it construct a custom compute payload? | CacheManager typed view builders |
 | Prefill execution | Full, chunked, raw-offload, or another registered mode? Can requests batch together? | Registry, RuntimeState, scheduler contract |
@@ -57,6 +57,11 @@ Trace one prefill step and one decode step end to end:
 4. Identify who builds the typed compute view and payload.
 5. Identify the operator/provider consuming that view.
 6. Identify how writes update storage and method metadata.
+
+Also identify the runtime lifecycle hook for each logical transition:
+`prepare_step`, prefill/decode selection, attention end, layer end, or
+`finish_step`. `SparseController` should only translate the engine lifecycle into
+these typed requests/events.
 
 Any untyped tuple, global side channel, or direct config inspection in attention is a boundary violation unless no existing typed contract can represent the data. In that case, extend the type at its owner.
 

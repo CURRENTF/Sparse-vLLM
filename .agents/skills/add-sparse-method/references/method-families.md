@@ -2,6 +2,17 @@
 
 Use these families to choose code to study. They describe mechanisms, not a required class hierarchy.
 
+Map the method to both axes independently:
+
+- logical orchestration through a `SparseMethodRuntime` under
+  `engine/sparse_methods/`;
+- physical storage and persistent lifecycle through a CacheManager under
+  `engine/cache_manager/`.
+
+The current runtime bases are deliberate, shallow mechanism reuse points. They
+are not a complete method taxonomy, and they do not imply a matching
+CacheManager inheritance tree.
+
 ## Logical View Methods
 
 Examples include standard/vanilla-like and OmniKV-like paths where physical cache ownership remains stable and the method primarily changes the logical tokens visible to attention.
@@ -20,11 +31,16 @@ SnapKV/PyramidKV-like methods score completed or chunked prefill state, then com
 
 Audit the prefill score contract, observation window, per-head/per-layer budgets, compaction writes, scheduler reservation peak, and restoration/prefix semantics.
 
-## Cumulative Decode Scoring
+## Cumulative Importance Scoring
 
-H2O-like methods maintain scores or statistics across decode steps and use them for repeated retention decisions.
+H2O-like methods maintain scores or statistics across cache mutations and use
+them for retention decisions. The current H2O runtime collects and applies this
+contract during prefill; decode scoring/eviction remains disabled until its
+separate lifecycle is implemented and validated.
 
-Audit score update order, new-token protection, numerical accumulation, deterministic ties, graph-safe mutation, and rollback/fork behavior.
+Audit score update order, new-token protection, numerical accumulation,
+deterministic ties, graph-safe mutation, and rollback/fork behavior. Do not infer
+decode scoring support from the presence of reusable score-buffer helpers.
 
 ## Query-State Reuse
 
@@ -36,7 +52,9 @@ Audit ownership of query state, cross-layer lifetime, batch reordering, topology
 
 SkipKV-like methods use hidden-state or activation signals to choose cache behavior or skip work.
 
-Use ActivationController for persistent/cross-layer activation state and SparseController for per-step decisions. Keep model layers generic and make layer-to-layer dependencies explicit.
+Use ActivationController for persistent/cross-layer activation state and a
+`SparseMethodRuntime` for per-step decisions. Keep the SparseController facade
+and model layers generic, and make layer-to-layer dependencies explicit.
 
 ## Query-Aware Paged Selection
 
@@ -64,3 +82,18 @@ Before subclassing or copying an existing method, compare:
 - supported models and topologies.
 
 Reuse is safe only when these mechanics match. Otherwise share a small helper or protocol implementation rather than inheriting incompatible lifecycle assumptions.
+
+Current runtime references are:
+
+| Mechanism | Runtime base | Methods to inspect |
+| --- | --- | --- |
+| Cache/provider-owned view | `PassThroughRuntime` | vanilla, QuEST |
+| Windowed physical retention | `StreamingLLMRuntime` | StreamingLLM |
+| Posthoc scored compaction | `ScoredCompactionRuntime` | SnapKV, PyramidKV |
+| Cumulative importance scoring | `H2ORuntime` | H2O |
+| Joint decode compaction | `JointDecodeRuntime` | R-KV, SkipKV |
+| Cross-layer dynamic selection | `DynamicSelectionRuntime` | OmniKV, DeltaKV |
+
+When a new method, including a native DSA model, does not match one row across
+score, selection, mutation, prefix, and graph semantics, create a new runtime
+instead of adding method-name branches to an existing one.

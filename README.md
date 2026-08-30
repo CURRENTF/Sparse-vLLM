@@ -163,9 +163,10 @@ See [Benchmarks](docs/en/benchmarking/README.md) for command examples and backen
 
 ## Contributing Sparse Methods
 
-New sparse methods should keep method-specific runtime state in
-`src/sparsevllm/engine/cache_manager/` and keep
-`src/sparsevllm/layers/attention.py` generic.
+New sparse methods should keep persistent physical cache state in
+`src/sparsevllm/engine/cache_manager/`, keep logical orchestration behind a
+`SparseMethodRuntime`, and keep `src/sparsevllm/layers/attention.py` generic.
+See the [sparse method runtime architecture](docs/en/design/sparse-method-runtime.md).
 
 
 ## Acknowledgements

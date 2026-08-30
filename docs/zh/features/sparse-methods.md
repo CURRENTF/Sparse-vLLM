@@ -74,10 +74,18 @@ processed logical token ID，以便文本 continuation 保持驻留的 BPE token
 
 ## Runtime 所有权
 
-- 方法特定的 runtime state 属于 `src/sparsevllm/engine/cache_manager/`。
-- 跨 layer observation 或 scheduling coordination 属于 `src/sparsevllm/engine/sparse_controller.py`。
+- 持久物理缓存和跟随 Prefix Cache 的元数据属于
+  `src/sparsevllm/engine/cache_manager/`。
+- 当前步骤的逐层逻辑状态、打分、跨层选择以及压缩/淘汰触发属于
+  `src/sparsevllm/engine/sparse_methods/` 下的
+  `SparseMethodRuntime`。
+- `src/sparsevllm/engine/sparse_controller.py` 是稳定、与方法无关的统一入口，
+  不得包含方法名热路径分支。
 - `src/sparsevllm/layers/attention.py` 应保持通用，只调用 shared hook。
 - 新的一等方法必须在 `src/sparsevllm/method_registry.py` 中注册默认 prefill policy，并在 `tests/test_prefill_schedule_policy.py` 中覆盖。
+
+完整的接口、职责划分、Prefix Cache、CUDA Graph 和扩展规则参见
+[稀疏方法运行时架构](../design/sparse-method-runtime.md)。
 
 ## Query-Aware 参数
 

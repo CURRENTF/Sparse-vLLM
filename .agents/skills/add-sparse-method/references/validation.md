@@ -9,6 +9,8 @@ Validate the declared contract in increasing cost order. Stop on failure; do not
 - Test every new registry capability and unsupported combination.
 - Test capacity, reservation, and prefill-mode calculations with boundary values.
 - Test selection and view construction against small deterministic tensors.
+- Test canonical method-to-`SparseMethodRuntime` construction and each lifecycle
+  hook whose behavior differs from its runtime base.
 - Test storage writes, compaction/reconstruction, and lifecycle state transitions independently of model execution where possible.
 
 Use the repository's focused tests rather than relying on import success or a single end-to-end prompt.
@@ -30,6 +32,10 @@ Relevant axes include:
 - required operator providers and optional dependencies.
 
 Compare selections, logical lengths, physical ownership, cache payloads, and attention outputs with a deterministic reference. Check invariants after every lifecycle transition, not only final logits.
+
+Verify that `SparseController`, Attention, ModelRunner, and Scheduler gained no
+method-name hot-path branches, and that persistent prefix-coupled metadata did
+not move from CacheManager into runtime state.
 
 ## 3. Model-Level And Quality Validation
 

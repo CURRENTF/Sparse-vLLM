@@ -12,9 +12,12 @@ The Sparse-vLLM inference path is:
 1. `sparsevllm.LLM(model, **kwargs)`
 2. `LLMEngine` validates kwargs against the canonical `Config` fields.
 3. `src/sparsevllm/config.py` validates engine config and method compatibility.
-4. `src/sparsevllm/engine/cache_manager/base.py` selects a cache manager.
-5. `Scheduler`, `ModelRunner`, `SparseController`, kernels, and the selected
-   cache manager execute prefill and decode.
+4. `CacheManager.create()` in `engine/cache_manager/base.py` selects a cache
+   manager, and `engine/sparse_methods/factory.py` selects the logical method
+   runtime.
+5. `Scheduler`, `ModelRunner`, the method-agnostic `SparseController`, its
+   selected `SparseMethodRuntime`, kernels, and the selected cache manager
+   execute prefill and decode.
 
 `src/sparsevllm/layers/attention.py` is intentionally generic. It writes K/V,
 asks the sparse controller for the logical read view, and lets the cache manager
@@ -22,12 +25,15 @@ customize decode-time views through hooks such as `build_decode_view(...)`.
 
 ## Method Ownership
 
-New Sparse-vLLM sparse methods should follow the cache-manager-first design:
+New Sparse-vLLM sparse methods should follow the cache-manager-first design and
+the [sparse method runtime architecture](sparse-method-runtime.md):
 
-- Method-specific runtime state belongs in
-  `src/sparsevllm/engine/cache_manager/<method>.py`.
-- Cross-layer observation or scheduling coordination belongs in
-  `src/sparsevllm/engine/sparse_controller.py`.
+- Persistent physical cache state and prefix-coupled metadata belong in
+  `src/sparsevllm/engine/cache_manager/`.
+- Per-step and cross-layer score/selection orchestration belongs in a
+  `src/sparsevllm/engine/sparse_methods/` runtime.
+- `src/sparsevllm/engine/sparse_controller.py` remains the stable generic
+  facade and must not grow method-name hot-path branches.
 - `src/sparsevllm/layers/attention.py` should only call generic hooks or shared
   kernels.
 - Public runtime arguments should use canonical names documented in
@@ -74,8 +80,11 @@ defaults. Add the method-to-policy mapping to the registry and update
 - `src/sparsevllm/config.py`: compatibility import facade for `Config`.
 - `src/sparsevllm/method_registry.py`: supported method names and prefill policy
   defaults.
-- `src/sparsevllm/engine/cache_manager/base.py`: method-to-cache-manager
-  routing and shared cache-manager hooks.
+- `src/sparsevllm/engine/cache_manager/base.py`: shared cache-manager contracts,
+  construction routing, and hooks.
+- `src/sparsevllm/engine/sparse_controller.py`: method-agnostic engine facade.
+- `src/sparsevllm/engine/sparse_methods/`: method runtime interface, factory,
+  per-step score/selection orchestration, and mechanism-specific runtimes.
 - `src/sparsevllm/engine/scheduler.py`: prefill/decode scheduling and admission.
 - `src/sparsevllm/layers/attention.py`: generic K/V storage and attention
   compute path.

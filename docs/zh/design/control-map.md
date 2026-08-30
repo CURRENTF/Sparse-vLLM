@@ -11,7 +11,10 @@
 
 ## 一句话模型
 
-Sparse-vLLM 是 sparse-first inference engine：`Scheduler` 决定运行什么，`ModelRunner` 执行，`Attention` 调用 generic hook，`CacheManager` 实现负责方法特定的 cache state、allocation、view、reconstruction 和 graph-stable metadata。
+Sparse-vLLM 是 sparse-first inference engine：`Scheduler` 决定运行什么，
+`ModelRunner` 执行，`SparseController` 把具体方法逻辑交给
+`SparseMethodRuntime`，`Attention` 只调用通用接口，`CacheManager` 负责物理
+缓存、空间分配、计算视图、数据重建和 CUDA Graph 使用的稳定元数据。
 
 对于 SnapKV、H2O、PyramidKV、R-KV 和 SkipKV 的 chain prefix cache，
 `ChainCacheIndex` 只负责逻辑生命周期，`ChainCacheCoordinator` 规划状态转换，
@@ -27,20 +30,23 @@ continuation 的准确 BPE identity 而保留紧凑逻辑 token ID；该历史�
 flowchart TD
     A["LLM(..., **kwargs)"] --> B["按 Config 字段校验 kwargs"]
     B --> C["Config.__post_init__: validate model, method, graph, budgets"]
-    C --> D["ModelRunner: load model, create CacheManager, SparseController"]
+    C --> D["ModelRunner: create CacheManager 与 SparseController"]
+    D --> DS["Runtime factory: bind one SparseMethodRuntime"]
     C --> E["Scheduler: waiting/decode queues and admission"]
     E --> F["LLMEngine.step"]
     F --> G["Scheduler.schedule"]
     G --> H["ModelRunner.run"]
     H --> I["CacheManager.prepare_step"]
     I --> J["SparseController.prepare_forward"]
-    J --> K["model layers"]
+    J --> JS["SparseMethodRuntime.prepare_step"]
+    JS --> K["model layers"]
     K --> L["Attention.forward"]
     L --> M["CacheManager store/view/reconstruct hooks"]
-    L --> N["SparseController read view and layer-end selection"]
+    L --> N["SparseController: Runtime 选择与逐层通知"]
     H --> O["Sampler"]
     H --> P["SparseController.post_forward"]
-    P --> Q["CacheManager eviction/compression hooks"]
+    P --> PS["SparseMethodRuntime.finish_step"]
+    PS --> Q["CacheManager eviction/compression hooks"]
     F --> R["Scheduler.postprocess and finished/free slots"]
 ```
 
@@ -54,8 +60,9 @@ flowchart TD
 | `src/sparsevllm/engine/scheduler.py` | Prefill/decode batching、长短请求分离、prompt admission、preemption。 | 使用 cache-manager budget hook，不了解方法内部实现。 |
 | `src/sparsevllm/engine/model_runner.py` | 模型加载、TP RPC、CUDA Graph runner、prepare/run/sample orchestration。 | 负责执行机制，不负责 token-selection policy。 |
 | `src/sparsevllm/engine/cache_manager/base.py` | Cache-manager interface 和方法 routing。 | 方法特定的 persistent state 属于该 interface 之后。 |
-| `src/sparsevllm/engine/cache_manager/*.py` | 各稀疏方法的 physical/logical KV state。 | 稀疏方法实现的主要位置。 |
-| `src/sparsevllm/engine/sparse_controller.py` | 跨 layer attention-score 收集、动态 token selection、post-forward compression trigger。 | Persistent method metadata 应保存在 cache manager，而不是这里。 |
+| `src/sparsevllm/engine/cache_manager/*.py` | 各稀疏方法的 physical/logical KV state。 | 持久物理方法实现的主要位置。 |
+| `src/sparsevllm/engine/sparse_controller.py` | 稳定、与方法无关的统一入口。 | 通过统一的 Runtime 请求和通知转交工作；不得增加方法名热路径分支。 |
+| `src/sparsevllm/engine/sparse_methods/` | Runtime 基类和 factory、当前步骤状态、打分、选择、跨层传递以及压缩/淘汰触发。 | 各方法的逻辑放在这里；长期物理状态仍属于 CacheManager。 |
 | `src/sparsevllm/layers/attention.py` | 通用 KV store、attention kernel dispatch 和 hook 调用。 | 必要时添加 generic hook；避免方法特定 branch。 |
 | `src/sparsevllm/kernels/triton/` | 仓库维护的 Triton kernel。 | shape/dtype 假设无效时，kernel wrapper 应快速失败。 |
 | `src/sparsevllm/kernels/tilelang/` | 仓库维护的 TileLang kernel 和 runtime binding。 | 编译和 launch 细节不能放入 operators。 |
@@ -69,18 +76,20 @@ flowchart TD
 | --- | --- | --- | --- |
 | Dense | `vanilla` / `""` | 完整 KV cache，无 sparse selection。 | `standard.py`、通用 attention path |
 | Streaming window | `streamingllm`, `attention-sink`, `attention_sink` | 物理淘汰，只保留 sink 加 recent token。 | `streamingllm.py`、`standard.py` 风格机制 |
-| SnapKV / PyramidKV | `snapkv`, `pyramidkv` | 基于 score 的 keep selection 后执行 physical eviction；PyramidKV 改变 per-layer budget。 | `snapkv.py`, `sparse_controller.py` |
-| OmniKV | `omnikv` | 根据 observation-layer score 构建 logical mask/view。`full_attention_layers=auto` 会解析可与 DeltaKV 共享的模型 profile；未登记模型应使用 `python -m sparsevllm.utils.select_omnikv_full_layers` 校准。 | `omnikv.py`, `sparse_controller.py`, `omnikv_fused.py` |
-| QuEST | `quest` | Query-aware decode page/chunk selection。 | `quest.py` |
-| DeltaKV | `deltakv` | 基于 compressor 的 hybrid cache：sparse full/reference pool 加 compressed latent state；已登记模型可与 OmniKV 共用 `full_attention_layers=auto` profile。 | `deltakv.py`, `deltakv_kernels.py` |
-| DeltaKV | `deltakv` 加 legacy `deltakv-less-memory*` alias | 基于 compressor 的精简 DeltaKV runtime，使用 graph-stable decode metadata。 | `deltakv_runtime.py`, `deltakv_less_memory*.py`, `deltakv_kernels.py` |
+| SnapKV / PyramidKV | `snapkv`, `pyramidkv` | 基于 score 的 keep selection 后执行 physical eviction；PyramidKV 改变 per-layer budget。 | `cache_manager/snapkv.py`, `sparse_methods/snapkv.py` |
+| OmniKV | `omnikv` | 根据 observation-layer score 构建 logical mask/view。`full_attention_layers=auto` 会解析可与 DeltaKV 共享的模型 profile；未登记模型应使用 `python -m sparsevllm.utils.select_omnikv_full_layers` 校准。 | `cache_manager/omnikv.py`, `sparse_methods/dynamic.py`, `omnikv_fused.py` |
+| QuEST | `quest` | Query-aware decode page/chunk selection；持久 page metadata 和原生 view 构造仍由 CacheManager/provider 持有。 | `cache_manager/quest.py`, `sparse_methods/passthrough.py` |
+| DeltaKV | `deltakv` | 基于 compressor 的 hybrid cache：sparse full/reference pool 加 compressed latent state；已登记模型可与 OmniKV 共用 `full_attention_layers=auto` profile。 | `cache_manager/deltakv*.py`, `sparse_methods/dynamic.py`, `deltakv_kernels.py` |
 
 ## 状态所有权 Contract
 
 - `Sequence` 持有 request-local counter：prompt length、prefilled length、当前 chunk size、generated token 数和 finished status。
 - `Scheduler` 持有 queue membership 和 admission decision。它必须向 cache manager 查询 cost、budget 和 full-prefill routing。
 - `CacheManager` 持有 physical slot、row map、full/sparse pool、compressed length、graph-stable metadata、临时 reconstruction slot 和方法 allocation 算术。
-- `SparseController` 持有 per-step、per-layer sparse state 和选中 index 的跨 layer 传播。它不应持有 long-lived cache metadata。
+- `SparseMethodRuntime` 持有当前步骤的逐层逻辑状态，并把选中位置传给后续层。
+  它不应持有长期缓存元数据。
+- `SparseController` 只提供稳定的引擎入口，并通过统一的 Runtime 请求和通知转交
+  具体方法逻辑。
 - `Attention` 不持有 policy 或 persistent state。它存储当前 K/V、请求 read view、运行 generic prefill/decode kernel，并调用 layer-end hook。
 - CUDA Graph runner 持有 graph capture/replay 机制；cache manager 提供 graph-stable buffer 和 plan reference。
 
@@ -90,8 +99,9 @@ flowchart TD
 | --- | --- | --- |
 | `src/sparsevllm/engine/cache_manager/deltakv_less_memory.py` | 体量很大的 direct-residual/full-layer-KIVI/static-graph 实现。 | 将其视为多个逻辑区域：allocation、prefill staging、full-layer KIVI、sparse raw/ref view、static decode plan、reconstruction/writeback。围绕改动区域添加测试。 |
 | `src/sparsevllm/engine/cache_manager/deltakv.py` | Compressor-backed V4 path 同时包含 clustering、latent storage、full pool、staging、reconstruction 和 graph hook。 | 避免外观性修改；改动时运行有针对性的原生 runtime 和 kernel 测试。 |
-| `src/sparsevllm/engine/sparse_controller.py` | OmniKV、DeltaKV、SnapKV、PyramidKV 的跨 layer policy、score dtype 和 debug capture 在此汇合。 | 不要加入新的 persistent state；这里只添加 orchestration 或 score/selection 逻辑。 |
-| `src/sparsevllm/layers/attention.py` | 文件不大，但所有方法都经过它，因此影响范围很大。 | 保持 method-agnostic。优先增加 cache-manager hook，而不是在此添加 branch。 |
+| `src/sparsevllm/engine/sparse_methods/dynamic.py` | OmniKV 与 DeltaKV 共用观察层打分，但选择结果和物理缓存格式不同。 | 保持共同的打分流程；缓存池和数据重建仍由各自 CacheManager 负责。 |
+| `src/sparsevllm/engine/sparse_methods/snapkv.py` | SnapKV 与 PyramidKV 共用打分压缩流程，但逐层预算和触发条件不同。 | 只复用确实相同的流程，保留各方法自己的边界行为。 |
+| `src/sparsevllm/layers/attention.py` | 文件不大，但所有方法都经过它，因此影响范围很大。 | 保持与方法无关。优先增加通用 CacheManager hook，不要直接增加方法分支。 |
 
 ## 改动护栏
 
@@ -99,11 +109,16 @@ flowchart TD
 
 1. 确认原生 Sparse-vLLM runtime 入口与参数。
 2. 确认 method family 和 graph mode：eager、decode graph、prefill graph 或两者。
-3. 确认 state owner。跨 step 持续存在的状态属于 cache manager。
+3. 确认状态归属。持久物理状态和跟随 Prefix Cache 的状态属于 CacheManager；
+   当前步骤和跨层传递的逻辑状态属于 SparseMethodRuntime。
 4. 新配置不要使用 legacy public runtime name。使用 `sparse_method`、`deltakv_checkpoint_path`、`decode_keep_tokens`、`sink_keep_tokens`、`recent_keep_tokens`、`full_attention_layers` 和 `engine_prefill_chunk_size`。
 5. Sparse-vLLM keep budget 是 token count，不是 ratio。
 6. 所有 fallback 都必须显式且有文档记录。不要静默忽略错误 config、缺失 checkpoint、缺失 dataset、parse failure 或 metric failure。
-7. 新增或重构稀疏方法时，保持 cache-manager-first：`attention.py` 通用、方法状态不放在 `utils/`，方法 default 注册到 `src/sparsevllm/method_registry.py`。
+7. 新增或重构稀疏方法时，遵守
+   [稀疏方法运行时架构](sparse-method-runtime.md)：`attention.py` 通用、
+   Controller 保持通用、持久物理状态属于 CacheManager、打分和选择逻辑属于
+   Runtime，方法默认值注册到
+   `src/sparsevllm/method_registry.py`。
 
 ## 最小本地检查
 

@@ -29,14 +29,22 @@ The registry describes static capabilities. Do not put mutable runtime state or 
 
 ## Runtime Construction And Control Plane
 
+Read the
+[official runtime architecture](../../../../docs/en/design/sparse-method-runtime.md)
+(or its [Chinese mirror](../../../../docs/zh/design/sparse-method-runtime.md))
+before choosing an owner. `SparseController` is the stable facade; method-owned
+logical behavior lives behind the `SparseMethodRuntime` interface.
+
 | Owner | Typical responsibilities |
 | --- | --- |
 | `src/sparsevllm/engine/model_runner.py` | Construct and connect generic runtime components. Inspect wiring; avoid method-name branches. |
 | `src/sparsevllm/engine/runtime_state.py` | Expose runtime capacity, lifecycle, and scheduling-facing state. |
-| `src/sparsevllm/engine/cache_manager/factory.py` | Select the registered cache manager implementation. |
-| `src/sparsevllm/engine/cache_manager/base.py` | Shared allocation, typed view, and lifecycle contracts. Extend narrowly. |
+| `src/sparsevllm/engine/cache_manager/base.py` | `CacheManager.create()` construction routing plus shared allocation, typed view, and lifecycle contracts. Extend narrowly. |
 | `src/sparsevllm/engine/cache_manager/` | Persistent method state, physical mutation, metadata, and view materialization. |
-| `src/sparsevllm/engine/sparse_controller.py` | Per-step/cross-layer score and selection orchestration. |
+| `src/sparsevllm/engine/sparse_controller.py` | Method-agnostic engine facade and typed lifecycle delegation. Keep it free of method algorithms and method-name hot-path branches. |
+| `src/sparsevllm/engine/sparse_methods/base.py` | Typed runtime contexts/events, current-step state, common score preparation, and the `SparseMethodRuntime` contract. |
+| `src/sparsevllm/engine/sparse_methods/factory.py` | Explicit canonical method-to-runtime construction binding. |
+| `src/sparsevllm/engine/sparse_methods/` | Mechanism-specific per-step/cross-layer score and selection orchestration. |
 | `src/sparsevllm/engine/activation_controller.py` | Hidden-state capture and activation-based method state. |
 | `src/sparsevllm/engine/scheduler.py` via `MemoryOracle` | Consume generic capacity, reservation, batching, and execution-mode contracts. |
 
@@ -84,6 +92,8 @@ Inspect before editing:
 
 - focused unit tests near config, registry, cache manager, scheduler, storage, and operators;
 - method evaluation scripts/configs and documented model/assets;
+- the official sparse method runtime architecture or its Chinese mirror for
+  runtime ownership and extension rules;
 - `docs/en/benchmarking/efficiency.md` or the Chinese equivalent for performance runs;
 - public method documentation and support matrices.
 

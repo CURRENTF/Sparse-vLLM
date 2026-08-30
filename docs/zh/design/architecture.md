@@ -11,17 +11,24 @@ Sparse-vLLM inference path：
 1. `sparsevllm.LLM(model, **kwargs)`
 2. `LLMEngine` 按规范 `Config` 字段校验 kwargs。
 3. `src/sparsevllm/config.py` 验证 engine config 和方法兼容性。
-4. `src/sparsevllm/engine/cache_manager/base.py` 选择 cache manager。
-5. `Scheduler`、`ModelRunner`、`SparseController`、kernel 和选中的 cache manager 执行 prefill 与 decode。
+4. `engine/cache_manager/base.py` 中的 `CacheManager.create()` 选择 cache
+   manager，`engine/sparse_methods/factory.py` 选择逻辑方法 runtime。
+5. `Scheduler`、`ModelRunner`、通用 `SparseController`、选中的
+   `SparseMethodRuntime`、kernel 和 cache manager 执行 prefill 与 decode。
 
 `src/sparsevllm/layers/attention.py` 有意保持通用。它写入 K/V，向 sparse controller 请求 logical read view，并允许 cache manager 通过 `build_decode_view(...)` 等 hook 自定义 decode-time view。
 
 ## 方法所有权
 
-新增 Sparse-vLLM 稀疏方法应遵循 cache-manager-first 设计：
+新增 Sparse-vLLM 稀疏方法应遵循 cache-manager-first 设计和
+[稀疏方法运行时架构](sparse-method-runtime.md)：
 
-- 方法特定的 runtime state 属于 `src/sparsevllm/engine/cache_manager/<method>.py`。
-- 跨 layer observation 或 scheduling coordination 属于 `src/sparsevllm/engine/sparse_controller.py`。
+- 持久物理缓存和跟随 Prefix Cache 的元数据属于
+  `src/sparsevllm/engine/cache_manager/`。
+- 当前推理步骤中的打分、选择和跨层协调属于
+  `src/sparsevllm/engine/sparse_methods/` 下的 runtime。
+- `src/sparsevllm/engine/sparse_controller.py` 保持稳定的统一入口，不得增加
+  方法名热路径分支。
 - `src/sparsevllm/layers/attention.py` 只应调用 generic hook 或 shared kernel。
 - Public runtime 参数应使用[运行时参数语义](../configuration/runtime-parameter-semantics.md)中记录的规范名称。
 
@@ -43,9 +50,13 @@ DeltaKV 和 PyramidKV 通过 `prefill_execution_mode()` 实现 long branch。thr
 ## 重要文件
 
 - `src/sparsevllm/configs/groups.py` 与 `runtime.py`：定义规范 runtime 字段、default 和 validation；public 与 internal 名称完全一致。
-- `src/sparsevllm/config.py`：`Config` 的 compatibility import facade。
+- `src/sparsevllm/config.py`：`Config` 的兼容导入入口。
 - `src/sparsevllm/method_registry.py`：支持的方法名和 prefill policy default。
-- `src/sparsevllm/engine/cache_manager/base.py`：method-to-cache-manager routing 和 shared cache-manager hook。
+- `src/sparsevllm/engine/cache_manager/base.py`：公共 CacheManager 接口、构造入口
+  和通用 hook。
+- `src/sparsevllm/engine/sparse_controller.py`：与方法无关的引擎统一入口。
+- `src/sparsevllm/engine/sparse_methods/`：方法 runtime interface、factory、
+  当前步骤的打分/选择协调和各类方法 runtime。
 - `src/sparsevllm/engine/scheduler.py`：prefill/decode scheduling 和 admission。
 - `src/sparsevllm/layers/attention.py`：通用 K/V storage 和 attention compute path。
 - `benchmark/`：LongBench、MathBench、SCBench、NIAH 和多模态 benchmark 入口。

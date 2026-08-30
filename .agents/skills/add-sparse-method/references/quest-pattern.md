@@ -7,7 +7,7 @@ Use this reference only when the method performs query-aware logical selection o
 A QuEST-like integration usually has three distinct pieces:
 
 1. CacheManager owns page metadata and keeps it synchronized with allocation, append, prefix attach/fork/restore, eviction, and free.
-2. SparseController or the method's selection path computes query-dependent page/token selection with an explicit score contract.
+2. The method's runtime or cache/provider-owned selection path computes query-dependent page/token selection with an explicit score contract; `SparseController` only delegates the generic lifecycle.
 3. CacheManager turns the selection into a typed decode view consumed by generic attention.
 
 Keep query-dependent scratch state separate from persistent page metadata. Document tensor shapes, head grouping, page indexing, and whether scores describe logical tokens, physical slots, or pages.

@@ -96,14 +96,22 @@ explicit ablation and document it with the benchmark result.
 
 ## Runtime Ownership
 
-- Method-specific runtime state belongs in `src/sparsevllm/engine/cache_manager/`.
-- Cross-layer observation or scheduling coordination belongs in
-  `src/sparsevllm/engine/sparse_controller.py`.
+- Persistent physical cache state and prefix-coupled metadata belong in
+  `src/sparsevllm/engine/cache_manager/`.
+- Per-step/per-layer logical state, score orchestration, cross-layer selection,
+  and mutation triggers belong in a `SparseMethodRuntime` under
+  `src/sparsevllm/engine/sparse_methods/`.
+- `src/sparsevllm/engine/sparse_controller.py` is the stable method-agnostic
+  facade and must not contain method-name hot-path branches.
 - `src/sparsevllm/layers/attention.py` should stay generic and call shared
   hooks.
 - New first-class methods must register their default prefill policy in
   `src/sparsevllm/method_registry.py` and cover it in
   `tests/test_prefill_schedule_policy.py`.
+
+See the [sparse method runtime architecture](../design/sparse-method-runtime.md)
+for the complete interface, ownership, prefix-cache, CUDA Graph, and extension
+contract.
 
 ## Query-Aware Knobs
 

@@ -1,13 +1,18 @@
 ---
 name: add-sparse-method
-description: Add or refactor a first-class Sparse-vLLM sparse method across configuration, capability registration, cache and controller ownership, scheduler admission, typed attention views, model and storage compatibility, CUDA Graph and prefix-cache lifecycles, operators, and reproducible validation. Use for a new canonical sparse_method or an integration whose sparse runtime semantics change; do not use for a kernel/provider optimization that leaves method semantics unchanged.
+description: Add or refactor a first-class Sparse-vLLM sparse method across configuration, capability registration, cache and SparseMethodRuntime ownership, scheduler admission, typed attention views, model and storage compatibility, CUDA Graph and prefix-cache lifecycles, operators, and reproducible validation. Use for a new canonical sparse_method or an integration whose sparse runtime semantics change; do not use for a kernel/provider optimization that leaves method semantics unchanged.
 ---
 
 # Add Sparse Method
 
 Treat a sparse method as a runtime capability contract, not as a file template. Start from the method's semantics, route each responsibility to its existing owner, and add only the narrow contracts the method actually needs.
 
-Always read [references/file-map.md](references/file-map.md) before editing. It maps the current architecture and distinguishes files to inspect from files that usually need modification.
+Always read the
+[official runtime architecture](../../../docs/en/design/sparse-method-runtime.md)
+(or its [Chinese mirror](../../../docs/zh/design/sparse-method-runtime.md)) and
+[references/file-map.md](references/file-map.md) before editing. The official
+document defines the stable runtime boundary; the file map distinguishes files
+to inspect from files that usually need modification.
 
 ## 1. Classify The Change
 
@@ -44,19 +49,38 @@ Preserve these boundaries:
 - Define canonical runtime fields in `configs/groups.py` or `configs/runtime.py`, use the same names in public and internal code, and reject unknown inputs at the engine boundary. Keep composed validation in the relevant config group, not the compatibility facade `config.py`.
 - Register static method capabilities, aliases, schedule defaults, score contracts, model/topology compatibility, prefix-cache support, graph support, and assets in `method_registry.py`.
 - Keep persistent cache-coupled method state, physical allocation, eviction/compaction, and attention-view materialization in `engine/cache_manager/`.
-- Keep per-step and cross-layer score/selection orchestration in `engine/sparse_controller.py`.
+- Keep `engine/sparse_controller.py` as the stable method-agnostic facade. It
+  constructs typed lifecycle requests/events and delegates; do not place method
+  algorithms or method-name hot-path branches there.
+- Keep per-step/per-layer logical state, score workspace orchestration,
+  cross-layer observation/selection, and mutation triggers in an
+  `engine/sparse_methods/` `SparseMethodRuntime`.
 - Keep hidden-state capture and activation reuse in `engine/activation_controller.py`.
 - Expose admission budgets, reservation costs, execution modes, and lifecycle state through `RuntimeState` and `MemoryOracle`; the scheduler consumes this generic contract.
 - Pass typed selections, views, payloads, and writes through the cache/attention boundary. Keep `layers/attention.py` and model attention call sites method-agnostic.
 - Let `ModelSpec`, `RuntimeLayout`, `ParallelTopology`, and storage protocols own physical cache layout compatibility. A sparse method does not own the model's KV representation.
 
-Do not add method-name branches to Attention, Scheduler, or ModelRunner. If a method requires behavior not expressible by an existing generic contract, add the smallest typed hook at the owning boundary. Do not introduce a broad strategy framework solely to avoid one local branch.
+Do not add method-name branches to `SparseController`, Attention, Scheduler, or
+ModelRunner. If a method requires behavior not expressible by an existing
+generic contract, add the smallest typed hook at the owning boundary. The
+existing `SparseMethodRuntime` interface is the logical strategy boundary; do
+not introduce a second broad strategy framework.
 
-## 4. Choose A Mechanism, Not An Inheritance Parent
+## 4. Choose A Runtime Mechanism, Not A Method Name
 
 Read [references/method-families.md](references/method-families.md), then select reference implementations by shared mechanics: logical view, physical compaction, scored selection, query-aware paged selection, activation reuse, or compressed/multi-pool storage.
 
-Existing Python inheritance often represents incidental code reuse rather than a stable method taxonomy. Reuse a base only after verifying that allocation, state, admission, graph, prefix, and storage semantics are all compatible.
+Select or add a runtime by shared logical mechanics. The current shallow runtime
+families include pass-through, scored compaction, joint decode compaction, and
+dynamic cross-layer selection. Reuse a runtime base only after verifying score
+representation, trigger order, selection domain, mutation order, graph buffer
+lifetime, and prefix behavior.
+
+CacheManager inheritance is a separate physical-storage axis. Do not choose a
+runtime parent because two methods share a CacheManager base, and do not choose
+a CacheManager parent because two methods share runtime orchestration. If the
+full lifecycle does not match, add a separate implementation and share only a
+narrow helper.
 
 For QuEST-like query-aware selection over explicit paged KV, also read [references/quest-pattern.md](references/quest-pattern.md). Do not apply that pattern to MLA latent or custom payload methods without proving the same view contract is valid.
 
@@ -91,7 +115,7 @@ Use `build_decode_view` when the method only changes the logical explicit-KV vie
 - Keep local benchmark profiles separate from atomic correctness eligibility.
   A method-specific measurement may add an exact dispatch route; it must not
   narrow an upstream provider's standard support domain.
-- Invoke method-internal selection, metadata, compaction, compression, or reconstruction kernels from the state owner, usually CacheManager or SparseController.
+- Invoke method-internal selection, metadata, compaction, compression, or reconstruction kernels from the state owner, usually CacheManager or a `SparseMethodRuntime`, never from the controller facade merely because it is globally reachable.
 - Keep kernel adapters thin and keep policy, allocation, and lifecycle decisions out of kernel modules.
 - Do not silently fall back to another provider or dense behavior. Any fallback must be an explicit registered capability with tested semantics.
 
@@ -106,7 +130,8 @@ Implement the smallest vertical slice in this order:
 1. Canonical public configuration and static registry contract.
 2. Model/storage/topology validation.
 3. State ownership, allocation, and lifecycle operations.
-4. Score/selection orchestration and typed view construction.
+4. `SparseMethodRuntime` score/selection orchestration, runtime factory binding,
+   and typed view construction.
 5. Scheduler admission and prefill execution semantics.
 6. Operator/provider or method-internal kernels, if required.
 7. Prefix-cache, CUDA Graph, and offload integration for every advertised capability.

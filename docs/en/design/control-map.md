@@ -18,8 +18,9 @@ before reporting results.
 ## One Sentence Model
 
 Sparse-VLLM is a sparse-first inference engine where `Scheduler` decides what
-runs, `ModelRunner` executes it, `Attention` calls generic hooks, and
-`CacheManager` implementations own method-specific cache state, allocation,
+runs, `ModelRunner` executes it, `SparseController` delegates logical method
+semantics to a `SparseMethodRuntime`, `Attention` calls generic hooks, and
+`CacheManager` implementations own method-specific physical state, allocation,
 views, reconstruction, and graph-stable metadata.
 
 For SnapKV, H2O, PyramidKV, R-KV, and SkipKV chain prefix caching,
@@ -37,20 +38,23 @@ history is capacity-bounded and is not part of the physical KV payload.
 flowchart TD
     A["LLM(..., **kwargs)"] --> B["validate kwargs against Config fields"]
     B --> C["Config.__post_init__: validate model, method, graph, budgets"]
-    C --> D["ModelRunner: load model, create CacheManager, SparseController"]
+    C --> D["ModelRunner: create CacheManager and SparseController"]
+    D --> DS["Runtime factory: bind one SparseMethodRuntime"]
     C --> E["Scheduler: waiting/decode queues and admission"]
     E --> F["LLMEngine.step"]
     F --> G["Scheduler.schedule"]
     G --> H["ModelRunner.run"]
     H --> I["CacheManager.prepare_step"]
     I --> J["SparseController.prepare_forward"]
-    J --> K["model layers"]
+    J --> JS["SparseMethodRuntime.prepare_step"]
+    JS --> K["model layers"]
     K --> L["Attention.forward"]
     L --> M["CacheManager store/view/reconstruct hooks"]
-    L --> N["SparseController read view and layer-end selection"]
+    L --> N["SparseController facade: runtime selection and layer hooks"]
     H --> O["Sampler"]
     H --> P["SparseController.post_forward"]
-    P --> Q["CacheManager eviction/compression hooks"]
+    P --> PS["SparseMethodRuntime.finish_step"]
+    PS --> Q["CacheManager eviction/compression hooks"]
     F --> R["Scheduler.postprocess and finished/free slots"]
 ```
 
@@ -64,8 +68,9 @@ flowchart TD
 | `src/sparsevllm/engine/scheduler.py` | Prefill execution-mode batching, decode long/short separation, prompt admission, preemption. | Uses cache-manager mode and budget hooks instead of knowing method internals. |
 | `src/sparsevllm/engine/model_runner.py` | Model load, TP RPC, CUDA graph runners, prepare/run/sample orchestration. | Owns execution mechanics, not token-selection policy. |
 | `src/sparsevllm/engine/cache_manager/base.py` | Cache-manager interface and method routing. | Method-specific persistent state belongs behind this interface. |
-| `src/sparsevllm/engine/cache_manager/*.py` | Physical/logical KV state for each sparse method. | This is the primary place for sparse-method implementation. |
-| `src/sparsevllm/engine/sparse_controller.py` | Cross-layer attention-score collection, dynamic token selection, post-forward compression triggers. | Keep persistent method metadata in cache managers, not here. |
+| `src/sparsevllm/engine/cache_manager/*.py` | Physical/logical KV state for each sparse method. | This is the primary place for persistent physical method implementation. |
+| `src/sparsevllm/engine/sparse_controller.py` | Stable method-agnostic lifecycle facade. | Delegate through typed runtime requests/events; do not add method-name hot-path branches. |
+| `src/sparsevllm/engine/sparse_methods/` | Runtime ABC/factory, current-step state, score/selection orchestration, cross-layer propagation, and mutation triggers. | Split method mechanics here while keeping persistent physical state in cache managers. |
 | `src/sparsevllm/layers/attention.py` | Generic KV store + attention kernel dispatch + hook calls. | Add generic hooks if needed; avoid method-specific branches. |
 | `src/sparsevllm/kernels/triton/` | Repository-owned Triton kernels. | Kernel wrappers should fail fast on invalid shape/dtype assumptions. |
 | `src/sparsevllm/kernels/tilelang/` | Repository-owned TileLang kernels and runtime bindings. | Keep compilation and launch details out of operators. |
@@ -79,11 +84,10 @@ flowchart TD
 | --- | --- | --- | --- |
 | Dense | `vanilla` / `""` | Full KV cache, no sparse selection. | `standard.py`, generic attention path |
 | Streaming window | `streamingllm`, `attention-sink`, `attention_sink` | Physical eviction to sink + recent tokens. | `streamingllm.py`, `standard.py`-style mechanics |
-| SnapKV / PyramidKV | `snapkv`, `pyramidkv` | Physical eviction after score-based keep selection; PyramidKV changes per-layer budgets. | `snapkv.py`, `sparse_controller.py` |
-| OmniKV | `omnikv` | Logical masking/view building from observation-layer scores. `full_attention_layers=auto` resolves a model profile that may be shared with DeltaKV; unregistered models should be calibrated with `python -m sparsevllm.utils.select_omnikv_full_layers`. | `omnikv.py`, `sparse_controller.py`, `omnikv_fused.py` |
-| QuEST | `quest` | Query-aware decode page/chunk selection. | `quest.py` |
-| DeltaKV | `deltakv` | Compressor-backed hybrid cache: sparse full/reference pool plus compressed latent state. Registered models may share OmniKV's `full_attention_layers=auto` profile. | `deltakv.py`, `deltakv_kernels.py` |
-| DeltaKV | `deltakv` plus legacy `deltakv-less-memory*` aliases | Slim compressor-backed DeltaKV runtime with graph-stable decode metadata. | `deltakv_runtime.py`, `deltakv_less_memory*.py`, `deltakv_kernels.py` |
+| SnapKV / PyramidKV | `snapkv`, `pyramidkv` | Physical eviction after score-based keep selection; PyramidKV changes per-layer budgets. | `cache_manager/snapkv.py`, `sparse_methods/snapkv.py` |
+| OmniKV | `omnikv` | Logical masking/view building from observation-layer scores. `full_attention_layers=auto` resolves a model profile that may be shared with DeltaKV; unregistered models should be calibrated with `python -m sparsevllm.utils.select_omnikv_full_layers`. | `cache_manager/omnikv.py`, `sparse_methods/dynamic.py`, `omnikv_fused.py` |
+| QuEST | `quest` | Query-aware decode page/chunk selection; persistent page metadata and native view construction remain cache-manager/provider owned. | `cache_manager/quest.py`, `sparse_methods/passthrough.py` |
+| DeltaKV | `deltakv` | Compressor-backed hybrid cache: sparse full/reference pool plus compressed latent state. Registered models may share OmniKV's `full_attention_layers=auto` profile. | `cache_manager/deltakv*.py`, `sparse_methods/dynamic.py`, `deltakv_kernels.py` |
 
 ## State Ownership Contracts
 
@@ -94,8 +98,10 @@ flowchart TD
 - `CacheManager` owns physical slots, row maps, full/sparse pools, compressed
   lengths, graph-stable metadata, temporary reconstruction slots, and method
   allocation arithmetic.
-- `SparseController` owns per-step, per-layer sparse state and cross-layer
+- `SparseMethodRuntime` owns per-step, per-layer logical state and cross-layer
   propagation of selected indices. It should not own long-lived cache metadata.
+- `SparseController` owns only the stable engine-facing lifecycle and delegates
+  logical method behavior through typed runtime requests and events.
 - `Attention` owns neither policy nor persistent state. It stores current K/V,
   asks for the read view, runs generic prefill/decode kernels, and invokes
   layer-end hooks.
@@ -108,7 +114,8 @@ flowchart TD
 | --- | --- | --- |
 | `src/sparsevllm/engine/cache_manager/deltakv_less_memory.py` | Very large direct-residual/full-layer-KIVI/static-graph implementation. | Treat as several logical regions: allocation, prefill staging, full-layer KIVI, sparse raw/ref views, static decode plan, reconstruction/writeback. Add tests around the region touched. |
 | `src/sparsevllm/engine/cache_manager/deltakv.py` | Compressor-backed V4 path combines clustering, latent storage, full pool, staging, reconstruction, and graph hooks. | Avoid cosmetic edits. Change only with focused native runtime and kernel tests. |
-| `src/sparsevllm/engine/sparse_controller.py` | Cross-layer policy for OmniKV, DeltaKV, SnapKV, PyramidKV, score dtype, and debug capture all meet here. | Keep new persistent state out. Only add orchestration or score/selection logic here. |
+| `src/sparsevllm/engine/sparse_methods/dynamic.py` | OmniKV and DeltaKV share observation-layer scoring but differ in logical selection and physical payload semantics. | Preserve the shared score lifecycle; keep pool/reconstruction ownership in each cache manager. |
+| `src/sparsevllm/engine/sparse_methods/snapkv.py` | SnapKV and PyramidKV share scored compaction while using different layer budgets and triggers. | Reuse only the common lifecycle and preserve method-specific boundary behavior. |
 | `src/sparsevllm/layers/attention.py` | Small enough, but high blast radius because every method passes through it. | Keep it method-agnostic. Prefer adding a cache-manager hook over adding a branch here. |
 ## Change Guardrails
 
@@ -117,8 +124,9 @@ Before changing Sparse-VLLM runtime code:
 1. Identify the affected native Sparse-vLLM runtime path.
 2. Identify the method family and graph mode: eager, decode graph, prefill
    graph, or both.
-3. Identify the state owner. If the state persists across steps, it belongs in
-   a cache manager.
+3. Identify the state owner. Persistent physical/prefix-coupled state belongs
+   in a cache manager; current-step/cross-layer logical state belongs in a
+   sparse method runtime.
 4. Do not use legacy public runtime names in new configs. Use
    `sparse_method`, `deltakv_checkpoint_path`, `decode_keep_tokens`,
    `sink_keep_tokens`, `recent_keep_tokens`, `full_attention_layers`, and
@@ -127,9 +135,11 @@ Before changing Sparse-VLLM runtime code:
 6. Any fallback must be explicit and documented. Do not silently ignore bad
    configs, missing checkpoints, missing datasets, failed parses, or failed
    metrics.
-7. If adding or refactoring a sparse method, keep the implementation
-   cache-manager first: generic `attention.py`, method state out of `utils/`,
-   and method defaults registered in `src/sparsevllm/method_registry.py`.
+7. If adding or refactoring a sparse method, follow the
+   [sparse method runtime architecture](sparse-method-runtime.md): generic
+   `attention.py`, a method-agnostic controller facade, persistent physical
+   state in cache managers, logical orchestration in runtimes, and defaults in
+   `src/sparsevllm/method_registry.py`.
 
 ## Minimal Local Checks
 
