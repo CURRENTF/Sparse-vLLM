@@ -18,6 +18,7 @@ from sparsevllm.kernels.external.sgl.fa3 import (
 )
 from sparsevllm.kernels.tilelang.mla.runtime import (
     TileMlaDecodeKernel,
+    TileMlaLaunchConfig,
     TileMlaLaunchPlan,
     tilelang_mla_support,
 )
@@ -70,6 +71,7 @@ class MlaAttentionOpSpec:
     score_output: AttentionScoreKind = AttentionScoreKind.NONE
     batch_only_cuda_graph: bool = False
     context_capacity: int | None = None
+    batch_capacity: int | None = None
 
     def __post_init__(self) -> None:
         dimensions = {
@@ -90,6 +92,8 @@ class MlaAttentionOpSpec:
             )
         if self.context_capacity is not None and self.context_capacity <= 0:
             raise ValueError("MLA context_capacity must be positive.")
+        if self.batch_capacity is not None and self.batch_capacity <= 0:
+            raise ValueError("MLA batch_capacity must be positive.")
         if self.score_output not in {
             AttentionScoreKind.NONE,
             AttentionScoreKind.RAW_QK_PER_HEAD,
@@ -148,7 +152,10 @@ MLA_ATTENTION_REGISTRY: OpRegistry[
         upstream_standard=("sgl_fa3_sm90",),
         repo_nonstandard=("triton_sm90",),
     ),
-    profile_order=("tilelang_score_sgl_fa3_h100_profile",),
+    profile_order=(
+        "tilelang_output_h100_quest_bs4_profile",
+        "tilelang_score_sgl_fa3_h100_profile",
+    ),
 )
 
 
@@ -748,6 +755,163 @@ class MlaSglFa3Provider(MlaTritonProvider):
     ProviderRole.REPO_NONSTANDARD,
     profile_only=True,
 )
+class MlaTileLangOutputProvider(MlaSglFa3Provider):
+    """TileLang decode output with FA3 retained for explicit prefill."""
+
+    name = "tilelang_output_h100_quest_bs4"
+
+    def __init__(
+        self,
+        *,
+        op_spec: MlaAttentionOpSpec,
+        device: torch.device | str,
+        max_batch_size: int,
+        launch_config: MlaDecodeLaunchConfig | None = None,
+    ) -> None:
+        super().__init__(
+            op_spec=op_spec,
+            device=device,
+            max_batch_size=max_batch_size,
+            launch_config=launch_config,
+        )
+        self.tilelang_output = TileMlaDecodeKernel(
+            device=self.device,
+            softmax_scale=self.spec.softmax_scale,
+            valid_heads=self.spec.local_q_heads,
+            fixed_config=TileMlaLaunchConfig(num_split=32),
+        )
+
+    @classmethod
+    def supports(
+        cls,
+        spec: MlaAttentionOpSpec,
+        caps: DeviceCaps,
+    ) -> SupportResult:
+        base = MlaSglFa3Provider.supports(spec, caps)
+        if not base.supported:
+            return base
+        if spec.context_capacity is None or spec.batch_capacity is None:
+            return SupportResult.unsupported(
+                "requires static decode context and batch capacities"
+            )
+        supported, reason = tilelang_mla_support()
+        return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            "implementation_kind": "composite_provider",
+            "implementation_source": "tilelang+sglang-kernel",
+            "decode_kernel_path": "tilelang_mla_decode",
+            "prefill_kernel_path": "sgl_kernel.fa3.fwd",
+            "tilelang_num_split": 32,
+            "profile_context_capacity": self.spec.context_capacity,
+            "profile_batch_capacity": self.spec.batch_capacity,
+        }
+
+    def runtime_kernel_stats(self) -> dict[str, object]:
+        return {
+            **super().runtime_kernel_stats(),
+            "tilelang": self.tilelang_output.runtime_metadata(),
+        }
+
+    @torch.no_grad()
+    def run(
+        self,
+        q_nope_absorbed: torch.Tensor,
+        q_rope: torch.Tensor,
+        view: DecodeComputeView,
+        output: torch.Tensor,
+        *,
+        validation_scope: object | None = None,
+        valid_batch_size: int | None = None,
+    ) -> torch.Tensor:
+        if view.meta.attn_score is not None:
+            raise RuntimeError(
+                "TileLang output-only MLA received an attention-score request."
+            )
+        payload = self._validate_run_inputs(
+            q_nope_absorbed,
+            q_rope,
+            view,
+            output,
+        )
+        self._validate_metadata(
+            view,
+            payload,
+            validation_scope=validation_scope,
+            valid_batch_size=valid_batch_size,
+        )
+        if view.meta.max_context_len is None:
+            raise ValueError("TileLang MLA requires max_context_len in the decode view.")
+        self._record_runtime_kernel_path("tilelang_output")
+        return self.tilelang_output(
+            q_nope_absorbed,
+            q_rope,
+            payload.latent_cache,
+            payload.rope_cache,
+            view.meta.active_slots,
+            view.meta.req_indices,
+            view.meta.context_lens,
+            output,
+            attn_score=None,
+            max_context_len=int(view.meta.max_context_len),
+        )
+
+
+@MLA_ATTENTION_REGISTRY.register_profile
+class MlaTileLangOutputQuestBs4Profile:
+    name = "tilelang_output_h100_quest_bs4_profile"
+
+    @classmethod
+    def atomic_provider_names(cls, spec: MlaAttentionOpSpec) -> tuple[str, ...]:
+        del spec
+        return ("tilelang_output_h100_quest_bs4",)
+
+    @classmethod
+    def matches(
+        cls,
+        spec: MlaAttentionOpSpec,
+        caps: DeviceCaps,
+    ) -> ProfileMatch:
+        expected = (
+            _PROFILED_H100_NAME,
+            2,
+            AttentionScoreKind.NONE,
+            True,
+            2048,
+            4,
+        )
+        actual = (
+            caps.device_name,
+            spec.tp_size,
+            spec.score_output,
+            spec.batch_only_cuda_graph,
+            spec.context_capacity,
+            spec.batch_capacity,
+        )
+        if actual != expected:
+            return ProfileMatch.no(
+                "requires exact H100 TP2 score-free batch-only graph profile "
+                "with context_capacity=2048 and batch_capacity=4, got "
+                f"device={caps.device_name} tp={spec.tp_size} "
+                f"score={spec.score_output.name} "
+                f"batch_only={spec.batch_only_cuda_graph} "
+                f"context={spec.context_capacity} batch={spec.batch_capacity}"
+            )
+        return ProfileMatch.yes(
+            "matched H100 TP2 QuEST BS4 2048-token TileLang profile"
+        )
+
+    @classmethod
+    def bind(cls, spec: MlaAttentionOpSpec, caps: DeviceCaps, **kwargs):
+        del spec, caps
+        return MlaTileLangOutputProvider(**kwargs)
+
+
+@MLA_ATTENTION_REGISTRY.register_atomic(
+    ProviderRole.REPO_NONSTANDARD,
+    profile_only=True,
+)
 class MlaTileLangScoreProvider(MlaSglFa3Provider):
     """Score-aware Composite over FA3 and statically planned TileLang."""
 
@@ -993,6 +1157,7 @@ __all__ = [
     "MlaAttentionOpSpec",
     "MlaAttentionProvider",
     "MlaSglFa3Provider",
+    "MlaTileLangOutputProvider",
     "MlaTileLangScoreProvider",
     "MlaTritonProvider",
     "resolve_mla_attention_provider",
