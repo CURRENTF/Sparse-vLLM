@@ -138,7 +138,6 @@ class BindingReport:
     selected_reason: str
     candidates: tuple[ProviderDecision, ...]
     profiles: tuple[ProfileDecision, ...] = ()
-    validation_evidence: _FrozenMapping = _FrozenMapping(())
     provider_metadata: _FrozenMapping = _FrozenMapping(())
 
     @property
@@ -160,7 +159,6 @@ class BindingReport:
             "selected_reason": self.selected_reason,
             "candidates": [candidate.as_dict() for candidate in self.candidates],
             "profiles": [profile.as_dict() for profile in self.profiles],
-            "validation_evidence": _thaw_snapshot(self.validation_evidence),
             "provider_metadata": _thaw_snapshot(self.provider_metadata),
         }
 
@@ -788,40 +786,6 @@ class OpResolver(Generic[SpecT, ProviderT]):
                         f"Profile {selected_profile.name!r} contains undeclared "
                         f"atomic routes {undeclared_routes}."
                     )
-        performance_evidence = (
-            str(metadata.get("profile_id", selected_type.name))
-            if selection_basis is SelectionBasis.PROFILE_OVERRIDE
-            else (
-                "upstream_default"
-                if selection_basis is SelectionBasis.UPSTREAM_DEFAULT
-                else "default_portfolio"
-            )
-        )
-        profile_atomic_roles = {
-            self.registry.atomic_registry.registration(name).role
-            for name in selected_profile_atomic_names
-        }
-        upstream_contract = (
-            selected_role is ProviderRole.UPSTREAM_STANDARD
-            or profile_atomic_roles == {ProviderRole.UPSTREAM_STANDARD}
-        )
-        if upstream_contract:
-            contract_evidence = "adapter_equivalence"
-            kernel_support_evidence = "upstream_declared"
-        elif selection_basis is SelectionBasis.PROFILE_OVERRIDE:
-            contract_evidence = "eligible_atomic_contracts"
-            kernel_support_evidence = "atomic_capability_filter"
-        elif selected_role is ProviderRole.REPO_PORTABLE:
-            contract_evidence = "portable_baseline"
-            kernel_support_evidence = "repo_declared"
-        else:
-            contract_evidence = "nonstandard_semantics"
-            kernel_support_evidence = "repo_declared"
-        validation_evidence = {
-            "contract": contract_evidence,
-            "kernel_support": kernel_support_evidence,
-            "performance": performance_evidence,
-        }
         report = BindingReport(
             operator_type=self.registry.family,
             spec_type=type(spec).__name__,
@@ -840,7 +804,6 @@ class OpResolver(Generic[SpecT, ProviderT]):
                 sorted(decisions, key=lambda decision: decision.provider)
             ),
             profiles=tuple(profile_decisions),
-            validation_evidence=_freeze_snapshot(validation_evidence),
             provider_metadata=_freeze_snapshot(metadata),
         )
         record_operator_binding(self.registry.family, selected, report=report)

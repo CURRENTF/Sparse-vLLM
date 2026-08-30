@@ -40,17 +40,17 @@ Sparse-vLLM 是研究导向项目，无法为所有硬件组合提供预先验�
 provider、伪造默认输出或掩盖失败。确认某项不兼容后，应优先用所需硬件特性、DSL
 能力或已知 toolchain 问题描述 exclusion，而不是长期维护具体设备型号白名单。
 
-Atomic eligibility 与验证、性能证据必须分开。`validation_evidence` 只记录实际验证
-过的设备、shape、dtype、graph mode 和结果；缺少记录不自动缩小 portable support。
-相反，性能 profile、默认性能优先级和跨系统性能结论必须严格限制在可复现的实测
-范围内。一个 kernel 可以在较宽设备范围内允许尝试，但只能在已有证据的范围内声称
-正确性已验证或性能占优。
+Atomic eligibility 与验证、性能证据必须分开。实际验证过的设备、shape、dtype、
+graph mode 和结果应写入可复现的 benchmark 或 validation artifact，不能根据 provider
+role 自动推导。缺少记录不自动缩小 portable support。相反，性能 profile、默认性能
+优先级和跨系统性能结论必须严格限制在可复现的实测范围内。一个 kernel 可以在较宽
+设备范围内允许尝试，但只能在已有证据的范围内声称正确性已验证或性能占优。
 
 Repo-owned nonstandard kernel 应遵循**乐观可移植、保守声明证据**的原则。当一种
 非标准契约使用 portable Triton 或 TileLang primitives 实现，且没有已知不兼容时，
 它的通用 atomic provider 应允许在本地少量 GPU 之外的设备上尝试。如果该 provider
 是这项契约的常规实现，就应进入对应的默认 portfolio。本地硬件覆盖有限只应体现在
-`validation_evidence` 中，不能仅凭这一点把整个 provider 变成 exact-device profile。
+验证 artifact 中，不能仅凭这一点把整个 provider 变成 exact-device profile。
 
 `profile_only=True` 应保留给真正的特化替代方案，例如 exact-device launch schedule、
 经过实测的 token-range dispatcher，或只应在已记录性能范围内覆盖通用 provider 的
@@ -94,15 +94,10 @@ portable repo-owned nonstandard 路径。
 `selection_basis=dependency_degraded`；已安装依赖损坏则直接终止绑定。运行期
 异常不会触发 provider 重选。
 
-每份 binding report 都记录最终 provider、可选 profile、`selection_basis`、
-全部 atomic/profile 判断和 `validation_evidence`。因此未命中本地 profile 的
-上游选择可以诚实表达：adapter equivalence 已验证，kernel 支持域来自上游声明，
-性能选择依赖上游默认 dispatcher，而不是本地 benchmark。
-
-验证证据遵循 ownership：只有纯上游 atomic 路径才能记录
-`adapter_equivalence` 和 `upstream_declared`。repo portable baseline、repo
-非标 kernel 以及混合 atomic role 的 profile plan 必须记录更窄的 contract
-证据，不能继承上游验证声明。
+每份 binding report 都记录最终 provider、可选 profile、`selection_basis`、全部
+atomic/profile 判断和 provider metadata。它只解释实现为何被选中，不证明数值
+正确性、上游支持域或本地性能。Adapter equivalence、kernel correctness 和性能证据
+必须记录在相应的可复现 validation artifact 中，声明范围不得超过实测契约。
 
 ## Ownership Rule
 

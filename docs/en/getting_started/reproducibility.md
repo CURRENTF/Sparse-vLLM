@@ -20,8 +20,9 @@ The README contains the current install command. The expected baseline is:
   or `pip install -e ".[cu130]"`. Training, benchmark, and test dependencies
   are included in the main installation.
 - Record the operator binding report, including `selected_provider`,
-  `selected_profile`, `selection_basis`, `validation_evidence`, and CUDA compute
-  capability. An upstream default is not evidence of a local performance
+  `selected_profile`, `selection_basis`, provider metadata, and CUDA compute
+  capability. Cite separate validation artifacts for numerical correctness and
+  performance claims; an upstream default is not evidence of a local performance
   benchmark. FP8 providers do not download Hub kernels during warmup.
 - RMSNorm defaults to `SPARSEVLLM_RMSNORM_PROVIDER=auto`, which prefers
   FlashInfer when installed. Set the variable to `triton` to force the local

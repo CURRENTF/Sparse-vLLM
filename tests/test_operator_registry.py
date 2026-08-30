@@ -114,11 +114,6 @@ def test_profile_overlay_is_separate_from_atomic_portfolio() -> None:
     assert profiled.report.selected_provider == "profiled_atomic"
     assert profiled.report.selected_profile == "exact_profile"
     assert profiled.report.selection_basis == "profile_override"
-    assert profiled.report.as_dict()["validation_evidence"] == {
-        "contract": "eligible_atomic_contracts",
-        "kernel_support": "atomic_capability_filter",
-        "performance": "profile-v1",
-    }
     assert unprofiled.provider.name == "portable"
     assert unprofiled.report.profiles[0].matched is False
     assert unprofiled.report.candidates[1].supported is True

@@ -48,12 +48,13 @@ hardware feature, DSL capability, or known toolchain issue over a permanent
 device-model whitelist.
 
 Keep atomic eligibility separate from validation and performance evidence.
-`validation_evidence` records only the devices, shapes, dtypes, graph modes, and
-results actually tested; missing evidence does not automatically narrow a
-portable support domain. In contrast, performance profiles, default performance
-preferences, and cross-system performance claims must stay within reproducible
-measured evidence. A kernel may be eligible to run broadly while claiming
-validated correctness or superior performance only where evidence exists.
+Record tested devices, shapes, dtypes, graph modes, and results in reproducible
+benchmark or validation artifacts rather than deriving them from provider roles.
+Missing evidence does not automatically narrow a portable support domain. In
+contrast, performance profiles, default performance preferences, and cross-system
+performance claims must stay within reproducible measured evidence. A kernel may
+be eligible to run broadly while claiming validated correctness or superior
+performance only where evidence exists.
 
 Apply an **optimistic portability, conservative evidence** rule to
 repository-owned nonstandard kernels. When a nonstandard contract is implemented
@@ -61,7 +62,7 @@ with portable Triton or TileLang primitives and has no known incompatibility, it
 general atomic provider should remain eligible beyond the small set of locally
 available GPUs. If that provider is the normal implementation of the contract,
 place it in the appropriate default portfolio. Limited local hardware coverage
-belongs in `validation_evidence`; it must not by itself turn the whole provider
+belongs in validation artifacts; it must not by itself turn the whole provider
 into an exact-device profile.
 
 Reserve `profile_only=True` for a genuinely specialized alternative: for example,
@@ -130,15 +131,11 @@ installed dependency fails binding. Runtime exceptions never trigger provider
 reselection.
 
 Every binding report records the selected provider and optional profile,
-`selection_basis`, all atomic and profile decisions, and `validation_evidence`.
-An unprofiled upstream selection therefore states that adapter equivalence was
-validated, kernel support is upstream-declared, and performance relies on the
-upstream default rather than a local benchmark.
-
-Evidence follows ownership. `adapter_equivalence` and `upstream_declared` are
-used only for a purely upstream atomic path. Portable baselines, repository
-nonstandard kernels, and profiles that mix atomic roles report their narrower
-contract evidence instead of inheriting upstream validation claims.
+`selection_basis`, all atomic and profile decisions, and provider metadata. It
+explains why an implementation was selected, but it does not certify numerical
+correctness, upstream support, or local performance. Record adapter-equivalence,
+kernel-correctness, and performance evidence in the corresponding reproducible
+validation artifacts, with scope no broader than the tested contract.
 
 ## Ownership Rule
 

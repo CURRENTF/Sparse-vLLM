@@ -15,9 +15,9 @@ README 包含当前安装命令。预期 baseline 为：
 - 在仓库根目录运行 `pip install -e ".[cu129]"` 或
   `pip install -e ".[cu130]"`。训练、benchmark 和测试依赖均包含在主安装中。
 - 记录 operator binding report 中的 `selected_provider`、`selected_profile`、
-  `selection_basis`、`validation_evidence` 和 CUDA compute capability。上游默认
-  选择不等价于本地性能 benchmark 证据。FP8 provider 在 warmup 期间不会下载
-  Hub kernel。
+  `selection_basis`、provider metadata 和 CUDA compute capability。数值正确性与
+  性能结论必须引用独立 validation artifact；上游默认选择不等价于本地性能
+  benchmark 证据。FP8 provider 在 warmup 期间不会下载 Hub kernel。
 - RMSNorm 默认使用 `SPARSEVLLM_RMSNORM_PROVIDER=auto`，在已安装时优先选择 FlashInfer。设为 `triton` 可强制使用本地 Triton kernel；设为 `flashinfer` 可明确要求 FlashInfer。
 
 每次报告 benchmark 时，都应记录 CUDA 版本、GPU 类型和数量、visible GPU ID、branch、commit 以及相关未提交改动。
