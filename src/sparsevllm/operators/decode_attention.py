@@ -679,7 +679,10 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
                 meta.context_lens.data_ptr(),
                 int(max_context_len),
             )
-            if getattr(state, "plan_key", None) != plan_key:
+            if (
+                spec.layer_varying_page_table
+                or getattr(state, "plan_key", None) != plan_key
+            ):
                 state.plan(
                     spec,
                     active_slots=meta.active_slots,

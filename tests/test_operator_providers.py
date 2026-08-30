@@ -31,6 +31,13 @@ from sparsevllm.operators.moe import (
     SglDerivedTritonMoeProvider,
     SglTritonGlmMoeProvider,
 )
+from sparsevllm.operators.quest_selection import (
+    H100ExactQuestPagedViewDispatch,
+    QUEST_PAGE_SELECTION_REGISTRY,
+    FlashInferQuestPageSelectionProvider,
+    QuestPageSelectionOpSpec,
+    TritonExactQuestPageSelectionProvider,
+)
 from sparsevllm.operators.registry import NoProviderError, OpResolver
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
 from sparsevllm.quantization.config import QuantizationConfig
@@ -147,6 +154,62 @@ def _non_cuda_caps(platform: PlatformEnum) -> DeviceCaps:
         supports_bfloat16=True,
         supports_native_fp8=platform == PlatformEnum.ROCM,
     )
+
+
+def test_quest_fused_paged_view_is_the_default_h100_profile() -> None:
+    spec = QuestPageSelectionOpSpec(
+        score_dtype=torch.bfloat16,
+        cuda_graph=True,
+    )
+    with patch(
+        "sparsevllm.operators.quest_selection."
+        "flashinfer_top_k_page_table_transform_support",
+        return_value=(True, "available"),
+    ):
+        resolved = OpResolver(QUEST_PAGE_SELECTION_REGISTRY).resolve(
+            spec,
+            _cuda_caps((9, 0), device_name="NVIDIA H100 80GB HBM3"),
+            op_spec=spec,
+        )
+
+    assert isinstance(resolved.provider, H100ExactQuestPagedViewDispatch)
+    assert resolved.report.selection_basis == "profile_override"
+
+
+def test_quest_fused_profile_miss_preserves_flashinfer_default() -> None:
+    spec = QuestPageSelectionOpSpec(
+        score_dtype=torch.bfloat16,
+        cuda_graph=True,
+    )
+    with patch(
+        "sparsevllm.operators.quest_selection."
+        "flashinfer_top_k_page_table_transform_support",
+        return_value=(True, "available"),
+    ):
+        resolved = OpResolver(QUEST_PAGE_SELECTION_REGISTRY).resolve(
+            spec,
+            _cuda_caps((9, 0), device_name="NVIDIA H100 PCIe"),
+            op_spec=spec,
+        )
+
+    assert isinstance(resolved.provider, FlashInferQuestPageSelectionProvider)
+    assert resolved.report.selection_basis == "upstream_default"
+
+
+def test_quest_triton_exact_atomic_capability_is_portable_cuda() -> None:
+    spec = QuestPageSelectionOpSpec(
+        score_dtype=torch.bfloat16,
+        cuda_graph=True,
+    )
+
+    assert TritonExactQuestPageSelectionProvider.supports(
+        spec,
+        _cuda_caps((8, 0), device_name="NVIDIA A100-SXM4-80GB"),
+    ).supported
+    assert not TritonExactQuestPageSelectionProvider.supports(
+        spec,
+        _non_cuda_caps(PlatformEnum.ROCM),
+    ).supported
 
 
 def _moe_spec(

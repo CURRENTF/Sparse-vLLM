@@ -19,7 +19,6 @@ from sparsevllm.engine.prefix_cache import (
 )
 from sparsevllm.kernels.triton.quest_decode_view import (
     finalize_quest_decode_view,
-    finalize_quest_paged_decode_view,
     score_quest_pages,
 )
 from sparsevllm.operators.quest_selection import (
@@ -135,6 +134,9 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                 torch.Tensor,
             ],
         ] = {}
+        self._decode_row_page_slots_buffers: dict[tuple[int, int], torch.Tensor] = {}
+        self._decode_row_page_slots: torch.Tensor | None = None
+        self._decode_row_page_slots_req_indices: torch.Tensor | None = None
         self._prefill_page_plan: QuestPrefillPagePlan | None = None
         self.enable_prefix_caching = bool(
             config.enable_prefix_caching
@@ -1696,6 +1698,10 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             self.layer_batch_state.slot_mapping = slot_mapping
             self.layer_batch_state.context_lens = context_lens
             self.layer_batch_state.req_indices = req_indices
+            self._prepare_decode_row_page_slots(
+                req_indices,
+                max_context_len=int(max(self.row_seq_lens[row_indices])),
+            )
 
             input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device=self.device)
             positions = torch.tensor(positions_list, dtype=torch.int64, device=self.device)
@@ -1778,8 +1784,56 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             self.layer_batch_state.context_lens = context_lens
             self.layer_batch_state.max_context_len = int(max(real_context_lens)) if row_indices else 0
             self.layer_batch_state.req_indices = req_indices
+            static_max_context_len = getattr(
+                self,
+                "_decode_static_max_context_len",
+                None,
+            )
+            self._prepare_decode_row_page_slots(
+                req_indices,
+                max_context_len=(
+                    int(static_max_context_len)
+                    if static_max_context_len is not None
+                    else int(max(real_context_lens))
+                ),
+            )
 
             return input_ids, positions, None
+
+    def _prepare_decode_row_page_slots(
+        self,
+        req_indices: torch.Tensor,
+        *,
+        max_context_len: int,
+    ) -> None:
+        """Pack the step's physical page rows once for all decode layers."""
+
+        max_pages_per_row = int(
+            getattr(
+                self,
+                "max_pages_per_row",
+                self.buffer_req_to_page_slots.shape[1],
+            )
+        )
+        width = min(
+            max_pages_per_row,
+            max(1, (int(max_context_len) + self.page_size - 1) // self.page_size),
+        )
+        key = (int(req_indices.numel()), width)
+        if not hasattr(self, "_decode_row_page_slots_buffers"):
+            self._decode_row_page_slots_buffers = {}
+        packed = self._decode_row_page_slots_buffers.get(key)
+        if packed is None:
+            packed = torch.empty(key, dtype=torch.int32, device=self.device)
+            self._decode_row_page_slots_buffers[key] = packed
+        torch.index_select(
+            self.buffer_req_to_page_slots[:, :width],
+            0,
+            req_indices,
+            out=packed,
+        )
+        self._decode_row_page_slots = packed
+        self._decode_row_page_slots_req_indices = req_indices
 
     @torch.no_grad()
     def _attention_metadata_keys(
@@ -2240,7 +2294,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             False,
         )
 
-    def _select_previous_decode_pages(
+    def _score_previous_decode_pages(
         self,
         layer_idx: int,
         score_query: torch.Tensor,
@@ -2248,10 +2302,9 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         context_lens: torch.Tensor,
         *,
         max_pages: int,
-        prev_budget: int,
         num_kv_heads: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Score physical pages and select the previous-page budget."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Score physical pages and return the exact selection inputs."""
 
         if int(num_kv_heads) != self.metadata_num_heads:
             raise ValueError(
@@ -2265,9 +2318,19 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             self.page_size,
             rounding_mode="floor",
         )
-        row_page_slots = self.buffer_req_to_page_slots.index_select(
-            0, req_indices.to(torch.long)
-        )[:, :max_pages]
+        row_page_slots = getattr(self, "_decode_row_page_slots", None)
+        if (
+            row_page_slots is None
+            or getattr(self, "_decode_row_page_slots_req_indices", None)
+            is not req_indices
+            or int(row_page_slots.shape[0]) != batch_size
+            or int(row_page_slots.shape[1]) < max_pages
+        ):
+            row_page_slots = self.buffer_req_to_page_slots.index_select(
+                0, req_indices
+            )[:, :max_pages]
+        else:
+            row_page_slots = row_page_slots[:, :max_pages]
         kv_idx = self.kv_layer_index(layer_idx)
         if self.platform.is_cuda_alike():
             page_scores = score_quest_pages(
@@ -2297,13 +2360,13 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                 self.metadata_num_heads,
             )
         safe_num_pages = num_pages.to(torch.long).clamp_min(1)
-        selected_prev_page_slots = self.quest_page_selector.select(
+        previous_page_counts = (safe_num_pages - 1).to(torch.int32).contiguous()
+        return (
             page_scores.contiguous(),
             row_page_slots.contiguous(),
-            (safe_num_pages - 1).to(torch.int32).contiguous(),
-            prev_budget,
+            num_pages,
+            previous_page_counts,
         )
-        return row_page_slots, num_pages, selected_prev_page_slots
 
     @torch.no_grad()
     def _build_token_decode_view_static(
@@ -2350,16 +2413,21 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                 dense_slots = self.buffer_req_to_token_slots.index_select(
                     0, req_indices.to(torch.long)
                 )[:, :max_keep]
-            row_page_slots, num_pages, selected_prev_page_slots = (
-                self._select_previous_decode_pages(
+            page_scores, row_page_slots, num_pages, previous_page_counts = (
+                self._score_previous_decode_pages(
                     layer_idx,
                     score_query,
                     req_indices,
                     context_lens,
                     max_pages=max_pages,
-                    prev_budget=prev_budget,
                     num_kv_heads=num_kv_heads,
                 )
+            )
+            selected_prev_page_slots = self.quest_page_selector.select(
+                page_scores,
+                row_page_slots,
+                previous_page_counts,
+                prev_budget,
             )
             output_width = (
                 (prev_budget + 1) * self.page_size
@@ -2438,14 +2506,13 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                 )
 
             is_long_text = bool(get_context().is_long_text)
-            row_page_slots, num_pages, selected_prev_page_slots = (
-                self._select_previous_decode_pages(
+            page_scores, row_page_slots, num_pages, previous_page_counts = (
+                self._score_previous_decode_pages(
                     layer_idx,
                     score_query,
                     req_indices,
                     context_lens,
                     max_pages=max_pages,
-                    prev_budget=prev_budget,
                     num_kv_heads=num_kv_heads,
                 )
             )
@@ -2454,18 +2521,16 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                 int(batch_size),
                 int(output_width),
             )
-            paged_view = finalize_quest_paged_decode_view(
-                selected_prev_page_slots,
+            paged_view = self.quest_page_selector.select_and_finalize_paged_view(
+                page_scores,
                 row_page_slots,
+                previous_page_counts,
                 num_pages.to(torch.int32).contiguous(),
                 context_lens,
+                k=prev_budget,
                 page_size=self.page_size,
                 token_budget=token_budget,
-                output_page_table=outputs[0],
-                output_req_indices=outputs[1],
-                output_context_lens=outputs[2],
-                output_page_counts=outputs[3],
-                output_last_page_lens=outputs[4],
+                outputs=outputs,
                 use_dense_fallback=not is_long_text,
             )
             return (*paged_view, bool(is_long_text))

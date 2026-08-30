@@ -496,6 +496,40 @@ def test_flashinfer_decode_reuses_plan_across_layers_in_one_step():
     assert state.plan.call_count == 2
 
 
+def test_flashinfer_decode_replans_layer_varying_page_tables():
+    provider = FlashInferPagedDecodeAttentionProvider()
+    wrapper = Mock(name="flashinfer_wrapper")
+    wrapper.run.side_effect = lambda _q, _kv, *, out, return_lse: out
+    state = SimpleNamespace(plan=Mock(name="plan"), wrapper=wrapper, plan_key=None)
+    provider._state = state
+    q = torch.empty(2, 32, 128, dtype=torch.bfloat16)
+    view = SimpleNamespace(
+        payload=SimpleNamespace(
+            k_cache=torch.empty(16, 8, 128, dtype=torch.bfloat16),
+            v_cache=torch.empty(16, 8, 128, dtype=torch.bfloat16),
+        ),
+        meta=SimpleNamespace(
+            active_slots=torch.arange(16, dtype=torch.int32).view(2, 8),
+            req_indices=torch.arange(2, dtype=torch.int32),
+            context_lens=torch.full((2,), 8, dtype=torch.int32),
+            max_context_len=8,
+            attn_score=None,
+        ),
+    )
+    context = SimpleNamespace(attention_validation_scope=object())
+    spec = _spec(cuda_graph=False, layer_varying_page_table=True)
+
+    with patch(
+        "sparsevllm.operators.decode_attention.get_context",
+        return_value=context,
+    ):
+        provider.run(spec, q, view)
+        view.meta.active_slots.copy_(view.meta.active_slots.flip(1))
+        provider.run(spec, q, view)
+
+    assert state.plan.call_count == 2
+
+
 def test_flashinfer_graph_page_pack_reuses_identical_layer_metadata():
     state = object.__new__(_FlashInferPagedDecodeGraphState)
     state.planned = True

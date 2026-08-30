@@ -3053,6 +3053,12 @@ def test_quest_decode_materialized_page_can_seed_later_prefix_hit():
     assert manager.row_seq_lens[row_idx] == 4
     assert manager.buffer_req_to_page_slots[row_idx, 0].item() == 9
     assert manager.buffer_req_to_token_slots[row_idx, :4].tolist() == [36, 37, 38, 39]
+    req_indices = torch.tensor([row_idx], dtype=torch.int32)
+    manager._prepare_decode_row_page_slots(req_indices, max_context_len=4)
+    assert manager._decode_row_page_slots.tolist() == [[9]]
+    packed_ptr = manager._decode_row_page_slots.data_ptr()
+    manager._prepare_decode_row_page_slots(req_indices, max_context_len=4)
+    assert manager._decode_row_page_slots.data_ptr() == packed_ptr
     block = manager.prefix_cache.get_block(second.prefix_cache_hit_last_block_id)
     assert block is not None
     assert block.ref_count == 2

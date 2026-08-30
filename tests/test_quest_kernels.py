@@ -14,6 +14,10 @@ from sparsevllm.kernels.triton.quest_decode_view import (
     finalize_quest_paged_decode_view,
     score_quest_pages,
 )
+from sparsevllm.kernels.triton.quest_fused_selection import (
+    exact_select_quest_pages,
+    fused_exact_select_quest_paged_view,
+)
 from sparsevllm.kernels.triton.store_kvcache import (
     store_prefill_kvcache_with_quest_metadata,
     store_kvcache_with_quest_metadata,
@@ -88,6 +92,99 @@ def test_flashinfer_quest_page_selection_matches_stable_oracle_and_graph() -> No
     graph.replay()
     expected = _stable_small_index_topk(scores, page_table, lengths, k)
     torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+
+
+@CUDA_REQUIRED
+@pytest.mark.parametrize("k", [1, 31, 63, 127, 129, 255])
+def test_fused_exact_quest_selection_and_paged_view_match_stable_oracle_and_graph(
+    k: int,
+) -> None:
+    torch.manual_seed(20260828)
+    batch_size, width, page_size = 4, 256, 16
+    scores = torch.randn(
+        batch_size,
+        width,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    scores[:, : k + 3] = 3
+    scores[:, -2:] = torch.tensor(
+        [0.0, -0.0], device="cuda", dtype=torch.bfloat16
+    )
+    page_table = torch.stack(
+        [torch.randperm(width, device="cuda") for _ in range(batch_size)]
+    ).to(torch.int32)
+    previous_page_counts = torch.tensor(
+        [255, max(k, 221), max(k, 180), max(k, 130)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    context_lens = (previous_page_counts + 1) * page_size - 3
+
+    selected = exact_select_quest_pages(
+        scores,
+        page_table,
+        previous_page_counts,
+        k,
+    )
+    expected = _stable_small_index_topk(
+        scores,
+        page_table,
+        previous_page_counts,
+        k,
+    )
+    torch.testing.assert_close(selected, expected, rtol=0, atol=0)
+
+    outputs = (
+        torch.empty((batch_size, k + 1), device="cuda", dtype=torch.int32),
+        *(
+            torch.empty((batch_size,), device="cuda", dtype=torch.int32)
+            for _ in range(4)
+        ),
+    )
+
+    def run_fused():
+        return fused_exact_select_quest_paged_view(
+            scores,
+            page_table,
+            previous_page_counts,
+            context_lens,
+            k=k,
+            page_size=page_size,
+            output_page_table=outputs[0],
+            output_req_indices=outputs[1],
+            output_context_lens=outputs[2],
+            output_page_counts=outputs[3],
+            output_last_page_lens=outputs[4],
+        )
+
+    run_fused()
+    expected_last_pages = page_table.gather(
+        1, previous_page_counts[:, None].to(torch.long)
+    ).squeeze(1)
+    torch.testing.assert_close(outputs[0][:, :k], expected, rtol=0, atol=0)
+    torch.testing.assert_close(outputs[0][:, k], expected_last_pages, rtol=0, atol=0)
+    torch.testing.assert_close(
+        outputs[2],
+        torch.full_like(context_lens, k * page_size + page_size - 3),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(outputs[3], torch.full_like(context_lens, k + 1))
+    torch.testing.assert_close(outputs[4], torch.full_like(context_lens, page_size - 3))
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_fused()
+    scores.copy_(torch.flip(scores, dims=(1,)))
+    graph.replay()
+    expected = _stable_small_index_topk(
+        scores,
+        page_table,
+        previous_page_counts,
+        k,
+    )
+    torch.testing.assert_close(outputs[0][:, :k], expected, rtol=0, atol=0)
 
 
 @CUDA_REQUIRED

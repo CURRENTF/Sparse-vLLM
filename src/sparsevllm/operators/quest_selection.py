@@ -13,9 +13,11 @@ from sparsevllm.operators.registry import (
     OpRegistry,
     OpResolver,
     PortfolioPolicy,
+    ProfileMatch,
     ProviderRole,
     SupportResult,
 )
+from sparsevllm.platforms import device_runtime
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
 
 
@@ -82,6 +84,46 @@ class QuestPageSelectionProvider:
     ) -> torch.Tensor:
         raise NotImplementedError
 
+    def select_and_finalize_paged_view(
+        self,
+        scores: torch.Tensor,
+        page_table: torch.Tensor,
+        previous_page_counts: torch.Tensor,
+        num_pages: torch.Tensor,
+        context_lens: torch.Tensor,
+        *,
+        k: int,
+        page_size: int,
+        token_budget: int,
+        outputs: tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+        ],
+        use_dense_fallback: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        from sparsevllm.kernels.triton.quest_decode_view import (
+            finalize_quest_paged_decode_view,
+        )
+
+        selected = self.select(scores, page_table, previous_page_counts, k)
+        return finalize_quest_paged_decode_view(
+            selected,
+            page_table,
+            num_pages,
+            context_lens,
+            page_size=page_size,
+            token_budget=token_budget,
+            output_page_table=outputs[0],
+            output_req_indices=outputs[1],
+            output_context_lens=outputs[2],
+            output_page_counts=outputs[3],
+            output_last_page_lens=outputs[4],
+            use_dense_fallback=use_dense_fallback,
+        )
+
 
 QUEST_PAGE_SELECTION_REGISTRY: OpRegistry[
     QuestPageSelectionOpSpec,
@@ -92,6 +134,7 @@ QUEST_PAGE_SELECTION_REGISTRY: OpRegistry[
         upstream_standard=("flashinfer",),
         repo_portable=("torch",),
     ),
+    profile_order=("h100_exact_paged_view_dispatch",),
 )
 
 
@@ -175,6 +218,212 @@ class TorchQuestPageSelectionProvider(QuestPageSelectionProvider):
         )
 
 
+@QUEST_PAGE_SELECTION_REGISTRY.register_atomic(
+    ProviderRole.REPO_NONSTANDARD,
+    profile_only=True,
+)
+class TritonExactQuestPageSelectionProvider(QuestPageSelectionProvider):
+    name = "triton_exact"
+
+    @classmethod
+    def supports(
+        cls,
+        spec: QuestPageSelectionOpSpec,
+        caps: DeviceCaps,
+    ) -> SupportResult:
+        if caps.platform != PlatformEnum.CUDA:
+            return SupportResult.unsupported(f"requires CUDA, got {caps.platform.name}")
+        if not caps.supports_triton:
+            return SupportResult.unsupported("platform does not support Triton")
+        if spec.score_dtype != torch.bfloat16:
+            return SupportResult.unsupported(
+                f"requires BF16 scores, got {spec.score_dtype}"
+            )
+        if spec.cuda_graph and not caps.supports_graph_capture:
+            return SupportResult.unsupported("device does not support CUDA Graph capture")
+        return SupportResult.yes("exact BF16 bitonic selection route")
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            "implementation_kind": "atomic_provider",
+            "implementation_source": "repo_triton",
+            "kernel_path": "triton.quest_fused_selection",
+            "deterministic": True,
+            "tie_break": "small",
+            "max_profiled_width": 512,
+        }
+
+    def select(self, scores, page_table, lengths, k):
+        k = _validate_inputs(self.spec, scores, page_table, lengths, k)
+        from sparsevllm.kernels.triton.quest_fused_selection import (
+            exact_select_quest_pages,
+        )
+
+        return exact_select_quest_pages(scores, page_table, lengths, k)
+
+    def select_and_finalize_paged_view(
+        self,
+        scores,
+        page_table,
+        previous_page_counts,
+        num_pages,
+        context_lens,
+        *,
+        k,
+        page_size,
+        token_budget,
+        outputs,
+        use_dense_fallback,
+    ):
+        if use_dense_fallback:
+            raise ValueError("Fused QuEST paged selection requires sparse-only rows.")
+        del num_pages, token_budget
+        _validate_inputs(self.spec, scores, page_table, previous_page_counts, k)
+        from sparsevllm.kernels.triton.quest_fused_selection import (
+            fused_exact_select_quest_paged_view,
+        )
+
+        return fused_exact_select_quest_paged_view(
+            scores,
+            page_table,
+            previous_page_counts,
+            context_lens,
+            k=k,
+            page_size=page_size,
+            output_page_table=outputs[0],
+            output_req_indices=outputs[1],
+            output_context_lens=outputs[2],
+            output_page_counts=outputs[3],
+            output_last_page_lens=outputs[4],
+        )
+
+
+@QUEST_PAGE_SELECTION_REGISTRY.register_profile
+class H100ExactQuestPagedViewDispatch(QuestPageSelectionProvider):
+    name = "h100_exact_paged_view_dispatch"
+
+    @classmethod
+    def atomic_provider_names(
+        cls,
+        spec: QuestPageSelectionOpSpec,
+    ) -> tuple[str, ...]:
+        del spec
+        return ("triton_exact", "flashinfer")
+
+    @classmethod
+    def matches(
+        cls,
+        spec: QuestPageSelectionOpSpec,
+        caps: DeviceCaps,
+    ) -> ProfileMatch:
+        if caps.device_name != "NVIDIA H100 80GB HBM3":
+            return ProfileMatch.no(
+                "requires profiled NVIDIA H100 80GB HBM3 hardware"
+            )
+        if spec.score_dtype != torch.bfloat16:
+            return ProfileMatch.no(f"requires BF16 scores, got {spec.score_dtype}")
+        return ProfileMatch.yes("matched H100 exact QuEST paged-view profile")
+
+    @classmethod
+    def bind(
+        cls,
+        spec: QuestPageSelectionOpSpec,
+        caps: DeviceCaps,
+        **kwargs,
+    ) -> H100ExactQuestPagedViewDispatch:
+        del caps
+        op_spec = kwargs.pop("op_spec", spec)
+        if kwargs:
+            raise TypeError(
+                f"{cls.name} does not accept provider arguments: {sorted(kwargs)}"
+            )
+        if op_spec != spec:
+            raise ValueError(f"{cls.name} received inconsistent operator specs.")
+        return cls(op_spec=spec)
+
+    def __init__(self, *, op_spec: QuestPageSelectionOpSpec) -> None:
+        super().__init__(op_spec=op_spec)
+        self.fused = TritonExactQuestPageSelectionProvider(op_spec=op_spec)
+        self.fallback = FlashInferQuestPageSelectionProvider(op_spec=op_spec)
+        self._route_counts: dict[str, dict[str, int]] = {}
+
+    def _record_route(self, route: str) -> None:
+        counts = self._route_counts.setdefault(
+            route,
+            {"eager_dispatches": 0, "cuda_graph_capture_dispatches": 0},
+        )
+        key = (
+            "cuda_graph_capture_dispatches"
+            if device_runtime.is_stream_capturing()
+            else "eager_dispatches"
+        )
+        counts[key] += 1
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            "implementation_kind": "dispatch_plan",
+            "routes": [
+                {
+                    "condition": "sparse paged view, 0<k<width<=512",
+                    "provider": self.fused.name,
+                    "provider_metadata": self.fused.binding_metadata(),
+                },
+                {
+                    "condition": "otherwise",
+                    "provider": self.fallback.name,
+                    "provider_metadata": self.fallback.binding_metadata(),
+                },
+            ],
+        }
+
+    def runtime_kernel_stats(self) -> dict[str, object]:
+        return {
+            "kernel_paths": {
+                route: dict(counts)
+                for route, counts in sorted(self._route_counts.items())
+            },
+            "fallback_reasons": {},
+        }
+
+    def select(self, scores, page_table, lengths, k):
+        self._record_route("flashinfer")
+        return self.fallback.select(scores, page_table, lengths, k)
+
+    def select_and_finalize_paged_view(
+        self,
+        scores,
+        page_table,
+        previous_page_counts,
+        num_pages,
+        context_lens,
+        *,
+        k,
+        page_size,
+        token_budget,
+        outputs,
+        use_dense_fallback,
+    ):
+        use_fused = (
+            not use_dense_fallback
+            and 0 < int(k) < int(scores.shape[1])
+            and int(scores.shape[1]) <= 512
+        )
+        provider = self.fused if use_fused else self.fallback
+        self._record_route("fused" if use_fused else "flashinfer")
+        return provider.select_and_finalize_paged_view(
+            scores,
+            page_table,
+            previous_page_counts,
+            num_pages,
+            context_lens,
+            k=k,
+            page_size=page_size,
+            token_budget=token_budget,
+            outputs=outputs,
+            use_dense_fallback=use_dense_fallback,
+        )
+
+
 def resolve_quest_page_selection_provider(
     spec: QuestPageSelectionOpSpec,
     *,
@@ -193,9 +442,11 @@ def resolve_quest_page_selection_provider(
 
 __all__ = [
     "FlashInferQuestPageSelectionProvider",
+    "H100ExactQuestPagedViewDispatch",
     "QUEST_PAGE_SELECTION_REGISTRY",
     "QuestPageSelectionOpSpec",
     "QuestPageSelectionProvider",
     "TorchQuestPageSelectionProvider",
+    "TritonExactQuestPageSelectionProvider",
     "resolve_quest_page_selection_provider",
 ]
