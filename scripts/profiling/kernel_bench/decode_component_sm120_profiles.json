@@ -63,8 +63,7 @@
         "num_experts": 128,
         "top_k": 8
       },
-      "batch_sizes": [1, 2, 4, 8, 16, 32, 64],
-      "probe_flashinfer_on_first_case": true
+      "batch_sizes": [1, 2, 4, 8, 16, 32, 64]
     },
     {
       "name": "qwen3_235b_a22b_fp8",
@@ -75,8 +74,7 @@
         "num_experts": 128,
         "top_k": 8
       },
-      "batch_sizes": [1, 2, 4, 8, 16, 32],
-      "probe_flashinfer_on_first_case": false
+      "batch_sizes": [1, 2, 4, 8, 16, 32]
     }
   ]
 }

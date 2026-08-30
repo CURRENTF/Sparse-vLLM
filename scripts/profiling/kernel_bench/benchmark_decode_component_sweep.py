@@ -186,16 +186,14 @@ def _build_report(summary: dict[str, Any]) -> str:
             "",
             "## Routed MoE",
             "",
-            "| Profile | Batch | Triton ms | FlashInfer ms | FI/Tri |",
-            "| --- | ---: | ---: | ---: | ---: |",
+            "| Profile | Batch | Triton ms |",
+            "| --- | ---: | ---: |",
         ]
     )
     for row in summary["moe_comparisons"]:
         lines.append(
             f"| {row['profile']} | {row['batch_size']} | "
-            f"{_format_ms(row['triton_ms'])} | "
-            f"{_format_ms(row['flashinfer_ms'])} | "
-            f"{_format_ratio(row['flashinfer_over_triton'])} |"
+            f"{_format_ms(row['triton_ms'])} |"
         )
     lines.extend(
         [
@@ -260,13 +258,13 @@ def run(args: argparse.Namespace) -> None:
                     str(benchmark),
                     "--run-root",
                     str(case_root),
-                    "--components",
+                    "--component",
                     "attention",
-                    "--attention-backends",
+                    "--attention-backend",
                     backend,
-                    "--context-lengths",
+                    "--context-len",
                     str(context_len),
-                    "--batch-sizes",
+                    "--batch-size",
                     str(batch_size),
                     *timing_args,
                     *_shape_args(shape),
@@ -314,15 +312,11 @@ def run(args: argparse.Namespace) -> None:
                     case_failures.append(status_row)
 
     moe_rows = []
-    flashinfer_moe_probe = None
     for profile in config["moe_profiles"]:
         profile_name = _validate_name(profile["name"], "MoE profile")
         shape = profile["shape"]
-        for batch_index, batch_size_value in enumerate(profile["batch_sizes"]):
+        for batch_size_value in profile["batch_sizes"]:
             batch_size = _require_positive_int(batch_size_value, "batch_size")
-            probe = bool(profile.get("probe_flashinfer_on_first_case")) and (
-                batch_index == 0
-            )
             case_id = f"{profile_name}_b{batch_size}"
             case_root = run_root / "cases" / "moe" / case_id
             command = [
@@ -330,11 +324,9 @@ def run(args: argparse.Namespace) -> None:
                 str(benchmark),
                 "--run-root",
                 str(case_root),
-                "--components",
+                "--component",
                 "moe",
-                "--flashinfer-moe",
-                "probe" if probe else "skip",
-                "--batch-sizes",
+                "--batch-size",
                 str(batch_size),
                 *timing_args,
                 *_shape_args(shape),
@@ -364,8 +356,6 @@ def run(args: argparse.Namespace) -> None:
             if status == "success" and child_summary is not None:
                 result = child_summary["moe"][str(batch_size)]
                 triton_stats = result["triton"]
-                if probe:
-                    flashinfer_moe_probe = child_summary["flashinfer_moe_probe"]
                 moe_rows.append(
                     {
                         **status_row,
@@ -427,8 +417,6 @@ def run(args: argparse.Namespace) -> None:
             "profile": row["profile"],
             "batch_size": row["batch_size"],
             "triton_ms": row["median_ms"],
-            "flashinfer_ms": None,
-            "flashinfer_over_triton": None,
         }
         for row in moe_rows
     ]
@@ -440,7 +428,6 @@ def run(args: argparse.Namespace) -> None:
             row["component"] == "moe" for row in case_failures
         ),
         "moe_result_count": len(moe_rows),
-        "flashinfer_moe_probe": flashinfer_moe_probe,
         "attention_results": attention_rows,
         "attention_comparisons": attention_comparisons,
         "moe_results": moe_rows,
@@ -455,10 +442,7 @@ def run(args: argparse.Namespace) -> None:
                 "The suite measures direct CUDA-Graph component callables, "
                 "not serving-level latency or throughput."
             ),
-            (
-                "FlashInfer routed-MoE performance remains absent when its "
-                "suite-level eligibility probe fails."
-            ),
+            "Routed-MoE rows cover the production Triton component boundary only.",
         ],
     }
     _write_json(run_root / "summary.json", summary)

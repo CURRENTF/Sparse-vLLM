@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Matched Qwen-style decode attention and routed-MoE microbenchmark.
+"""Run one Qwen-style decode attention or routed-MoE microbenchmark case.
 
-The benchmark measures serving-relevant steady-state call boundaries and reports
-the attention/MoE share of their two-component sum. It intentionally excludes
-QKV/O projections, router logits/top-k, collectives, normalization, sampling,
-and host scheduling, so the result is not an end-to-end decode-step metric.
+The benchmark measures one serving-relevant steady-state callable in an isolated
+process. It intentionally excludes QKV/O projections, router logits/top-k,
+collectives, normalization, sampling, and host scheduling, so the result is not
+an end-to-end decode-step metric.
 """
 
 from __future__ import annotations
@@ -33,10 +33,14 @@ for path in (REPO_ROOT, SRC_ROOT):
 
 
 @dataclass(frozen=True)
-class ModelShape:
+class AttentionShape:
     num_query_heads: int
     num_kv_heads: int
     head_dim: int
+
+
+@dataclass(frozen=True)
+class MoeShape:
     hidden_size: int
     intermediate_size: int
     num_experts: int
@@ -49,15 +53,6 @@ class TimedCallable:
     run: Callable[[], object]
     output: torch.Tensor
     keepalive: tuple[object, ...]
-
-
-def _parse_int_list(value: str) -> list[int]:
-    values = [int(part.strip()) for part in value.split(",") if part.strip()]
-    if not values or any(item <= 0 for item in values):
-        raise argparse.ArgumentTypeError("expected comma-separated positive integers")
-    if len(set(values)) != len(values):
-        raise argparse.ArgumentTypeError("duplicate values are not allowed")
-    return values
 
 
 def _git(*args: str) -> str:
@@ -182,7 +177,7 @@ def _attention_oracle(
 
 
 def _make_attention_callables(
-    shape: ModelShape,
+    shape: AttentionShape,
     *,
     batch_size: int,
     context_len: int,
@@ -414,28 +409,13 @@ def _moe_oracle(
     return output.to(hidden_states.dtype)
 
 
-def _make_moe_callables(
-    shape: ModelShape,
+def _make_moe_callable(
+    shape: MoeShape,
     *,
     batch_size: int,
     seed: int,
-    include_flashinfer: bool,
-) -> tuple[
-    TimedCallable,
-    TimedCallable | None,
-    dict[str, dict[str, float]],
-]:
+) -> tuple[TimedCallable, dict[str, dict[str, float]]]:
     from sparsevllm.kernels.triton.moe import fused_moe_fp8
-
-    if include_flashinfer:
-        from flashinfer.fused_moe import (
-            Fp8QuantizationType,
-            trtllm_fp8_block_scale_routed_moe,
-        )
-        from flashinfer.tllm_enums import ActivationType, RoutingMethodType
-        from sparsevllm.kernels.external.sgl.moe import (
-            sgl_per_token_group_quant_8bit,
-        )
 
     generator = torch.Generator(device="cuda")
     generator.manual_seed(seed + 7919 * batch_size)
@@ -510,84 +490,7 @@ def _make_moe_callables(
         triton_output_holder["output"] = output
         return output
 
-    flashinfer_callable = None
-    flashinfer_output = None
-    if include_flashinfer:
-        hidden_states_q = torch.empty_like(hidden_states, dtype=torch.float8_e4m3fn)
-        hidden_scale_token_major = torch.empty(
-            batch_size,
-            shape.hidden_size // 128,
-            dtype=torch.float32,
-            device="cuda",
-        )
-        hidden_scale_k_major = torch.empty(
-            shape.hidden_size // 128,
-            batch_size,
-            dtype=torch.float32,
-            device="cuda",
-        )
-        packed_topk = torch.empty_like(topk_ids, dtype=torch.int32)
-        flashinfer_output = torch.empty_like(hidden_states)
-        fp8_info = torch.finfo(torch.float8_e4m3fn)
-
-        def run_flashinfer() -> torch.Tensor:
-            sgl_per_token_group_quant_8bit(
-                hidden_states,
-                hidden_states_q,
-                hidden_scale_token_major,
-                128,
-                1.0e-10,
-                fp8_info.min,
-                fp8_info.max,
-                enable_v2=True,
-            )
-            hidden_scale_k_major.copy_(hidden_scale_token_major.T)
-            weight_bits = topk_weights.view(torch.int16).to(torch.int32)
-            packed_topk.copy_((topk_ids << 16) | (weight_bits & 0xFFFF))
-            trtllm_fp8_block_scale_routed_moe(
-                packed_topk,
-                None,
-                hidden_states_q,
-                hidden_scale_k_major,
-                w13_weight,
-                w13_scale,
-                w2_weight,
-                w2_scale,
-                shape.num_experts,
-                shape.top_k,
-                None,
-                None,
-                shape.intermediate_size,
-                0,
-                shape.num_experts,
-                None,
-                routing_method_type=RoutingMethodType.TopK.value,
-                use_shuffled_weight=False,
-                weight_layout=0,
-                do_finalize=True,
-                enable_pdl=None,
-                output=flashinfer_output,
-                tune_max_num_tokens=max(128, batch_size),
-                fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
-                activation_type=ActivationType.Swiglu.value,
-            )
-            return flashinfer_output
-
-        flashinfer_callable = TimedCallable(
-            "flashinfer",
-            run_flashinfer,
-            flashinfer_output,
-            (
-                hidden_states_q,
-                hidden_scale_token_major,
-                hidden_scale_k_major,
-                packed_topk,
-            ),
-        )
-
     triton_output = run_triton()
-    if flashinfer_callable is not None:
-        flashinfer_callable.run()
     torch.cuda.synchronize()
     expected = _moe_oracle(
         hidden_states,
@@ -601,12 +504,6 @@ def _make_moe_callables(
     )
     errors = {"triton_vs_torch": _error(triton_output, expected)}
     _check_error("Triton MoE", errors["triton_vs_torch"], relative_l2=0.12)
-    if flashinfer_output is not None:
-        errors["flashinfer_vs_torch"] = _error(flashinfer_output, expected)
-        errors["flashinfer_vs_triton"] = _error(flashinfer_output, triton_output)
-        _check_error(
-            "FlashInfer MoE", errors["flashinfer_vs_torch"], relative_l2=0.12
-        )
 
     shared = (
         hidden_states,
@@ -617,16 +514,12 @@ def _make_moe_callables(
         topk_ids,
         topk_weights,
     )
-    return (
-        TimedCallable(
-            "triton",
-            run_triton,
-            triton_output,
-            (*shared, triton_output_holder),
-        ),
-        flashinfer_callable,
-        errors,
-    )
+    return TimedCallable(
+        "triton",
+        run_triton,
+        triton_output,
+        (*shared, triton_output_holder),
+    ), errors
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -666,125 +559,21 @@ def _record_samples(
         )
 
 
-def _format_metric(value: object, digits: int = 4) -> str:
-    if value is None:
-        return "n/a"
-    return f"{float(value):.{digits}f}"
-
-
-def _report(rows: list[dict[str, object]]) -> str:
-    lines = [
-        "# Decode component microbenchmark",
-        "",
-        "| KV len | Batch | Attn Triton ms | Attn FI ms | FI/Tri attn | "
-        "MoE Triton ms | MoE FI ms | FI/Tri MoE | Triton attn share | "
-        "Triton MoE share |",
-        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-    ]
-    for row in rows:
-        lines.append(
-            "| {context_len} | {batch_size} | {attention_triton_ms} | "
-            "{attention_flashinfer_ms} | {attention_ratio} | {moe_triton_ms} | "
-            "{moe_flashinfer_ms} | {moe_ratio} | {attention_share:.1%} | "
-            "{moe_share:.1%} |".format(
-                context_len=row["context_len"],
-                batch_size=row["batch_size"],
-                attention_triton_ms=_format_metric(row["attention_triton_ms"]),
-                attention_flashinfer_ms=_format_metric(
-                    row["attention_flashinfer_ms"]
-                ),
-                attention_ratio=_format_metric(
-                    row["attention_flashinfer_over_triton"], 3
-                ),
-                moe_triton_ms=_format_metric(row["moe_triton_ms"]),
-                moe_flashinfer_ms=_format_metric(row["moe_flashinfer_ms"]),
-                moe_ratio=_format_metric(row["moe_flashinfer_over_triton"], 3),
-                attention_share=row["triton_attention_share"],
-                moe_share=row["triton_moe_share"],
-            )
-        )
-    lines.extend(
-        [
-            "",
-            "Ratios above 1 mean FlashInfer is slower. Shares use the Triton "
-            "attention + Triton MoE two-component sum and are not end-to-end "
-            "decode shares. `n/a` means the provider failed or was skipped by "
-            "the eligibility probe; consult `summary.json` and the probe log.",
-            "",
-        ]
-    )
-    return "\n".join(lines)
-
-
-def _model_shape_from_args(args: argparse.Namespace) -> ModelShape:
-    return ModelShape(
+def _attention_shape_from_args(args: argparse.Namespace) -> AttentionShape:
+    return AttentionShape(
         num_query_heads=args.num_query_heads,
         num_kv_heads=args.num_kv_heads,
         head_dim=args.head_dim,
+    )
+
+
+def _moe_shape_from_args(args: argparse.Namespace) -> MoeShape:
+    return MoeShape(
         hidden_size=args.hidden_size,
         intermediate_size=args.intermediate_size,
         num_experts=args.num_experts,
         top_k=args.top_k,
     )
-
-
-def _probe_flashinfer_moe(args: argparse.Namespace) -> None:
-    shape = _model_shape_from_args(args)
-    _, flashinfer_call, _ = _make_moe_callables(
-        shape,
-        batch_size=args.batch_sizes[0],
-        seed=args.seed,
-        include_flashinfer=True,
-    )
-    if flashinfer_call is None:
-        raise RuntimeError("FlashInfer MoE probe did not construct a callable")
-    if args.graph:
-        flashinfer_call = _capture(flashinfer_call)
-    flashinfer_call.run()
-    torch.cuda.synchronize()
-
-
-def _run_flashinfer_moe_probe(
-    args: argparse.Namespace, run_root: Path
-) -> dict[str, object]:
-    log_path = run_root / "flashinfer_moe_probe.log"
-    command = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "--probe-flashinfer-moe",
-        "--run-root",
-        str(run_root),
-        "--batch-sizes",
-        str(args.batch_sizes[0]),
-        "--seed",
-        str(args.seed),
-        "--num-query-heads",
-        str(args.num_query_heads),
-        "--num-kv-heads",
-        str(args.num_kv_heads),
-        "--head-dim",
-        str(args.head_dim),
-        "--hidden-size",
-        str(args.hidden_size),
-        "--intermediate-size",
-        str(args.intermediate_size),
-        "--num-experts",
-        str(args.num_experts),
-        "--top-k",
-        str(args.top_k),
-        "--graph" if args.graph else "--no-graph",
-    ]
-    with log_path.open("w", encoding="utf-8") as log:
-        result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
-    if result.returncode == 0:
-        return {"status": "available", "probe_log": str(log_path)}
-    signal_number = -result.returncode if result.returncode < 0 else None
-    return {
-        "status": "unavailable",
-        "return_code": result.returncode,
-        "signal": signal_number,
-        "probe_log": str(log_path),
-    }
 
 
 def run(args: argparse.Namespace) -> None:
@@ -804,19 +593,31 @@ def run(args: argparse.Namespace) -> None:
             )
     raw_path.touch()
 
-    shape = _model_shape_from_args(args)
-    if shape.num_query_heads % shape.num_kv_heads:
-        raise ValueError("num_query_heads must be divisible by num_kv_heads")
-    for value, label in (
-        (shape.hidden_size, "hidden_size"),
-        (shape.intermediate_size, "intermediate_size"),
-    ):
-        if value % 128:
-            raise ValueError(f"{label} must be divisible by 128")
+    if args.component == "attention":
+        shape = _attention_shape_from_args(args)
+        if shape.num_query_heads % shape.num_kv_heads:
+            raise ValueError("num_query_heads must be divisible by num_kv_heads")
+        if args.context_len is None:
+            raise ValueError("attention benchmark requires --context-len")
+        if args.attention_backend == "flashinfer":
+            import flashinfer
 
-    import flashinfer
-    import sgl_kernel
-    import triton
+            provider_version = flashinfer.__version__
+        else:
+            import triton
+
+            provider_version = triton.__version__
+    else:
+        shape = _moe_shape_from_args(args)
+        for value, label in (
+            (shape.hidden_size, "hidden_size"),
+            (shape.intermediate_size, "intermediate_size"),
+        ):
+            if value % 128:
+                raise ValueError(f"{label} must be divisible by 128")
+        import triton
+
+        provider_version = triton.__version__
 
     manifest = {
         "status": "running",
@@ -833,15 +634,17 @@ def run(args: argparse.Namespace) -> None:
             "python": platform.python_version(),
             "torch": torch.__version__,
             "cuda": torch.version.cuda,
-            "triton": triton.__version__,
-            "flashinfer": flashinfer.__version__,
-            "sglang_kernel": getattr(sgl_kernel, "__version__", "unknown"),
+            args.attention_backend if args.component == "attention" else "triton": (
+                provider_version
+            ),
         },
-        "model_shape": asdict(shape),
-        "components": args.components,
-        "attention_backends": list(args.attention_backends),
-        "context_lengths": args.context_lengths,
-        "batch_sizes": args.batch_sizes,
+        "shape": asdict(shape),
+        "component": args.component,
+        "backend": (
+            args.attention_backend if args.component == "attention" else "triton"
+        ),
+        "context_len": args.context_len if args.component == "attention" else None,
+        "batch_size": args.batch_size,
         "timing": {
             "graph": args.graph,
             "warmup": args.warmup,
@@ -849,284 +652,135 @@ def run(args: argparse.Namespace) -> None:
             "iterations_per_sample": args.iterations,
             "synchronization": "CUDA events with end-event synchronization",
         },
-        "boundaries": {
-            "attention_triton": "GQA stage1 + stage2 with preallocated workspace",
-            "attention_flashinfer": "planned BatchDecodeWithPagedKVCacheWrapper.run",
-            "moe_triton": (
+        "boundary": (
+            "GQA stage1 + stage2 with preallocated workspace"
+            if args.component == "attention" and args.attention_backend == "triton"
+            else "planned BatchDecodeWithPagedKVCacheWrapper.run"
+            if args.component == "attention"
+            else (
                 "fused_moe_fp8 including activation quantization and routing "
                 "alignment"
-            ),
-            "moe_flashinfer": (
-                "activation quantization + K-major scale copy + route packing "
-                "+ trtllm_fp8_block_scale_routed_moe"
-            ),
-        },
+            )
+        ),
     }
     _write_json(run_root / "run_manifest.json", manifest)
 
-    run_attention = args.components in {"attention", "both"}
-    run_moe = args.components in {"moe", "both"}
-    if not run_moe:
-        flashinfer_moe_probe = {
-            "status": "skipped_by_policy",
-            "reason": "MoE component was not requested",
-        }
-    elif args.flashinfer_moe == "skip":
-        flashinfer_moe_probe = {"status": "skipped_by_policy"}
-    else:
-        print("[moe] probing FlashInfer in an isolated process", flush=True)
-        flashinfer_moe_probe = _run_flashinfer_moe_probe(args, run_root)
-        if (
-            flashinfer_moe_probe["status"] != "available"
-            and args.flashinfer_moe == "required"
-        ):
-            raise RuntimeError(
-                "FlashInfer MoE preflight failed; see "
-                f"{flashinfer_moe_probe['probe_log']}"
-            )
-    manifest["flashinfer_moe_probe"] = flashinfer_moe_probe
-    _write_json(run_root / "run_manifest.json", manifest)
-    flashinfer_moe_available = flashinfer_moe_probe["status"] == "available"
-    if run_moe and not flashinfer_moe_available:
-        _append_jsonl(
-            raw_path,
-            {
-                "status": (
-                    "skipped_by_policy"
-                    if flashinfer_moe_probe["status"] == "skipped_by_policy"
-                    else "model_failed"
-                ),
-                "component": "moe",
-                "backend": "flashinfer",
-                "batch_size": args.batch_sizes[0],
-                "context_len": None,
-                "graph": args.graph,
-                "probe": flashinfer_moe_probe,
-            },
-        )
-
+    attention_results: list[dict[str, object]] = []
     moe_results: dict[int, dict[str, object]] = {}
-    if run_moe:
-        for batch_size in args.batch_sizes:
-            print(f"[moe] batch={batch_size}", flush=True)
-            triton_call, flashinfer_call, errors = _make_moe_callables(
-                shape,
-                batch_size=batch_size,
-                seed=args.seed,
-                include_flashinfer=flashinfer_moe_available,
-            )
-            if args.graph:
-                triton_call = _capture(triton_call)
-                if flashinfer_call is not None:
-                    flashinfer_call = _capture(flashinfer_call)
-            values = {}
-            order = (triton_call,) + (
-                (flashinfer_call,) if flashinfer_call is not None else ()
-            )
-            for callable_ in order:
-                measured = _measure(
-                    callable_,
-                    warmup=args.warmup,
-                    samples=args.samples,
-                    iterations=args.iterations,
-                )
-                values[callable_.name] = measured
-                _record_samples(
-                    raw_path,
-                    component="moe",
-                    backend=callable_.name,
-                    batch_size=batch_size,
-                    context_len=None,
-                    values=measured,
-                    graph=args.graph,
-                )
-            moe_results[batch_size] = {
-                "triton": _stats(values["triton"]),
-                "flashinfer": (
-                    _stats(values["flashinfer"])
-                    if "flashinfer" in values
-                    else flashinfer_moe_probe
-                ),
+    if args.component == "attention":
+        print(
+            f"[attention] backend={args.attention_backend} "
+            f"context={args.context_len} batch={args.batch_size}",
+            flush=True,
+        )
+        callables, errors = _make_attention_callables(
+            shape,
+            batch_size=args.batch_size,
+            context_len=args.context_len,
+            seed=args.seed,
+            backends={args.attention_backend},
+        )
+        callable_ = callables[args.attention_backend]
+        if args.graph:
+            callable_ = _capture(callable_)
+        measured = _measure(
+            callable_,
+            warmup=args.warmup,
+            samples=args.samples,
+            iterations=args.iterations,
+        )
+        _record_samples(
+            raw_path,
+            component="attention",
+            backend=args.attention_backend,
+            batch_size=args.batch_size,
+            context_len=args.context_len,
+            values=measured,
+            graph=args.graph,
+        )
+        attention_results.append(
+            {
+                "context_len": args.context_len,
+                "batch_size": args.batch_size,
+                args.attention_backend: _stats(measured),
                 "correctness": errors,
             }
-            del triton_call, flashinfer_call
-            torch.cuda.empty_cache()
+        )
+    else:
+        print(f"[moe] backend=triton batch={args.batch_size}", flush=True)
+        callable_, errors = _make_moe_callable(
+            shape,
+            batch_size=args.batch_size,
+            seed=args.seed,
+        )
+        if args.graph:
+            callable_ = _capture(callable_)
+        measured = _measure(
+            callable_,
+            warmup=args.warmup,
+            samples=args.samples,
+            iterations=args.iterations,
+        )
+        _record_samples(
+            raw_path,
+            component="moe",
+            backend="triton",
+            batch_size=args.batch_size,
+            context_len=None,
+            values=measured,
+            graph=args.graph,
+        )
+        moe_results[args.batch_size] = {
+            "triton": _stats(measured),
+            "correctness": errors,
+        }
 
-    rows = []
-    attention_results = []
-    if run_attention:
-        for context_len in args.context_lengths:
-            for batch_size in args.batch_sizes:
-                print(
-                    f"[attention] context={context_len} batch={batch_size}",
-                    flush=True,
-                )
-                attention_callables, errors = _make_attention_callables(
-                    shape,
-                    batch_size=batch_size,
-                    context_len=context_len,
-                    seed=args.seed,
-                    backends=set(args.attention_backends),
-                )
-                if args.graph:
-                    attention_callables = {
-                        name: _capture(callable_)
-                        for name, callable_ in attention_callables.items()
-                    }
-                values = {}
-                for callable_ in attention_callables.values():
-                    measured = _measure(
-                        callable_,
-                        warmup=args.warmup,
-                        samples=args.samples,
-                        iterations=args.iterations,
-                    )
-                    values[callable_.name] = measured
-                    _record_samples(
-                        raw_path,
-                        component="attention",
-                        backend=callable_.name,
-                        batch_size=batch_size,
-                        context_len=context_len,
-                        values=measured,
-                        graph=args.graph,
-                    )
-                attention = {
-                    "context_len": context_len,
-                    "batch_size": batch_size,
-                    "correctness": errors,
-                }
-                for backend, samples in values.items():
-                    attention[backend] = _stats(samples)
-                attention_results.append(attention)
-                if run_moe and set(values) == {"triton", "flashinfer"}:
-                    attention_triton = float(attention["triton"]["median_ms"])
-                    attention_flashinfer = float(
-                        attention["flashinfer"]["median_ms"]
-                    )
-                    moe_triton = float(
-                        moe_results[batch_size]["triton"]["median_ms"]
-                    )
-                    moe_flashinfer_stats = moe_results[batch_size]["flashinfer"]
-                    moe_flashinfer = (
-                        float(moe_flashinfer_stats["median_ms"])
-                        if "median_ms" in moe_flashinfer_stats
-                        else None
-                    )
-                    triton_sum = attention_triton + moe_triton
-                    rows.append(
-                        {
-                            "context_len": context_len,
-                            "batch_size": batch_size,
-                            "attention_triton_ms": attention_triton,
-                            "attention_flashinfer_ms": attention_flashinfer,
-                            "attention_flashinfer_over_triton": (
-                                attention_flashinfer / attention_triton
-                            ),
-                            "moe_triton_ms": moe_triton,
-                            "moe_flashinfer_ms": moe_flashinfer,
-                            "moe_flashinfer_over_triton": (
-                                moe_flashinfer / moe_triton
-                                if moe_flashinfer is not None
-                                else None
-                            ),
-                            "triton_attention_share": (
-                                attention_triton / triton_sum
-                            ),
-                            "triton_moe_share": moe_triton / triton_sum,
-                            "component_sum_ms": {
-                                "triton_attention_triton_moe": triton_sum,
-                                "flashinfer_attention_triton_moe": (
-                                    attention_flashinfer + moe_triton
-                                ),
-                                "triton_attention_flashinfer_moe": (
-                                    attention_triton + moe_flashinfer
-                                    if moe_flashinfer is not None
-                                    else None
-                                ),
-                                "flashinfer_attention_flashinfer_moe": (
-                                    attention_flashinfer + moe_flashinfer
-                                    if moe_flashinfer is not None
-                                    else None
-                                ),
-                            },
-                        }
-                    )
-                del attention_callables
-                torch.cuda.empty_cache()
-
+    limitations = [
+        (
+            "Direct components exclude projections, router logits/top-k, "
+            "collectives, normalization, sampling, and host scheduling."
+        )
+    ]
+    if args.component == "moe":
+        limitations.append(
+            "Synthetic FP8 expert weights preserve shapes and layouts but are not "
+            "checkpoint values."
+        )
     summary = {
         "status": "success",
-        "components": args.components,
-        "metric_scope": (
-            "steady-state decode attention and routed-MoE component callables"
-        ),
+        "component": args.component,
+        "metric_scope": "steady-state direct decode component callable",
         "graph": args.graph,
-        "model_shape": asdict(shape),
-        "flashinfer_moe_probe": flashinfer_moe_probe,
+        "shape": asdict(shape),
         "moe": moe_results,
         "attention": attention_results,
-        "rows": rows,
-        "limitations": [
-            (
-                "Component sums exclude projections, router logits/top-k, "
-                "collectives, normalization, sampling, and host scheduling."
-            ),
-            (
-                "The FlashInfer MoE candidate is a raw public-API composition, "
-                "not yet a production Sparse-vLLM provider."
-            ),
-            (
-                "Synthetic FP8 expert weights preserve shapes and layouts but "
-                "are not checkpoint values."
-            ),
-        ],
+        "limitations": limitations,
     }
     _write_json(run_root / "summary.json", summary)
-    report = _report(rows) if args.components == "both" else ""
-    (run_root / "report.md").write_text(report, encoding="utf-8")
     manifest["status"] = "completed"
+    manifest["completed_at"] = datetime.now(timezone.utc).isoformat()
     _write_json(run_root / "run_manifest.json", manifest)
-    if report:
-        print(report, flush=True)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", required=True, type=Path)
     parser.add_argument(
-        "--components",
-        choices=("attention", "moe", "both"),
-        default="both",
+        "--component",
+        choices=("attention", "moe"),
+        required=True,
     )
     parser.add_argument(
-        "--attention-backends",
-        type=lambda value: tuple(
-            part.strip() for part in value.split(",") if part.strip()
-        ),
-        default=("triton", "flashinfer"),
+        "--attention-backend",
+        choices=("triton", "flashinfer"),
     )
-    parser.add_argument(
-        "--context-lengths", type=_parse_int_list, default=[1024, 4096, 8192]
-    )
-    parser.add_argument("--batch-sizes", type=_parse_int_list, default=[1, 4, 8])
+    parser.add_argument("--context-len", type=int)
+    parser.add_argument("--batch-size", required=True, type=int)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--samples", type=int, default=7)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--seed", type=int, default=20260829)
     parser.add_argument("--graph", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument(
-        "--flashinfer-moe",
-        choices=("probe", "required", "skip"),
-        default="probe",
-        help=(
-            "isolate the optional FlashInfer MoE launch and record failure, "
-            "fail the benchmark when unavailable, or skip it"
-        ),
-    )
-    parser.add_argument(
-        "--probe-flashinfer-moe", action="store_true", help=argparse.SUPPRESS
-    )
     parser.add_argument("--num-query-heads", type=int, default=32)
     parser.add_argument("--num-kv-heads", type=int, default=4)
     parser.add_argument("--head-dim", type=int, default=128)
@@ -1135,25 +789,15 @@ def main() -> None:
     parser.add_argument("--num-experts", type=int, default=128)
     parser.add_argument("--top-k", type=int, default=8)
     args = parser.parse_args()
-    valid_attention_backends = {"triton", "flashinfer"}
-    if not args.attention_backends:
-        parser.error("--attention-backends must select at least one backend")
-    if len(set(args.attention_backends)) != len(args.attention_backends):
-        parser.error("--attention-backends contains duplicates")
-    invalid_attention_backends = (
-        set(args.attention_backends) - valid_attention_backends
-    )
-    if invalid_attention_backends:
-        parser.error(
-            "unsupported --attention-backends values: "
-            + ",".join(sorted(invalid_attention_backends))
-        )
-    for name in ("warmup", "samples", "iterations"):
+    if args.component == "attention" and args.attention_backend is None:
+        parser.error("attention benchmark requires --attention-backend")
+    if args.component == "moe" and args.attention_backend is not None:
+        parser.error("MoE benchmark does not accept --attention-backend")
+    for name in ("batch_size", "warmup", "samples", "iterations"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
-    if args.probe_flashinfer_moe:
-        _probe_flashinfer_moe(args)
-        return
+    if args.context_len is not None and args.context_len <= 0:
+        parser.error("--context-len must be positive")
     try:
         run(args)
     except Exception as error:
