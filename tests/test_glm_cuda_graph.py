@@ -120,6 +120,7 @@ def test_startup_graph_plan_keeps_max_context_when_mandatory_cannot_fit():
 
 def test_sparse_startup_graph_plan_covers_short_and_long_families():
     config = SimpleNamespace(
+        decode_graph_shape_policy="bucketed",
         decode_graph_capture_sizes=list(range(1, 9)),
         decode_graph_context_sizes=[1024, 2048, 4096, 8192, 16384, 32768],
         decode_graph_startup_capture_limit=48,
@@ -149,6 +150,7 @@ def test_sparse_startup_graph_plan_covers_short_and_long_families():
 
 def test_h2o_startup_graph_plan_uses_normal_context_buckets():
     config = SimpleNamespace(
+        decode_graph_shape_policy="bucketed",
         decode_graph_capture_sizes=[1, 2, 4],
         decode_graph_context_sizes=[1024, 2048, 4096, 8192, 16384],
         decode_graph_startup_capture_limit=48,
@@ -180,6 +182,7 @@ def test_h2o_startup_graph_plan_uses_normal_context_buckets():
 def test_sparse_startup_graph_plan_covers_default_64_sequence_limit():
     batches = _default_decode_cuda_graph_capture_sizes(64)
     config = SimpleNamespace(
+        decode_graph_shape_policy="bucketed",
         decode_graph_capture_sizes=batches,
         decode_graph_context_sizes=[1024, 2048, 4096, 8192, 16384, 32768, 65536],
         decode_graph_startup_capture_limit=48,
@@ -634,6 +637,7 @@ def _make_glm_full_graph_lane(
     runtime_layout = RuntimeLayout.dense(num_layers)
     runtime_config = SimpleNamespace(
         sparse_method="",
+        max_model_len=128,
         runtime_layout=runtime_layout,
         hf_config=model_config,
         obs_layer_ids=[],

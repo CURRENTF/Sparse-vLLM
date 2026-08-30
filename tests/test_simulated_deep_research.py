@@ -18,6 +18,21 @@ CODE_REVISION = {
 }
 
 
+def _clean_git_command(*args):
+    outputs = {
+        ("rev-parse", "HEAD"): "0123456789abcdef\n",
+        ("branch", "--show-current"): "test\n",
+        ("status", "--porcelain"): "",
+        ("status", "--porcelain", "--untracked-files=all"): "",
+    }
+    return run.subprocess.CompletedProcess(
+        ["git", *args],
+        0,
+        outputs[args],
+        "",
+    )
+
+
 def _json_response(
     payload,
     *,
@@ -224,6 +239,15 @@ class FakeService:
 
 
 class SimulatedDeepResearchTest(unittest.TestCase):
+    def setUp(self):
+        git_patch = patch.object(
+            run,
+            "_git_command",
+            side_effect=_clean_git_command,
+        )
+        git_patch.start()
+        self.addCleanup(git_patch.stop)
+
     def _config(self, output_dir):
         return run.BenchmarkConfig(
             base_url="http://router.test/v1",

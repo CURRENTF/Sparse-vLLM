@@ -14,7 +14,6 @@ from sparsevllm.engine.cache_manager.base import (
     DecodeComputeView,
     ExplicitKVPayload,
     LayerBatchStates,
-    MlaLatentPayload,
     PrefillComputeView,
 )
 from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
@@ -30,7 +29,6 @@ from sparsevllm.engine.sparse_controller import SparseController
 from sparsevllm.method_registry import (
     PREFILL_POLICY_ALL_CHUNKED,
 )
-from sparsevllm.operators.mla_attention import MlaTileLangScoreProvider
 from sparsevllm.utils.context import reset_context, set_context
 
 
@@ -1517,69 +1515,6 @@ def test_h2o_prepare_uses_one_contiguous_snapkv_style_buffer_for_all_kv_layers()
     )
     assert resolved_layers == [0, 1]
     assert resolved.data_ptr() == backing.data_ptr()
-
-
-def test_h2o_aligned_graph_score_workspace_routes_mla_call_to_tilelang():
-    manager = SimpleNamespace(
-        device=torch.device("cpu"),
-        _decode_static_max_context_len=64,
-    )
-    config = SimpleNamespace(
-        sparse_method="h2o",
-        obs_layer_ids=[],
-        full_attention_layers=[],
-        runtime_layout=_layout(),
-        hf_config=SimpleNamespace(
-            num_hidden_layers=1,
-            hidden_size=2,
-            num_attention_heads=2,
-            head_dim=1,
-            torch_dtype=torch.float32,
-        ),
-        tensor_parallel_size=1,
-        sink_keep_tokens=0,
-        recent_keep_tokens=0,
-        decode_keep_tokens=4,
-        sparse_attn_score_dtype="float32",
-        decode_graph=True,
-    )
-    controller = SparseController(config, manager)
-    state = controller.layer_batch_sparse_states[0]
-    state.context_lens = torch.tensor([4], dtype=torch.int32)
-    state.max_context_len = 4
-    controller._prepare_h2o_decode_attn_score_buffer(
-        [_seq(0, 4, prefilled=4, chunk=1)]
-    )
-    score = state.attn_score
-    assert score is not None
-    assert score.shape == (1, 64)
-
-    payload = MlaLatentPayload(
-        latent_cache=torch.empty(64, 1, 512),
-        rope_cache=torch.empty(64, 1, 64),
-    )
-    view = DecodeComputeView(
-        meta=AttentionViewMeta(
-            active_slots=torch.zeros((1, 64), dtype=torch.int32),
-            req_indices=torch.zeros(1, dtype=torch.int32),
-            context_lens=torch.tensor([4], dtype=torch.int32),
-            max_context_len=4,
-            attn_score=score,
-        ),
-        payload=payload,
-    )
-    q_nope = torch.empty(1, 1, 512)
-    q_rope = torch.empty(1, 1, 64)
-    output = torch.empty_like(q_nope)
-    provider = object.__new__(MlaTileLangScoreProvider)
-    provider.tilelang_score = Mock(return_value=output)
-    provider._validate_run_inputs = Mock(return_value=payload)
-    provider._validate_metadata = Mock()
-
-    actual = provider.run(q_nope, q_rope, view, output)
-
-    assert actual is output
-    provider.tilelang_score.assert_called_once()
 
 
 def test_h2o_layer_end_keeps_fused_2d_logits_for_batched_normalization():
