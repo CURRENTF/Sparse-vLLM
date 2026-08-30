@@ -18,6 +18,7 @@ from sparsevllm.engine.prefix_cache import (
     usable_prefix_cache_tokens,
 )
 from sparsevllm.kernels.triton.quest_decode_view import (
+    fuse_mla_quest_selection_query,
     finalize_quest_decode_view,
     prepare_quest_decode_geometry,
     score_quest_pages,
@@ -2150,7 +2151,10 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             # MLA compute consumes one shared page set across all query heads.
             # Match Vortex quest_mla by routing with the TP-local head-mean
             # fused query, rather than taking the union/max of per-head bounds.
-            query = q.fused().mean(dim=1, keepdim=True)
+            if q.latent.is_cuda:
+                query = fuse_mla_quest_selection_query(q.latent, q.rope)
+            else:
+                query = q.fused().mean(dim=1, keepdim=True)
         else:
             if not isinstance(q, torch.Tensor):
                 raise TypeError(

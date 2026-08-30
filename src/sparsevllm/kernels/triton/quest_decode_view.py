@@ -6,6 +6,106 @@ import triton.language as tl
 
 
 @triton.jit
+def _fuse_mla_quest_selection_query_kernel(
+    latent,
+    rope,
+    output,
+    latent_stride_row,
+    latent_stride_head,
+    latent_stride_dim,
+    rope_stride_row,
+    rope_stride_head,
+    rope_stride_dim,
+    output_stride_row,
+    NUM_HEADS: tl.constexpr,
+    LATENT_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(0)
+    dim_offsets = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
+    output_dim: tl.constexpr = LATENT_DIM + ROPE_DIM
+    output_mask = dim_offsets < output_dim
+    latent_mask = output_mask & (dim_offsets < LATENT_DIM)
+    rope_offsets = dim_offsets - LATENT_DIM
+    rope_mask = output_mask & (dim_offsets >= LATENT_DIM)
+    total = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    for head in tl.static_range(0, NUM_HEADS):
+        latent_values = tl.load(
+            latent
+            + row * latent_stride_row
+            + head * latent_stride_head
+            + dim_offsets * latent_stride_dim,
+            mask=latent_mask,
+            other=0.0,
+        )
+        rope_values = tl.load(
+            rope
+            + row * rope_stride_row
+            + head * rope_stride_head
+            + rope_offsets * rope_stride_dim,
+            mask=rope_mask,
+            other=0.0,
+        )
+        total += tl.where(latent_mask, latent_values, rope_values).to(tl.float32)
+    tl.store(
+        output + row * output_stride_row + dim_offsets,
+        total / NUM_HEADS,
+        mask=output_mask,
+    )
+
+
+def fuse_mla_quest_selection_query(
+    latent: torch.Tensor,
+    rope: torch.Tensor,
+) -> torch.Tensor:
+    """Concatenate MLA query coordinates and mean query heads in one kernel."""
+
+    if latent.ndim != 3 or rope.ndim != 3:
+        raise ValueError("MLA QuEST query inputs must be rank-3 tensors")
+    if latent.shape[:2] != rope.shape[:2]:
+        raise ValueError("MLA QuEST latent and RoPE queries must share row/head axes")
+    if latent.device != rope.device or latent.dtype != rope.dtype:
+        raise TypeError("MLA QuEST latent and RoPE queries must share device and dtype")
+    if not latent.is_cuda:
+        raise ValueError("Fused MLA QuEST query preparation requires CUDA tensors")
+    if latent.dtype not in {torch.float16, torch.bfloat16, torch.float32}:
+        raise TypeError("Fused MLA QuEST query preparation requires FP16, BF16, or FP32")
+    batch_size, num_heads, latent_dim = map(int, latent.shape)
+    rope_dim = int(rope.shape[-1])
+    if batch_size <= 0 or num_heads <= 0 or latent_dim <= 0 or rope_dim <= 0:
+        raise ValueError("MLA QuEST query dimensions must be positive")
+    output_dim = latent_dim + rope_dim
+    output = torch.empty(
+        (batch_size, 1, output_dim),
+        dtype=latent.dtype,
+        device=latent.device,
+    )
+    block_d = 128
+    _fuse_mla_quest_selection_query_kernel[
+        (batch_size, triton.cdiv(output_dim, block_d))
+    ](
+        latent,
+        rope,
+        output,
+        latent.stride(0),
+        latent.stride(1),
+        latent.stride(2),
+        rope.stride(0),
+        rope.stride(1),
+        rope.stride(2),
+        output.stride(0),
+        NUM_HEADS=num_heads,
+        LATENT_DIM=latent_dim,
+        ROPE_DIM=rope_dim,
+        BLOCK_D=block_d,
+        num_warps=4,
+        num_stages=1,
+    )
+    return output
+
+
+@triton.jit
 def _prepare_quest_decode_geometry_kernel(
     context_lens,
     num_pages,
@@ -655,6 +755,7 @@ def finalize_quest_paged_decode_view(
 
 
 __all__ = [
+    "fuse_mla_quest_selection_query",
     "finalize_quest_decode_view",
     "finalize_quest_paged_decode_view",
     "prepare_quest_decode_geometry",

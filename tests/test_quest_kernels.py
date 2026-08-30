@@ -10,6 +10,7 @@ from sparsevllm.kernels.triton.mla.copy_latent import (
     copy_latent_to_cache_with_quest_metadata,
 )
 from sparsevllm.kernels.triton.quest_decode_view import (
+    fuse_mla_quest_selection_query,
     finalize_quest_decode_view,
     finalize_quest_paged_decode_view,
     prepare_quest_decode_geometry,
@@ -52,6 +53,26 @@ def _stable_small_index_topk(
         indices = indices.sort().values
         rows.append(page_table[row].cpu().index_select(0, indices))
     return torch.stack(rows).to(scores.device)
+
+
+@CUDA_REQUIRED
+def test_fused_mla_quest_selection_query_matches_glm_tensor_oracle_and_graph() -> None:
+    torch.manual_seed(20260831)
+    latent = torch.randn(4, 10, 512, dtype=torch.bfloat16, device="cuda")
+    rope = torch.randn(4, 10, 64, dtype=torch.bfloat16, device="cuda")
+
+    expected = torch.cat((latent, rope), dim=-1).mean(dim=1, keepdim=True)
+    actual = fuse_mla_quest_selection_query(latent, rope)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = fuse_mla_quest_selection_query(latent, rope)
+    latent.copy_(torch.flip(latent, dims=(1,)))
+    rope.copy_(torch.flip(rope, dims=(1,)))
+    graph.replay()
+    expected = torch.cat((latent, rope), dim=-1).mean(dim=1, keepdim=True)
+    torch.testing.assert_close(captured, expected, rtol=0, atol=0)
 
 
 @CUDA_REQUIRED
