@@ -364,7 +364,7 @@ class FlashInferFa2Sm120PagedPrefillAttentionProvider(
         platforms=frozenset({PlatformEnum.CUDA}),
         compute_capabilities=frozenset({(12, 0)}),
         activation_dtypes=frozenset({torch.bfloat16}),
-        head_dims=frozenset({128, 256}),
+        head_dims=frozenset({64, 128, 256}),
         page_sizes=frozenset({1}),
         score_outputs=frozenset({AttentionScoreKind.NONE}),
         layer_varying_page_table=False,

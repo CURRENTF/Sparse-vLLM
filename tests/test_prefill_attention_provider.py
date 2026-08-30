@@ -317,8 +317,8 @@ def test_flashinfer_fa2_sm120_support_is_not_limited_by_local_device_profile():
         _spec(
             num_query_heads=32,
             num_kv_heads=8,
-            head_dim=256,
-            softmax_scale=256**-0.5,
+            head_dim=64,
+            softmax_scale=64**-0.5,
         ),
         _sm120_caps(device_name="NVIDIA GeForce RTX 5090"),
     )
@@ -824,6 +824,7 @@ def test_flashinfer_page_size_one_matches_noncontiguous_torch_oracle():
 @pytest.mark.parametrize(
     ("num_query_heads", "num_kv_heads", "head_dim"),
     [
+        (32, 8, 64),
         (32, 4, 128),
         (24, 4, 256),
     ],
