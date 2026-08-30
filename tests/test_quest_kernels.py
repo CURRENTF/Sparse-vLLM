@@ -12,6 +12,7 @@ from sparsevllm.kernels.triton.mla.copy_latent import (
 from sparsevllm.kernels.triton.quest_decode_view import (
     finalize_quest_decode_view,
     finalize_quest_paged_decode_view,
+    prepare_quest_decode_geometry,
     score_quest_pages,
 )
 from sparsevllm.kernels.triton.quest_fused_selection import (
@@ -51,6 +52,48 @@ def _stable_small_index_topk(
         indices = indices.sort().values
         rows.append(page_table[row].cpu().index_select(0, indices))
     return torch.stack(rows).to(scores.device)
+
+
+@CUDA_REQUIRED
+def test_quest_decode_geometry_matches_integer_oracle_and_graph() -> None:
+    page_size = 16
+    context_lens = torch.tensor(
+        [1, 16, 17, 32768], dtype=torch.int32, device="cuda"
+    )
+    num_pages = torch.empty_like(context_lens)
+    previous_page_counts = torch.empty_like(context_lens)
+
+    def run_geometry() -> None:
+        prepare_quest_decode_geometry(
+            context_lens,
+            page_size=page_size,
+            num_pages=num_pages,
+            previous_page_counts=previous_page_counts,
+        )
+
+    run_geometry()
+    torch.testing.assert_close(
+        num_pages.cpu(), torch.tensor([1, 1, 2, 2048], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        previous_page_counts.cpu(),
+        torch.tensor([0, 0, 1, 2047], dtype=torch.int32),
+    )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_geometry()
+    context_lens.copy_(
+        torch.tensor([32, 33, 2048, 32767], dtype=torch.int32, device="cuda")
+    )
+    graph.replay()
+    torch.testing.assert_close(
+        num_pages.cpu(), torch.tensor([2, 3, 128, 2048], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        previous_page_counts.cpu(),
+        torch.tensor([1, 2, 127, 2047], dtype=torch.int32),
+    )
 
 
 @CUDA_REQUIRED

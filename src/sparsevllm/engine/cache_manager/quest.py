@@ -19,6 +19,7 @@ from sparsevllm.engine.prefix_cache import (
 )
 from sparsevllm.kernels.triton.quest_decode_view import (
     finalize_quest_decode_view,
+    prepare_quest_decode_geometry,
     score_quest_pages,
 )
 from sparsevllm.operators.quest_selection import (
@@ -137,6 +138,13 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         self._decode_row_page_slots_buffers: dict[tuple[int, int], torch.Tensor] = {}
         self._decode_row_page_slots: torch.Tensor | None = None
         self._decode_row_page_slots_req_indices: torch.Tensor | None = None
+        self._decode_page_geometry_buffers: dict[
+            int, tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        self._decode_num_pages: torch.Tensor | None = None
+        self._decode_previous_page_counts: torch.Tensor | None = None
+        self._decode_page_geometry_context_lens: torch.Tensor | None = None
+        self._decode_page_geometry_ready = False
         self._prefill_page_plan: QuestPrefillPagePlan | None = None
         self.enable_prefix_caching = bool(
             config.enable_prefix_caching
@@ -1702,6 +1710,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                 req_indices,
                 max_context_len=int(max(self.row_seq_lens[row_indices])),
             )
+            self._prepare_decode_page_geometry(context_lens)
 
             input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device=self.device)
             positions = torch.tensor(positions_list, dtype=torch.int64, device=self.device)
@@ -1834,6 +1843,44 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         )
         self._decode_row_page_slots = packed
         self._decode_row_page_slots_req_indices = req_indices
+        if not hasattr(self, "_decode_page_geometry_buffers"):
+            self._decode_page_geometry_buffers = {}
+        geometry = self._decode_page_geometry_buffers.get(int(req_indices.numel()))
+        if geometry is None:
+            row_buffer = torch.empty_like(req_indices)
+            geometry = (row_buffer, torch.empty_like(row_buffer))
+            self._decode_page_geometry_buffers[int(req_indices.numel())] = geometry
+        self._decode_num_pages, self._decode_previous_page_counts = geometry
+        self._decode_page_geometry_context_lens = self.layer_batch_state.context_lens
+        self._decode_page_geometry_ready = False
+
+    def _prepare_decode_page_geometry(self, context_lens: torch.Tensor) -> None:
+        num_pages = self._decode_num_pages
+        previous_page_counts = self._decode_previous_page_counts
+        if num_pages is None or previous_page_counts is None:
+            raise RuntimeError("QuEST decode page geometry buffers are not initialized.")
+        if context_lens.is_cuda:
+            prepare_quest_decode_geometry(
+                context_lens,
+                page_size=self.page_size,
+                num_pages=num_pages,
+                previous_page_counts=previous_page_counts,
+            )
+        else:
+            torch.div(
+                context_lens + self.page_size - 1,
+                self.page_size,
+                rounding_mode="floor",
+                out=num_pages,
+            )
+            torch.sub(num_pages, 1, out=previous_page_counts)
+            previous_page_counts.clamp_min_(0)
+        self._decode_page_geometry_context_lens = context_lens
+        self._decode_page_geometry_ready = True
+
+    def prepare_decode_graph_in(self, state) -> None:
+        super().prepare_decode_graph_in(state)
+        self._prepare_decode_page_geometry(state.inputs.context_lens)
 
     @torch.no_grad()
     def _attention_metadata_keys(
@@ -2313,11 +2360,24 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                 f"metadata_heads={self.metadata_num_heads}."
             )
         batch_size = int(score_query.shape[0])
-        num_pages = torch.div(
-            context_lens + self.page_size - 1,
-            self.page_size,
-            rounding_mode="floor",
+        num_pages = getattr(self, "_decode_num_pages", None)
+        previous_page_counts = getattr(
+            self, "_decode_previous_page_counts", None
         )
+        if (
+            num_pages is None
+            or previous_page_counts is None
+            or getattr(self, "_decode_page_geometry_context_lens", None)
+            is not context_lens
+            or int(num_pages.numel()) != batch_size
+        ):
+            num_pages = torch.empty_like(context_lens)
+            previous_page_counts = torch.empty_like(context_lens)
+            self._decode_num_pages = num_pages
+            self._decode_previous_page_counts = previous_page_counts
+            self._prepare_decode_page_geometry(context_lens)
+        elif not getattr(self, "_decode_page_geometry_ready", False):
+            self._prepare_decode_page_geometry(context_lens)
         row_page_slots = getattr(self, "_decode_row_page_slots", None)
         if (
             row_page_slots is None
@@ -2359,8 +2419,6 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                 prev_page_min,
                 self.metadata_num_heads,
             )
-        safe_num_pages = num_pages.to(torch.long).clamp_min(1)
-        previous_page_counts = (safe_num_pages - 1).to(torch.int32).contiguous()
         return (
             page_scores.contiguous(),
             row_page_slots.contiguous(),

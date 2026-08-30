@@ -6,6 +6,76 @@ import triton.language as tl
 
 
 @triton.jit
+def _prepare_quest_decode_geometry_kernel(
+    context_lens,
+    num_pages,
+    previous_page_counts,
+    NUM_ROWS: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < NUM_ROWS
+    context_len = tl.load(context_lens + offsets, mask=mask)
+    row_num_pages = (context_len + PAGE_SIZE - 1) // PAGE_SIZE
+    tl.store(num_pages + offsets, row_num_pages, mask=mask)
+    tl.store(
+        previous_page_counts + offsets,
+        tl.maximum(row_num_pages - 1, 0),
+        mask=mask,
+    )
+
+
+def prepare_quest_decode_geometry(
+    context_lens: torch.Tensor,
+    *,
+    page_size: int,
+    num_pages: torch.Tensor,
+    previous_page_counts: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare layer-invariant QuEST page counts into stable graph buffers."""
+
+    num_rows = int(context_lens.numel())
+    if (
+        context_lens.ndim != 1
+        or context_lens.dtype != torch.int32
+        or not context_lens.is_contiguous()
+        or not context_lens.is_cuda
+    ):
+        raise TypeError("QuEST decode context lengths must be contiguous CUDA int32.")
+    for name, output in {
+        "num_pages": num_pages,
+        "previous_page_counts": previous_page_counts,
+    }.items():
+        if (
+            output.shape != context_lens.shape
+            or output.dtype != torch.int32
+            or not output.is_contiguous()
+            or output.device != context_lens.device
+        ):
+            raise TypeError(
+                f"QuEST {name} must be contiguous int32 and match context_lens."
+            )
+    if num_rows <= 0:
+        raise ValueError("QuEST decode geometry requires a non-empty batch.")
+    if int(page_size) <= 0:
+        raise ValueError("QuEST decode geometry requires a positive page size.")
+
+    block_size = triton.next_power_of_2(num_rows)
+    _prepare_quest_decode_geometry_kernel[(1,)](
+        context_lens,
+        num_pages,
+        previous_page_counts,
+        NUM_ROWS=num_rows,
+        PAGE_SIZE=int(page_size),
+        BLOCK_SIZE=block_size,
+        num_warps=1,
+        num_stages=1,
+    )
+    return num_pages, previous_page_counts
+
+
+@triton.jit
 def _score_quest_pages_kernel(
     query,
     page_max,
@@ -587,5 +657,6 @@ def finalize_quest_paged_decode_view(
 __all__ = [
     "finalize_quest_decode_view",
     "finalize_quest_paged_decode_view",
+    "prepare_quest_decode_geometry",
     "score_quest_pages",
 ]
