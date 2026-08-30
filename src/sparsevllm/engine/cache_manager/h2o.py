@@ -67,12 +67,6 @@ class H2OCacheManager(SnapKVCacheManager):
     def h2o_prefill_budget(self) -> int:
         return int(self.config.h2o_prefill_budget)
 
-    def _h2o_budget_partition(self) -> tuple[int, int]:
-        budget = self.h2o_decode_budget
-        recent_count = max(1, int(budget * float(self.config.h2o_recent_ratio)))
-        recent_count = min(recent_count, budget)
-        return budget - recent_count, recent_count
-
     def _prefill_append_peak(
         self,
         resident_len: int,

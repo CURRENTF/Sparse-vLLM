@@ -333,9 +333,6 @@ class SnapKVCacheManager(CacheManager):
     def requires_full_prefill_step(self, seq: Sequence) -> bool:
         return self.prefill_execution_mode(seq) == PREFILL_EXECUTION_FULL
 
-    def is_full_prefill_step(self, seqs: list[Sequence]) -> bool:
-        return self._should_use_pyramidkv_full_prefill_staging(seqs)
-
     def allocate_kv_cache(self):
         available_memory, slot_bytes_per_layer = self._get_available_slots_info()
         config = self.config
@@ -1103,7 +1100,7 @@ class SnapKVCacheManager(CacheManager):
         return acc
 
     def _prefill_score_initial_value(self) -> float:
-        mode = getattr(self.config, "sparse_prefill_score_mode", None) or "logits"
+        mode = self.config.sparse_prefill_score_mode
         return -torch.inf if mode == "logits" else 0.0
 
     def _run_prefill_score(
@@ -1122,7 +1119,7 @@ class SnapKVCacheManager(CacheManager):
         recent_keep_tokens: int,
         batch_indices: torch.Tensor | None = None,
     ) -> None:
-        mode = getattr(self.config, "sparse_prefill_score_mode", None) or "logits"
+        mode = self.config.sparse_prefill_score_mode
         with profiler.record("prefill_token_score"):
             prefill_score_fwd(
                 q,

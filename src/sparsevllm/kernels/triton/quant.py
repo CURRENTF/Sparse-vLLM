@@ -347,7 +347,3 @@ def unpack_quantized_to_16bit(packed, scale, mn, group_size, bits: int):
         res = unpacked.view(B, nh, num_imp, num_groups, group_size)
         res = res * scale.unsqueeze(-1) + mn.unsqueeze(-1)
         return res.view(B, nh, num_imp, D)
-
-
-def unpack_4bit_to_16bit(packed, scale, mn, group_size):
-    return unpack_quantized_to_16bit(packed, scale, mn, group_size, 4)

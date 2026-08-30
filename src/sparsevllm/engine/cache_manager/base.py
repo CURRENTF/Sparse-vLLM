@@ -355,9 +355,6 @@ class CacheManager(ABC):
     def is_full_attention_layer(self, layer_idx: int) -> bool:
         return bool(self.runtime_layout.is_full_attention(int(layer_idx)))
 
-    def is_linear_attention_layer(self, layer_idx: int) -> bool:
-        return bool(self.runtime_layout.is_linear_attention(int(layer_idx)))
-
     def kv_layer_index(self, layer_idx: int) -> int:
         return int(self.runtime_layout.kv_layer_index(int(layer_idx)))
 
@@ -1489,10 +1486,6 @@ class CacheManager(ABC):
 
     def requires_full_prefill_step(self, seq: Sequence) -> bool:
         """Whether this prefill candidate must run its remaining tokens in one step."""
-        return False
-
-    def is_full_prefill_step(self, seqs: list[Sequence]) -> bool:
-        """Whether the current prepared prefill step is backed by a full-prefill staging view."""
         return False
 
     def prefill_step_free_slots_for(self, seq: Sequence) -> int:

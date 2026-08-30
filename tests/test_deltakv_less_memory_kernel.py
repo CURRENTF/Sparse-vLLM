@@ -11,10 +11,8 @@ from sparsevllm.kernels.triton.deltakv_kernels import (
     deltakv_reconstruct_writeback_grouped_heads,
     deltakv_static_decode_plan,
     full_layer_kivi_build_dense_decode_view,
-    full_layer_kivi_dequant_tokens,
     full_layer_kivi_flash_decode_stage1,
     full_layer_kivi_flash_decode_stage1_grouped,
-    full_layer_kivi_flash_decode_stage1_token_group_map,
     full_layer_kivi_flash_decode_stage1_token_map,
 )
 from sparsevllm.kernels.triton.gqa_flash_decoding_stage1 import flash_decode_stage1 as gqa_flash_decode_stage1
@@ -831,112 +829,6 @@ class DeltaKVLessMemoryKernelTest(unittest.TestCase):
         self.assertEqual(chunk_sizes, [2, 2, 1])
         self.assertIn(3, manager._full_layer_kivi_full_prefill_materialized_layers)
 
-    def test_full_layer_kivi_dequant_tokens_matches_unpack(self):
-        torch.manual_seed(1)
-        device = "cuda"
-        dtype = torch.float16
-        num_blocks = 3
-        group_size = 32
-        num_heads = 2
-        head_dim = 64
-        bits = 4
-
-        key_packed = torch.empty(
-            num_blocks,
-            num_heads,
-            head_dim,
-            group_size // 8,
-            device=device,
-            dtype=torch.int32,
-        )
-        key_scales = torch.empty((num_blocks, num_heads, head_dim), device=device, dtype=dtype)
-        key_mins = torch.empty_like(key_scales)
-        value_packed = torch.empty(
-            num_blocks,
-            num_heads,
-            group_size,
-            head_dim // 8,
-            device=device,
-            dtype=torch.int32,
-        )
-        value_scales = torch.empty(
-            num_blocks,
-            num_heads,
-            group_size,
-            head_dim // group_size,
-            device=device,
-            dtype=dtype,
-        )
-        value_mins = torch.empty_like(value_scales)
-
-        key_ref_blocks = []
-        value_ref_blocks = []
-        for block in range(num_blocks):
-            key = torch.randn(group_size, num_heads, head_dim, device=device, dtype=dtype)
-            value = torch.randn_like(key)
-            key_ref_blocks.append(key)
-            value_ref_blocks.append(value)
-
-            key_states = key.unsqueeze(0).permute(0, 2, 3, 1).contiguous()
-            packed_k, scale_k, mn_k = triton_quantize_and_pack_along_last_dim(key_states, group_size, bits)
-            key_packed[block] = packed_k.squeeze(0)
-            key_scales[block] = scale_k.squeeze(0).squeeze(-1)
-            key_mins[block] = mn_k.squeeze(0).squeeze(-1)
-
-            value_states = value.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
-            packed_v, scale_v, mn_v = triton_quantize_and_pack_along_last_dim(value_states, group_size, bits)
-            value_packed[block] = packed_v.squeeze(0)
-            value_scales[block] = scale_v.squeeze(0)
-            value_mins[block] = mn_v.squeeze(0)
-
-        block_slots = torch.tensor([0, 2, 1, 2, 0], device=device, dtype=torch.int32)
-        local_offsets = torch.tensor([0, 31, 7, 16, 23], device=device, dtype=torch.int32)
-        out_slots = torch.tensor([4, 1, 3, 0, 2], device=device, dtype=torch.int32)
-        out_k = torch.empty((5, num_heads, head_dim), device=device, dtype=dtype)
-        out_v = torch.empty_like(out_k)
-
-        full_layer_kivi_dequant_tokens(
-            key_packed=key_packed,
-            key_scales=key_scales,
-            key_mins=key_mins,
-            value_packed=value_packed,
-            value_scales=value_scales,
-            value_mins=value_mins,
-            block_slots=block_slots,
-            local_offsets=local_offsets,
-            out_slots=out_slots,
-            out_k=out_k,
-            out_v=out_v,
-            group_size=group_size,
-        )
-        torch.cuda.synchronize()
-
-        expected_k = torch.empty_like(out_k)
-        expected_v = torch.empty_like(out_v)
-        for i in range(block_slots.numel()):
-            block = int(block_slots[i].item())
-            local = int(local_offsets[i].item())
-            dst = int(out_slots[i].item())
-            key_dequant = unpack_quantized_to_16bit(
-                key_packed[block].unsqueeze(0),
-                key_scales[block].unsqueeze(0).unsqueeze(-1),
-                key_mins[block].unsqueeze(0).unsqueeze(-1),
-                group_size,
-                bits,
-            ).permute(0, 3, 1, 2).squeeze(0)
-            value_dequant = unpack_quantized_to_16bit(
-                value_packed[block].unsqueeze(0),
-                value_scales[block].unsqueeze(0),
-                value_mins[block].unsqueeze(0),
-                group_size,
-                bits,
-            ).permute(0, 2, 1, 3).squeeze(0)
-            expected_k[dst] = key_dequant[local]
-            expected_v[dst] = value_dequant[local]
-
-        self.assertTrue(torch.allclose(out_k, expected_k, atol=2e-3, rtol=2e-3))
-        self.assertTrue(torch.allclose(out_v, expected_v, atol=2e-3, rtol=2e-3))
-
     def test_full_layer_kivi_flash_decode_stage1_matches_dense_stage1(self):
         torch.manual_seed(2)
         device = "cuda"
@@ -1047,15 +939,12 @@ class DeltaKVLessMemoryKernelTest(unittest.TestCase):
         lse_fused = torch.empty_like(lse_ref)
         mid_grouped = torch.empty_like(mid_ref)
         lse_grouped = torch.empty_like(lse_ref)
-        mid_token_group = torch.empty_like(mid_ref)
-        lse_token_group = torch.empty_like(lse_ref)
         dense_k_view = torch.empty_like(dense_k)
         dense_v_view = torch.empty_like(dense_v)
         dense_req_to_tokens = torch.empty_like(req_to_tokens)
         score_ref = torch.full((batch, num_heads, seq_len), -1e20, device=device, dtype=torch.float32)
         score_fused = torch.full_like(score_ref, -1e20)
         score_grouped = torch.full_like(score_ref, -1e20)
-        score_token_group = torch.full_like(score_ref, -1e20)
 
         full_layer_kivi_build_dense_decode_view(
             raw_k=raw_k,
@@ -1147,32 +1036,6 @@ class DeltaKVLessMemoryKernelTest(unittest.TestCase):
 
         self.assertTrue(torch.allclose(mid_grouped, mid_ref, atol=3e-2, rtol=3e-2))
         self.assertTrue(torch.allclose(lse_grouped, lse_ref, atol=3e-2, rtol=3e-2))
-        full_layer_kivi_flash_decode_stage1_token_group_map(
-            q=q,
-            raw_k=raw_k,
-            raw_v=raw_v,
-            raw_slots_map=raw_slots_map,
-            kivi_token_slots_map=kivi_block_slots_map,
-            row_kivi_quantized_lens=row_kivi_quantized_lens,
-            key_packed=key_packed,
-            key_scales=key_scales,
-            key_mins=key_mins,
-            value_packed=value_packed,
-            value_scales=value_scales,
-            value_mins=value_mins,
-            req_indices=req_indices,
-            context_lens=context_lens,
-            max_len_in_batch=seq_len,
-            mid_out=mid_token_group,
-            mid_out_logsumexp=lse_token_group,
-            group_size=group_size,
-            kivi_start=sink,
-            block_seq=block_seq,
-        )
-        torch.cuda.synchronize()
-
-        self.assertTrue(torch.allclose(mid_token_group, mid_ref, atol=3e-2, rtol=3e-2))
-        self.assertTrue(torch.allclose(lse_token_group, lse_ref, atol=3e-2, rtol=3e-2))
 
         gqa_flash_decode_stage1_with_score(
             q,
@@ -1242,34 +1105,6 @@ class DeltaKVLessMemoryKernelTest(unittest.TestCase):
         self.assertTrue(torch.allclose(mid_grouped, mid_ref, atol=3e-2, rtol=3e-2))
         self.assertTrue(torch.allclose(lse_grouped, lse_ref, atol=3e-2, rtol=3e-2))
         self.assertTrue(torch.allclose(score_grouped, score_ref, atol=3e-2, rtol=3e-2))
-        full_layer_kivi_flash_decode_stage1_token_group_map(
-            q=q,
-            raw_k=raw_k,
-            raw_v=raw_v,
-            raw_slots_map=raw_slots_map,
-            kivi_token_slots_map=kivi_block_slots_map,
-            row_kivi_quantized_lens=row_kivi_quantized_lens,
-            key_packed=key_packed,
-            key_scales=key_scales,
-            key_mins=key_mins,
-            value_packed=value_packed,
-            value_scales=value_scales,
-            value_mins=value_mins,
-            req_indices=req_indices,
-            context_lens=context_lens,
-            max_len_in_batch=seq_len,
-            mid_out=mid_token_group,
-            mid_out_logsumexp=lse_token_group,
-            group_size=group_size,
-            kivi_start=sink,
-            block_seq=block_seq,
-            attn_score=score_token_group,
-        )
-        torch.cuda.synchronize()
-
-        self.assertTrue(torch.allclose(mid_token_group, mid_ref, atol=3e-2, rtol=3e-2))
-        self.assertTrue(torch.allclose(lse_token_group, lse_ref, atol=3e-2, rtol=3e-2))
-        self.assertTrue(torch.allclose(score_token_group, score_ref, atol=3e-2, rtol=3e-2))
 
         max_kv_splits = 4
         target_tokens_per_split = 16

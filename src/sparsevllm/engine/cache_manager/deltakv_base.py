@@ -368,9 +368,6 @@ class DeltaKVCacheManager(CacheManager):
     def requires_full_prefill_step(self, seq: Sequence) -> bool:
         return self.prefill_execution_mode(seq) == PREFILL_EXECUTION_FULL
 
-    def is_full_prefill_step(self, seqs: list[Sequence]) -> bool:
-        return self._should_use_full_prefill_staging(seqs)
-
     def defer_prefill_eviction(self) -> bool:
         return bool(getattr(self, "_deltakv_long_prefill_offload_step_active", False))
 

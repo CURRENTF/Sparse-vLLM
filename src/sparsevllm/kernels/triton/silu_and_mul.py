@@ -110,22 +110,3 @@ def silu_and_mul_fwd(
         **launch_kwargs,
     )
     return output
-
-
-def torch_silu_and_mul(input: torch.Tensor):
-    return torch.nn.functional.silu(input[:, 0 : (input.shape[-1] // 2)]) * input[:, (input.shape[-1] // 2) :]
-
-
-def test_silu_and_mul(M, N, dtype, device="cuda"):
-    # create data
-    X = torch.randn((M, N), dtype=dtype, device=device)
-
-    # run
-    y_tri = silu_and_mul_fwd(X)
-    y_ref = torch_silu_and_mul(X)
-
-    # compare
-    print("type:", y_tri.dtype, y_ref.dtype)
-    print("max delta:", torch.max(torch.abs(y_tri - y_ref)))
-    assert torch.allclose(y_tri, y_ref, atol=1e-6, rtol=0)
-    return

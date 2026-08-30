@@ -395,15 +395,6 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         )
         return int(freeable_blocks * self.page_size)
 
-    def _prefix_evictable_pages(self) -> int:
-        if self.prefix_cache is None:
-            return 0
-        return int(
-            self.prefix_cache.device_freeable_blocks()
-            if self._prefix_offload_enabled()
-            else self.prefix_cache.freeable_blocks()
-        )
-
     def _prefix_step_reclaimable_pages(self) -> int:
         if self.prefix_cache is None:
             return 0
@@ -488,12 +479,6 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                 else self.prefix_cache.freeable_blocks()
             )
         return int(self.num_free_slots + reclaimable_blocks * self.page_size)
-
-    def _prefix_hit_evictable_slots(self, seq: Sequence) -> int:
-        if self.prefix_cache is None or int(getattr(seq, "prefix_cache_hit_len", 0) or 0) <= 0:
-            return 0
-        reclaimable_blocks, _ = self._prefix_hit_capacity_counts(seq)
-        return int(reclaimable_blocks * self.page_size)
 
     def _ceil_to_page_slots(self, n_tokens: int) -> int:
         n_tokens = int(n_tokens)
@@ -1353,15 +1338,6 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         row_idx = self.free_rows.popleft()
         self.seq_id_to_row[seq_id] = row_idx
         return row_idx
-
-    def _allocate_new_page(self, row_idx: int, page_idx: int) -> int:
-        if self._num_free_pages <= 0:
-            raise RuntimeError("Out of QuEST KV pages")
-        ptr = self._num_free_pages
-        page_slot = int(self.free_pages_stack[ptr - 1].item())
-        self._num_free_pages -= 1
-        self.buffer_req_to_page_slots[row_idx, page_idx] = page_slot
-        return page_slot
 
     def _required_new_pages(self, seq_id: int, size: int) -> int:
         row_idx = self.seq_id_to_row.get(seq_id)

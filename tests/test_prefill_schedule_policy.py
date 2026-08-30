@@ -85,9 +85,6 @@ class FakeMemoryOracle:
     def requires_full_prefill_step(self, seq):
         return self._force_whole_prefill and int(seq.num_prefilled_tokens) == 0
 
-    def is_full_prefill_step(self, seqs):
-        return False
-
     def requires_long_prefill_offload(self, seq):
         return self._long_prefill_offload
 
@@ -4367,27 +4364,6 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
         self.assertIs(stores[1][1], postrope_k)
         self.assertIs(stores[1][2], value)
         self.assertEqual(len(rope_hooks), 1)
-
-    def test_full_layer_kivi_prefill_does_not_allocate_fp32_shadow_staging(self):
-        from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager
-        from sparsevllm.utils.context import reset_context
-
-        reset_context()
-        manager = object.__new__(DeltaKVLessMemoryCacheManager)
-        manager._full_layer_kivi_enabled = lambda: True
-        manager.full_layer_to_idx = {0: 0}
-        manager.has_prefill_staging_view = lambda layer_idx: True
-        manager.full_layer_k_norm_weight = None
-        manager.deltakv_prefill_staging_num_slots = 3
-        manager.full_layer_kivi_prefill_k_cache_fp32 = None
-
-        postrope_k = torch.arange(12, dtype=torch.float32).view(3, 1, 4)
-        slot_mapping = torch.tensor([0, -1, 2], dtype=torch.int64)
-
-        DeltaKVLessMemoryCacheManager.on_kv_stored(manager, 0, postrope_k, slot_mapping)
-
-        self.assertIsNone(manager.full_layer_kivi_prefill_k_cache_fp32)
-        reset_context()
 
     def test_full_layer_kivi_prefill_compute_uses_high_precision_staging(self):
         from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager

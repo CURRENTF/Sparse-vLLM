@@ -427,18 +427,6 @@ class DeltaKVLessMemoryCudaGraphCacheManager(DeltaKVLessMemoryCacheManager):
                 self._raise_if_capture_allocation("full-layer quant out slots", (total_slots,))
         return super()._ensure_full_layer_quant_decode_workspace(batch_size, max_len)
 
-    def _ensure_full_layer_score_key_workspace(self, batch_size: int, max_len: int):
-        batch_size = max(1, int(batch_size))
-        max_len = max(1, int(max_len))
-        score_k = getattr(self, "_full_layer_score_k_cache_fp32", None)
-        if (
-            score_k is None
-            or score_k.device.type != "cuda"
-            or int(score_k.shape[0]) < batch_size * max_len
-        ):
-            self._raise_if_capture_allocation("full-layer score-key", (batch_size, max_len, self.num_kv_heads, self.head_dim))
-        return super()._ensure_full_layer_score_key_workspace(batch_size, max_len)
-
     def _ensure_deltakv_postrope_dummy_slot(self) -> torch.Tensor:
         """Reserve one stable scratch slot used to mask invalid padded entries."""
         slot = getattr(self, "_deltakv_postrope_dummy_slot", None)
