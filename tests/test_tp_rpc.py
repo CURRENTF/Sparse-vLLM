@@ -19,6 +19,7 @@ from sparsevllm.engine.model_runner import (
     _create_model,
     make_tp_shm_name,
 )
+from sparsevllm.engine.startup import DeviceMemorySnapshot
 from sparsevllm.models.spec import ModelSpec
 from sparsevllm.operators import registry as operator_registry
 
@@ -602,6 +603,49 @@ def test_model_runner_reset_after_warmup_resets_local_runtime_state():
         ModelRunner.reset_after_warmup(runner)
 
     assert calls == ["runtime"]
+
+
+def test_model_runner_releases_the_complete_profiling_cache_runtime():
+    calls = []
+    controller = object()
+    runner = object.__new__(ModelRunner)
+    runner.cache_runtime_phase = "profiling"
+    runner.platform = SimpleNamespace(synchronize=lambda: calls.append("sync"))
+    runner.reset_after_warmup = lambda: calls.append("reset")
+    runner.decode_graph_runner = SimpleNamespace(
+        clear_captured_graphs=lambda: calls.append("clear_graphs")
+    )
+    runner.config = SimpleNamespace(decode_graph=True)
+    runner.collective_runtime = SimpleNamespace(
+        reset_for_cuda_graph_recapture=lambda: calls.append("reset_collectives")
+    )
+    runner.model = SimpleNamespace(model=SimpleNamespace(sparse_controller=controller))
+    runner.sparse_controller = controller
+    runner.runtime_state = object()
+    runner.prefix_cache_coordinator = object()
+    runner.chain_cache_coordinator = object()
+    runner.cache_manager = object()
+    runner.world_size = 1
+    runner.rank = 0
+    runner.device = torch.device("cpu")
+    snapshot = DeviceMemorySnapshot(700, 1000, 300, 300)
+
+    with (
+        patch(
+            "sparsevllm.engine.model_runner.release_unused_device_memory",
+            side_effect=lambda _platform: calls.append("release_memory"),
+        ),
+        patch.object(DeviceMemorySnapshot, "capture", return_value=snapshot),
+    ):
+        records = ModelRunner.release_profiling_cache_runtime(runner)
+
+    assert calls == ["sync", "reset", "clear_graphs", "reset_collectives", "release_memory"]
+    assert runner.cache_runtime_phase == "released"
+    assert runner.model.model.sparse_controller is None
+    assert runner.decode_graph_runner is None
+    assert runner.runtime_state is None
+    assert runner.cache_manager is None
+    assert records == [{"world_rank": 0, "snapshot": snapshot}]
 
 
 def test_model_runner_decode_graph_startup_controls_use_live_runner():

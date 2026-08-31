@@ -365,6 +365,8 @@ class ParallelCollectiveRuntime:
             )
 
     def reset_for_cuda_graph_recapture(self) -> None:
+        if self.state is ParallelCollectiveState.PREPARED:
+            return
         if self.state is not ParallelCollectiveState.REPLAYABLE:
             raise RuntimeError(
                 "Parallel collective runtime can reset only after a complete CUDA "

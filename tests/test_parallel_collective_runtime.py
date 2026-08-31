@@ -286,6 +286,32 @@ def test_completed_collectives_can_reset_for_production_graph_recapture():
     production_op.close.assert_not_called()
 
 
+def test_uncaptured_collectives_need_no_reset_before_runtime_rebuild():
+    world = _group((0, 1), process_group=object())
+    runtime = ParallelCollectiveRuntime(
+        _context(world=world, attention=world),
+        cuda_graph=True,
+        device_index=0,
+    )
+    runtime.request_decode_collectives(
+        attention_max_rows=8,
+        moe_max_rows=8,
+        hidden_size=128,
+        dtype=torch.float16,
+    )
+    op = _prepared_op()
+    with patch(
+        "sparsevllm.distributed.collective_runtime.prepare_parallel_all_reduce",
+        return_value=op,
+    ):
+        runtime.prepare()
+
+    runtime.reset_for_cuda_graph_recapture()
+
+    assert runtime.state is ParallelCollectiveState.PREPARED
+    op.close.assert_not_called()
+
+
 def test_handle_uses_plain_collective_for_prefill_and_prepared_op_for_decode():
     world = _group((0, 1), process_group=object())
     context = _context(world=world, attention=world)

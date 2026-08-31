@@ -1,3 +1,4 @@
+import copy
 import os
 import pickle
 import socket
@@ -49,6 +50,13 @@ from sparsevllm.engine.prefix_prune import select_global_keep_indices
 from sparsevllm.engine.chain_cache import ChainAdmissionPlan, ChainCacheCoordinator
 from sparsevllm.engine.recurrent_state_manager import RecurrentStateManager, RecurrentStateSpec
 from sparsevllm.engine.runtime_state import RuntimeState
+from sparsevllm.engine.startup import (
+    DeviceMemorySnapshot,
+    StartupMemoryProfiler,
+    profiling_kv_budget_bytes,
+    profiling_kv_slots,
+    release_unused_device_memory,
+)
 from sparsevllm.multimodal.runtime import MultiModalRuntime
 from sparsevllm.engine.sparse_controller import SparseController
 from sparsevllm.models.spec import ModelSpec
@@ -157,6 +165,13 @@ DECODE_GRAPH_HOST_STATUS_SYNC_METHODS = {
     "register_decode_cuda_graph_buffers",
     "seal_decode_cuda_graph_startup_plan",
 }
+STARTUP_HOST_STATUS_SYNC_METHODS = {
+    "begin_startup_memory_profile",
+    "build_production_cache_runtime",
+    "capture_startup_memory_snapshot",
+    "finish_startup_memory_profile",
+    "release_profiling_cache_runtime",
+}
 RECOVERABLE_TP_CONTROL_RPC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "chain_validate_admission_plan",
     "finish_slots_batch",
@@ -164,7 +179,7 @@ RECOVERABLE_TP_CONTROL_RPC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "free_slots",
     "free_slots_batch",
     "register_multimodal_shared",
-} | DECODE_GRAPH_HOST_STATUS_SYNC_METHODS
+} | DECODE_GRAPH_HOST_STATUS_SYNC_METHODS | STARTUP_HOST_STATUS_SYNC_METHODS
 TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "chain_admission_plan",
     "chain_apply_admission",
@@ -183,7 +198,7 @@ TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "run",
     "register_multimodal_shared",
     "warmup_moe_workspace",
-} | DECODE_GRAPH_HOST_STATUS_SYNC_METHODS
+} | DECODE_GRAPH_HOST_STATUS_SYNC_METHODS | STARTUP_HOST_STATUS_SYNC_METHODS
 
 
 def make_tp_shm_name() -> str:
@@ -413,32 +428,75 @@ class ModelRunner:
                 platform=self.platform,
                 state_spec=state_spec,
             )
-        # Model loading and backend warmup can leave released temporary tensors in
-        # the allocator cache. Flush them before KV sizing so device-used memory
-        # and allocator peak history do not reserve the same temporary memory.
-        self.platform.synchronize()
-        self.platform.empty_cache()
-        self.platform.reset_peak_memory_stats(self.device)
-        # Recurrent rows are persistent runtime state. Allocate them before the
-        # cache manager sizes KV so gpu_memory_utilization accounts for both.
-        self.cache_manager = CacheManager.create(config, self.parallel_context)
+        release_unused_device_memory(self.platform)
+        self.startup_memory_profiler = StartupMemoryProfiler(
+            self.platform,
+            self.device,
+        )
+        self.profiling_kv_slots = profiling_kv_slots(config)
+        self.profiling_kv_budget_bytes = profiling_kv_budget_bytes(
+            config,
+            self.profiling_kv_slots,
+        )
+        self._build_cache_runtime(
+            copy.copy(config),
+            allocation_budget_bytes=self.profiling_kv_budget_bytes,
+        )
+        self.cache_runtime_phase = "profiling"
+
+        torch.set_default_device("cpu")
+        torch.set_default_dtype(default_dtype)
+
+        # TP 场景下的多进程指令同步
+        if self.world_size > 1:
+            if not self.tp_shm_name:
+                raise ValueError("tp_shm_name is required when world_size > 1.")
+            if rank == 0:
+                # Rank 0 创建共享内存用于发送方法调用指令
+                self.shm = SharedMemory(name=self.tp_shm_name, create=True, size=TP_SHM_SIZE)
+                self.parallel_context.world_barrier(
+                    device_ids=self.platform.barrier_device_ids(rank)
+                )
+            else:
+                # 其他 Rank 监听共享内存中的方法调用指令
+                self.parallel_context.world_barrier(
+                    device_ids=self.platform.barrier_device_ids(rank)
+                )
+                self.shm = SharedMemory(name=self.tp_shm_name)
+                self.loop()
+
+    def _build_cache_runtime(
+        self,
+        runtime_config: Config,
+        *,
+        allocation_budget_bytes: int,
+    ) -> None:
+        self.cache_manager = CacheManager.create(
+            runtime_config,
+            self.parallel_context,
+            allocation_budget_bytes=int(allocation_budget_bytes),
+        )
         prefix_cache_mode = str(
-            getattr(config, "resolved_prefix_cache_mode", "disabled")
+            getattr(runtime_config, "resolved_prefix_cache_mode", "disabled")
         )
         self.prefix_cache_coordinator = (
-            PrefixCacheCoordinator(config, self.cache_manager, self.recurrent_state_manager)
-            if has_linear_layers and prefix_cache_mode == "radix"
+            PrefixCacheCoordinator(
+                runtime_config,
+                self.cache_manager,
+                self.recurrent_state_manager,
+            )
+            if self.recurrent_state_manager is not None and prefix_cache_mode == "radix"
             else None
         )
         self.chain_cache_coordinator = (
-            ChainCacheCoordinator(config, self.cache_manager)
+            ChainCacheCoordinator(runtime_config, self.cache_manager)
             if prefix_cache_mode == "chain"
             else None
         )
         if self.prefix_cache_coordinator is not None:
             self.cache_manager.prefix_cache_coordinator = self.prefix_cache_coordinator
         self.runtime_state = RuntimeState(
-            config,
+            runtime_config,
             self.cache_manager,
             self.recurrent_state_manager,
             self.prefix_cache_coordinator,
@@ -446,9 +504,7 @@ class ModelRunner:
             decode_graph_participants=collect_decode_graph_participants(self.model),
         )
 
-        # 初始化稀疏控制器
-        self.sparse_controller = SparseController(config, self.cache_manager)
-        # 注入模型
+        self.sparse_controller = SparseController(runtime_config, self.cache_manager)
         if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
             self.model.model.sparse_controller = self.sparse_controller
             if self.recurrent_state_manager is not None:
@@ -457,7 +513,6 @@ class ModelRunner:
             if hasattr(self.cache_manager, "set_model_layers"):
                 self.cache_manager.set_model_layers(self.model.model.layers)
 
-        # 加载 DeltaKV 压缩器
         self.load_deltakv_compressors()
 
         decode_static_context_sizes = _resolve_decode_cuda_graph_context_sizes(
@@ -483,33 +538,98 @@ class ModelRunner:
             graph_pool=self.cuda_graph_pool,
             collective_runtime=self.collective_runtime,
         )
-        torch.set_default_device("cpu")
-        torch.set_default_dtype(default_dtype)
 
-        # TP 场景下的多进程指令同步
-        if self.world_size > 1:
-            if not self.tp_shm_name:
-                raise ValueError("tp_shm_name is required when world_size > 1.")
-            if rank == 0:
-                # Rank 0 创建共享内存用于发送方法调用指令
-                self.shm = SharedMemory(name=self.tp_shm_name, create=True, size=TP_SHM_SIZE)
-                self.parallel_context.world_barrier(
-                    device_ids=self.platform.barrier_device_ids(rank)
-                )
-            else:
-                # 其他 Rank 监听共享内存中的指令
-                self.parallel_context.world_barrier(
-                    device_ids=self.platform.barrier_device_ids(rank)
-                )
-                self.shm = SharedMemory(name=self.tp_shm_name)
-                self.loop()
+    def _gather_startup_record(self, local_record):
+        if self.world_size == 1:
+            return [local_record]
+        records = [None] * self.world_size
+        dist.all_gather_object(
+            records,
+            local_record,
+            group=self.parallel_context.world.process_group,
+        )
+        return records if self.rank == 0 else None
+
+    def begin_startup_memory_profile(self, phase: str) -> None:
+        self.startup_memory_profiler.begin(phase)
+
+    def finish_startup_memory_profile(self, phase: str):
+        result = self.startup_memory_profiler.finish(phase)
+        return self._gather_startup_record(
+            {
+                "world_rank": int(self.rank),
+                "before": result.before,
+                "after": result.after,
+                "measurement": result.measurement,
+            }
+        )
+
+    def release_profiling_cache_runtime(self):
+        if self.cache_runtime_phase != "profiling":
+            raise RuntimeError(
+                "Profiling cache runtime can be released only once, got "
+                f"phase={self.cache_runtime_phase!r}."
+            )
+        self.platform.synchronize()
+        self.reset_after_warmup()
+        self.decode_graph_runner.clear_captured_graphs()
+        if self.config.decode_graph:
+            self.collective_runtime.reset_for_cuda_graph_recapture()
+        model = getattr(self.model, "model", None)
+        if model is not None and getattr(model, "sparse_controller", None) is self.sparse_controller:
+            model.sparse_controller = None
+        self.decode_graph_runner = None
+        self.sparse_controller = None
+        self.runtime_state = None
+        self.prefix_cache_coordinator = None
+        self.chain_cache_coordinator = None
+        self.cache_manager = None
+        release_unused_device_memory(self.platform)
+        self.cache_runtime_phase = "released"
+        snapshot = DeviceMemorySnapshot.capture(self.platform, self.device)
+        return self._gather_startup_record(
+            {
+                "world_rank": int(self.rank),
+                "snapshot": snapshot,
+            }
+        )
+
+    def build_production_cache_runtime(self, allocation_budget_bytes: int):
+        if self.cache_runtime_phase != "released":
+            raise RuntimeError(
+                "Production cache runtime requires a released profiling runtime, got "
+                f"phase={self.cache_runtime_phase!r}."
+            )
+        release_unused_device_memory(self.platform)
+        self._build_cache_runtime(
+            self.config,
+            allocation_budget_bytes=int(allocation_budget_bytes),
+        )
+        self.platform.synchronize()
+        self.cache_runtime_phase = "production"
+        return self._gather_startup_record(
+            {
+                "world_rank": int(self.rank),
+                "num_kvcache_slots": self.config.num_kvcache_slots,
+            }
+        )
+
+    def capture_startup_memory_snapshot(self):
+        release_unused_device_memory(self.platform)
+        snapshot = DeviceMemorySnapshot.capture(self.platform, self.device)
+        return self._gather_startup_record(
+            {
+                "world_rank": int(self.rank),
+                "snapshot": snapshot,
+            }
+        )
 
     def exit(self):
         """释放资源并注销分布式进程组"""
         # Graph replay is asynchronous on every rank. Drain and release captured
         # NCCL work before entering the shutdown barrier or destroying its group.
         self.platform.synchronize()
-        if self.config.decode_graph:
+        if self.config.decode_graph and self.decode_graph_runner is not None:
             self.decode_graph_runner.clear_captured_graphs()
             self.platform.synchronize()
         close_runtime_operators = getattr(self.model, "close_runtime_operators", None)
@@ -612,7 +732,10 @@ class ModelRunner:
                 local_error = exc
             if method_name == "run" and self.config.decode_graph:
                 self._sync_tp_run_status(local_error)
-            elif method_name in DECODE_GRAPH_HOST_STATUS_SYNC_METHODS:
+            elif method_name in (
+                DECODE_GRAPH_HOST_STATUS_SYNC_METHODS
+                | STARTUP_HOST_STATUS_SYNC_METHODS
+            ):
                 self._sync_tp_host_status(method_name, local_error)
             else:
                 self._sync_tp_rpc_status(method_name, local_error)
