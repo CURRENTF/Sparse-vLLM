@@ -95,19 +95,52 @@ def profiling_kv_slots(config) -> int:
     if not bool(config.decode_graph_startup_capture):
         return required
 
-    threshold = decode_sparse_long_text_threshold(
-        config.sparse_method,
-        num_sink_tokens=config.sink_keep_tokens,
-        decode_keep_tokens=config.decode_keep_tokens,
-        num_recent_tokens=config.recent_keep_tokens,
-    )
     for batch_size, _, is_long_text in build_decode_cuda_graph_startup_family_plan(config):
-        prompt_tokens = int(threshold) if is_long_text else 1
         required = max(
             required,
-            batch_slots((prompt_tokens,) * int(batch_size), 2),
+            startup_graph_family_kv_slots(config, batch_size, is_long_text),
         )
     return required
+
+
+def startup_graph_family_kv_slots(
+    config,
+    batch_size: int,
+    is_long_text: bool,
+) -> int:
+    method = normalize_sparse_method(config.sparse_method)
+    prompt_tokens = (
+        decode_sparse_long_text_threshold(
+            method,
+            num_sink_tokens=config.sink_keep_tokens,
+            decode_keep_tokens=config.decode_keep_tokens,
+            num_recent_tokens=config.recent_keep_tokens,
+        )
+        if is_long_text
+        else 1
+    )
+    page_size = int(config.quest_chunk_size) if method == "quest" else 1
+    slots_per_sequence = ceil((int(prompt_tokens) + 2) / page_size) * page_size
+    return int(batch_size) * slots_per_sequence
+
+
+def feasible_startup_graph_plan(
+    config,
+    startup_plan: list[tuple[int, int, bool]],
+    available_kv_slots: int,
+) -> tuple[list[tuple[int, int, bool]], list[tuple[int, int, bool]]]:
+    feasible = []
+    skipped = []
+    for entry in startup_plan:
+        batch_size, _, is_long_text = entry
+        destination = (
+            feasible
+            if startup_graph_family_kv_slots(config, batch_size, is_long_text)
+            <= int(available_kv_slots)
+            else skipped
+        )
+        destination.append(entry)
+    return feasible, skipped
 
 
 def profiling_prefill_prompt_lengths(config) -> tuple[int, ...]:
@@ -218,4 +251,6 @@ __all__ = [
     "profiling_kv_budget_bytes",
     "profiling_kv_slots",
     "profiling_prefill_prompt_lengths",
+    "feasible_startup_graph_plan",
+    "startup_graph_family_kv_slots",
 ]

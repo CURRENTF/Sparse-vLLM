@@ -8,6 +8,7 @@ from sparsevllm.engine.cache_manager.storage import CacheLayout
 from sparsevllm.engine.startup import (
     KVCapacityPlan,
     StartupMemoryProfile,
+    feasible_startup_graph_plan,
     profiling_kv_budget_bytes,
     profiling_kv_slots,
     profiling_prefill_prompt_lengths,
@@ -113,3 +114,16 @@ def test_quest_profiling_slots_round_each_request_to_a_page():
     config = _config(sparse_method="quest")
 
     assert profiling_kv_slots(config) == 64
+
+
+def test_production_graph_plan_skips_families_larger_than_final_kv():
+    config = _config(sparse_method="quest")
+    config.sink_keep_tokens = 2
+    config.decode_keep_tokens = 8
+    config.recent_keep_tokens = 6
+    plan = [(4, 32, True), (2, 32, True), (4, 16, False)]
+
+    feasible, skipped = feasible_startup_graph_plan(config, plan, 64)
+
+    assert feasible == [(2, 32, True), (4, 16, False)]
+    assert skipped == [(4, 32, True)]

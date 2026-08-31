@@ -29,6 +29,7 @@ from sparsevllm.engine.model_runner import ModelRunner, make_tp_shm_name, select
 from sparsevllm.engine.input_processor import tokenize_text_prompt
 from sparsevllm.engine.startup import (
     build_startup_capacity_decision,
+    feasible_startup_graph_plan,
     log_startup_capacity_decision,
     log_startup_completion,
     profiling_prefill_prompt_lengths,
@@ -385,12 +386,26 @@ class LLMEngine:
             raise RuntimeError("Startup decode CUDA Graph prefill parked unexpected sequences.")
         return parked, prompt_offset + batch_size
 
-    def _capture_startup_decode_graphs(self, prompt_offset: int) -> int:
+    def _capture_startup_decode_graphs(
+        self,
+        prompt_offset: int,
+        *,
+        respect_runtime_capacity: bool = False,
+    ) -> int:
         if not bool(getattr(self.config, "decode_graph_startup_capture", False)):
             return prompt_offset
         startup_plan = build_decode_cuda_graph_startup_family_plan(self.config)
+        skipped_plan = []
+        if respect_runtime_capacity:
+            startup_plan, skipped_plan = feasible_startup_graph_plan(
+                self.config,
+                startup_plan,
+                self.model_runner.runtime_state.prompt_admission_free_slots(),
+            )
         if not startup_plan:
-            return prompt_offset
+            raise RuntimeError(
+                "Production KV capacity cannot capture any configured decode CUDA Graph."
+            )
 
         capture_groups: dict[tuple[int, bool], list[int]] = {}
         for batch_size, context_capacity, is_long_text in startup_plan:
@@ -408,10 +423,12 @@ class LLMEngine:
         self.model_runner.call("begin_decode_cuda_graph_capture")
         short_graphs = sum(not is_long for _, _, is_long in startup_plan)
         logger.info(
-            "Startup CUDA Graph capture: graphs={} short={} long={} plan={}.",
+            "Startup CUDA Graph capture: graphs={} short={} long={} "
+            "skipped_for_kv_capacity={} plan={}.",
             len(startup_plan),
             short_graphs,
             len(startup_plan) - short_graphs,
+            len(skipped_plan),
             startup_plan,
         )
         capture_params = SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True)
@@ -557,7 +574,10 @@ class LLMEngine:
             decision.selected_kv_budget_bytes,
         )
         self.scheduler = self._create_scheduler()
-        prompt_offset = self._capture_startup_decode_graphs(prompt_offset=0)
+        prompt_offset = self._capture_startup_decode_graphs(
+            prompt_offset=0,
+            respect_runtime_capacity=True,
+        )
         self._after_warmup_debug_cleanup()
 
         post_capture_batch = int(self.config.max_decoding_seqs)

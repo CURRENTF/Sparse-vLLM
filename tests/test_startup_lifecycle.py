@@ -57,8 +57,8 @@ def test_engine_rebuilds_production_runtime_before_final_graph_warmup():
         return prompt_offset + len(prompt_lengths)
 
     engine._run_startup_batch = run_batch
-    engine._capture_startup_decode_graphs = lambda prompt_offset: (
-        calls.append(("capture_graphs", prompt_offset)) or prompt_offset
+    engine._capture_startup_decode_graphs = lambda prompt_offset, **kwargs: (
+        calls.append(("capture_graphs", prompt_offset, kwargs)) or prompt_offset
     )
 
     engine._warmup()
@@ -72,5 +72,5 @@ def test_engine_rebuilds_production_runtime_before_final_graph_warmup():
     ]
     assert [call[0] for call in calls].count("capture_graphs") == 2
     assert calls.index(("build_production_cache_runtime", 430)) < calls.index(
-        ("capture_graphs", 0)
+        ("capture_graphs", 0, {"respect_runtime_capacity": True})
     )

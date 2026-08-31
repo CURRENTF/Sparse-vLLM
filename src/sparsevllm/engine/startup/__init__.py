@@ -1,9 +1,11 @@
 from .capacity import (
     KVCapacityPlan,
     StartupMemoryProfile,
+    feasible_startup_graph_plan,
     profiling_kv_budget_bytes,
     profiling_kv_slots,
     profiling_prefill_prompt_lengths,
+    startup_graph_family_kv_slots,
 )
 from .memory import (
     DeviceMemorySnapshot,
@@ -29,10 +31,12 @@ __all__ = [
     "StartupMemoryProfiler",
     "StartupCapacityDecision",
     "build_startup_capacity_decision",
+    "feasible_startup_graph_plan",
     "log_startup_capacity_decision",
     "log_startup_completion",
     "profiling_kv_budget_bytes",
     "profiling_kv_slots",
     "profiling_prefill_prompt_lengths",
+    "startup_graph_family_kv_slots",
     "release_unused_device_memory",
 ]
