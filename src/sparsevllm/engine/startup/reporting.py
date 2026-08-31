@@ -162,10 +162,14 @@ def log_startup_completion(
 
 def validate_production_kv_records(
     production_records: list[dict[str, Any]],
-) -> int:
+) -> int | tuple[int, ...]:
     production = _records_by_rank(production_records, "production")
     slot_counts = {
-        int(record["num_kvcache_slots"])
+        (
+            tuple(int(value) for value in record["num_kvcache_slots"])
+            if isinstance(record["num_kvcache_slots"], (list, tuple))
+            else int(record["num_kvcache_slots"])
+        )
         for record in production.values()
     }
     if len(slot_counts) != 1:

@@ -72,3 +72,12 @@ def test_production_kv_records_must_match_across_ranks():
         assert "differs across ranks" in str(exc)
     else:  # pragma: no cover - contract failure path.
         raise AssertionError("mismatched production capacities were accepted")
+
+
+def test_layer_varying_production_capacities_compare_structurally():
+    records = [
+        {"world_rank": 0, "num_kvcache_slots": [10, 8]},
+        {"world_rank": 1, "num_kvcache_slots": [10, 8]},
+    ]
+
+    assert validate_production_kv_records(records) == (10, 8)
