@@ -37,6 +37,7 @@ def _config(*, sparse_method: str = ""):
         quest_chunk_size=16,
         max_num_batched_tokens=16,
         max_num_seqs_in_batch=4,
+        max_num_seqs_in_gpu=8,
         max_decoding_seqs=4,
         engine_prefill_chunk_size=8,
         max_model_len=32,
@@ -66,7 +67,8 @@ def test_explicit_profiling_budget_uses_tp_local_kv_shape():
     budget = profiling_kv_budget_bytes(config, 10)
 
     expected_bytes_per_slot = 4 * 2 * 4 * 128 * 2
-    assert budget == 10 * expected_bytes_per_slot
+    expected_row_mapping = 8 * 32 * 4
+    assert budget == 10 * (expected_bytes_per_slot + 4) + expected_row_mapping
 
 
 def test_quest_profiling_budget_includes_page_metadata():
@@ -75,7 +77,8 @@ def test_quest_profiling_budget_includes_page_metadata():
     budget = profiling_kv_budget_bytes(config, 17)
 
     bytes_per_slot = 4 * 2 * 4 * 128 * 2
-    assert budget == 32 * bytes_per_slot + 2 * bytes_per_slot
+    fixed_metadata = 8 * 32 * 4 + 8 * 2 * 4 + 16 * (4 + 8)
+    assert budget == 32 * bytes_per_slot + 2 * (bytes_per_slot + 4) + fixed_metadata
 
 
 def test_prefill_profile_fills_token_chunk_and_batch_limits_together():

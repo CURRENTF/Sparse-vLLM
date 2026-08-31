@@ -166,8 +166,18 @@ def profiling_kv_budget_bytes(config, num_slots: int) -> int:
 
     method = normalize_sparse_method(config.sparse_method)
     if method != "quest":
-        multiplier = 1 if method in {"", "vanilla", "omnikv"} else 2
-        return int(num_slots * bytes_per_slot * multiplier)
+        if method in {"", "vanilla", "omnikv"}:
+            int32_bytes = torch.empty((), dtype=torch.int32).element_size()
+            row_mapping_bytes = (
+                int(config.max_num_seqs_in_gpu)
+                * int(config.max_model_len)
+                * int32_bytes
+            )
+            return int(
+                num_slots * (bytes_per_slot + int32_bytes)
+                + row_mapping_bytes
+            )
+        return int(num_slots * bytes_per_slot * 2)
 
     page_size = int(config.quest_chunk_size)
     pages = ceil(num_slots / page_size)
@@ -177,7 +187,20 @@ def profiling_kv_budget_bytes(config, num_slots: int) -> int:
         if cache_layout is CacheLayout.EXPLICIT_KV
         else 2 * bytes_per_slot
     )
-    return int(token_slots * bytes_per_slot + pages * metadata_bytes_per_page)
+    int32_bytes = torch.empty((), dtype=torch.int32).element_size()
+    fixed_metadata_bytes = (
+        int(config.max_num_seqs_in_gpu) * int(config.max_model_len) * int32_bytes
+        + int(config.max_num_seqs_in_gpu)
+        * ceil(int(config.max_model_len) / page_size)
+        * int32_bytes
+        + page_size
+        * (int32_bytes + torch.empty((), dtype=torch.int64).element_size())
+    )
+    return int(
+        token_slots * bytes_per_slot
+        + pages * (metadata_bytes_per_page + int32_bytes)
+        + fixed_metadata_bytes
+    )
 
 
 __all__ = [

@@ -277,12 +277,29 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
     def allocate_kv_cache(self):
         available_memory, slot_bytes_per_layer = self._get_available_slots_info()
 
+        int32_bytes = torch.empty((), dtype=torch.int32).element_size()
+        fixed_metadata_bytes = (
+            self.max_buffer_rows * self.max_model_len * int32_bytes
+            + self.max_buffer_rows * self.max_pages_per_row * int32_bytes
+            + self.page_size
+            * (
+                int32_bytes
+                + torch.empty((), dtype=torch.int64).element_size()
+            )
+        )
+        available_memory -= fixed_metadata_bytes
+        if available_memory <= 0:
+            raise RuntimeError(
+                "Available memory is insufficient for QuEST row and page metadata: "
+                f"budget={available_memory + fixed_metadata_bytes} "
+                f"metadata={fixed_metadata_bytes}."
+            )
         page_bytes_per_layer = (
             self.page_size * int(slot_bytes_per_layer)
             + self._metadata_bytes_per_page_per_layer()
         )
         total_pages = available_memory // (
-            self.num_kv_layers * page_bytes_per_layer
+            self.num_kv_layers * page_bytes_per_layer + int32_bytes
         )
         total_token_slots = int(total_pages * self.page_size)
         assert total_token_slots > 0, "Available memory is insufficient for QuEST paged KV cache"
