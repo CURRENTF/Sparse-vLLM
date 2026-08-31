@@ -119,6 +119,76 @@ def test_write_shm_waits_until_worker_reads_command():
         shm.unlink()
 
 
+def test_write_shm_can_defer_read_ack_to_status_sync():
+    ctx = get_context("spawn")
+    command_event = ctx.Event()
+    completion_event = ctx.Event()
+    shm = SharedMemory(
+        name=f"sparsevllm_test_rpc_{os.getpid()}_{uuid4().hex}",
+        create=True,
+        size=2**20,
+    )
+    rank0 = SimpleNamespace(
+        world_size=2,
+        rank=0,
+        event=[(command_event, completion_event)],
+        shm=shm,
+        _run_status_offset=lambda rank: len(shm.buf) - 2 + rank,
+    )
+    worker = SimpleNamespace(
+        world_size=2,
+        rank=1,
+        event=(command_event, completion_event),
+        shm=shm,
+    )
+
+    try:
+        ModelRunner.write_shm(
+            rank0,
+            "run",
+            [1],
+            False,
+            wait_for_read=False,
+        )
+
+        assert command_event.is_set()
+        method_name, args = ModelRunner.read_shm(worker)
+        assert method_name == "run"
+        assert args == [[1], False]
+    finally:
+        if command_event.is_set():
+            command_event.clear()
+        shm.close()
+        shm.unlink()
+
+
+def test_call_defers_read_ack_only_for_status_synchronized_rpc():
+    runner = object.__new__(ModelRunner)
+    runner.world_size = 2
+    runner.rank = 0
+    runner.config = SimpleNamespace(decode_graph=False)
+    calls = []
+    runner.write_shm = lambda method, *args, **kwargs: calls.append(
+        ("write", method, args, kwargs)
+    )
+    runner._sync_tp_rpc_status = lambda method, error: calls.append(
+        ("sync", method, error)
+    )
+    runner.free_slots = lambda seq_id: calls.append(("free", seq_id))
+    runner.unsynchronized = lambda value: value + 1
+
+    ModelRunner.call(runner, "free_slots", 7)
+    result = ModelRunner.call(runner, "unsynchronized", 8)
+
+    assert result == 9
+    assert calls == [
+        ("write", "free_slots", (7,), {"wait_for_read": False}),
+        ("free", 7),
+        ("sync", "free_slots", None),
+        ("write", "unsynchronized", (8,), {"wait_for_read": True}),
+    ]
+
+
 def test_tp_shm_name_is_unique_per_engine_instance():
     names = {make_tp_shm_name() for _ in range(3)}
 

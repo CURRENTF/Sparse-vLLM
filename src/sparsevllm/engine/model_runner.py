@@ -535,7 +535,7 @@ class ModelRunner:
         command_event.clear()
         return method_name, args
 
-    def write_shm(self, method_name, *args):
+    def write_shm(self, method_name, *args, wait_for_read: bool = True):
         """序列化方法名 and 参数并写入共享内存"""
         assert self.world_size > 1 and self.rank == 0
         data = pickle.dumps([method_name, *args])
@@ -551,6 +551,8 @@ class ModelRunner:
             completion_event.clear()
             self.shm.buf[self._run_status_offset(rank)] = TP_RUN_STATUS_PENDING
             command_event.set()
+        if not wait_for_read:
+            return
         timeout_s = float(os.getenv("SPARSEVLLM_TP_RPC_ACK_TIMEOUT_S", "30"))
         deadline = time.monotonic() + timeout_s
         for command_event, _ in self.event:
@@ -564,12 +566,20 @@ class ModelRunner:
 
     def call(self, method_name, *args):
         """RPC 风格的调用：如果是 Rank 0 则先广播指令，然后所有进程执行本地逻辑"""
+        synchronizes_status = method_name in TP_RPC_STATUS_SYNC_METHODS
         if self.world_size > 1 and self.rank == 0:
-            self.write_shm(method_name, *args)
+            # A status-synchronized RPC already waits for every worker before
+            # the shared command buffer can be reused.  Let rank 0 begin its
+            # local work immediately instead of polling for a separate read ACK.
+            self.write_shm(
+                method_name,
+                *args,
+                wait_for_read=not synchronizes_status,
+            )
         method = getattr(self, method_name, None)
         # Ensure *all* runner-side ops (including sparse post-processing like DeltaKV eviction)
         # run without autograd bookkeeping to avoid large activation graphs / OOM.
-        if method_name in TP_RPC_STATUS_SYNC_METHODS:
+        if synchronizes_status:
             local_error: BaseException | None = None
             result = None
             try:
