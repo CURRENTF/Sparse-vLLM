@@ -35,6 +35,7 @@ class MoeOpSpec:
     routing_method: str = "softmax"
     scale_dtype: torch.dtype | None = None
     activation: str = "silu"
+    max_num_tokens: int = 1
 
     def __post_init__(self) -> None:
         if self.num_experts <= 0 or self.num_local_experts <= 0:
@@ -50,6 +51,8 @@ class MoeOpSpec:
             )
         if self.hidden_size <= 0 or self.intermediate_size <= 0:
             raise ValueError("MoE hidden/intermediate sizes must be positive.")
+        if self.max_num_tokens <= 0:
+            raise ValueError("MoE max_num_tokens must be positive.")
         if not 1 <= self.top_k <= self.num_experts:
             raise ValueError(
                 f"MoE top_k must be in [1, {self.num_experts}], got {self.top_k}."
@@ -183,6 +186,17 @@ class MoeProvider:
             scale_target.copy_(loaded_scale)
         weight_target.copy_(loaded_weight)
 
+    def prepare(
+        self,
+        spec: MoeOpSpec,
+        *,
+        device: torch.device,
+        tp_rank: int,
+        ep_rank: int,
+        max_num_tokens: int | None = None,
+    ) -> None:
+        del spec, device, tp_rank, ep_rank, max_num_tokens
+
     def run(
         self,
         spec: MoeOpSpec,
@@ -195,6 +209,7 @@ class MoeProvider:
         w2_scale_inv: torch.Tensor | None,
         *,
         local_expert_start: int,
+        tp_rank: int,
         ep_rank: int,
     ) -> torch.Tensor:
         raise NotImplementedError
@@ -285,6 +300,45 @@ class MoeDispatchPlan(MoeProvider):
         )
         counts[key] += 1
 
+    def prepare(
+        self,
+        spec: MoeOpSpec,
+        *,
+        device: torch.device,
+        tp_rank: int,
+        ep_rank: int,
+        max_num_tokens: int | None = None,
+    ) -> None:
+        if spec is not self.spec:
+            raise RuntimeError(
+                f"{self.name} was bound for {self.spec!r}, got {spec!r}."
+            )
+        requested_max = (
+            int(spec.max_num_tokens)
+            if max_num_tokens is None
+            else int(max_num_tokens)
+        )
+        if requested_max <= 0:
+            raise ValueError(
+                f"MoE prepared max_num_tokens must be positive, got {requested_max}."
+            )
+        prepared_max = min(int(spec.max_num_tokens), requested_max)
+        for route in self.routes:
+            if route.min_tokens > prepared_max:
+                continue
+            route_max = (
+                prepared_max
+                if route.max_tokens is None
+                else min(prepared_max, route.max_tokens)
+            )
+            route.provider.prepare(
+                spec,
+                device=device,
+                tp_rank=tp_rank,
+                ep_rank=ep_rank,
+                max_num_tokens=route_max,
+            )
+
     def runtime_kernel_stats(self) -> dict[str, object]:
         return {
             "kernel_paths": {
@@ -322,6 +376,7 @@ class MoeDispatchPlan(MoeProvider):
         w2_scale_inv,
         *,
         local_expert_start,
+        tp_rank,
         ep_rank,
     ):
         if spec is not self.spec:
@@ -340,6 +395,7 @@ class MoeDispatchPlan(MoeProvider):
             w13_scale_inv,
             w2_scale_inv,
             local_expert_start=local_expert_start,
+            tp_rank=tp_rank,
             ep_rank=ep_rank,
         )
 
@@ -347,7 +403,7 @@ MOE_REGISTRY: OpRegistry[MoeOpSpec, MoeProvider] = OpRegistry(
     "routed MoE",
     portfolio=PortfolioPolicy(
         upstream_standard=("flashinfer_cutlass_fp8_sm90",),
-        repo_portable=("triton",),
+        repo_portable=("triton_minimax_m2_fused", "triton"),
     ),
     profile_order=(
         "h20_qwen36_fp8_dispatch_plan",
@@ -505,9 +561,10 @@ class SglAlignedTritonGlmMoeProvider(MoeProvider):
         w2_scale_inv,
         *,
         local_expert_start,
+        tp_rank,
         ep_rank,
     ):
-        del ep_rank
+        del tp_rank, ep_rank
         if w13_scale_inv is not None or w2_scale_inv is not None:
             raise RuntimeError("SGL-aligned BF16 MoE does not accept expert scales.")
         from sparsevllm.kernels.triton.moe import fused_moe
@@ -604,10 +661,7 @@ class GlmH100Bf16DecodeMoeDispatchPlan(MoeDispatchPlan):
         )
 
 
-@MOE_REGISTRY.register_atomic(
-    ProviderRole.REPO_PORTABLE,
-    profile_only=True,
-)
+@MOE_REGISTRY.register_atomic(ProviderRole.REPO_PORTABLE)
 class TritonMinimaxM2FusedMoeProvider(MoeProvider):
     name = "triton_minimax_m2_fused"
     gate_up_order = "gate_up"
@@ -684,9 +738,10 @@ class TritonMinimaxM2FusedMoeProvider(MoeProvider):
         w2_scale_inv,
         *,
         local_expert_start,
+        tp_rank,
         ep_rank,
     ):
-        del ep_rank
+        del tp_rank, ep_rank
         if w13_scale_inv is None or w2_scale_inv is None:
             raise RuntimeError("MiniMax M2.7 fused MoE requires expert scales.")
         from sparsevllm.kernels.triton.minimax_m2_moe import (
@@ -710,14 +765,18 @@ class TritonMinimaxM2FusedMoeProvider(MoeProvider):
 class FlashInferCutlassFp8MoeProvider(MoeProvider):
     name = "flashinfer_cutlass_fp8_sm90"
     gate_up_order = "up_gate"
+    workspace_lane = "flashinfer_cutlass_moe"
+
+    def __init__(self) -> None:
+        self._workspace_lease = None
+        self._workspace_num_tokens = 0
+        self._workspace_contract: tuple[object, ...] | None = None
 
     @classmethod
     def supports(cls, spec: MoeOpSpec, caps: DeviceCaps) -> SupportResult:
         activation = _silu_activation_support(spec)
         if activation is not None:
             return activation
-        if spec.tp_size != 1:
-            return SupportResult.unsupported("does not support tensor-parallel expert shards")
         if spec.weight_dtype != torch.float8_e4m3fn:
             return SupportResult.unsupported(f"requires FP8 E4M3 weights, got {spec.weight_dtype}")
         if spec.block_shape != (128, 128):
@@ -732,6 +791,10 @@ class FlashInferCutlassFp8MoeProvider(MoeProvider):
             return SupportResult.unsupported(
                 f"requires CUDA SM90, got {caps.platform.name} {caps.compute_capability}"
             )
+        if not caps.supports_native_fp8:
+            return SupportResult.unsupported(
+                "device does not provide native FP8 tensor cores"
+            )
         if not runtime_version_at_least(caps.runtime_version, (12, 8)):
             return SupportResult.unsupported(
                 "requires CUDA runtime >= 12.8, "
@@ -743,6 +806,100 @@ class FlashInferCutlassFp8MoeProvider(MoeProvider):
 
         supported, reason = flashinfer_cutlass_fp8_moe_support()
         return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            **super().binding_metadata(),
+            "workspace": "shared_reusable_byte_buffer",
+            "workspace_lane": self.workspace_lane,
+            "workspace_sized_by": "flashinfer.cutlass_fused_moe_workspace_size",
+        }
+
+    def prepare(
+        self,
+        spec: MoeOpSpec,
+        *,
+        device: torch.device,
+        tp_rank: int,
+        ep_rank: int,
+        max_num_tokens: int | None = None,
+    ) -> None:
+        device = torch.device(device)
+        if device.type != "cuda":
+            return
+        tp_rank, ep_rank = int(tp_rank), int(ep_rank)
+        if not 0 <= tp_rank < int(spec.tp_size):
+            raise ValueError(
+                f"MoE tp_rank must be in [0, {spec.tp_size}), got {tp_rank}."
+            )
+        if not 0 <= ep_rank < int(spec.ep_size):
+            raise ValueError(
+                f"MoE ep_rank must be in [0, {spec.ep_size}), got {ep_rank}."
+            )
+        contract = (spec, device, tp_rank, ep_rank)
+        if self._workspace_contract is not None and self._workspace_contract != contract:
+            raise RuntimeError(
+                "FlashInfer CUTLASS MoE provider cannot change its prepared "
+                "shape, device, or TP/EP rank contract."
+            )
+        self._workspace_contract = contract
+        requested_max = (
+            int(spec.max_num_tokens)
+            if max_num_tokens is None
+            else int(max_num_tokens)
+        )
+        if requested_max <= 0:
+            raise ValueError(
+                f"MoE prepared max_num_tokens must be positive, got {requested_max}."
+            )
+        self._reserve_workspace(
+            spec,
+            device,
+            tp_rank,
+            ep_rank,
+            min(int(spec.max_num_tokens), requested_max),
+        )
+
+    def _reserve_workspace(
+        self,
+        spec: MoeOpSpec,
+        device: torch.device,
+        tp_rank: int,
+        ep_rank: int,
+        num_tokens: int,
+    ) -> None:
+        num_tokens = int(num_tokens)
+        if num_tokens <= self._workspace_num_tokens:
+            return
+        from sparsevllm.kernels.external.flashinfer.moe import (
+            flashinfer_cutlass_fused_moe_workspace_size,
+        )
+        from sparsevllm.operators.workspace import get_workspace_manager
+
+        required_bytes = flashinfer_cutlass_fused_moe_workspace_size(
+            max_num_tokens=num_tokens,
+            hidden_size=spec.hidden_size,
+            intermediate_size=spec.intermediate_size,
+            num_experts=spec.num_experts,
+            top_k=spec.top_k,
+            activation_dtype=spec.activation_dtype,
+            weight_dtype=spec.weight_dtype,
+            tp_size=spec.tp_size,
+            tp_rank=tp_rank,
+            ep_size=spec.ep_size,
+            ep_rank=ep_rank,
+            device=device,
+        )
+        manager = get_workspace_manager(device, create=True)
+        if self._workspace_lease is None:
+            self._workspace_lease = manager.reserve_bytes(
+                required_bytes,
+                label=self.name,
+                lane=self.workspace_lane,
+            )
+        else:
+            self._workspace_lease.ensure_bytes(required_bytes)
+        self._workspace_num_tokens = num_tokens
 
     def run(
         self,
@@ -756,6 +913,7 @@ class FlashInferCutlassFp8MoeProvider(MoeProvider):
         w2_scale_inv,
         *,
         local_expert_start,
+        tp_rank,
         ep_rank,
     ):
         del local_expert_start
@@ -764,6 +922,25 @@ class FlashInferCutlassFp8MoeProvider(MoeProvider):
         from sparsevllm.kernels.external.flashinfer.moe import (
             flashinfer_cutlass_fused_moe,
         )
+
+        device = hidden_states.device
+        contract = (spec, device, int(tp_rank), int(ep_rank))
+        if self._workspace_contract is None:
+            self._workspace_contract = contract
+        elif self._workspace_contract != contract:
+            raise RuntimeError(
+                "FlashInfer CUTLASS MoE execution does not match its prepared "
+                "shape, device, or TP/EP rank contract."
+            )
+        self._reserve_workspace(
+            spec,
+            device,
+            int(tp_rank),
+            int(ep_rank),
+            int(hidden_states.shape[0]),
+        )
+        if self._workspace_lease is None:
+            raise RuntimeError("FlashInfer CUTLASS MoE workspace was not prepared.")
 
         output = torch.empty_like(hidden_states)
         flashinfer_cutlass_fused_moe(
@@ -774,9 +951,12 @@ class FlashInferCutlassFp8MoeProvider(MoeProvider):
             w2_weight,
             w13_scale_inv,
             w2_scale_inv,
+            tp_size=int(spec.tp_size),
+            tp_rank=int(tp_rank),
             ep_size=int(spec.ep_size),
             ep_rank=int(ep_rank),
             output=output,
+            workspace_buffer=self._workspace_lease.buffer,
         )
         return output
 
@@ -831,9 +1011,10 @@ class TritonHopperFusedMoeProvider(MoeProvider):
         w2_scale_inv,
         *,
         local_expert_start,
+        tp_rank,
         ep_rank,
     ):
-        del ep_rank
+        del tp_rank, ep_rank
         if w13_scale_inv is not None or w2_scale_inv is not None:
             raise RuntimeError("Fused Hopper BF16 MoE does not accept expert scales.")
         from sparsevllm.kernels.triton.moe import fused_moe_gate_up_swiglu
@@ -915,9 +1096,10 @@ class SglDerivedTritonMoeProvider(MoeProvider):
         w2_scale_inv,
         *,
         local_expert_start,
+        tp_rank,
         ep_rank,
     ):
-        del ep_rank
+        del tp_rank, ep_rank
         if w13_scale_inv is not None or w2_scale_inv is not None:
             raise RuntimeError("SGL-derived BF16 Triton MoE does not accept scales.")
         from sparsevllm.kernels.triton.sgl_fused_moe import sgl_fused_moe
@@ -1115,12 +1297,26 @@ class SglTritonGlmTp1MoeProfile(_SingleAtomicMoeProfile):
 class TritonMinimaxM2MoeProfile(_SingleAtomicMoeProfile):
     name = "triton_minimax_m2_profile"
     atomic_provider_name = "triton_minimax_m2_fused"
+    profiled_shape = (256, 256, 3072, 384, 8, 4, 1)
 
     @classmethod
     def matches(cls, spec: MoeOpSpec, caps: DeviceCaps) -> ProfileMatch:
-        del spec
         if caps.device_name != "NVIDIA H100 80GB HBM3":
             return ProfileMatch.no("requires profiled NVIDIA H100 80GB HBM3")
+        actual = (
+            spec.num_experts,
+            spec.num_local_experts,
+            spec.hidden_size,
+            spec.intermediate_size,
+            spec.top_k,
+            spec.tp_size,
+            spec.ep_size,
+        )
+        if actual != cls.profiled_shape:
+            return ProfileMatch.no(
+                f"requires profiled MiniMax M2 TP4/EP1 shape {cls.profiled_shape}, "
+                f"got {actual}"
+            )
         return ProfileMatch.yes("matched MiniMax M2 FP8 MoE profile")
 
 
@@ -1212,9 +1408,10 @@ class TritonMoeProvider(MoeProvider):
         w2_scale_inv,
         *,
         local_expert_start,
+        tp_rank,
         ep_rank,
     ):
-        del ep_rank
+        del tp_rank, ep_rank
         if spec.weight_dtype == torch.float8_e4m3fn:
             if w13_scale_inv is None or w2_scale_inv is None:
                 raise RuntimeError("Triton FP8 MoE requires expert scales.")
@@ -1408,9 +1605,14 @@ def resolve_moe_provider(
     spec: MoeOpSpec,
     *,
     device_index: int | None = None,
+    force_atomic_provider: str | None = None,
 ) -> MoeProvider:
     platform = platforms.current_platform
     if device_index is None:
         device_index = torch.cuda.current_device() if platform.is_cuda_alike() else 0
     caps = platform.get_device_caps(int(device_index))
-    return OpResolver(MOE_REGISTRY).resolve(spec, caps).provider
+    return OpResolver(MOE_REGISTRY).resolve(
+        spec,
+        caps,
+        force_atomic_provider=force_atomic_provider,
+    ).provider

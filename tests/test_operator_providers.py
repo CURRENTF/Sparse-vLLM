@@ -26,10 +26,13 @@ from sparsevllm.operators.gate_up_swiglu import (
     NativeGateUpSwiGLUProvider,
 )
 from sparsevllm.operators.moe import (
+    FlashInferCutlassFp8MoeProvider,
     MOE_REGISTRY,
     MoeOpSpec,
+    Qwen3Fp8MoeDispatchPlan,
     SglDerivedTritonMoeProvider,
     SglTritonGlmMoeProvider,
+    resolve_moe_provider,
 )
 from sparsevllm.operators.quest_selection import (
     H100ExactQuestPagedViewDispatch,
@@ -228,6 +231,7 @@ def _moe_spec(
     scale_dtype=None,
     cuda_graph=True,
     activation="silu",
+    max_num_tokens=1,
 ) -> MoeOpSpec:
     return MoeOpSpec(
         num_experts=num_experts,
@@ -244,6 +248,7 @@ def _moe_spec(
         routing_method=routing_method,
         scale_dtype=scale_dtype,
         activation=activation,
+        max_num_tokens=max_num_tokens,
     )
 
 
@@ -681,6 +686,168 @@ def test_minimax_m2_fused_moe_requires_native_fp8():
         )
 
 
+def test_minimax_m2_tp4_ep1_keeps_exact_triton_profile() -> None:
+    spec = _moe_spec(
+        hidden_size=3072,
+        intermediate_size=384,
+        num_local_experts=256,
+        num_experts=256,
+        top_k=8,
+        ep_size=1,
+        tp_size=4,
+        routing_method="biased_sigmoid",
+        scale_dtype=torch.float32,
+    )
+
+    resolved = OpResolver(MOE_REGISTRY).resolve(
+        spec,
+        _cuda_caps((9, 0), device_name="NVIDIA H100 80GB HBM3"),
+    )
+
+    assert resolved.provider.name == "triton_minimax_m2_fused"
+    assert resolved.report.selected_profile == "triton_minimax_m2_profile"
+
+
+def test_minimax_m2_tp4_ep1_benchmark_override_forces_flashinfer() -> None:
+    spec = _moe_spec(
+        hidden_size=3072,
+        intermediate_size=384,
+        num_local_experts=256,
+        num_experts=256,
+        top_k=8,
+        ep_size=1,
+        tp_size=4,
+        routing_method="biased_sigmoid",
+        scale_dtype=torch.float32,
+    )
+
+    resolved = OpResolver(MOE_REGISTRY).resolve(
+        spec,
+        _cuda_caps((9, 0), device_name="NVIDIA H100 80GB HBM3"),
+        force_atomic_provider="flashinfer_cutlass_fp8_sm90",
+    )
+
+    assert resolved.provider.name == "flashinfer_cutlass_fp8_sm90"
+    assert resolved.report.selected_profile is None
+    assert resolved.report.selection_basis == "benchmark_override"
+
+
+def test_moe_benchmark_provider_override_is_wired() -> None:
+    spec = _moe_spec()
+    caps = _cuda_caps((9, 0))
+
+    with patch(
+        "sparsevllm.operators.moe.platforms.current_platform.get_device_caps",
+        return_value=caps,
+    ):
+        provider = resolve_moe_provider(
+            spec,
+            device_index=0,
+            force_atomic_provider="flashinfer_cutlass_fp8_sm90",
+        )
+
+    assert provider.name == "flashinfer_cutlass_fp8_sm90"
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "ep_size", "num_local_experts", "intermediate_size"),
+    [(2, 2, 128, 768), (1, 4, 64, 1536), (1, 8, 32, 1536)],
+)
+def test_minimax_m2_mixed_tp_ep_uses_flashinfer_upstream_default(
+    tp_size: int,
+    ep_size: int,
+    num_local_experts: int,
+    intermediate_size: int,
+) -> None:
+    spec = _moe_spec(
+        hidden_size=3072,
+        intermediate_size=intermediate_size,
+        num_local_experts=num_local_experts,
+        num_experts=256,
+        top_k=8,
+        ep_size=ep_size,
+        tp_size=tp_size,
+        routing_method="biased_sigmoid",
+        scale_dtype=torch.float32,
+    )
+
+    resolved = OpResolver(MOE_REGISTRY).resolve(
+        spec,
+        _cuda_caps((9, 0), device_name="NVIDIA H100 80GB HBM3"),
+    )
+
+    assert resolved.provider.name == "flashinfer_cutlass_fp8_sm90"
+    assert resolved.report.selected_profile is None
+    assert resolved.report.selection_basis == "upstream_default"
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "ep_size", "num_local_experts", "intermediate_size"),
+    [(2, 2, 128, 768), (1, 4, 64, 1536), (1, 8, 32, 1536)],
+)
+def test_minimax_mixed_ep_uses_triton_when_flashinfer_missing(
+    tp_size: int,
+    ep_size: int,
+    num_local_experts: int,
+    intermediate_size: int,
+) -> None:
+    spec = _moe_spec(
+        hidden_size=3072,
+        intermediate_size=intermediate_size,
+        num_local_experts=num_local_experts,
+        num_experts=256,
+        top_k=8,
+        ep_size=ep_size,
+        tp_size=tp_size,
+        routing_method="biased_sigmoid",
+        scale_dtype=torch.float32,
+    )
+
+    with patch(
+        "sparsevllm.kernels.external.flashinfer.moe."
+        "flashinfer_cutlass_fp8_moe_support",
+        side_effect=_missing_flashinfer_family("SM90 CUTLASS FP8 MoE"),
+    ):
+        resolved = OpResolver(MOE_REGISTRY).resolve(
+            spec,
+            _cuda_caps((9, 0), device_name="NVIDIA H100 80GB HBM3"),
+        )
+
+    assert resolved.provider.name == "triton_minimax_m2_fused"
+    assert resolved.report.selected_profile is None
+    assert resolved.report.selection_basis == "dependency_degraded"
+
+
+def test_minimax_ep4_uses_triton_when_flashinfer_unsupported() -> None:
+    spec = _moe_spec(
+        hidden_size=3072,
+        intermediate_size=1536,
+        num_local_experts=64,
+        num_experts=256,
+        top_k=8,
+        ep_size=4,
+        tp_size=1,
+        routing_method="biased_sigmoid",
+        scale_dtype=torch.float32,
+    )
+
+    resolved = OpResolver(MOE_REGISTRY).resolve(
+        spec,
+        _cuda_caps(
+            (9, 0),
+            runtime_version="12.7",
+            device_name="NVIDIA H100 80GB HBM3",
+        ),
+    )
+
+    assert resolved.provider.name == "triton_minimax_m2_fused"
+    assert resolved.report.selected_profile is None
+    assert resolved.report.selection_basis == "semantic_fallback"
+    assert "requires CUDA runtime >= 12.8" in dict(resolved.rejected)[
+        "flashinfer_cutlass_fp8_sm90"
+    ]
+
+
 @pytest.mark.parametrize(
     ("overrides", "reason"),
     [
@@ -786,25 +953,109 @@ def test_fp8_moe_rejects_pre_fp8_cuda():
         )
 
 
-def test_fp8_moe_uses_triton_for_tensor_parallel_expert_shards():
+@pytest.mark.parametrize(
+    ("tp_size", "ep_size", "num_local_experts"),
+    [(4, 1, 8), (2, 2, 4), (1, 4, 2)],
+)
+def test_fp8_moe_uses_flashinfer_for_all_tp_ep_topologies(
+    tp_size: int,
+    ep_size: int,
+    num_local_experts: int,
+):
     with patch(
         "sparsevllm.kernels.external.flashinfer.moe."
         "flashinfer_cutlass_fp8_moe_support",
         return_value=(True, "available"),
     ):
         resolved = OpResolver(MOE_REGISTRY).resolve(
-            _moe_spec(tp_size=2, ep_size=1, num_local_experts=8),
+            _moe_spec(
+                tp_size=tp_size,
+                ep_size=ep_size,
+                num_local_experts=num_local_experts,
+            ),
             _cuda_caps((9, 0)),
         )
 
-    assert (
-        "flashinfer_cutlass_fp8_sm90",
-        "does not support tensor-parallel expert shards",
-    ) in resolved.rejected
-    assert (
-        "triton_hopper_fused",
-        "requires unquantized BF16 expert weights",
-    ) in resolved.rejected
+    assert resolved.provider.name == "flashinfer_cutlass_fp8_sm90"
+    assert resolved.report.selection_basis == "upstream_default"
+
+
+def test_flashinfer_moe_prepare_reserves_shared_topology_workspace() -> None:
+    provider = FlashInferCutlassFp8MoeProvider()
+    spec = _moe_spec(
+        tp_size=2,
+        ep_size=2,
+        num_local_experts=4,
+        max_num_tokens=512,
+    )
+    manager = Mock()
+    lease = Mock()
+    manager.reserve_bytes.return_value = lease
+
+    with (
+        patch(
+            "sparsevllm.kernels.external.flashinfer.moe."
+            "flashinfer_cutlass_fused_moe_workspace_size",
+            return_value=8192,
+        ) as workspace_size,
+        patch(
+            "sparsevllm.operators.workspace.get_workspace_manager",
+            return_value=manager,
+        ),
+    ):
+        provider.prepare(
+            spec,
+            device=torch.device("cuda", 1),
+            tp_rank=1,
+            ep_rank=1,
+        )
+
+    assert workspace_size.call_args.kwargs["max_num_tokens"] == 512
+    assert workspace_size.call_args.kwargs["tp_size"] == 2
+    assert workspace_size.call_args.kwargs["tp_rank"] == 1
+    assert workspace_size.call_args.kwargs["ep_size"] == 2
+    assert workspace_size.call_args.kwargs["ep_rank"] == 1
+    manager.reserve_bytes.assert_called_once_with(
+        8192,
+        label="flashinfer_cutlass_fp8_sm90",
+        lane="flashinfer_cutlass_moe",
+    )
+
+
+def test_moe_dispatch_prepares_flashinfer_for_its_route_capacity() -> None:
+    spec = _moe_spec(
+        hidden_size=2048,
+        intermediate_size=768,
+        num_local_experts=128,
+        num_experts=128,
+        top_k=8,
+        ep_size=1,
+        tp_size=1,
+        max_num_tokens=16_384,
+    )
+    provider = Qwen3Fp8MoeDispatchPlan(spec)
+    manager = Mock()
+    manager.reserve_bytes.return_value = Mock()
+
+    with (
+        patch(
+            "sparsevllm.kernels.external.flashinfer.moe."
+            "flashinfer_cutlass_fused_moe_workspace_size",
+            return_value=8192,
+        ) as workspace_size,
+        patch(
+            "sparsevllm.operators.workspace.get_workspace_manager",
+            return_value=manager,
+        ),
+    ):
+        provider.prepare(
+            spec,
+            device=torch.device("cuda", 0),
+            tp_rank=0,
+            ep_rank=0,
+        )
+
+    assert workspace_size.call_args.kwargs["max_num_tokens"] == 128
 
 
 @pytest.mark.parametrize("platform", [PlatformEnum.CPU, PlatformEnum.ROCM])

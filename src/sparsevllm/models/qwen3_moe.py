@@ -85,6 +85,7 @@ class Qwen3MoePackedExperts(PackedMoeExperts):
                 )
             ),
             cuda_graph=bool(getattr(config, "decode_graph", False)),
+            max_num_tokens=int(getattr(config, "moe_max_num_tokens", 1)),
             model_label="Qwen3MoE",
             provider_resolver=resolve_moe_provider,
             parallel_context=get_parallel_context(),

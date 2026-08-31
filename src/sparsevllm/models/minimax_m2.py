@@ -191,6 +191,7 @@ class MiniMaxM2PackedExperts(PackedMoeExperts):
             ),
             routing_method="biased_sigmoid",
             scale_dtype=torch.float32,
+            max_num_tokens=int(getattr(config, "moe_max_num_tokens", 1)),
             model_label="MiniMax",
             provider_resolver=resolve_moe_provider,
             parallel_context=get_parallel_context(),

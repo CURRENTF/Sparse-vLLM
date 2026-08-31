@@ -12,6 +12,7 @@ from sparsevllm.kernels.external.support import (
     KernelFamilyState,
 )
 from sparsevllm.operators.registry import (
+    NoProviderError,
     OpRegistry,
     OpResolver,
     PortfolioPolicy,
@@ -109,6 +110,11 @@ def test_profile_overlay_is_separate_from_atomic_portfolio() -> None:
 
     profiled = OpResolver(registry).resolve(_Spec(enabled=True), _caps())
     unprofiled = OpResolver(registry).resolve(_Spec(enabled=False), _caps())
+    forced = OpResolver(registry).resolve(
+        _Spec(enabled=True),
+        _caps(),
+        force_atomic_provider="portable",
+    )
 
     assert profiled.provider.name == "profiled_atomic"
     assert profiled.report.selected_provider == "profiled_atomic"
@@ -117,6 +123,47 @@ def test_profile_overlay_is_separate_from_atomic_portfolio() -> None:
     assert unprofiled.provider.name == "portable"
     assert unprofiled.report.profiles[0].matched is False
     assert unprofiled.report.candidates[1].supported is True
+    assert forced.provider.name == "portable"
+    assert forced.report.selected_profile is None
+    assert forced.report.selection_basis == "benchmark_override"
+    assert forced.report.profiles[0].matched is True
+
+
+def test_forced_atomic_provider_fails_instead_of_falling_back() -> None:
+    registry = OpRegistry(
+        "_test",
+        portfolio=PortfolioPolicy(repo_portable=("portable",)),
+    )
+
+    @registry.register_atomic(ProviderRole.REPO_PORTABLE)
+    class Portable:
+        name = "portable"
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.yes()
+
+    @registry.register_atomic(ProviderRole.UPSTREAM_STANDARD, profile_only=True)
+    class Unsupported:
+        name = "unsupported"
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.unsupported("wrong dtype")
+
+    resolver = OpResolver(registry)
+    with pytest.raises(NoProviderError, match="wrong dtype"):
+        resolver.resolve(
+            _Spec(),
+            _caps(),
+            force_atomic_provider="unsupported",
+        )
+    with pytest.raises(ValueError, match="Unknown forced"):
+        resolver.resolve(
+            _Spec(),
+            _caps(),
+            force_atomic_provider="missing",
+        )
 
 
 def test_profile_cannot_reference_ineligible_atomic_provider() -> None:

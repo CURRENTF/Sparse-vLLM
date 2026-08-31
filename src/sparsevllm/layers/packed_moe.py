@@ -41,6 +41,7 @@ class PackedMoeExperts(PackedExpertWeightLoader, nn.Module):
         routing_method: str = "softmax",
         scale_dtype: torch.dtype | None = None,
         activation: str = "silu",
+        max_num_tokens: int = 1,
         model_label: str = "PackedMoE",
         provider_resolver: Callable[[MoeOpSpec], MoeProvider] = resolve_moe_provider,
         parallel_context=None,
@@ -123,6 +124,7 @@ class PackedMoeExperts(PackedExpertWeightLoader, nn.Module):
             routing_method=str(routing_method),
             scale_dtype=scale_dtype,
             activation=str(activation),
+            max_num_tokens=int(max_num_tokens),
         )
         self.provider = provider_resolver(self.op_spec)
         self.w13_weight = nn.Parameter(
@@ -166,6 +168,12 @@ class PackedMoeExperts(PackedExpertWeightLoader, nn.Module):
             self.register_buffer("w13_scale_inv", None)
             self.register_buffer("w2_scale_inv", None)
         self._loaded_expert_shards: set[tuple[int, str]] = set()
+        self.provider.prepare(
+            self.op_spec,
+            device=self.w13_weight.device,
+            tp_rank=int(self.tp_rank),
+            ep_rank=int(self.ep_rank),
+        )
 
     def is_local_expert(self, global_expert_id: int) -> bool:
         return self.local_expert_start <= int(global_expert_id) < self.local_expert_end
@@ -303,6 +311,7 @@ class PackedMoeExperts(PackedExpertWeightLoader, nn.Module):
             self.w13_scale_inv,
             self.w2_scale_inv,
             local_expert_start=self.local_expert_start,
+            tp_rank=int(self.tp_rank),
             ep_rank=int(self.ep_rank),
         )
 

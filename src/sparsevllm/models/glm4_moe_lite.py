@@ -390,6 +390,7 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
             fp8_enabled=False,
             cuda_graph=bool(decode_graph),
             routing_method="biased_sigmoid",
+            max_num_tokens=int(getattr(config, "moe_max_num_tokens", 1)),
             model_label="GLM-4.7-Flash",
             provider_resolver=resolve_moe_provider,
             parallel_context=parallel_context,
@@ -417,8 +418,15 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
                 tp_size=self.op_spec.tp_size,
                 routing_method=self.op_spec.routing_method,
                 scale_dtype=self.op_spec.scale_dtype,
+                max_num_tokens=self.op_spec.max_num_tokens,
             )
             self.routed_provider = resolve_moe_provider(self.routed_op_spec)
+            self.routed_provider.prepare(
+                self.routed_op_spec,
+                device=self.w13_weight.device,
+                tp_rank=int(self.tp_rank),
+                ep_rank=int(self.ep_rank),
+            )
         else:
             self.routed_op_spec = self.op_spec
             self.routed_provider = self.provider
@@ -441,6 +449,7 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
             self.w13_scale_inv,
             self.w2_scale_inv,
             local_expert_start=0,
+            tp_rank=int(self.tp_rank),
             ep_rank=int(self.ep_rank),
         )
 

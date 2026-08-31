@@ -17,6 +17,7 @@ from sparsevllm.kernels.external.flashinfer.moe import (
     _cutlass_fp8_moe_op,
     flashinfer_cutlass_fp8_moe_support,
     flashinfer_cutlass_fused_moe,
+    flashinfer_cutlass_fused_moe_workspace_size,
 )
 from sparsevllm.kernels.external.flashinfer.support import (
     flashinfer_kernel_health,
@@ -176,11 +177,15 @@ def test_flashinfer_sm90_adapter_fixes_scale_contract() -> None:
 
 def test_flashinfer_moe_feature_accepts_public_contract() -> None:
     function = Mock()
+    workspace_size = Mock()
     activation_type = object()
 
     def import_module(name):
         if name == "flashinfer.fused_moe":
-            return SimpleNamespace(cutlass_fused_moe=function)
+            return SimpleNamespace(
+                cutlass_fused_moe=function,
+                cutlass_fused_moe_workspace_size=workspace_size,
+            )
         if name == "flashinfer.tllm_enums":
             return SimpleNamespace(
                 ActivationType=SimpleNamespace(Swiglu=activation_type)
@@ -190,6 +195,10 @@ def test_flashinfer_moe_feature_accepts_public_contract() -> None:
     _cutlass_fp8_moe_op.cache_clear()
     try:
         with (
+            patch(
+                "sparsevllm.kernels.external.flashinfer.moe.flashinfer_kernel_health",
+                return_value=SimpleNamespace(ready=True, version="0.6.17"),
+            ),
             patch(
                 "sparsevllm.kernels.external.flashinfer.moe.flashinfer_kernel_support",
                 return_value=(True, "available"),
@@ -206,6 +215,10 @@ def test_flashinfer_moe_feature_rejects_missing_contract() -> None:
     try:
         with (
             patch(
+                "sparsevllm.kernels.external.flashinfer.moe.flashinfer_kernel_health",
+                return_value=SimpleNamespace(ready=True, version="0.6.17"),
+            ),
+            patch(
                 "sparsevllm.kernels.external.flashinfer.moe.flashinfer_kernel_support",
                 return_value=(True, "available"),
             ),
@@ -220,21 +233,37 @@ def test_flashinfer_moe_feature_rejects_missing_contract() -> None:
         _cutlass_fp8_moe_op.cache_clear()
 
 
+def test_flashinfer_moe_workspace_requires_0617() -> None:
+    with patch(
+        "sparsevllm.kernels.external.flashinfer.moe.flashinfer_kernel_health",
+        return_value=SimpleNamespace(ready=True, version="0.6.15"),
+    ):
+        supported, reason = flashinfer_cutlass_fp8_moe_support()
+
+    assert not supported
+    assert "requires flashinfer-python>=0.6.17" in reason
+
+
 def test_flashinfer_moe_adapter_fixes_execution_contract() -> None:
     function = Mock()
+    workspace_size = Mock()
     activation_type = object()
     hidden_states = torch.empty(2, 128, dtype=torch.bfloat16)
     topk_ids = torch.empty(2, 2, dtype=torch.int64)
-    topk_weights = torch.empty(2, 2, dtype=torch.bfloat16)
+    topk_weights = torch.tensor(
+        [[0.75, 0.25], [0.625, 0.375]],
+        dtype=torch.bfloat16,
+    )
     w13_weight = torch.empty(4, 256, 128)
     w2_weight = torch.empty(4, 128, 128)
     w13_scale_inv = torch.empty(4, 2, 1)
     w2_scale_inv = torch.empty(4, 1, 1)
     output = torch.empty_like(hidden_states)
+    workspace = torch.empty(1024, dtype=torch.uint8)
 
     with patch(
         "sparsevllm.kernels.external.flashinfer.moe._cutlass_fp8_moe_op",
-        return_value=(function, activation_type, "available"),
+        return_value=(function, workspace_size, activation_type, "available"),
     ):
         flashinfer_cutlass_fused_moe(
             hidden_states,
@@ -244,9 +273,12 @@ def test_flashinfer_moe_adapter_fixes_execution_contract() -> None:
             w2_weight,
             w13_scale_inv,
             w2_scale_inv,
+            tp_size=2,
+            tp_rank=1,
             ep_size=2,
             ep_rank=1,
             output=output,
+            workspace_buffer=workspace,
         )
 
     function.assert_called_once()
@@ -259,10 +291,49 @@ def test_flashinfer_moe_adapter_fixes_execution_contract() -> None:
     assert args[5] is hidden_states.dtype
     assert kwargs["quant_scales"][0] is w13_scale_inv
     assert kwargs["quant_scales"][1] is w2_scale_inv
+    assert kwargs["tp_size"] == 2
+    assert kwargs["tp_rank"] == 1
     assert kwargs["ep_size"] == 2
     assert kwargs["ep_rank"] == 1
     assert kwargs["output"] is output
+    assert kwargs["workspace_buffer"] is workspace
     assert kwargs["use_deepseek_fp8_block_scale"] is True
     assert kwargs["use_fused_finalize"] is False
     assert kwargs["enable_pdl"] is None
+    assert kwargs["activation_type"] is activation_type
+
+
+def test_flashinfer_moe_workspace_query_fixes_topology_contract() -> None:
+    function = Mock()
+    workspace_size = Mock(return_value=4096)
+    activation_type = object()
+
+    with patch(
+        "sparsevllm.kernels.external.flashinfer.moe._cutlass_fp8_moe_op",
+        return_value=(function, workspace_size, activation_type, "available"),
+    ):
+        actual = flashinfer_cutlass_fused_moe_workspace_size(
+            max_num_tokens=512,
+            hidden_size=3072,
+            intermediate_size=768,
+            num_experts=256,
+            top_k=8,
+            activation_dtype=torch.bfloat16,
+            weight_dtype=torch.float8_e4m3fn,
+            tp_size=2,
+            tp_rank=1,
+            ep_size=2,
+            ep_rank=1,
+            device=torch.device("cuda", 1),
+        )
+
+    assert actual == 4096
+    args, kwargs = workspace_size.call_args
+    assert args == (512, 3072, 768, 256, 8)
+    assert kwargs["tp_size"] == 2
+    assert kwargs["tp_rank"] == 1
+    assert kwargs["ep_size"] == 2
+    assert kwargs["ep_rank"] == 1
+    assert kwargs["use_deepseek_fp8_block_scale"] is True
+    assert kwargs["use_fused_finalize"] is False
     assert kwargs["activation_type"] is activation_type

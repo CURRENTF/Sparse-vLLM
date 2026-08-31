@@ -308,6 +308,7 @@ class ProviderRole(str, Enum):
 
 
 class SelectionBasis(str, Enum):
+    BENCHMARK_OVERRIDE = "benchmark_override"
     PROFILE_OVERRIDE = "profile_override"
     UPSTREAM_DEFAULT = "upstream_default"
     SEMANTIC_FALLBACK = "semantic_fallback"
@@ -598,6 +599,8 @@ class OpResolver(Generic[SpecT, ProviderT]):
         self,
         spec: SpecT,
         caps: DeviceCaps,
+        *,
+        force_atomic_provider: str | None = None,
         **provider_kwargs,
     ) -> ResolvedProvider[ProviderT]:
         self.registry.validate()
@@ -697,7 +700,33 @@ class OpResolver(Generic[SpecT, ProviderT]):
         selected_type: type[ProviderT] | type[ProfileOverlay[SpecT, ProviderT]]
         selected_role: ProviderRole | None
         selection_basis: SelectionBasis
-        if selected_profile is not None:
+        if force_atomic_provider is not None:
+            forced_name = str(force_atomic_provider).strip()
+            if not forced_name:
+                raise ValueError("force_atomic_provider must not be empty.")
+            if forced_name not in results:
+                available = sorted(results)
+                raise ValueError(
+                    f"Unknown forced {self.registry.family} atomic provider "
+                    f"{forced_name!r}; available={available}."
+                )
+            selected_registration = self.registry.atomic_registry.registration(
+                forced_name
+            )
+            result = results[forced_name]
+            if not result.supported:
+                raise NoProviderError(
+                    f"Forced {self.registry.family} provider {forced_name!r} "
+                    f"does not support spec={spec!r} on "
+                    f"device={caps.device_name!r}: {result.reason}."
+                )
+            selected_profile = None
+            selected_profile_atomic_names = ()
+            selected_type = selected_registration.provider
+            selected_role = selected_registration.role
+            selected_reason = f"benchmark override: {result.reason}"
+            selection_basis = SelectionBasis.BENCHMARK_OVERRIDE
+        elif selected_profile is not None:
             selected_type = selected_profile
             selected_role = None
             selection_basis = SelectionBasis.PROFILE_OVERRIDE

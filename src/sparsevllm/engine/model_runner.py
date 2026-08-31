@@ -33,6 +33,11 @@ from sparsevllm.operators.decode_attention import (
     collect_decode_graph_participants,
     validate_batch_only_decode_graph_model,
 )
+from sparsevllm.operators.workspace import (
+    close_workspace_manager,
+    init_workspace_manager,
+    lock_workspace_manager,
+)
 from sparsevllm.utils.context import set_context, get_context, reset_context
 from sparsevllm.utils.loader import load_model, sync_deltakv_config_from_checkpoint
 
@@ -270,6 +275,20 @@ class ModelRunner:
         setattr(hf_config, "mlp_chunk_size", config.mlp_chunk_size)
         setattr(
             hf_config,
+            "moe_max_num_tokens",
+            min(
+                int(
+                    getattr(
+                        config,
+                        "max_num_batched_tokens",
+                        config.mlp_chunk_size,
+                    )
+                ),
+                int(config.mlp_chunk_size),
+            ),
+        )
+        setattr(
+            hf_config,
             "decode_graph",
             bool(getattr(config, "decode_graph", False)),
         )
@@ -297,6 +316,7 @@ class ModelRunner:
             cuda_graph=config.decode_graph,
             device_index=int(self.device.index or 0),
         )
+        init_workspace_manager(self.device)
         try:
             self.model = _create_model(
                 hf_config,
@@ -327,6 +347,7 @@ class ModelRunner:
             if callable(close_runtime_operators):
                 close_runtime_operators()
             self.collective_runtime.close()
+            close_workspace_manager()
             raise
         if (
             self.config.decode_graph
@@ -359,6 +380,7 @@ class ModelRunner:
         warmup_moe = getattr(self.model, "warmup_moe", None)
         if callable(warmup_moe):
             warmup_moe()
+        lock_workspace_manager()
         
         self.sampler = Sampler()
 
@@ -496,6 +518,7 @@ class ModelRunner:
             self.platform.synchronize()
         self.collective_runtime.close()
         self.platform.synchronize()
+        close_workspace_manager()
         if self.world_size > 1:
             self.shm.close()
             self.parallel_context.world_barrier(
