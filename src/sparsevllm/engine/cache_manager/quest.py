@@ -278,14 +278,22 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         available_memory, slot_bytes_per_layer = self._get_available_slots_info()
 
         int32_bytes = torch.empty((), dtype=torch.int32).element_size()
-        fixed_metadata_bytes = (
-            self.max_buffer_rows * self.max_model_len * int32_bytes
-            + self.max_buffer_rows * self.max_pages_per_row * int32_bytes
-            + self.page_size
+        max_buffer_rows = int(getattr(self, "max_buffer_rows", 0))
+        max_model_len = int(getattr(self, "max_model_len", 0))
+        max_pages_per_row = int(getattr(self, "max_pages_per_row", 0))
+        page_offset_bytes = (
+            self.page_size
             * (
                 int32_bytes
                 + torch.empty((), dtype=torch.int64).element_size()
             )
+            if hasattr(self, "page_offsets_i32")
+            else 0
+        )
+        fixed_metadata_bytes = (
+            max_buffer_rows * max_model_len * int32_bytes
+            + max_buffer_rows * max_pages_per_row * int32_bytes
+            + page_offset_bytes
         )
         available_memory -= fixed_metadata_bytes
         if available_memory <= 0:

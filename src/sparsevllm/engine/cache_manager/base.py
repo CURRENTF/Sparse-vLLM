@@ -427,6 +427,8 @@ class CacheManager(ABC):
         allocation_budget_bytes: int | None = None,
     ) -> "CacheManager":
         def create_manager(manager_cls):
+            if allocation_budget_bytes is None:
+                return manager_cls(config, parallel_context)
             return manager_cls(
                 config,
                 parallel_context,
@@ -478,8 +480,9 @@ class CacheManager(ABC):
         config = self.config
         hf_config = config.hf_config
         slot_bytes_per_layer = self.attention_cache_bytes_per_slot_per_layer()
-        if self.allocation_budget_bytes is not None:
-            return self.allocation_budget_bytes, slot_bytes_per_layer
+        allocation_budget_bytes = getattr(self, "allocation_budget_bytes", None)
+        if allocation_budget_bytes is not None:
+            return int(allocation_budget_bytes), slot_bytes_per_layer
 
         free, total = self.platform.get_available_memory(self.device.index or 0)
 
