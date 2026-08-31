@@ -241,9 +241,6 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                 self.config.num_kvcache_slots // getattr(self.config, "prefix_cache_block_size", 16),
             )
 
-        logger.info(
-            f"Standard Mode: Each layer can accommodate {self.config.num_kvcache_slots} tokens."
-        )
         self.attention_cache_storage.allocate(
             num_layers=num_layers,
             num_slots=self.config.num_kvcache_slots,

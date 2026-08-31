@@ -1250,23 +1250,13 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
             decode_graph=decode_graph,
         )
 
-    def test_graph_warmup_uses_distinct_prompts_across_requests_and_rounds(self):
+    def test_startup_batch_uses_distinct_prompts_and_requested_shapes(self):
         engine = object.__new__(LLMEngine)
         engine.config = SimpleNamespace(
-            sparse_method="omnikv",
-            decode_graph=True,
-            engine_prefill_chunk_size=8,
-            max_decoding_seqs=3,
-            max_model_len=2048,
             hf_config=SimpleNamespace(vocab_size=32),
-            model_spec=SimpleNamespace(num_experts_field=None),
         )
         prompts = []
         pending = 0
-        runner_calls = []
-
-        def runner_call(method, *args):
-            runner_calls.append((method, *args))
 
         def add_request(prompt, sampling_params):
             nonlocal pending
@@ -1277,91 +1267,57 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
             nonlocal pending
             pending = 0
 
-        engine.model_runner = SimpleNamespace(
-            call=runner_call,
-            runtime_state=SimpleNamespace(prompt_admission_free_slots=lambda: 100),
-        )
         engine.add_request = add_request
         engine.is_finished = lambda: pending == 0
         engine.step = step
-        engine._after_warmup_debug_cleanup = lambda: None
 
-        engine._warmup()
+        next_offset = engine._run_startup_batch(
+            (8, 3, 1),
+            SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True),
+            4,
+        )
 
-        self.assertEqual(len(prompts), 6)
-        self.assertEqual([prompt[0] for prompt, _ in prompts], list(range(6)))
+        self.assertEqual(next_offset, 7)
+        self.assertEqual([prompt[0] for prompt, _ in prompts], [4, 5, 6])
         self.assertEqual(
             [len(prompt) for prompt, _ in prompts],
-            [8, 1, 1, 8, 1, 1],
+            [8, 3, 1],
         )
-        self.assertEqual([max_tokens for _, max_tokens in prompts], [2, 2, 2, 1, 1, 1])
-        self.assertEqual(runner_calls, [("log_operator_implementations",)])
+        self.assertEqual([max_tokens for _, max_tokens in prompts], [2, 2, 2])
 
     def test_graph_warmup_propagates_failure(self):
         engine = object.__new__(LLMEngine)
         engine.config = SimpleNamespace(
-            sparse_method="omnikv",
-            decode_graph=True,
-            engine_prefill_chunk_size=1,
-            max_decoding_seqs=2,
-            max_model_len=2048,
             hf_config=SimpleNamespace(vocab_size=32),
         )
-        calls = []
         pending = 0
 
         def add_request(_prompt, _sampling_params):
             nonlocal pending
             pending += 1
 
-        engine.model_runner = SimpleNamespace(
-            call=lambda method, *args: calls.append((method, *args)),
-            runtime_state=SimpleNamespace(prompt_admission_free_slots=lambda: 100),
-        )
         engine.add_request = add_request
         engine.is_finished = lambda: pending == 0
         engine.step = lambda: (_ for _ in ()).throw(RuntimeError("warmup failed"))
 
         with self.assertRaisesRegex(RuntimeError, "warmup failed"):
-            engine._warmup()
+            engine._run_startup_batch(
+                (1,),
+                SamplingParams(max_tokens=1, temperature=0.0),
+                0,
+            )
 
-        self.assertEqual(calls, [])
-
-    def test_graph_warmup_is_clamped_to_runtime_capacity(self):
+    def test_startup_batch_rejects_exhausted_dummy_token_range(self):
         engine = object.__new__(LLMEngine)
         engine.config = SimpleNamespace(
-            sparse_method="omnikv",
-            decode_graph=True,
-            engine_prefill_chunk_size=64,
-            max_decoding_seqs=3,
-            max_model_len=2048,
-            hf_config=SimpleNamespace(vocab_size=32),
-            model_spec=SimpleNamespace(num_experts_field=None),
+            hf_config=SimpleNamespace(vocab_size=4),
         )
-        prompts = []
-        pending = 0
-
-        def add_request(prompt, _sampling_params):
-            nonlocal pending
-            prompts.append(list(prompt))
-            pending += 1
-
-        def step():
-            nonlocal pending
-            pending = 0
-
-        engine.model_runner = SimpleNamespace(
-            call=lambda *_args: None,
-            runtime_state=SimpleNamespace(prompt_admission_free_slots=lambda: 10),
-        )
-        engine.add_request = add_request
-        engine.is_finished = lambda: pending == 0
-        engine.step = step
-        engine._after_warmup_debug_cleanup = lambda: None
-
-        engine._warmup()
-
-        self.assertEqual([len(prompt) for prompt in prompts], [2, 1, 1, 2, 1, 1])
+        with self.assertRaisesRegex(ValueError, "distinct leading token"):
+            engine._run_startup_batch(
+                (1, 1),
+                SamplingParams(max_tokens=1, temperature=0.0),
+                3,
+            )
 
     def test_moe_workspace_warmup_profiles_decode_and_maximum_mlp_shapes(self):
         config = self.make_config(method="omnikv")
