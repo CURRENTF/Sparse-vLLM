@@ -648,6 +648,69 @@ def test_model_runner_releases_the_complete_profiling_cache_runtime():
     assert records == [{"world_rank": 0, "snapshot": snapshot}]
 
 
+def test_model_runner_runtime_rebuild_resolves_graph_shapes_locally():
+    runner = object.__new__(ModelRunner)
+    runner.parallel_context = object()
+    runner.recurrent_state_manager = None
+    runner.model = SimpleNamespace()
+    runner.load_deltakv_compressors = lambda: None
+    runner.run_model = object()
+    runner._is_long_text_batch = object()
+    runner.collective_runtime = object()
+    config = SimpleNamespace(
+        resolved_prefix_cache_mode="disabled",
+        max_num_seqs_in_batch=8,
+        max_decoding_seqs=16,
+        decode_graph_capture_sizes="auto",
+        decode_graph_context_sizes="auto",
+        max_model_len=1024,
+        sparse_method="vanilla",
+        decode_graph_shape_policy="batch_only",
+    )
+    graph_kwargs = {}
+
+    with (
+        patch(
+            "sparsevllm.engine.model_runner.CacheManager.create",
+            return_value=object(),
+        ),
+        patch("sparsevllm.engine.model_runner.RuntimeState", return_value=object()),
+        patch(
+            "sparsevllm.engine.model_runner.SparseController",
+            return_value=SimpleNamespace(),
+        ),
+        patch(
+            "sparsevllm.engine.model_runner.collect_decode_graph_participants",
+            return_value=(),
+        ),
+        patch(
+            "sparsevllm.engine.model_runner._decode_cuda_graph_max_real_batch_size",
+            return_value=8,
+        ),
+        patch(
+            "sparsevllm.engine.model_runner._resolve_decode_cuda_graph_capture_sizes",
+            return_value=(1, 8),
+        ),
+        patch(
+            "sparsevllm.engine.model_runner._resolve_decode_cuda_graph_context_sizes",
+            return_value=(128,),
+        ),
+        patch(
+            "sparsevllm.engine.model_runner.DecodeCudaGraphRunner",
+            side_effect=lambda **kwargs: graph_kwargs.update(kwargs) or object(),
+        ),
+    ):
+        ModelRunner._build_cache_runtime(
+            runner,
+            config,
+            allocation_budget_bytes=1234,
+        )
+
+    assert graph_kwargs["capture_sizes"] == (1, 8)
+    assert graph_kwargs["context_sizes"] == (128,)
+    assert graph_kwargs["method"] == "vanilla"
+
+
 def test_model_runner_decode_graph_startup_controls_use_live_runner():
     calls = []
     runner = object.__new__(ModelRunner)

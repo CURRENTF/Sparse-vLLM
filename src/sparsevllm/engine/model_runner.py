@@ -515,9 +515,17 @@ class ModelRunner:
 
         self.load_deltakv_compressors()
 
+        max_real_decode_batch_size = _decode_cuda_graph_max_real_batch_size(
+            max_num_seqs_in_batch=runtime_config.max_num_seqs_in_batch,
+            max_decoding_seqs=runtime_config.max_decoding_seqs,
+        )
+        decode_static_capture_sizes = _resolve_decode_cuda_graph_capture_sizes(
+            runtime_config.decode_graph_capture_sizes,
+            max_real_decode_batch_size,
+        )
         decode_static_context_sizes = _resolve_decode_cuda_graph_context_sizes(
-            self.config.decode_graph_context_sizes,
-            self.config.max_model_len,
+            runtime_config.decode_graph_context_sizes,
+            runtime_config.max_model_len,
         )
         # Decode graph keys are captured lazily and replayed in workload order,
         # which is not necessarily their capture order.  Do not force those
@@ -531,10 +539,10 @@ class ModelRunner:
             sparse_controller=self.sparse_controller,
             run_model=self.run_model,
             is_long_text_batch=self._is_long_text_batch,
-            method=self.config.sparse_method,
+            method=runtime_config.sparse_method,
             capture_sizes=decode_static_capture_sizes,
             context_sizes=decode_static_context_sizes,
-            shape_policy=self.config.decode_graph_shape_policy,
+            shape_policy=runtime_config.decode_graph_shape_policy,
             graph_pool=self.cuda_graph_pool,
             collective_runtime=self.collective_runtime,
         )

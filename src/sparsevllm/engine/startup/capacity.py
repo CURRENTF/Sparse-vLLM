@@ -11,6 +11,7 @@ from sparsevllm.method_registry import (
     decode_sparse_long_text_threshold,
     normalize_sparse_method,
 )
+from sparsevllm.models.layout import resolve_attention_qk_head_dim
 
 
 @dataclass(frozen=True)
@@ -145,9 +146,7 @@ def profiling_kv_budget_bytes(config, num_slots: int) -> int:
         if not local_shapes:
             heads = int(config.hf_config.num_key_value_heads)
             local_heads = max(1, heads // tp_size)
-            head_dim = int(config.hf_config.hidden_size) // int(
-                config.hf_config.num_attention_heads
-            )
+            head_dim = resolve_attention_qk_head_dim(config.hf_config)
             local_shapes = tuple(
                 (local_heads, head_dim) for _ in range(int(layout.num_kv_layers))
             )

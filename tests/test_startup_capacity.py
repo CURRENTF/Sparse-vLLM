@@ -33,6 +33,7 @@ def _config(*, sparse_method: str = ""):
             num_key_value_heads=8,
             num_attention_heads=32,
             hidden_size=4096,
+            head_dim=128,
         ),
         quest_chunk_size=16,
         max_num_batched_tokens=16,
@@ -63,6 +64,17 @@ def test_capacity_plan_uses_larger_runtime_peak_and_external_headroom():
 
 def test_explicit_profiling_budget_uses_tp_local_kv_shape():
     config = _config()
+
+    budget = profiling_kv_budget_bytes(config, 10)
+
+    expected_bytes_per_slot = 4 * 2 * 4 * 128 * 2
+    expected_row_mapping = 8 * 32 * 4
+    assert budget == 10 * (expected_bytes_per_slot + 4) + expected_row_mapping
+
+
+def test_explicit_profiling_budget_uses_declared_head_dim_without_layout_shapes():
+    config = _config()
+    config.runtime_layout = RuntimeLayout.dense(4)
 
     budget = profiling_kv_budget_bytes(config, 10)
 
