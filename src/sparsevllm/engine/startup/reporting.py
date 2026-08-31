@@ -63,6 +63,10 @@ def build_startup_capacity_decision(
     rank_plans = []
     for rank in sorted(expected_ranks):
         snapshot: DeviceMemorySnapshot = phases["persistent"][rank]["snapshot"]
+        graph_after: DeviceMemorySnapshot = phases["graph"][rank]["after"]
+        post_graph_release: DeviceMemorySnapshot = phases["persistent"][rank][
+            "post_graph_release_snapshot"
+        ]
         profile = StartupMemoryProfile(
             total_bytes=int(snapshot.total_bytes),
             persistent_bytes=int(snapshot.total_bytes - snapshot.free_bytes),
@@ -72,7 +76,10 @@ def build_startup_capacity_decision(
             decode_transient_bytes=int(
                 phases["decode"][rank]["measurement"].transient_peak_bytes
             ),
-            cuda_graph_bytes=int(phases["graph"][rank]["measurement"].consumed_bytes),
+            cuda_graph_bytes=max(
+                0,
+                int(post_graph_release.free_bytes - graph_after.free_bytes),
+            ),
         )
         rank_plans.append(
             RankStartupMemoryPlan(
@@ -140,6 +147,23 @@ def log_startup_completion(
             "Production and final startup records cover different ranks: "
             f"production={sorted(production)} final={sorted(final)}."
         )
+    slot_count = validate_production_kv_records(production_records)
+    for rank in sorted(final):
+        snapshot: DeviceMemorySnapshot = final[rank]["snapshot"]
+        logger.info(
+            "Startup final state: rank={} kv_slots={} free={:.2f} GiB "
+            "used={:.2f} GiB post_capture_warmup=passed.",
+            rank,
+            slot_count,
+            _gib(snapshot.free_bytes),
+            _gib(snapshot.total_bytes - snapshot.free_bytes),
+        )
+
+
+def validate_production_kv_records(
+    production_records: list[dict[str, Any]],
+) -> int:
+    production = _records_by_rank(production_records, "production")
     slot_counts = {
         int(record["num_kvcache_slots"])
         for record in production.values()
@@ -149,16 +173,7 @@ def log_startup_completion(
             "Production KV capacity differs across ranks: "
             f"records={production_records!r}."
         )
-    for rank in sorted(final):
-        snapshot: DeviceMemorySnapshot = final[rank]["snapshot"]
-        logger.info(
-            "Startup final state: rank={} kv_slots={} free={:.2f} GiB "
-            "used={:.2f} GiB post_capture_warmup=passed.",
-            rank,
-            next(iter(slot_counts)),
-            _gib(snapshot.free_bytes),
-            _gib(snapshot.total_bytes - snapshot.free_bytes),
-        )
+    return next(iter(slot_counts))
 
 
 __all__ = [
@@ -167,4 +182,5 @@ __all__ = [
     "build_startup_capacity_decision",
     "log_startup_capacity_decision",
     "log_startup_completion",
+    "validate_production_kv_records",
 ]

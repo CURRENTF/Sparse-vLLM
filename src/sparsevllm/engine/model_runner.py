@@ -585,6 +585,11 @@ class ModelRunner:
         self.decode_graph_runner.clear_captured_graphs()
         if self.config.decode_graph:
             self.collective_runtime.reset_for_cuda_graph_recapture()
+        release_unused_device_memory(self.platform)
+        post_graph_release_snapshot = DeviceMemorySnapshot.capture(
+            self.platform,
+            self.device,
+        )
         model = getattr(self.model, "model", None)
         if model is not None and getattr(model, "sparse_controller", None) is self.sparse_controller:
             model.sparse_controller = None
@@ -601,6 +606,7 @@ class ModelRunner:
             {
                 "world_rank": int(self.rank),
                 "snapshot": snapshot,
+                "post_graph_release_snapshot": post_graph_release_snapshot,
             }
         )
 

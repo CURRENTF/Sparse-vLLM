@@ -19,6 +19,7 @@ from .reporting import (
     build_startup_capacity_decision,
     log_startup_capacity_decision,
     log_startup_completion,
+    validate_production_kv_records,
 )
 
 __all__ = [
@@ -34,6 +35,7 @@ __all__ = [
     "feasible_startup_graph_plan",
     "log_startup_capacity_decision",
     "log_startup_completion",
+    "validate_production_kv_records",
     "profiling_kv_budget_bytes",
     "profiling_kv_slots",
     "profiling_prefill_prompt_lengths",

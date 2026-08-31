@@ -27,7 +27,10 @@ def test_engine_rebuilds_production_runtime_before_final_graph_warmup():
             "cuda_graph": MemoryProfileMeasurement(50, 20),
             "decode": MemoryProfileMeasurement(0, 120),
         }[phase]
-        return [{"world_rank": 0, "measurement": measurement}]
+        record = {"world_rank": 0, "measurement": measurement}
+        if phase == "cuda_graph":
+            record["after"] = DeviceMemorySnapshot(700, 1000, 300, 300)
+        return [record]
 
     def runner_call(method, *args):
         calls.append((method, *args))
@@ -35,7 +38,15 @@ def test_engine_rebuilds_production_runtime_before_final_graph_warmup():
             return profile_record(args[0])
         if method == "release_profiling_cache_runtime":
             assert engine.scheduler is None
-            return [{"world_rank": 0, "snapshot": snapshot}]
+            return [
+                {
+                    "world_rank": 0,
+                    "snapshot": snapshot,
+                    "post_graph_release_snapshot": DeviceMemorySnapshot(
+                        750, 1000, 250, 250
+                    ),
+                }
+            ]
         if method == "build_production_cache_runtime":
             assert args == (430,)
             return [{"world_rank": 0, "num_kvcache_slots": 64}]

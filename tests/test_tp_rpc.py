@@ -639,13 +639,26 @@ def test_model_runner_releases_the_complete_profiling_cache_runtime():
     ):
         records = ModelRunner.release_profiling_cache_runtime(runner)
 
-    assert calls == ["sync", "reset", "clear_graphs", "reset_collectives", "release_memory"]
+    assert calls == [
+        "sync",
+        "reset",
+        "clear_graphs",
+        "reset_collectives",
+        "release_memory",
+        "release_memory",
+    ]
     assert runner.cache_runtime_phase == "released"
     assert runner.model.model.sparse_controller is None
     assert runner.decode_graph_runner is None
     assert runner.runtime_state is None
     assert runner.cache_manager is None
-    assert records == [{"world_rank": 0, "snapshot": snapshot}]
+    assert records == [
+        {
+            "world_rank": 0,
+            "snapshot": snapshot,
+            "post_graph_release_snapshot": snapshot,
+        }
+    ]
 
 
 def test_model_runner_runtime_rebuild_resolves_graph_shapes_locally():

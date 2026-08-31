@@ -33,6 +33,7 @@ from sparsevllm.engine.startup import (
     log_startup_capacity_decision,
     log_startup_completion,
     profiling_prefill_prompt_lengths,
+    validate_production_kv_records,
 )
 from sparsevllm.multimodal.inputs import (
     MultiModalInputProcessor,
@@ -573,6 +574,7 @@ class LLMEngine:
             "build_production_cache_runtime",
             decision.selected_kv_budget_bytes,
         )
+        validate_production_kv_records(production_records)
         self.scheduler = self._create_scheduler()
         prompt_offset = self._capture_startup_decode_graphs(
             prompt_offset=0,
