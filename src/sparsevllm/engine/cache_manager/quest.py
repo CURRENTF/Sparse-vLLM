@@ -8,6 +8,11 @@ import torch
 
 from sparsevllm.config import Config
 from sparsevllm.distributed import ParallelContext
+from sparsevllm.engine.decode_graph_contract import (
+    CacheDecodeGraphState,
+    DecodeGraphContract,
+    DecodeGraphInputs,
+)
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.prefix_cache import (
     PrefixCacheBlock,
@@ -20,6 +25,7 @@ from sparsevllm.engine.prefix_cache import (
 from sparsevllm.kernels.triton.quest_decode_view import (
     fuse_mla_quest_selection_query,
     finalize_quest_decode_view,
+    prepare_quest_decode_graph_metadata,
     prepare_quest_decode_geometry,
     score_quest_pages,
 )
@@ -65,6 +71,16 @@ class QuestPrefillPagePlan:
     """Packed-token runs, each owned by exactly one physical QuEST page."""
 
     segments: torch.Tensor
+
+
+@dataclass
+class QuestDecodeGraphState(CacheDecodeGraphState):
+    """Stable QuEST decode metadata for the no-prefix graph path."""
+
+    row_page_slots: torch.Tensor
+    num_pages: torch.Tensor
+    previous_page_counts: torch.Tensor
+    host_write_slots: torch.Tensor
 
 
 class QuestCacheManager(PrefixCacheMixin, CacheManager):
@@ -1732,6 +1748,206 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                     controller.wait_for_layer(operation, kv_layer_index)
         return super().before_prefill_layer_attention(layer_idx, selection)
 
+    def init_decode_graph_state(
+        self,
+        contract: DecodeGraphContract,
+        inputs: DecodeGraphInputs,
+    ) -> CacheDecodeGraphState:
+        inputs.validate(contract)
+        if self.enable_prefix_caching:
+            return CacheDecodeGraphState(contract=contract, inputs=inputs)
+
+        page_width = min(
+            int(self.max_pages_per_row),
+            max(
+                1,
+                (int(contract.context_capacity) + int(self.page_size) - 1)
+                // int(self.page_size),
+            ),
+        )
+        batch_capacity = int(contract.batch_capacity)
+        return QuestDecodeGraphState(
+            contract=contract,
+            inputs=inputs,
+            row_page_slots=torch.empty(
+                (batch_capacity, page_width),
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            num_pages=torch.empty(
+                batch_capacity,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            previous_page_counts=torch.empty(
+                batch_capacity,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            host_write_slots=torch.empty(
+                batch_capacity,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=bool(inputs.host.input_ids.is_pinned()),
+            ),
+        )
+
+    def _plan_decode_rows(
+        self,
+        seq_ids: np.ndarray,
+    ) -> tuple[np.ndarray, tuple[tuple[int, int], ...]]:
+        rows = np.empty(int(seq_ids.size), dtype=np.int64)
+        pending: list[tuple[int, int]] = []
+        free_rows = iter(self.free_rows)
+        planned_by_seq: dict[int, int] = {}
+        for index, raw_seq_id in enumerate(seq_ids):
+            seq_id = int(raw_seq_id)
+            row = self.seq_id_to_row.get(seq_id)
+            if row is None:
+                row = planned_by_seq.get(seq_id)
+            if row is None:
+                try:
+                    row = int(next(free_rows))
+                except StopIteration as error:
+                    raise RuntimeError(
+                        "No free rows for QuEST graph decode: "
+                        f"need={len(pending) + 1} free={len(self.free_rows)}."
+                    ) from error
+                planned_by_seq[seq_id] = row
+                pending.append((seq_id, row))
+            rows[index] = row
+        return rows, tuple(pending)
+
+    def _commit_decode_rows(
+        self,
+        pending: tuple[tuple[int, int], ...],
+    ) -> None:
+        for seq_id, expected_row in pending:
+            if not self.free_rows or int(self.free_rows[0]) != int(expected_row):
+                raise RuntimeError(
+                    "QuEST graph decode row plan changed before commit: "
+                    f"expected={expected_row} "
+                    f"actual={self.free_rows[0] if self.free_rows else None}."
+                )
+            row = int(self.free_rows.popleft())
+            self.seq_id_to_row[int(seq_id)] = row
+
+    def _prepare_decode_graph_step_no_prefix(
+        self,
+        seqs: list[Sequence],
+        state: QuestDecodeGraphState,
+    ):
+        inputs = state.inputs
+        host = inputs.host
+        real_batch_size = len(seqs)
+        graph_batch_size = int(inputs.batch_capacity)
+        if real_batch_size <= 0 or real_batch_size > graph_batch_size:
+            raise ValueError(
+                "QuEST decode graph requires a non-empty active batch within capacity: "
+                f"real={real_batch_size} capacity={graph_batch_size}."
+            )
+
+        seq_ids = host.pack_requests(seqs)
+        row_indices, pending_rows = self._plan_decode_rows(seq_ids)
+        current_lens = self.row_seq_lens[row_indices]
+        next_lens = current_lens + 1
+        max_context_len = int(next_lens.max())
+        if max_context_len > int(state.contract.context_capacity):
+            raise ValueError(
+                "QuEST decode request exceeded the captured graph context capacity: "
+                f"requested={max_context_len} "
+                f"captured={state.contract.context_capacity}."
+            )
+        if max_context_len > int(self.max_model_len):
+            raise RuntimeError(
+                "QuEST decode request exceeded max_model_len: "
+                f"requested={max_context_len} max_model_len={self.max_model_len}."
+            )
+
+        page_indices = current_lens // int(self.page_size)
+        page_offsets = current_lens % int(self.page_size)
+        new_page_positions = np.flatnonzero(page_offsets == 0)
+        needed_pages = int(new_page_positions.size)
+        if needed_pages > 0:
+            self._evict_prefix_cache_until_free(needed_pages * int(self.page_size))
+        if int(self._num_free_pages) < needed_pages:
+            raise RuntimeError(
+                "Out of QuEST KV pages during graph reservation: "
+                f"need={needed_pages} free={self._num_free_pages}."
+            )
+
+        self._commit_decode_rows(pending_rows)
+        if needed_pages > 0:
+            ptr = int(self._num_free_pages)
+            new_page_slots = self.free_pages_cpu_stack[
+                ptr - needed_pages : ptr
+            ][::-1].copy()
+            self.buffer_req_to_page_slots_cpu[
+                row_indices[new_page_positions],
+                page_indices[new_page_positions],
+            ] = new_page_slots
+            self._num_free_pages -= needed_pages
+
+        page_slots = self.buffer_req_to_page_slots_cpu[row_indices, page_indices]
+        if np.any(page_slots < 0):
+            raise RuntimeError(
+                "QuEST graph reservation resolved an unallocated physical page."
+            )
+        allocated_slots = (
+            page_slots * int(self.page_size) + page_offsets
+        ).astype(np.int32, copy=False)
+        self.row_seq_lens[row_indices] = next_lens
+
+        host.pack_cache_facts(
+            context_lens=next_lens.astype(np.int32, copy=False),
+            request_indices=row_indices.astype(np.int32, copy=False),
+            real_batch_size=real_batch_size,
+            padding_active=bool(state.contract.padding.active),
+        )
+        state.host_write_slots[:real_batch_size].copy_(
+            torch.from_numpy(allocated_slots)
+        )
+        if graph_batch_size > real_batch_size:
+            state.host_write_slots[real_batch_size:].fill_(
+                int(state.contract.padding.write_slot)
+            )
+
+        non_blocking = bool(host.input_ids.is_pinned())
+        inputs.input_ids.copy_(host.input_ids, non_blocking=non_blocking)
+        inputs.positions.copy_(host.positions, non_blocking=non_blocking)
+        inputs.context_lens.copy_(host.context_lens, non_blocking=non_blocking)
+        inputs.request_indices.copy_(host.request_indices, non_blocking=non_blocking)
+        inputs.active_mask.copy_(host.active_mask, non_blocking=non_blocking)
+        inputs.write_slot_mapping.copy_(
+            state.host_write_slots,
+            non_blocking=bool(state.host_write_slots.is_pinned()),
+        )
+
+        self.layer_batch_state.slot_mapping = inputs.write_slot_mapping
+        self.layer_batch_state.context_lens = inputs.context_lens
+        self.layer_batch_state.max_context_len = max_context_len
+        self.layer_batch_state.req_indices = inputs.request_indices
+        self._decode_row_page_slots = state.row_page_slots
+        self._decode_row_page_slots_req_indices = inputs.request_indices
+        self._decode_num_pages = state.num_pages
+        self._decode_previous_page_counts = state.previous_page_counts
+        self._decode_page_geometry_context_lens = inputs.context_lens
+        self._decode_page_geometry_ready = False
+        return inputs.input_ids, inputs.positions, None
+
+    @torch.no_grad()
+    def prepare_decode_graph_step(
+        self,
+        seqs: list[Sequence],
+        state: CacheDecodeGraphState,
+    ):
+        if not isinstance(state, QuestDecodeGraphState):
+            return super().prepare_decode_graph_step(seqs, state)
+        with profiler.record("cache_prepare_decode"):
+            self._poll_prefix_offload()
+            self._prefix_offload_step_h2d_operations = []
+            return self._prepare_decode_graph_step_no_prefix(seqs, state)
+
     @torch.no_grad()
     def prepare_decode_static(
         self,
@@ -1879,9 +2095,40 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         self._decode_page_geometry_context_lens = context_lens
         self._decode_page_geometry_ready = True
 
-    def prepare_decode_graph_in(self, state) -> None:
-        super().prepare_decode_graph_in(state)
-        self._prepare_decode_page_geometry(state.inputs.context_lens)
+    def prepare_decode_graph_in(self, state: CacheDecodeGraphState) -> None:
+        if not isinstance(state, QuestDecodeGraphState):
+            super().prepare_decode_graph_in(state)
+            self._prepare_decode_page_geometry(state.inputs.context_lens)
+            return
+        prepare_quest_decode_graph_metadata(
+            self.buffer_req_to_token_slots,
+            self.buffer_req_to_page_slots,
+            state.inputs.request_indices,
+            state.inputs.context_lens,
+            state.inputs.write_slot_mapping,
+            state.inputs.active_mask,
+            page_size=int(self.page_size),
+            row_page_slots=state.row_page_slots,
+            num_pages=state.num_pages,
+            previous_page_counts=state.previous_page_counts,
+        )
+        self._decode_page_geometry_ready = True
+
+    def decode_graph_state_keepalive_tensors(
+        self,
+        state: CacheDecodeGraphState,
+    ) -> list[torch.Tensor]:
+        tensors = super().decode_graph_state_keepalive_tensors(state)
+        if isinstance(state, QuestDecodeGraphState):
+            tensors.extend(
+                (
+                    state.row_page_slots,
+                    state.num_pages,
+                    state.previous_page_counts,
+                    state.host_write_slots,
+                )
+            )
+        return tensors
 
     @torch.no_grad()
     def _attention_metadata_keys(

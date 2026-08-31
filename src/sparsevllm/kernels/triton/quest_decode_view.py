@@ -176,6 +176,205 @@ def prepare_quest_decode_geometry(
 
 
 @triton.jit
+def _publish_quest_decode_graph_metadata_kernel(
+    token_slot_table,
+    page_slot_table,
+    request_indices,
+    context_lens,
+    write_slots,
+    active_mask,
+    num_pages,
+    previous_page_counts,
+    token_table_stride_row: tl.constexpr,
+    token_table_stride_token: tl.constexpr,
+    page_table_stride_row: tl.constexpr,
+    page_table_stride_page: tl.constexpr,
+    NUM_ROWS: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK_SIZE)
+    in_bounds = offsets < NUM_ROWS
+    active = tl.load(active_mask + offsets, mask=in_bounds, other=False)
+    rows = tl.load(request_indices + offsets, mask=in_bounds, other=0)
+    context = tl.load(context_lens + offsets, mask=in_bounds, other=1)
+    slots = tl.load(write_slots + offsets, mask=in_bounds, other=0)
+    token_columns = context - 1
+    page_columns = token_columns // PAGE_SIZE
+    tl.store(
+        token_slot_table
+        + rows * token_table_stride_row
+        + token_columns * token_table_stride_token,
+        slots,
+        mask=in_bounds & active,
+    )
+    tl.store(
+        page_slot_table
+        + rows * page_table_stride_row
+        + page_columns * page_table_stride_page,
+        slots // PAGE_SIZE,
+        mask=in_bounds & active,
+    )
+    row_num_pages = (context + PAGE_SIZE - 1) // PAGE_SIZE
+    tl.store(num_pages + offsets, row_num_pages, mask=in_bounds)
+    tl.store(
+        previous_page_counts + offsets,
+        tl.maximum(row_num_pages - 1, 0),
+        mask=in_bounds,
+    )
+
+
+@triton.jit
+def _gather_quest_decode_graph_pages_kernel(
+    page_slot_table,
+    request_indices,
+    row_page_slots,
+    page_table_stride_row: tl.constexpr,
+    page_table_stride_page: tl.constexpr,
+    output_stride_row: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < WIDTH
+    request_row = tl.load(request_indices + row)
+    slots = tl.load(
+        page_slot_table
+        + request_row * page_table_stride_row
+        + offsets * page_table_stride_page,
+        mask=mask,
+        other=-1,
+    )
+    tl.store(
+        row_page_slots + row * output_stride_row + offsets,
+        slots,
+        mask=mask,
+    )
+
+
+def prepare_quest_decode_graph_metadata(
+    token_slot_table: torch.Tensor,
+    page_slot_table: torch.Tensor,
+    request_indices: torch.Tensor,
+    context_lens: torch.Tensor,
+    write_slots: torch.Tensor,
+    active_mask: torch.Tensor,
+    *,
+    page_size: int,
+    row_page_slots: torch.Tensor,
+    num_pages: torch.Tensor,
+    previous_page_counts: torch.Tensor,
+) -> None:
+    """Publish QuEST reservations and gather graph-stable page rows."""
+
+    batch_capacity = int(request_indices.numel())
+    inputs = (request_indices, context_lens, write_slots, active_mask)
+    if any(tensor.ndim != 1 or tensor.numel() != batch_capacity for tensor in inputs):
+        raise ValueError("QuEST graph metadata inputs must share one 1D capacity.")
+    if tuple(tensor.dtype for tensor in inputs) != (
+        torch.int32,
+        torch.int32,
+        torch.int32,
+        torch.bool,
+    ):
+        raise TypeError("QuEST graph metadata inputs have invalid dtypes.")
+    if token_slot_table.ndim != 2 or token_slot_table.dtype != torch.int32:
+        raise TypeError("QuEST token slot table must be rank-2 int32.")
+    if page_slot_table.ndim != 2 or page_slot_table.dtype != torch.int32:
+        raise TypeError("QuEST page slot table must be rank-2 int32.")
+    if (
+        row_page_slots.ndim != 2
+        or row_page_slots.shape[0] != batch_capacity
+        or row_page_slots.dtype != torch.int32
+    ):
+        raise TypeError("QuEST gathered page rows must be batch-aligned rank-2 int32.")
+    if num_pages.shape != (batch_capacity,) or num_pages.dtype != torch.int32:
+        raise TypeError("QuEST num_pages must be batch-aligned int32.")
+    if (
+        previous_page_counts.shape != (batch_capacity,)
+        or previous_page_counts.dtype != torch.int32
+    ):
+        raise TypeError("QuEST previous_page_counts must be batch-aligned int32.")
+    tensors = inputs + (
+        page_slot_table,
+        row_page_slots,
+        num_pages,
+        previous_page_counts,
+    )
+    if any(tensor.device != token_slot_table.device for tensor in tensors):
+        raise ValueError("QuEST graph metadata tensors must share one device.")
+    if batch_capacity <= 0 or int(page_size) <= 0:
+        raise ValueError("QuEST graph metadata requires positive batch and page size.")
+    width = int(row_page_slots.shape[1])
+    if width <= 0 or width > int(page_slot_table.shape[1]):
+        raise ValueError("QuEST gathered page width exceeds its source page table.")
+
+    if token_slot_table.device.type == "cpu":
+        active_rows = active_mask.nonzero(as_tuple=False).flatten()
+        if active_rows.numel() > 0:
+            rows = request_indices.index_select(0, active_rows).to(torch.long)
+            token_columns = (
+                context_lens.index_select(0, active_rows).to(torch.long) - 1
+            )
+            slots = write_slots.index_select(0, active_rows)
+            token_slot_table[rows, token_columns] = slots
+            page_slot_table[rows, token_columns // int(page_size)] = torch.div(
+                slots,
+                int(page_size),
+                rounding_mode="floor",
+            )
+        row_page_slots.copy_(
+            page_slot_table.index_select(0, request_indices.to(torch.long))[:, :width]
+        )
+        torch.div(
+            context_lens + int(page_size) - 1,
+            int(page_size),
+            rounding_mode="floor",
+            out=num_pages,
+        )
+        torch.sub(num_pages, 1, out=previous_page_counts)
+        previous_page_counts.clamp_min_(0)
+        return
+
+    block_size = triton.next_power_of_2(batch_capacity)
+    _publish_quest_decode_graph_metadata_kernel[(1,)](
+        token_slot_table,
+        page_slot_table,
+        request_indices,
+        context_lens,
+        write_slots,
+        active_mask,
+        num_pages,
+        previous_page_counts,
+        token_slot_table.stride(0),
+        token_slot_table.stride(1),
+        page_slot_table.stride(0),
+        page_slot_table.stride(1),
+        NUM_ROWS=batch_capacity,
+        PAGE_SIZE=int(page_size),
+        BLOCK_SIZE=block_size,
+        num_warps=1,
+        num_stages=1,
+    )
+    gather_block = 256
+    _gather_quest_decode_graph_pages_kernel[
+        (batch_capacity, triton.cdiv(width, gather_block))
+    ](
+        page_slot_table,
+        request_indices,
+        row_page_slots,
+        page_slot_table.stride(0),
+        page_slot_table.stride(1),
+        row_page_slots.stride(0),
+        WIDTH=width,
+        BLOCK_SIZE=gather_block,
+        num_warps=4,
+        num_stages=1,
+    )
+
+
+@triton.jit
 def _score_quest_pages_kernel(
     query,
     page_max,
@@ -758,6 +957,7 @@ __all__ = [
     "fuse_mla_quest_selection_query",
     "finalize_quest_decode_view",
     "finalize_quest_paged_decode_view",
+    "prepare_quest_decode_graph_metadata",
     "prepare_quest_decode_geometry",
     "score_quest_pages",
 ]

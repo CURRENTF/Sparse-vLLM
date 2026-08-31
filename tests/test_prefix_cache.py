@@ -11,7 +11,11 @@ import pytest
 import torch
 
 from sparsevllm.config import Config
-from sparsevllm.engine.cache_manager.quest import QuestCacheManager, QuestPrefixBlockPayload
+from sparsevllm.engine.cache_manager.quest import (
+    QuestCacheManager,
+    QuestDecodeGraphState,
+    QuestPrefixBlockPayload,
+)
 from sparsevllm.configs.model import RuntimeLayout
 from sparsevllm.engine.cache_manager import MlaLatentPayload
 from sparsevllm.engine.cache_manager.omnikv import OmniKVCacheManager
@@ -394,6 +398,27 @@ def _make_quest_manager_for_prefix(page_size=2):
     manager.prefix_offload_controller = None
     manager._prefix_offload_step_h2d_operations = []
     manager._init_prefix_cache_runtime()
+    return manager
+
+
+def _make_quest_manager_for_no_prefix_graph(page_size=4):
+    manager = _make_quest_manager_for_prefix(page_size=page_size)
+    manager.enable_prefix_caching = False
+    manager.prefix_cache = None
+    manager.max_model_len = int(manager.buffer_req_to_token_slots.shape[1])
+    manager.max_pages_per_row = int(manager.buffer_req_to_page_slots.shape[1])
+    manager.buffer_req_to_page_slots_cpu = np.full(
+        tuple(manager.buffer_req_to_page_slots.shape),
+        -1,
+        dtype=np.int32,
+    )
+    manager.free_pages_cpu_stack = np.arange(manager.num_pages, dtype=np.int32)
+    manager._decode_row_page_slots = None
+    manager._decode_row_page_slots_req_indices = None
+    manager._decode_num_pages = None
+    manager._decode_previous_page_counts = None
+    manager._decode_page_geometry_context_lens = None
+    manager._decode_page_geometry_ready = False
     return manager
 
 
@@ -3031,6 +3056,83 @@ def test_quest_static_decode_padding_does_not_materialize_padded_rows():
     assert block.payload.block_slot == 9
     assert block.payload.token_slots.tolist() == [36, 37, 38, 39]
     assert manager._num_free_pages == 9
+
+
+def test_quest_no_prefix_graph_publishes_page_boundary_in_graph_phase():
+    manager = _make_quest_manager_for_no_prefix_graph(page_size=4)
+    seq = Sequence([1, 2, 3, 4])
+    manager._allocate(seq.seq_id, 4)
+    seq.num_prefilled_tokens = seq.num_prompt_tokens
+    seq.append_token(5)
+    row = manager.seq_id_to_row[seq.seq_id]
+
+    contract = DecodeGraphContract(
+        method="quest",
+        shape_policy="batch_only",
+        topology_path_id="long",
+        batch_capacity=2,
+        context_capacity=16,
+    )
+    inputs = DecodeGraphInputs.allocate(
+        contract,
+        device=torch.device("cpu"),
+        pin_memory=False,
+    )
+    state = manager.init_decode_graph_state(contract, inputs)
+    assert isinstance(state, QuestDecodeGraphState)
+    pointers = inputs.data_ptrs()
+
+    manager.prepare_decode_graph_step([seq], state)
+
+    reserved_slot = int(inputs.write_slot_mapping[0])
+    reserved_page = reserved_slot // manager.page_size
+    assert inputs.data_ptrs() == pointers
+    assert inputs.active_mask.tolist() == [True, False]
+    assert manager.buffer_req_to_page_slots[row, 1].item() == -1
+    assert manager.buffer_req_to_token_slots[row, 4].item() == 0
+
+    manager.prepare_decode_graph_in(state)
+
+    assert manager.buffer_req_to_page_slots[row, 1].item() == reserved_page
+    assert manager.buffer_req_to_token_slots[row, 4].item() == reserved_slot
+    assert state.row_page_slots[:, :2].tolist() == [
+        manager.buffer_req_to_page_slots[row, :2].tolist(),
+        manager.buffer_req_to_page_slots[row, :2].tolist(),
+    ]
+    assert state.num_pages.tolist() == [2, 2]
+    assert state.previous_page_counts.tolist() == [1, 1]
+
+
+def test_quest_no_prefix_graph_capacity_failure_preserves_allocator():
+    manager = _make_quest_manager_for_no_prefix_graph(page_size=4)
+    seq = Sequence([1, 2, 3, 4])
+    manager._allocate(seq.seq_id, 4)
+    seq.num_prefilled_tokens = seq.num_prompt_tokens
+    seq.append_token(5)
+    row = manager.seq_id_to_row[seq.seq_id]
+    contract = DecodeGraphContract(
+        method="quest",
+        shape_policy="batch_only",
+        topology_path_id="long",
+        batch_capacity=1,
+        context_capacity=4,
+    )
+    inputs = DecodeGraphInputs.allocate(
+        contract,
+        device=torch.device("cpu"),
+        pin_memory=False,
+    )
+    state = manager.init_decode_graph_state(contract, inputs)
+    free_pages_before = manager._num_free_pages
+    row_len_before = int(manager.row_seq_lens[row])
+    page_table_before = manager.buffer_req_to_page_slots_cpu.copy()
+
+    with pytest.raises(ValueError, match="exceeded the captured graph context"):
+        manager.prepare_decode_graph_step([seq], state)
+
+    assert manager._num_free_pages == free_pages_before
+    assert int(manager.row_seq_lens[row]) == row_len_before
+    assert np.array_equal(manager.buffer_req_to_page_slots_cpu, page_table_before)
 
 
 def test_quest_decode_materialized_page_can_seed_later_prefix_hit():

@@ -13,6 +13,7 @@ from sparsevllm.kernels.triton.quest_decode_view import (
     fuse_mla_quest_selection_query,
     finalize_quest_decode_view,
     finalize_quest_paged_decode_view,
+    prepare_quest_decode_graph_metadata,
     prepare_quest_decode_geometry,
     score_quest_pages,
 )
@@ -115,6 +116,69 @@ def test_quest_decode_geometry_matches_integer_oracle_and_graph() -> None:
         previous_page_counts.cpu(),
         torch.tensor([1, 2, 127, 2047], dtype=torch.int32),
     )
+
+
+@CUDA_REQUIRED
+def test_quest_decode_graph_metadata_matches_table_oracle_and_graph() -> None:
+    page_size = 16
+    token_slots = torch.zeros((4, 80), dtype=torch.int32, device="cuda")
+    page_slots = torch.arange(32, dtype=torch.int32, device="cuda").view(4, 8)
+    request_indices = torch.tensor([1, 3, 1, 0], dtype=torch.int32, device="cuda")
+    context_lens = torch.tensor([17, 32, 48, 64], dtype=torch.int32, device="cuda")
+    write_slots = torch.tensor([160, 191, -1, 223], dtype=torch.int32, device="cuda")
+    active_mask = torch.tensor([True, True, False, True], device="cuda")
+    row_page_slots = torch.empty((4, 4), dtype=torch.int32, device="cuda")
+    num_pages = torch.empty((4,), dtype=torch.int32, device="cuda")
+    previous_page_counts = torch.empty_like(num_pages)
+
+    def run_metadata() -> None:
+        prepare_quest_decode_graph_metadata(
+            token_slots,
+            page_slots,
+            request_indices,
+            context_lens,
+            write_slots,
+            active_mask,
+            page_size=page_size,
+            row_page_slots=row_page_slots,
+            num_pages=num_pages,
+            previous_page_counts=previous_page_counts,
+        )
+
+    def assert_oracle() -> None:
+        expected_pages = torch.div(
+            context_lens.cpu() + page_size - 1,
+            page_size,
+            rounding_mode="floor",
+        )
+        torch.testing.assert_close(num_pages.cpu(), expected_pages)
+        torch.testing.assert_close(
+            previous_page_counts.cpu(), (expected_pages - 1).clamp_min(0)
+        )
+        torch.testing.assert_close(
+            row_page_slots.cpu(),
+            page_slots.cpu().index_select(0, request_indices.cpu().long())[:, :4],
+        )
+        active_rows = active_mask.cpu().nonzero(as_tuple=False).flatten()
+        rows = request_indices.cpu().index_select(0, active_rows).long()
+        columns = context_lens.cpu().index_select(0, active_rows).long() - 1
+        torch.testing.assert_close(
+            token_slots.cpu()[rows, columns],
+            write_slots.cpu().index_select(0, active_rows),
+        )
+
+    run_metadata()
+    assert_oracle()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_metadata()
+    request_indices.copy_(torch.tensor([2, 0, 3, 2], device="cuda", dtype=torch.int32))
+    context_lens.copy_(torch.tensor([1, 18, 33, 50], device="cuda", dtype=torch.int32))
+    write_slots.copy_(torch.tensor([240, -1, 256, 271], device="cuda", dtype=torch.int32))
+    active_mask.copy_(torch.tensor([True, False, True, True], device="cuda"))
+    graph.replay()
+    assert_oracle()
 
 
 @CUDA_REQUIRED
