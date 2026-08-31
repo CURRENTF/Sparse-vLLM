@@ -2,70 +2,14 @@
 
 Adapted from Tile-AI/TileLang at commit
 ``c7fabc4cc65e480b88b7606eb1bc9c340dbd8c8c``. The local adaptation uses
-BF16, page-size-one indirect cache slots, GLM TP-local query heads padded to
-complete MMA tiles, caller-owned outputs/workspaces, and CUDA Graph capture.
+BF16, page-size-one indirect cache slots, direct strided GLM queries with
+internal zero padding to complete MMA tiles, caller-owned outputs/workspaces,
+and CUDA Graph capture.
 See ``LICENSE.tilelang`` and ``README.md`` in this package.
 """
 
 import tilelang
-import triton
-import triton.language as tl
 import tilelang.language as T
-
-
-@triton.jit
-def pad_glm_q_kernel(
-    q_latent,
-    q_rope,
-    padded_latent,
-    padded_rope,
-    stride_q_latent_batch,
-    stride_q_latent_head,
-    stride_q_latent_dim,
-    stride_q_rope_batch,
-    stride_q_rope_head,
-    stride_q_rope_dim,
-    batch_size: tl.constexpr,
-    valid_heads: tl.constexpr,
-    padded_heads: tl.constexpr,
-    latent_dim: tl.constexpr,
-    rope_dim: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    latent_total = batch_size * padded_heads * latent_dim
-    latent_mask = offsets < latent_total
-    latent_head = (offsets // latent_dim) % padded_heads
-    latent_batch = offsets // (padded_heads * latent_dim)
-    latent_col = offsets % latent_dim
-    latent_src = (
-        latent_batch * stride_q_latent_batch
-        + latent_head * stride_q_latent_head
-        + latent_col * stride_q_latent_dim
-    )
-    latent_value = tl.load(
-        q_latent + latent_src,
-        mask=latent_mask & (latent_head < valid_heads),
-        other=0.0,
-    )
-    tl.store(padded_latent + offsets, latent_value, mask=latent_mask)
-
-    rope_total = batch_size * padded_heads * rope_dim
-    rope_mask = offsets < rope_total
-    rope_head = (offsets // rope_dim) % padded_heads
-    rope_batch = offsets // (padded_heads * rope_dim)
-    rope_col = offsets % rope_dim
-    rope_src = (
-        rope_batch * stride_q_rope_batch
-        + rope_head * stride_q_rope_head
-        + rope_col * stride_q_rope_dim
-    )
-    rope_value = tl.load(
-        q_rope + rope_src,
-        mask=rope_mask & (rope_head < valid_heads),
-        other=0.0,
-    )
-    tl.store(padded_rope + offsets, rope_value, mask=rope_mask)
 
 
 @tilelang.jit(
@@ -89,6 +33,8 @@ def build_glm_mla_decode_kernel(
     block_H,
     num_split,
     block_size,
+    q_latent_strides,
+    q_rope_strides,
     softmax_scale=None,
     need_score=False,
     score_mode="direct",
@@ -120,8 +66,12 @@ def build_glm_mla_decode_kernel(
 
     @T.prim_func
     def main_split(
-        Q: T.Tensor([batch, h_q, dv], dtype),
-        Q_pe: T.Tensor([batch, h_q, dpe], dtype),
+        Q: T.StridedTensor(
+            [batch, VALID_OUTPUT_HEADS, dv], q_latent_strides, dtype
+        ),
+        Q_pe: T.StridedTensor(
+            [batch, VALID_OUTPUT_HEADS, dpe], q_rope_strides, dtype
+        ),
         KV: T.Tensor([cache_slots, h_kv, dv], dtype),
         K_pe: T.Tensor([cache_slots, h_kv, dpe], dtype),
         active_slots: T.Tensor([slot_rows, active_slot_width], T.int32),
@@ -157,8 +107,20 @@ def build_glm_mla_decode_kernel(
             if HEAD_TILE_COUNT == 1:
                 T.use_swizzle(10)
 
-            T.copy(Q[bx, by * VALID_BLOCK_H : (by + 1) * VALID_BLOCK_H, :], Q_shared)
-            T.copy(Q_pe[bx, by * VALID_BLOCK_H : (by + 1) * VALID_BLOCK_H, :], Q_pe_shared)
+            for i, j in T.Parallel(block_H, dv):
+                global_head = by * VALID_BLOCK_H + i
+                Q_shared[i, j] = T.if_then_else(
+                    global_head < VALID_OUTPUT_HEADS,
+                    Q[bx, global_head, j],
+                    0,
+                )
+            for i, j in T.Parallel(block_H, dpe):
+                global_head = by * VALID_BLOCK_H + i
+                Q_pe_shared[i, j] = T.if_then_else(
+                    global_head < VALID_OUTPUT_HEADS,
+                    Q_pe[bx, global_head, j],
+                    0,
+                )
             T.fill(acc_o, 0)
             T.fill(logsum, 0)
             T.fill(scores_max, -T.infinity(accum_dtype))
@@ -291,8 +253,12 @@ def build_glm_mla_decode_kernel(
 
     @T.prim_func
     def main_no_split(
-        Q: T.Tensor([batch, h_q, dv], dtype),
-        Q_pe: T.Tensor([batch, h_q, dpe], dtype),
+        Q: T.StridedTensor(
+            [batch, VALID_OUTPUT_HEADS, dv], q_latent_strides, dtype
+        ),
+        Q_pe: T.StridedTensor(
+            [batch, VALID_OUTPUT_HEADS, dpe], q_rope_strides, dtype
+        ),
         KV: T.Tensor([cache_slots, h_kv, dv], dtype),
         K_pe: T.Tensor([cache_slots, h_kv, dpe], dtype),
         active_slots: T.Tensor([slot_rows, active_slot_width], T.int32),
@@ -326,8 +292,20 @@ def build_glm_mla_decode_kernel(
             if HEAD_TILE_COUNT == 1:
                 T.use_swizzle(10)
 
-            T.copy(Q[bx, by * VALID_BLOCK_H : (by + 1) * VALID_BLOCK_H, :], Q_shared)
-            T.copy(Q_pe[bx, by * VALID_BLOCK_H : (by + 1) * VALID_BLOCK_H, :], Q_pe_shared)
+            for i, j in T.Parallel(block_H, dv):
+                global_head = by * VALID_BLOCK_H + i
+                Q_shared[i, j] = T.if_then_else(
+                    global_head < VALID_OUTPUT_HEADS,
+                    Q[bx, global_head, j],
+                    0,
+                )
+            for i, j in T.Parallel(block_H, dpe):
+                global_head = by * VALID_BLOCK_H + i
+                Q_pe_shared[i, j] = T.if_then_else(
+                    global_head < VALID_OUTPUT_HEADS,
+                    Q_pe[bx, global_head, j],
+                    0,
+                )
             T.fill(acc_o, 0)
             T.fill(logsum, 0)
             T.fill(scores_max, -T.infinity(accum_dtype))

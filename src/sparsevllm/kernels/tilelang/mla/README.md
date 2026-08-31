@@ -8,7 +8,7 @@ Local changes implement the GLM-4.7-Flash TP1/TP2/TP4 decode contracts used by
 Sparse-vLLM:
 
 - BF16 query and cache tensors;
-- 20/10/5 TP-local query heads padded to complete MMA tiles;
+- direct strided 20/10/5 TP-local queries, zero-padded inside complete MMA tiles;
 - page-size-one indirect cache slots;
 - explicit caller-owned output and split-KV workspaces;
 - optional fused FP32 raw-QK score reduced by max over the real local heads

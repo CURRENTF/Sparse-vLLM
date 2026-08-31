@@ -1,8 +1,8 @@
 """Lazy TileLang adapter for GLM TP1/TP2/TP4 MLA decode.
 
 The repository-owned TileLang kernel is shape-specialized.  This adapter keeps
-compilation, padded-query storage, and split-KV workspaces outside the kernel
-call and caches them by the CUDA Graph's static batch/context shape.
+compilation and split-KV workspaces outside the kernel call and caches them by
+the CUDA Graph's static batch/context/query-stride shape.
 """
 
 from __future__ import annotations
@@ -228,8 +228,6 @@ def select_tile_mla_config(
 
 @dataclass(slots=True)
 class TileMlaWorkspace:
-    padded_latent: torch.Tensor
-    padded_rope: torch.Tensor
     glse: torch.Tensor
     partial_output: torch.Tensor
     score: torch.Tensor
@@ -246,6 +244,8 @@ class _KernelKey:
     block_h: int
     score_mode: str
     need_score: bool
+    q_latent_strides: tuple[int, int, int]
+    q_rope_strides: tuple[int, int, int]
 
 
 @dataclass(slots=True)
@@ -294,8 +294,6 @@ class TileMlaDecodeKernel:
         variants = []
         for key, bound in self._kernels.items():
             workspace_tensors = (
-                bound.workspace.padded_latent,
-                bound.workspace.padded_rope,
                 bound.workspace.glse,
                 bound.workspace.partial_output,
                 bound.workspace.score,
@@ -311,6 +309,8 @@ class TileMlaDecodeKernel:
                     "block_h": key.block_h,
                     "score_mode": key.score_mode,
                     "need_score": key.need_score,
+                    "q_latent_strides": key.q_latent_strides,
+                    "q_rope_strides": key.q_rope_strides,
                     "workspace_bytes": sum(
                         tensor.numel() * tensor.element_size()
                         for tensor in workspace_tensors
@@ -390,23 +390,11 @@ class TileMlaDecodeKernel:
             softmax_scale=self.softmax_scale,
             need_score=key.need_score,
             score_mode=config.score_mode,
+            q_latent_strides=key.q_latent_strides,
+            q_rope_strides=key.q_rope_strides,
         )
         dtype = torch.bfloat16
         workspace = TileMlaWorkspace(
-            padded_latent=torch.empty(
-                key.batch_size,
-                self.padded_heads,
-                _LATENT_DIM,
-                dtype=dtype,
-                device=self.device,
-            ),
-            padded_rope=torch.empty(
-                key.batch_size,
-                self.padded_heads,
-                _ROPE_DIM,
-                dtype=dtype,
-                device=self.device,
-            ),
             glse=torch.empty(
                 key.batch_size,
                 self.padded_heads,
@@ -595,37 +583,15 @@ class TileMlaDecodeKernel:
             block_h=config.block_h,
             score_mode=config.score_mode,
             need_score=need_score,
+            q_latent_strides=tuple(map(int, q_latent.stride())),
+            q_rope_strides=tuple(map(int, q_rope.stride())),
         )
         bound = self._kernels.get(key)
         if bound is None:
             bound = self._bind(key)
             self._kernels[key] = bound
 
-        import triton
-
-        from sparsevllm.kernels.tilelang.mla.decode import pad_glm_q_kernel
-
         workspace = bound.workspace
-        pad_glm_q_kernel[
-            (triton.cdiv(batch_size * self.padded_heads * _LATENT_DIM, 256),)
-        ](
-            q_latent,
-            q_rope,
-            workspace.padded_latent,
-            workspace.padded_rope,
-            q_latent.stride(0),
-            q_latent.stride(1),
-            q_latent.stride(2),
-            q_rope.stride(0),
-            q_rope.stride(1),
-            q_rope.stride(2),
-            batch_size=batch_size,
-            valid_heads=self.valid_heads,
-            padded_heads=self.padded_heads,
-            latent_dim=_LATENT_DIM,
-            rope_dim=_ROPE_DIM,
-            BLOCK=256,
-        )
         score_output = workspace.score
         if attn_score is not None:
             if config.score_mode == "partial":
@@ -638,8 +604,8 @@ class TileMlaDecodeKernel:
             else:
                 score_output = attn_score.unsqueeze(1)
         bound.call(
-            workspace.padded_latent,
-            workspace.padded_rope,
+            q_latent,
+            q_rope,
             latent_cache,
             rope_cache,
             active_slots,
