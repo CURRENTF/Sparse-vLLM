@@ -21,6 +21,7 @@ from sparsevllm.engine.decode_graph_contract import (
 from sparsevllm.engine.prefix_cache_coordinator import PrefixCacheCoordinator
 from sparsevllm.engine.recurrent_state_manager import RecurrentStateManager
 from sparsevllm.engine.sequence import Sequence
+from sparsevllm.sampling_params import SamplingParams
 
 
 class MemoryOracle(Protocol):
@@ -57,6 +58,12 @@ class MemoryOracle(Protocol):
     def scheduler_capacity_snapshot(self) -> ContextManager[None]: ...
     def free_slot_stats(self) -> dict[str, int]: ...
     def debug_live_seq_slots(self) -> dict[int, int]: ...
+    def startup_batch_fits(
+        self,
+        prompt_lengths: tuple[int, ...],
+        *,
+        max_tokens: int,
+    ) -> bool: ...
 
 
 @dataclass
@@ -422,6 +429,45 @@ class RuntimeState:
             None,
         )
         return snapshot() if callable(snapshot) else nullcontext()
+
+    def startup_batch_fits(
+        self,
+        prompt_lengths: tuple[int, ...],
+        *,
+        max_tokens: int,
+    ) -> bool:
+        """Check startup admission through the same budgets as Scheduler."""
+        if not prompt_lengths or any(int(length) <= 0 for length in prompt_lengths):
+            raise ValueError(
+                f"Startup prompt lengths must be positive, got {prompt_lengths!r}."
+            )
+        sampling_params = SamplingParams(
+            max_tokens=int(max_tokens),
+            temperature=0.0,
+            ignore_eos=True,
+        )
+        seqs = [
+            Sequence([0] * int(prompt_len), sampling_params)
+            for prompt_len in prompt_lengths
+        ]
+        waiting = deque(seqs)
+        chunk_size = int(self.config.engine_prefill_chunk_size)
+        with self.scheduler_capacity_snapshot():
+            budgets = self.prompt_admission_budgets(waiting, chunk_size)
+            aggregate_costs: dict[str, int] = {}
+            logical_cost = 0
+            for seq in seqs:
+                for name, cost in self.prompt_admission_costs(seq).items():
+                    aggregate_costs[name] = (
+                        int(aggregate_costs.get(name, 0)) + int(cost)
+                    )
+                logical_cost += int(self.prompt_logical_reservation_cost(seq))
+            if any(
+                int(aggregate_costs.get(name, 0)) > int(budgets.get(name, 0))
+                for name in aggregate_costs
+            ):
+                return False
+            return logical_cost <= int(self.prompt_admission_free_slots())
 
     def prefill_step_free_slots(self) -> int:
         return int(

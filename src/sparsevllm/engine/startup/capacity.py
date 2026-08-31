@@ -18,6 +18,8 @@ from sparsevllm.models.layout import resolve_attention_qk_head_dim
 class StartupMemoryProfile:
     total_bytes: int
     persistent_bytes: int
+    runtime_persistent_bytes: int
+    profile_persistent_growth_bytes: int
     prefill_transient_bytes: int
     decode_transient_bytes: int
     cuda_graph_bytes: int
@@ -36,6 +38,7 @@ class KVCapacityPlan:
     target_bytes: int
     safety_headroom_bytes: int
     persistent_bytes: int
+    runtime_persistent_bytes: int
     runtime_transient_bytes: int
     cuda_graph_bytes: int
     local_kv_budget_bytes: int
@@ -56,6 +59,7 @@ class KVCapacityPlan:
         local_kv_budget_bytes = (
             target_bytes
             - int(profile.persistent_bytes)
+            - int(profile.runtime_persistent_bytes)
             - int(profile.runtime_transient_bytes)
             - int(profile.cuda_graph_bytes)
         )
@@ -63,6 +67,7 @@ class KVCapacityPlan:
             raise RuntimeError(
                 "Startup profiling left no memory for KV cache: "
                 f"target={target_bytes} persistent={profile.persistent_bytes} "
+                f"runtime_persistent={profile.runtime_persistent_bytes} "
                 f"runtime_transient={profile.runtime_transient_bytes} "
                 f"cuda_graph={profile.cuda_graph_bytes}."
             )
@@ -71,6 +76,7 @@ class KVCapacityPlan:
             target_bytes=target_bytes,
             safety_headroom_bytes=int(profile.total_bytes) - target_bytes,
             persistent_bytes=int(profile.persistent_bytes),
+            runtime_persistent_bytes=int(profile.runtime_persistent_bytes),
             runtime_transient_bytes=int(profile.runtime_transient_bytes),
             cuda_graph_bytes=int(profile.cuda_graph_bytes),
             local_kv_budget_bytes=local_kv_budget_bytes,
@@ -127,16 +133,28 @@ def startup_graph_family_kv_slots(
 def feasible_startup_graph_plan(
     config,
     startup_plan: list[tuple[int, int, bool]],
-    available_kv_slots: int,
+    memory_oracle,
 ) -> tuple[list[tuple[int, int, bool]], list[tuple[int, int, bool]]]:
     feasible = []
     skipped = []
     for entry in startup_plan:
         batch_size, _, is_long_text = entry
+        prompt_tokens = (
+            decode_sparse_long_text_threshold(
+                normalize_sparse_method(config.sparse_method),
+                num_sink_tokens=config.sink_keep_tokens,
+                decode_keep_tokens=config.decode_keep_tokens,
+                num_recent_tokens=config.recent_keep_tokens,
+            )
+            if is_long_text
+            else 1
+        )
         destination = (
             feasible
-            if startup_graph_family_kv_slots(config, batch_size, is_long_text)
-            <= int(available_kv_slots)
+            if memory_oracle.startup_batch_fits(
+                (int(prompt_tokens),) * int(batch_size),
+                max_tokens=2,
+            )
             else skipped
         )
         destination.append(entry)

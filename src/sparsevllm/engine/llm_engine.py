@@ -29,7 +29,6 @@ from sparsevllm.engine.model_runner import ModelRunner, make_tp_shm_name, select
 from sparsevllm.engine.input_processor import tokenize_text_prompt
 from sparsevllm.engine.startup import (
     build_startup_capacity_decision,
-    feasible_startup_graph_plan,
     log_startup_capacity_decision,
     log_startup_completion,
     profiling_prefill_prompt_lengths,
@@ -398,11 +397,22 @@ class LLMEngine:
         startup_plan = build_decode_cuda_graph_startup_family_plan(self.config)
         skipped_plan = []
         if respect_runtime_capacity:
-            startup_plan, skipped_plan = feasible_startup_graph_plan(
-                self.config,
+            plan_records = self.model_runner.call(
+                "resolve_startup_decode_graph_plan",
                 startup_plan,
-                self.model_runner.runtime_state.prompt_admission_free_slots(),
             )
+            feasible_by_rank = [
+                {tuple(entry) for entry in record["feasible"]}
+                for record in plan_records
+            ]
+            skipped_plan = [
+                entry
+                for entry in startup_plan
+                if not all(tuple(entry) in feasible for feasible in feasible_by_rank)
+            ]
+            startup_plan = [
+                entry for entry in startup_plan if entry not in skipped_plan
+            ]
         if not startup_plan:
             raise RuntimeError(
                 "Production KV capacity cannot capture any configured decode CUDA Graph."
@@ -594,7 +604,7 @@ class LLMEngine:
         )
         self._after_warmup_debug_cleanup()
         final_records = self.model_runner.call("capture_startup_memory_snapshot")
-        log_startup_completion(production_records, final_records)
+        log_startup_completion(production_records, final_records, decision)
         self.model_runner.call("log_operator_implementations")
         logger.info("Startup completed; production runtime is ready.")
 

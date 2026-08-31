@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
 
 from sparsevllm.engine.cache_manager.storage import CacheLayout
+from sparsevllm.engine.cache_manager.standard import StandardCacheManager
+from sparsevllm.engine.runtime_state import RuntimeState
 from sparsevllm.engine.startup import (
     KVCapacityPlan,
     StartupMemoryProfile,
@@ -45,6 +48,9 @@ def _config(*, sparse_method: str = ""):
         engine_prefill_chunk_size=8,
         max_model_len=32,
         decode_graph_startup_capture=False,
+        sink_keep_tokens=2,
+        decode_keep_tokens=8,
+        recent_keep_tokens=6,
     )
 
 
@@ -52,6 +58,8 @@ def test_capacity_plan_uses_larger_runtime_peak_and_external_headroom():
     profile = StartupMemoryProfile(
         total_bytes=1000,
         persistent_bytes=300,
+        runtime_persistent_bytes=0,
+        profile_persistent_growth_bytes=0,
         prefill_transient_bytes=120,
         decode_transient_bytes=80,
         cuda_graph_bytes=50,
@@ -123,7 +131,68 @@ def test_production_graph_plan_skips_families_larger_than_final_kv():
     config.recent_keep_tokens = 6
     plan = [(4, 32, True), (2, 32, True), (4, 16, False)]
 
-    feasible, skipped = feasible_startup_graph_plan(config, plan, 64)
+    class AdmissionOracle:
+        def startup_batch_fits(self, prompt_lengths, *, max_tokens):
+            full_layers = sum(int(length) + int(max_tokens) for length in prompt_lengths)
+            centers = sum((int(length) + 7) // 8 for length in prompt_lengths)
+            return full_layers <= 32 and centers <= 4
 
-    assert feasible == [(2, 32, True), (4, 16, False)]
-    assert skipped == [(4, 32, True)]
+    feasible, skipped = feasible_startup_graph_plan(
+        config,
+        plan,
+        AdmissionOracle(),
+    )
+
+    assert feasible == [(4, 16, False)]
+    assert skipped == [(4, 32, True), (2, 32, True)]
+
+
+def test_explicit_budget_still_resolves_mixed_kv_and_recurrent_prefix_capacity():
+    manager = object.__new__(StandardCacheManager)
+    manager.config = SimpleNamespace(
+        resolved_prefix_cache_mode="radix",
+        prefix_recurrent_bytes_per_block=40,
+        prefix_cache_max_blocks=None,
+        prefix_cache_block_size=4,
+        hf_config=SimpleNamespace(),
+    )
+    manager.allocation_budget_bytes = 1_000
+    manager.attention_cache_bytes_per_slot_per_layer = lambda: 10
+    manager._kv_allocation_bytes_per_prefix_block = lambda _slot_bytes: 60
+
+    available, slot_bytes = manager._get_available_slots_info()
+
+    assert available == 600
+    assert slot_bytes == 10
+    assert manager.config.prefix_cache_max_blocks == 10
+    assert manager.config.prefix_recurrent_capacity_bytes == 400
+    assert manager.config.prefix_kv_block_capacity == 10
+
+
+def test_startup_batch_feasibility_uses_all_memory_oracle_budgets():
+    class MultiBudgetManager:
+        def scheduler_capacity_snapshot(self):
+            return nullcontext()
+
+        def prompt_admission_budgets(self, _waiting, _chunk_size):
+            return {"full_layers": 100, "centers": 2}
+
+        def prompt_admission_costs(self, seq):
+            return {
+                "full_layers": int(seq.num_prompt_tokens + seq.max_tokens),
+                "centers": 1,
+            }
+
+        def prompt_logical_reservation_cost(self, seq):
+            return int(seq.num_prompt_tokens)
+
+        def prompt_admission_free_slots(self):
+            return 100
+
+    runtime = RuntimeState(
+        SimpleNamespace(engine_prefill_chunk_size=8, max_num_seqs_in_gpu=8),
+        MultiBudgetManager(),
+    )
+
+    assert runtime.startup_batch_fits((16, 16), max_tokens=2)
+    assert not runtime.startup_batch_fits((16, 16, 16), max_tokens=2)

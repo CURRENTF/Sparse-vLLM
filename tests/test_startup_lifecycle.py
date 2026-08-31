@@ -1,7 +1,12 @@
 from types import SimpleNamespace
 
 from sparsevllm.engine.llm_engine import LLMEngine
-from sparsevllm.engine.startup import DeviceMemorySnapshot, MemoryProfileMeasurement
+from sparsevllm.engine.model_runner import ModelRunner
+from sparsevllm.engine.startup import (
+    CacheRuntimeBuildMeasurement,
+    DeviceMemorySnapshot,
+    MemoryProfileMeasurement,
+)
 
 
 def test_engine_rebuilds_production_runtime_before_final_graph_warmup():
@@ -42,9 +47,14 @@ def test_engine_rebuilds_production_runtime_before_final_graph_warmup():
                 {
                     "world_rank": 0,
                     "snapshot": snapshot,
+                    "pre_graph_release_snapshot": DeviceMemorySnapshot(
+                        700, 1000, 300, 300
+                    ),
                     "post_graph_release_snapshot": DeviceMemorySnapshot(
                         750, 1000, 250, 250
                     ),
+                    "profiling_kv_budget_bytes": 0,
+                    "runtime_build": CacheRuntimeBuildMeasurement(0, 0, 0),
                 }
             ]
         if method == "build_production_cache_runtime":
@@ -85,3 +95,29 @@ def test_engine_rebuilds_production_runtime_before_final_graph_warmup():
     assert calls.index(("build_production_cache_runtime", 430)) < calls.index(
         ("capture_graphs", 0, {"respect_runtime_capacity": True})
     )
+
+
+def test_model_runner_restores_tokenizer_metadata_after_controller_rebuild():
+    class Controller:
+        def __init__(self):
+            self.calls = []
+
+        def set_tokenizer_metadata(self, **kwargs):
+            self.calls.append(kwargs)
+
+    runner = object.__new__(ModelRunner)
+    runner._tokenizer_metadata = None
+    profiling_controller = Controller()
+    runner.sparse_controller = profiling_controller
+    runner.set_tokenizer_metadata([3, 7], [11])
+
+    production_controller = Controller()
+    runner.sparse_controller = production_controller
+    runner._restore_tokenizer_metadata()
+
+    expected = {
+        "delimiter_token_ids": [3, 7],
+        "non_execution_token_ids": [11],
+    }
+    assert profiling_controller.calls == [expected]
+    assert production_controller.calls == [expected]

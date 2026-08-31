@@ -51,8 +51,10 @@ from sparsevllm.engine.chain_cache import ChainAdmissionPlan, ChainCacheCoordina
 from sparsevllm.engine.recurrent_state_manager import RecurrentStateManager, RecurrentStateSpec
 from sparsevllm.engine.runtime_state import RuntimeState
 from sparsevllm.engine.startup import (
+    CacheRuntimeBuildMeasurement,
     DeviceMemorySnapshot,
     StartupMemoryProfiler,
+    feasible_startup_graph_plan,
     profiling_kv_budget_bytes,
     profiling_kv_slots,
     release_unused_device_memory,
@@ -171,6 +173,7 @@ STARTUP_HOST_STATUS_SYNC_METHODS = {
     "capture_startup_memory_snapshot",
     "finish_startup_memory_profile",
     "release_profiling_cache_runtime",
+    "resolve_startup_decode_graph_plan",
 }
 RECOVERABLE_TP_CONTROL_RPC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "chain_validate_admission_plan",
@@ -398,6 +401,7 @@ class ModelRunner:
         lock_workspace_manager()
         
         self.sampler = Sampler()
+        self._tokenizer_metadata: tuple[tuple[int, ...], tuple[int, ...] | None] | None = None
 
         # DeltaKV cache allocation depends on latent dimension / compressor architecture.
         # Sync those fields from the compressor checkpoint before creating CacheManager.
@@ -473,11 +477,14 @@ class ModelRunner:
         *,
         allocation_budget_bytes: int,
     ) -> None:
+        before_manager = DeviceMemorySnapshot.capture(self.platform, self.device)
         self.cache_manager = CacheManager.create(
             runtime_config,
             self.parallel_context,
             allocation_budget_bytes=int(allocation_budget_bytes),
         )
+        release_unused_device_memory(self.platform)
+        after_manager = DeviceMemorySnapshot.capture(self.platform, self.device)
         prefix_cache_mode = str(
             getattr(runtime_config, "resolved_prefix_cache_mode", "disabled")
         )
@@ -507,6 +514,7 @@ class ModelRunner:
         )
 
         self.sparse_controller = SparseController(runtime_config, self.cache_manager)
+        self._restore_tokenizer_metadata()
         if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
             self.model.model.sparse_controller = self.sparse_controller
             if self.recurrent_state_manager is not None:
@@ -548,6 +556,16 @@ class ModelRunner:
             graph_pool=self.cuda_graph_pool,
             collective_runtime=self.collective_runtime,
         )
+        release_unused_device_memory(self.platform)
+        after_runtime = DeviceMemorySnapshot.capture(self.platform, self.device)
+        self.cache_runtime_build_measurement = (
+            CacheRuntimeBuildMeasurement.from_snapshots(
+                before_manager,
+                after_manager,
+                after_runtime,
+                allocation_budget_bytes=int(allocation_budget_bytes),
+            )
+        )
 
     def _gather_startup_record(self, local_record):
         if self.world_size == 1:
@@ -582,6 +600,11 @@ class ModelRunner:
             )
         self.platform.synchronize()
         self.reset_after_warmup()
+        release_unused_device_memory(self.platform)
+        pre_graph_release_snapshot = DeviceMemorySnapshot.capture(
+            self.platform,
+            self.device,
+        )
         self.decode_graph_runner.clear_captured_graphs()
         if self.config.decode_graph:
             self.collective_runtime.reset_for_cuda_graph_recapture()
@@ -606,7 +629,10 @@ class ModelRunner:
             {
                 "world_rank": int(self.rank),
                 "snapshot": snapshot,
+                "pre_graph_release_snapshot": pre_graph_release_snapshot,
                 "post_graph_release_snapshot": post_graph_release_snapshot,
+                "profiling_kv_budget_bytes": int(self.profiling_kv_budget_bytes),
+                "runtime_build": self.cache_runtime_build_measurement,
             }
         )
 
@@ -637,6 +663,23 @@ class ModelRunner:
             {
                 "world_rank": int(self.rank),
                 "snapshot": snapshot,
+            }
+        )
+
+    def resolve_startup_decode_graph_plan(
+        self,
+        startup_plan: list[tuple[int, int, bool]],
+    ):
+        feasible, skipped = feasible_startup_graph_plan(
+            self.config,
+            startup_plan,
+            self.runtime_state,
+        )
+        return self._gather_startup_record(
+            {
+                "world_rank": int(self.rank),
+                "feasible": feasible,
+                "skipped": skipped,
             }
         )
 
@@ -1065,14 +1108,29 @@ class ModelRunner:
         delimiter_token_ids: list[int],
         non_execution_token_ids: list[int] | None = None,
     ):
+        self._tokenizer_metadata = (
+            tuple(int(x) for x in delimiter_token_ids),
+            (
+                None
+                if non_execution_token_ids is None
+                else tuple(int(x) for x in non_execution_token_ids)
+            ),
+        )
+        self._restore_tokenizer_metadata()
+
+    def _restore_tokenizer_metadata(self) -> None:
+        metadata = getattr(self, "_tokenizer_metadata", None)
+        if metadata is None:
+            return
         setter = getattr(self.sparse_controller, "set_tokenizer_metadata", None)
         if setter is not None:
+            delimiter_token_ids, non_execution_token_ids = metadata
             setter(
-                delimiter_token_ids=[int(x) for x in delimiter_token_ids],
+                delimiter_token_ids=list(delimiter_token_ids),
                 non_execution_token_ids=(
                     None
                     if non_execution_token_ids is None
-                    else [int(x) for x in non_execution_token_ids]
+                    else list(non_execution_token_ids)
                 ),
             )
 

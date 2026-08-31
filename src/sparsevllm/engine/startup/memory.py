@@ -56,6 +56,49 @@ class MemoryProfileMeasurement:
         )
 
 
+@dataclass(frozen=True)
+class CacheRuntimeBuildMeasurement:
+    manager_consumed_bytes: int
+    manager_budget_overflow_bytes: int
+    auxiliary_consumed_bytes: int
+
+    @classmethod
+    def from_snapshots(
+        cls,
+        before_manager: DeviceMemorySnapshot,
+        after_manager: DeviceMemorySnapshot,
+        after_runtime: DeviceMemorySnapshot,
+        *,
+        allocation_budget_bytes: int,
+    ) -> "CacheRuntimeBuildMeasurement":
+        totals = {
+            int(before_manager.total_bytes),
+            int(after_manager.total_bytes),
+            int(after_runtime.total_bytes),
+        }
+        if len(totals) != 1:
+            raise RuntimeError(
+                "GPU total memory changed while building the cache runtime: "
+                f"before={before_manager.total_bytes} "
+                f"manager={after_manager.total_bytes} runtime={after_runtime.total_bytes}."
+            )
+        manager_consumed = max(
+            0,
+            int(before_manager.free_bytes) - int(after_manager.free_bytes),
+        )
+        return cls(
+            manager_consumed_bytes=manager_consumed,
+            manager_budget_overflow_bytes=max(
+                0,
+                manager_consumed - int(allocation_budget_bytes),
+            ),
+            auxiliary_consumed_bytes=max(
+                0,
+                int(after_manager.free_bytes) - int(after_runtime.free_bytes),
+            ),
+        )
+
+
 def release_unused_device_memory(platform: Platform) -> None:
     platform.synchronize()
     gc.collect()
@@ -64,6 +107,7 @@ def release_unused_device_memory(platform: Platform) -> None:
 
 
 __all__ = [
+    "CacheRuntimeBuildMeasurement",
     "DeviceMemorySnapshot",
     "MemoryProfileMeasurement",
     "release_unused_device_memory",

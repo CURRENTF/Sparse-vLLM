@@ -1396,6 +1396,24 @@ class DeltaKVLessMemoryCudaGraphReserveTest(unittest.TestCase):
                 0,
             )
 
+    def test_graph_mode_uses_profiled_global_reserve_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                self.make_manager(decode_graph=True)._decode_cuda_graph_memory_reserve_bytes(),
+                0,
+            )
+
+    def test_explicit_graph_reserve_remains_available_for_experiments(self):
+        with patch.dict(
+            os.environ,
+            {"SPARSEVLLM_DELTAKV_CUDAGRAPH_RESERVE_BYTES": "4096"},
+            clear=True,
+        ):
+            self.assertEqual(
+                self.make_manager(decode_graph=True)._decode_cuda_graph_memory_reserve_bytes(),
+                4096,
+            )
+
     def test_graph_reserve_env_must_be_non_negative_integer(self):
         manager = self.make_manager(decode_graph=True)
 

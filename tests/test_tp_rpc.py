@@ -19,7 +19,10 @@ from sparsevllm.engine.model_runner import (
     _create_model,
     make_tp_shm_name,
 )
-from sparsevllm.engine.startup import DeviceMemorySnapshot
+from sparsevllm.engine.startup import (
+    CacheRuntimeBuildMeasurement,
+    DeviceMemorySnapshot,
+)
 from sparsevllm.models.spec import ModelSpec
 from sparsevllm.operators import registry as operator_registry
 
@@ -628,6 +631,8 @@ def test_model_runner_releases_the_complete_profiling_cache_runtime():
     runner.world_size = 1
     runner.rank = 0
     runner.device = torch.device("cpu")
+    runner.profiling_kv_budget_bytes = 123
+    runner.cache_runtime_build_measurement = CacheRuntimeBuildMeasurement(120, 0, 3)
     snapshot = DeviceMemorySnapshot(700, 1000, 300, 300)
 
     with (
@@ -642,6 +647,7 @@ def test_model_runner_releases_the_complete_profiling_cache_runtime():
     assert calls == [
         "sync",
         "reset",
+        "release_memory",
         "clear_graphs",
         "reset_collectives",
         "release_memory",
@@ -656,7 +662,10 @@ def test_model_runner_releases_the_complete_profiling_cache_runtime():
         {
             "world_rank": 0,
             "snapshot": snapshot,
+            "pre_graph_release_snapshot": snapshot,
             "post_graph_release_snapshot": snapshot,
+            "profiling_kv_budget_bytes": 123,
+            "runtime_build": CacheRuntimeBuildMeasurement(120, 0, 3),
         }
     ]
 
@@ -664,6 +673,8 @@ def test_model_runner_releases_the_complete_profiling_cache_runtime():
 def test_model_runner_runtime_rebuild_resolves_graph_shapes_locally():
     runner = object.__new__(ModelRunner)
     runner.parallel_context = object()
+    runner.platform = object()
+    runner.device = torch.device("cpu")
     runner.recurrent_state_manager = None
     runner.model = SimpleNamespace()
     runner.load_deltakv_compressors = lambda: None
@@ -712,6 +723,18 @@ def test_model_runner_runtime_rebuild_resolves_graph_shapes_locally():
             "sparsevllm.engine.model_runner.DecodeCudaGraphRunner",
             side_effect=lambda **kwargs: graph_kwargs.update(kwargs) or object(),
         ),
+        patch(
+            "sparsevllm.engine.model_runner.release_unused_device_memory",
+        ),
+        patch.object(
+            DeviceMemorySnapshot,
+            "capture",
+            side_effect=(
+                DeviceMemorySnapshot(900, 1000, 100, 100),
+                DeviceMemorySnapshot(700, 1000, 300, 300),
+                DeviceMemorySnapshot(680, 1000, 320, 320),
+            ),
+        ),
     ):
         ModelRunner._build_cache_runtime(
             runner,
@@ -722,6 +745,11 @@ def test_model_runner_runtime_rebuild_resolves_graph_shapes_locally():
     assert graph_kwargs["capture_sizes"] == (1, 8)
     assert graph_kwargs["context_sizes"] == (128,)
     assert graph_kwargs["method"] == "vanilla"
+    assert runner.cache_runtime_build_measurement == CacheRuntimeBuildMeasurement(
+        manager_consumed_bytes=200,
+        manager_budget_overflow_bytes=0,
+        auxiliary_consumed_bytes=20,
+    )
 
 
 def test_model_runner_decode_graph_startup_controls_use_live_runner():

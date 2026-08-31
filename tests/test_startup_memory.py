@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from sparsevllm.engine.startup import (
+    CacheRuntimeBuildMeasurement,
     DeviceMemorySnapshot,
     MemoryProfileMeasurement,
     release_unused_device_memory,
@@ -78,6 +79,19 @@ def test_memory_profile_separates_consumed_and_transient_bytes():
 
     assert measurement.consumed_bytes == 50
     assert measurement.transient_peak_bytes == 180
+
+
+def test_cache_runtime_build_separates_budget_overflow_and_auxiliary_state():
+    measurement = CacheRuntimeBuildMeasurement.from_snapshots(
+        DeviceMemorySnapshot(900, 1000, 100, 100),
+        DeviceMemorySnapshot(680, 1000, 320, 320),
+        DeviceMemorySnapshot(650, 1000, 350, 350),
+        allocation_budget_bytes=200,
+    )
+
+    assert measurement.manager_consumed_bytes == 220
+    assert measurement.manager_budget_overflow_bytes == 20
+    assert measurement.auxiliary_consumed_bytes == 30
 
 
 def test_memory_profile_rejects_changed_total_memory():

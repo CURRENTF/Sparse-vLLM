@@ -482,7 +482,11 @@ class CacheManager(ABC):
         slot_bytes_per_layer = self.attention_cache_bytes_per_slot_per_layer()
         allocation_budget_bytes = getattr(self, "allocation_budget_bytes", None)
         if allocation_budget_bytes is not None:
-            return int(allocation_budget_bytes), slot_bytes_per_layer
+            available_memory, _, _ = self._resolve_joint_prefix_budget(
+                int(allocation_budget_bytes),
+                slot_bytes_per_layer,
+            )
+            return available_memory, slot_bytes_per_layer
 
         free, total = self.platform.get_available_memory(self.device.index or 0)
 
@@ -592,49 +596,23 @@ class CacheManager(ABC):
             + current
             - recurrent_explicit_deduction
         )
+        available_memory, joint_capacity, kv_bytes_per_block = (
+            self._resolve_joint_prefix_budget(
+                available_memory,
+                slot_bytes_per_layer,
+            )
+        )
         recurrent_bytes_per_block = int(
             getattr(config, "prefix_recurrent_bytes_per_block", 0) or 0
         )
-        prefix_block_capacity = 0
-        prefix_recurrent_capacity_bytes = 0
-        kv_bytes_per_block = 0
-        if (
-            str(getattr(config, "resolved_prefix_cache_mode", "disabled"))
-            == "radix"
-            and recurrent_bytes_per_block > 0
-        ):
-            kv_bytes_per_block = self._kv_allocation_bytes_per_prefix_block(
-                slot_bytes_per_layer
-            )
-            requested_max_blocks = getattr(
-                config,
-                "prefix_cache_requested_max_blocks",
-                getattr(config, "prefix_cache_max_blocks", None),
-            )
-            config.prefix_cache_requested_max_blocks = requested_max_blocks
-            joint_capacity = resolve_joint_prefix_capacity(
-                available_bytes=available_memory,
-                kv_bytes_per_block=kv_bytes_per_block,
-                recurrent_bytes_per_block=recurrent_bytes_per_block,
-                requested_max_blocks=requested_max_blocks,
-            )
-            if joint_capacity.block_capacity <= 0:
-                raise RuntimeError(
-                    "Insufficient GPU memory for one mixed prefix block: "
-                    f"available_bytes={available_memory} "
-                    f"kv_bytes_per_block={kv_bytes_per_block} "
-                    f"recurrent_bytes_per_block={recurrent_bytes_per_block}."
-                )
-            available_memory = joint_capacity.kv_allocatable_bytes
-            prefix_block_capacity = joint_capacity.block_capacity
-            prefix_recurrent_capacity_bytes = joint_capacity.recurrent_capacity_bytes
-            config.prefix_cache_max_blocks = int(prefix_block_capacity)
-            config.prefix_recurrent_capacity_bytes = int(
-                prefix_recurrent_capacity_bytes
-            )
-            config.prefix_kv_bytes_per_block = int(kv_bytes_per_block)
-            config.prefix_kv_block_capacity = int(prefix_block_capacity)
-            config.kv_allocatable_bytes = int(available_memory)
+        prefix_block_capacity = (
+            0 if joint_capacity is None else int(joint_capacity.block_capacity)
+        )
+        prefix_recurrent_capacity_bytes = (
+            0
+            if joint_capacity is None
+            else int(joint_capacity.recurrent_capacity_bytes)
+        )
 
         model_current_bytes = max(0, int(current) - recurrent_pool_bytes)
         ratio = (
@@ -680,6 +658,57 @@ class CacheManager(ABC):
             )
 
         return available_memory, slot_bytes_per_layer
+
+    def _resolve_joint_prefix_budget(
+        self,
+        available_memory: int,
+        slot_bytes_per_layer: int,
+    ) -> tuple[int, JointPrefixCapacity | None, int]:
+        config = self.config
+        recurrent_bytes_per_block = int(
+            getattr(config, "prefix_recurrent_bytes_per_block", 0) or 0
+        )
+        if (
+            str(getattr(config, "resolved_prefix_cache_mode", "disabled"))
+            != "radix"
+            or recurrent_bytes_per_block <= 0
+        ):
+            return int(available_memory), None, 0
+
+        kv_bytes_per_block = self._kv_allocation_bytes_per_prefix_block(
+            int(slot_bytes_per_layer)
+        )
+        requested_max_blocks = getattr(
+            config,
+            "prefix_cache_requested_max_blocks",
+            getattr(config, "prefix_cache_max_blocks", None),
+        )
+        config.prefix_cache_requested_max_blocks = requested_max_blocks
+        joint_capacity = resolve_joint_prefix_capacity(
+            available_bytes=int(available_memory),
+            kv_bytes_per_block=kv_bytes_per_block,
+            recurrent_bytes_per_block=recurrent_bytes_per_block,
+            requested_max_blocks=requested_max_blocks,
+        )
+        if joint_capacity.block_capacity <= 0:
+            raise RuntimeError(
+                "Insufficient GPU memory for one mixed prefix block: "
+                f"available_bytes={available_memory} "
+                f"kv_bytes_per_block={kv_bytes_per_block} "
+                f"recurrent_bytes_per_block={recurrent_bytes_per_block}."
+            )
+        config.prefix_cache_max_blocks = int(joint_capacity.block_capacity)
+        config.prefix_recurrent_capacity_bytes = int(
+            joint_capacity.recurrent_capacity_bytes
+        )
+        config.prefix_kv_bytes_per_block = int(kv_bytes_per_block)
+        config.prefix_kv_block_capacity = int(joint_capacity.block_capacity)
+        config.kv_allocatable_bytes = int(joint_capacity.kv_allocatable_bytes)
+        return (
+            int(joint_capacity.kv_allocatable_bytes),
+            joint_capacity,
+            int(kv_bytes_per_block),
+        )
 
     def attention_cache_bytes_per_slot_per_layer(self) -> int:
         """Persistent attention-cache bytes for one token in one KV layer."""

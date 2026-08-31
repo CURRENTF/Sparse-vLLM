@@ -82,7 +82,7 @@ class DeltaKVLessMemoryCudaGraphCacheManager(DeltaKVLessMemoryCacheManager):
 
         env_value = os.getenv("SPARSEVLLM_DELTAKV_CUDAGRAPH_RESERVE_BYTES")
         if env_value is None:
-            return 4 * 1024**3
+            return 0
 
         try:
             reserve_bytes = int(env_value)

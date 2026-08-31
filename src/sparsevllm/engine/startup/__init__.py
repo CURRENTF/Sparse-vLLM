@@ -8,6 +8,7 @@ from .capacity import (
     startup_graph_family_kv_slots,
 )
 from .memory import (
+    CacheRuntimeBuildMeasurement,
     DeviceMemorySnapshot,
     MemoryProfileMeasurement,
     release_unused_device_memory,
@@ -24,6 +25,7 @@ from .reporting import (
 
 __all__ = [
     "CompletedMemoryProfile",
+    "CacheRuntimeBuildMeasurement",
     "DeviceMemorySnapshot",
     "KVCapacityPlan",
     "MemoryProfileMeasurement",
