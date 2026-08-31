@@ -300,7 +300,7 @@ def test_model_runtime_builds_and_binds_one_shared_gdn_operator():
         linear_num_value_heads=8,
         linear_key_head_dim=128,
         linear_value_head_dim=128,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         quantization_config=None,
     )
     prepared = Mock(name="prepared_gdn")

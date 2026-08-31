@@ -1,4 +1,5 @@
 import copy
+import inspect
 import os
 import pickle
 import socket
@@ -99,6 +100,30 @@ try:
     from sparsevllm.models.gemma4 import Gemma4ForCausalLM
 except ImportError:
     Gemma4ForCausalLM = None
+
+
+_INIT_PROCESS_GROUP_SUPPORTS_DEVICE_ID = (
+    "device_id" in inspect.signature(dist.init_process_group).parameters
+)
+
+
+def _init_process_group(
+    *,
+    backend: str,
+    init_method: str,
+    world_size: int,
+    rank: int,
+    device: torch.device,
+) -> None:
+    kwargs = {
+        "backend": backend,
+        "init_method": init_method,
+        "world_size": world_size,
+        "rank": rank,
+    }
+    if _INIT_PROCESS_GROUP_SUPPORTS_DEVICE_ID:
+        kwargs["device_id"] = device
+    dist.init_process_group(**kwargs)
 
 
 def _close_runtime_bindings(runtime_bindings: dict) -> None:
@@ -273,11 +298,12 @@ class ModelRunner:
         self.platform.set_device(self.device)
         if not dist.is_initialized():
             master_port = select_master_port() if master_port is None else master_port
-            dist.init_process_group(
-                self.platform.get_distributed_backend(),
-                f"tcp://localhost:{master_port}",
+            _init_process_group(
+                backend=self.platform.get_distributed_backend(),
+                init_method=f"tcp://localhost:{master_port}",
                 world_size=self.world_size,
                 rank=rank,
+                device=self.device,
             )
         self.parallel_context = init_parallel_context(
             topology=config.parallel_topology,
@@ -288,7 +314,7 @@ class ModelRunner:
         self.platform.reset_peak_memory_stats(self.device)
         
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.torch_dtype)
+        torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device(self.device)
         setattr(hf_config, "mlp_chunk_size", config.mlp_chunk_size)
         setattr(

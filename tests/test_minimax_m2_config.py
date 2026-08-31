@@ -49,7 +49,7 @@ def _official_config(**overrides):
         "use_routing_bias": True,
         "use_mtp": True,
         "tie_word_embeddings": False,
-        "torch_dtype": torch.bfloat16,
+        "dtype": torch.bfloat16,
         "quantization_config": _quantization_config(),
     }
     values.update(overrides)

@@ -388,7 +388,7 @@ class Qwen35MoeForCausalLM(Qwen35ForCausalLM):
                 RecurrentTensorSpec(
                     "conv_state",
                     (conv_dim, int(config.linear_conv_kernel_dim) - 1),
-                    config.torch_dtype,
+                    config.dtype,
                 ),
                 RecurrentTensorSpec(
                     "recurrent_state",

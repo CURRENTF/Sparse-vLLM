@@ -26,7 +26,7 @@ def _config(method: str):
             hidden_size=4,
             num_attention_heads=1,
             head_dim=4,
-            torch_dtype=torch.float32,
+            dtype=torch.float32,
         ),
         tensor_parallel_size=1,
         sink_keep_tokens=0,

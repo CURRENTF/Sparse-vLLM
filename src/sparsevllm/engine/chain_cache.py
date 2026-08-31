@@ -12,6 +12,7 @@ from enum import Enum
 from typing import Any, Iterable
 
 
+
 CHAIN_PREFIX_METHODS = frozenset(
     {"streamingllm", "snapkv", "h2o", "pyramidkv", "rkv", "skipkv"}
 )
@@ -273,7 +274,7 @@ def build_chain_cache_fingerprint(config: Any) -> bytes:
         "schema": 1,
         "model": getattr(config, "model", None),
         "model_type": getattr(hf_config, "model_type", None),
-        "dtype": str(getattr(hf_config, "torch_dtype", None)),
+        "dtype": str(hf_config.dtype),
         "tp_size": int(getattr(config, "tensor_parallel_size", 1)),
         "max_model_len": int(getattr(config, "max_model_len", 0)),
         "full_attention_layers": _jsonable(

@@ -192,7 +192,7 @@ def profiling_kv_budget_bytes(config, num_slots: int) -> int:
     num_slots = int(num_slots)
     if num_slots <= 0:
         raise ValueError(f"Profiling KV slots must be positive, got {num_slots}.")
-    dtype_size = torch.empty((), dtype=config.hf_config.torch_dtype).element_size()
+    dtype_size = torch.empty((), dtype=config.hf_config.dtype).element_size()
     layout = config.runtime_layout
     tp_size = int(config.parallel_topology.attention_tp_size)
     configured_layout = config.attention_cache_layout

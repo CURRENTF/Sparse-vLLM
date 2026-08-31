@@ -133,7 +133,7 @@ def _config(**overrides):
         "rms_norm_eps": 1.0e-6,
         "hidden_act": "silu",
         "tie_word_embeddings": False,
-        "torch_dtype": torch.bfloat16,
+        "dtype": torch.bfloat16,
         "quantization_config": QuantizationConfig(
             enabled=True,
             quant_method="fp8",

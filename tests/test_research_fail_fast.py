@@ -409,7 +409,7 @@ class ResearchFailFastTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             model_dir = Path(tmp)
             (model_dir / "config.json").write_text(
-                '{"model_type": "qwen2", "torch_dtype": "float16", "max_position_embeddings": 32768}\n',
+                '{"model_type": "qwen2", "dtype": "float16", "max_position_embeddings": 32768}\n',
                 encoding="utf-8",
             )
             with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", side_effect=RuntimeError("boom")):
@@ -419,7 +419,7 @@ class ResearchFailFastTest(unittest.TestCase):
     def test_sparsevllm_rejects_unsupported_model_type(self):
         hf_config = SimpleNamespace(
             model_type="deepseek_v2",
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             max_position_embeddings=32768,
             hidden_size=8,
             intermediate_size=32,
@@ -433,7 +433,7 @@ class ResearchFailFastTest(unittest.TestCase):
     def test_sparsevllm_deltakv_requires_checkpoint_path(self):
         hf_config = SimpleNamespace(
             model_type="qwen2",
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             max_position_embeddings=32768,
             hidden_size=8,
             intermediate_size=32,

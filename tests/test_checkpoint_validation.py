@@ -33,7 +33,7 @@ def test_dense_fp8_checkpoint_boundary_accepts_aligned_models(
 ):
     config = SimpleNamespace(
         architectures=[architecture],
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         hidden_size=4096,
         intermediate_size=14336,
         num_attention_heads=32,
@@ -54,7 +54,7 @@ def test_dense_fp8_checkpoint_boundary_accepts_aligned_models(
 def test_dense_fp8_checkpoint_boundary_rejects_unaligned_tp_projection():
     config = SimpleNamespace(
         architectures=["Qwen2ForCausalLM"],
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         hidden_size=4096,
         intermediate_size=11072,
         num_attention_heads=32,

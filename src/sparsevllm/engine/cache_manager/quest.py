@@ -125,7 +125,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
 
         self.quest_page_selector = resolve_quest_page_selection_provider(
             QuestPageSelectionOpSpec(
-                score_dtype=self.hf_config.torch_dtype,
+                score_dtype=self.hf_config.dtype,
                 cuda_graph=bool(config.decode_graph),
             ),
             device_index=self.device.index or 0,
@@ -203,7 +203,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             self.num_pages,
             self.metadata_num_heads,
             self.metadata_head_dim,
-            dtype=self.hf_config.torch_dtype,
+            dtype=self.hf_config.dtype,
             device=self.device,
         )
         self._init_prefix_cache_runtime()
@@ -329,7 +329,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         return int(storage.bytes_per_slot_per_layer())
 
     def _metadata_bytes_per_page_per_layer(self) -> int:
-        dtype_size = torch.empty((), dtype=self.hf_config.torch_dtype).element_size()
+        dtype_size = torch.empty((), dtype=self.hf_config.dtype).element_size()
         metadata_num_heads = getattr(self, "metadata_num_heads", None)
         metadata_head_dim = getattr(self, "metadata_head_dim", None)
         if metadata_num_heads is None:

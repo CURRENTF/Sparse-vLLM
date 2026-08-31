@@ -568,7 +568,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
     def allocate_kv_cache(self):
         available_memory, slot_bytes_per_layer = self._get_available_slots_info()
         config = self.config
-        dtype_size = torch.tensor([], dtype=self.hf_config.torch_dtype).element_size()
+        dtype_size = torch.tensor([], dtype=self.hf_config.dtype).element_size()
         sink = int(config.sink_keep_tokens)
         recent = int(config.recent_keep_tokens)
         max_seqs = self._max_decode_scratch_seqs()
@@ -892,7 +892,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             self.full_num_slots,
             self.num_kv_heads,
             self.head_dim,
-            dtype=self.hf_config.torch_dtype,
+            dtype=self.hf_config.dtype,
             device=self.device,
         )
         self.deltakv_full_kv_cache = torch.empty(
@@ -901,7 +901,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             self.deltakv_full_num_slots,
             self.num_kv_heads,
             self.head_dim,
-            dtype=self.hf_config.torch_dtype,
+            dtype=self.hf_config.dtype,
             device=self.device,
         )
         self.deltakv_materialized_kv_cache = torch.empty(
@@ -909,7 +909,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             self.deltakv_materialized_compute_num_slots,
             self.num_kv_heads,
             self.head_dim,
-            dtype=self.hf_config.torch_dtype,
+            dtype=self.hf_config.dtype,
             device=self.device,
         )
         self._deltakv_postrope_slot_mask = torch.zeros(
@@ -926,18 +926,18 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             self.deltakv_prefill_staging_num_slots,
             self.num_kv_heads,
             self.head_dim,
-            dtype=self.hf_config.torch_dtype,
+            dtype=self.hf_config.dtype,
             device=self.device,
         )
         self.deltakv_prefill_staging_pre_rope_k_cache = torch.empty(
             self.deltakv_prefill_staging_num_slots,
             self.num_kv_heads,
             self.head_dim,
-            dtype=self.hf_config.torch_dtype,
+            dtype=self.hf_config.dtype,
             device=self.device,
         )
         latent_width = sparse_payload_dim // (32 // quant_bits) if quant_bits else sparse_payload_dim
-        latent_dtype = torch.int32 if quant_bits else self.hf_config.torch_dtype
+        latent_dtype = torch.int32 if quant_bits else self.hf_config.dtype
         self.deltakv_latent_cache = torch.empty(
             num_deltakv_layers,
             self.deltakv_latent_num_slots,
@@ -951,7 +951,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 num_deltakv_layers,
                 self.deltakv_latent_num_slots,
                 sparse_num_groups,
-                dtype=self.hf_config.torch_dtype,
+                dtype=self.hf_config.dtype,
                 device=self.device,
             )
             self.deltakv_latent_mins = torch.empty_like(self.deltakv_latent_scales)
@@ -992,7 +992,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 num_full_layers,
                 self.full_layer_latent_num_slots,
                 full_num_groups,
-                dtype=self.hf_config.torch_dtype,
+                dtype=self.hf_config.dtype,
                 device=self.device,
             )
             self.full_layer_latent_mins = torch.empty_like(self.full_layer_latent_scales)
@@ -1073,7 +1073,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 self.num_kv_heads,
                 full_kivi_group_size,
                 value_groups,
-                dtype=self.hf_config.torch_dtype,
+                dtype=self.hf_config.dtype,
                 device=self.device,
             )
             self.full_layer_kivi_value_mins = torch.empty_like(self.full_layer_kivi_value_scales)
@@ -1136,7 +1136,11 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             k_norm = getattr(attn, "k_norm", None)
             if k_norm is None:
                 return None, None
-            weights.append(k_norm.weight.detach().to(device=self.device, dtype=self.hf_config.torch_dtype).clone())
+            weights.append(
+                k_norm.weight.detach()
+                .to(device=self.device, dtype=self.hf_config.dtype)
+                .clone()
+            )
             eps = float(getattr(k_norm, "eps", 1e-6))
         return torch.stack(weights, dim=0) if weights else None, eps
 
@@ -2375,7 +2379,9 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             existing_centers = (
                 self._stage_pre_rope_kv_by_pos(sink_pos + staging_start, validate=False).unsqueeze(0)
                 if sink_slots.numel() > 0
-                else evict_pos.new_zeros((1, 0, kv_dim), dtype=self.hf_config.torch_dtype)
+                else evict_pos.new_zeros(
+                    (1, 0, kv_dim), dtype=self.hf_config.dtype
+                )
             )
             new_centers = (
                 self._stage_pre_rope_kv_by_pos(
@@ -2525,7 +2531,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         if slots.numel() == 0:
             return torch.empty(
                 (0, 2 * self.num_kv_heads * self.head_dim),
-                dtype=self.hf_config.torch_dtype,
+                dtype=self.hf_config.dtype,
                 device=self.device,
             )
         slots_i32 = slots.to(torch.int32)
@@ -2773,7 +2779,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 num_slots,
                 self.num_kv_heads,
                 self.head_dim,
-                dtype=self.hf_config.torch_dtype,
+                dtype=self.hf_config.dtype,
                 device=self.device,
             )
             self._full_layer_quant_v_cache = torch.empty_like(self._full_layer_quant_k_cache)
@@ -2816,7 +2822,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         if slots.numel() == 0:
             return torch.empty(
                 (0, 2 * self.num_kv_heads * self.head_dim),
-                dtype=self.hf_config.torch_dtype,
+                dtype=self.hf_config.dtype,
                 device=self.device,
             )
         l_idx = self.full_layer_to_idx[layer_idx]

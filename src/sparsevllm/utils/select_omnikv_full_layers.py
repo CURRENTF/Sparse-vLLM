@@ -532,7 +532,7 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
     removed_fp8_exclusions = prepare_fp8_transformers_config(base_config)
     model_kwargs = {
         "config": base_config,
-        "torch_dtype": dtype,
+        "dtype": dtype,
         "trust_remote_code": args.trust_remote_code,
         "attn_implementation": "eager",
     }

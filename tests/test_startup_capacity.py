@@ -34,7 +34,7 @@ def _config(*, sparse_method: str = ""):
         runtime_layout=layout,
         parallel_topology=SimpleNamespace(attention_tp_size=2),
         hf_config=SimpleNamespace(
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             num_key_value_heads=8,
             num_attention_heads=32,
             hidden_size=4096,

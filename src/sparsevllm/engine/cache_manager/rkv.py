@@ -83,7 +83,7 @@ class RKVCacheManager(SnapKVCacheManager):
         return bool(getattr(self, "_rkv_query_cache_enabled", True))
 
     def _rkv_query_cache_dtype(self) -> torch.dtype:
-        dtype = getattr(self.hf_config, "torch_dtype", torch.float16)
+        dtype = self.hf_config.dtype
         return dtype if isinstance(dtype, torch.dtype) else torch.float16
 
     def _rkv_num_query_heads(self) -> int:

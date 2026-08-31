@@ -76,9 +76,7 @@ class MoeOpSpec:
 
 
 def model_activation_dtype(config) -> torch.dtype:
-    value = getattr(config, "dtype", None)
-    if value is None:
-        value = getattr(config, "torch_dtype", None)
+    value = config.dtype
     if isinstance(value, torch.dtype):
         return value
     normalized = str(value or "").lower().replace("torch.", "")

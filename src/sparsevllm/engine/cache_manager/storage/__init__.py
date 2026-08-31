@@ -22,7 +22,7 @@ def create_attention_cache_storage(
         if isinstance(configured_layout, CacheLayout)
         else CacheLayout(str(configured_layout))
     )
-    dtype = config.hf_config.torch_dtype
+    dtype = config.hf_config.dtype
     if layout is CacheLayout.EXPLICIT_KV:
         runtime_layout = getattr(config, "runtime_layout", None)
         parallel_topology = getattr(config, "parallel_topology", None)

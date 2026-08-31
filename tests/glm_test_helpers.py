@@ -15,7 +15,7 @@ def _glm_hf_config(**overrides):
     values = {
         "model_type": "glm4_moe_lite",
         "architectures": ["Glm4MoeLiteForCausalLM"],
-        "torch_dtype": torch.bfloat16,
+        "dtype": torch.bfloat16,
         "max_position_embeddings": 4096,
         "hidden_size": 64,
         "intermediate_size": 128,

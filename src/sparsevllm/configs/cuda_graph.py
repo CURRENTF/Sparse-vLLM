@@ -570,13 +570,14 @@ def normalize_decode_cuda_graph(config) -> None:
                     "decode_graph with tensor_parallel_size > 1 supports these methods only: "
                     f"'', {supported}. DeltaKV is not supported."
                 )
-            log_once(
-                "decode_graph with tensor_parallel_size > 1 uses TP-local sparse selection: "
-                "each rank selects sparse tokens from its local heads/KV heads without cross-rank "
-                "sparse-index aggregation, so sparse behavior is not guaranteed equivalent to TP=1 "
-                "or global-head sparse selection.",
-                level="WARNING",
-            )
+            if config.sparse_method:
+                log_once(
+                    "decode_graph with tensor_parallel_size > 1 uses TP-local sparse selection: "
+                    "each rank selects sparse tokens from its local heads/KV heads without cross-rank "
+                    "sparse-index aggregation, so sparse behavior is not guaranteed equivalent to TP=1 "
+                    "or global-head sparse selection.",
+                    level="WARNING",
+                )
         elif not is_decode_cuda_graph_supported(config.sparse_method):
             supported = ", ".join(
                 repr(method) for method in sorted(DECODE_CUDA_GRAPH_SUPPORTED_METHODS) if method

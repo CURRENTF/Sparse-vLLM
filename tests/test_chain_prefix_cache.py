@@ -458,7 +458,7 @@ def test_runtime_chain_lru_reclaims_payload_before_reusing_capacity():
     config = SimpleNamespace(
         sparse_method="snapkv",
         model="/models/test",
-        hf_config=SimpleNamespace(model_type="test", torch_dtype="float16"),
+        hf_config=SimpleNamespace(model_type="test", dtype="float16"),
         tensor_parallel_size=1,
         max_model_len=128,
         prefix_cache_salt="",
@@ -527,7 +527,7 @@ def test_runtime_warmup_reset_reclaims_chain_payload_before_metadata():
     config = SimpleNamespace(
         sparse_method="snapkv",
         model="/models/test",
-        hf_config=SimpleNamespace(model_type="test", torch_dtype="float16"),
+        hf_config=SimpleNamespace(model_type="test", dtype="float16"),
         tensor_parallel_size=1,
         max_model_len=128,
         prefix_cache_salt="",
@@ -957,7 +957,7 @@ def _h2o_fingerprint_config(**overrides):
         "model": "/models/test",
         "hf_config": SimpleNamespace(
             model_type="qwen2",
-            torch_dtype="float16",
+            dtype="float16",
         ),
         "tensor_parallel_size": 1,
         "max_model_len": 128,
@@ -999,7 +999,7 @@ def test_chain_admission_reserves_capacity_before_prefill_allocation():
     config = SimpleNamespace(
         sparse_method="snapkv",
         model="/models/test",
-        hf_config=SimpleNamespace(model_type="test", torch_dtype="float16"),
+        hf_config=SimpleNamespace(model_type="test", dtype="float16"),
         tensor_parallel_size=1,
         max_model_len=128,
         prefix_cache_salt="",
@@ -1059,7 +1059,7 @@ def test_engine_chain_admission_reuses_resident_seq_and_logical_boundary():
         max_model_len=128,
         sparse_method="snapkv",
         model="/models/test",
-        hf_config=SimpleNamespace(model_type="test", torch_dtype="float16"),
+        hf_config=SimpleNamespace(model_type="test", dtype="float16"),
         tensor_parallel_size=1,
         prefix_cache_salt="",
         chain_cache_max_tombstones=8,

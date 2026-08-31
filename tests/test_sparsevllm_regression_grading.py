@@ -45,7 +45,7 @@ class FakeCacheManager(CacheManager):
             head_dim=4,
             hidden_size=4,
             num_attention_heads=1,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
         )
         config = types.SimpleNamespace(
             hf_config=hf_config,

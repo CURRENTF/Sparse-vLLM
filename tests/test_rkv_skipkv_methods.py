@@ -194,7 +194,7 @@ class RKVSkipKVMethodTest(unittest.TestCase):
 
         config = SimpleNamespace(
             sparse_method="skipkv",
-            hf_config=SimpleNamespace(num_hidden_layers=28, torch_dtype=torch.float32, hidden_size=4),
+            hf_config=SimpleNamespace(num_hidden_layers=28, dtype=torch.float32, hidden_size=4),
             skipkv_sentence_embedding_layer=-1,
             skipkv_steering_layer=20,
             skipkv_steering_vector_path=None,

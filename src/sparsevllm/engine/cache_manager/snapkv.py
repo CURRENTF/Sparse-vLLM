@@ -388,7 +388,7 @@ class SnapKVCacheManager(CacheManager):
                     self.pyramidkv_prefill_staging_num_slots,
                     self.num_kv_heads,
                     self.head_dim,
-                    dtype=self.hf_config.torch_dtype,
+                    dtype=self.hf_config.dtype,
                     device=self.device,
                 )
 
@@ -398,11 +398,11 @@ class SnapKVCacheManager(CacheManager):
                 layer_slots[layer_idx] = num_slots
                 k_cache = torch.empty(
                     num_slots, self.num_kv_heads, self.head_dim,
-                    dtype=self.hf_config.torch_dtype, device=self.device
+                    dtype=self.hf_config.dtype, device=self.device
                 )
                 v_cache = torch.empty(
                     num_slots, self.num_kv_heads, self.head_dim,
-                    dtype=self.hf_config.torch_dtype, device=self.device
+                    dtype=self.hf_config.dtype, device=self.device
                 )
                 self.kv_cache.append((k_cache, v_cache))
 

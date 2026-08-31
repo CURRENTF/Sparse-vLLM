@@ -20,9 +20,7 @@ def _validate_architecture(model_name: str, config: Any, expected: str) -> None:
 
 
 def _validate_bf16(model_name: str, config: Any, description: str) -> None:
-    dtype = config_get(config, "torch_dtype", None)
-    if dtype is None:
-        dtype = config_get(config, "dtype", None)
+    dtype = config.dtype
     if dtype not in {torch.bfloat16, "bfloat16"}:
         raise ValueError(f"{model_name} requires {description}, got dtype={dtype!r}.")
 
@@ -159,16 +157,16 @@ def _validate_qwen3_moe(
             "Qwen3MoE v1 does not support shared experts, got "
             f"shared_expert_intermediate_size={shared_intermediate_size}."
         )
-    dtype = config_get(config, "torch_dtype", None)
+    dtype = config.dtype
     if dtype not in {torch.bfloat16, torch.float16}:
         raise NotImplementedError(
             "Qwen3MoE v1 supports BF16/FP16 checkpoints only, "
-            f"got torch_dtype={dtype}."
+            f"got dtype={dtype}."
         )
     if topology.is_outer_tp_moe and dtype != torch.bfloat16:
         raise NotImplementedError(
             "Qwen3MoE outer TP supports BF16 checkpoints only, "
-            f"got torch_dtype={dtype}."
+            f"got dtype={dtype}."
         )
     if quantization.enabled:
         _validate_qwen3_moe_fp8(config, raw_quantization_config)

@@ -167,9 +167,9 @@ def build_tiny_random_hf_model(
     from transformers import AutoModelForCausalLM
 
     config = copy.deepcopy(hf_config)
-    dtype = getattr(config, "torch_dtype", None)
+    dtype = config.dtype
     if dtype not in {torch.float16, torch.bfloat16, torch.float32}:
-        raise TypeError(f"Tiny random mode requires a floating torch_dtype, got {dtype!r}.")
+        raise TypeError(f"Tiny random mode requires a floating dtype, got {dtype!r}.")
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(int(seed))
         with _cpu_default_dtype(dtype):

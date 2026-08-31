@@ -495,7 +495,7 @@ class CacheManager(ABC):
         intermediate_size = getattr(hf_config, "intermediate_size", hf_config.hidden_size * 4)
         # Dense MLP activations are sharded only by tensor parallelism.
         intermediate_size_per_rank = intermediate_size // self.tp_size
-        dtype_size = torch.tensor([], dtype=hf_config.torch_dtype).element_size()
+        dtype_size = torch.tensor([], dtype=hf_config.dtype).element_size()
 
         # Keep this heuristic conservative: large prefill batches can still peak on
         # MLP/linear-attention projections and allocator fragmentation after KV
@@ -1814,7 +1814,7 @@ class CacheManager(ABC):
 
     def _cache_slot_dtype_size(self) -> int:
         hf_config = getattr(self, "hf_config", getattr(self.config, "hf_config", None))
-        dtype = getattr(hf_config, "torch_dtype", torch.float16)
+        dtype = hf_config.dtype
         if not isinstance(dtype, torch.dtype):
             dtype = torch.float16
         return int(torch.tensor([], dtype=dtype).element_size())

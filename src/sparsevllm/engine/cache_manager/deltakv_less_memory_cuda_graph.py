@@ -399,7 +399,7 @@ class DeltaKVLessMemoryCudaGraphCacheManager(DeltaKVLessMemoryCacheManager):
                 num_slots,
                 self.num_kv_heads,
                 self.head_dim,
-                dtype=self.hf_config.torch_dtype,
+                dtype=self.hf_config.dtype,
                 device=self.device,
             )
             self._full_layer_quant_v_cache = torch.empty_like(self._full_layer_quant_k_cache)

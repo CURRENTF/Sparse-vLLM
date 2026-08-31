@@ -42,7 +42,7 @@ def _make_controller():
             hidden_size=8,
             num_attention_heads=2,
             head_dim=4,
-            torch_dtype=torch.float32,
+            dtype=torch.float32,
         ),
         tensor_parallel_size=1,
         sink_keep_tokens=0,

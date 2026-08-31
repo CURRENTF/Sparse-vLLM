@@ -478,7 +478,7 @@ class DeltaKVCacheManager(CacheManager):
     def allocate_kv_cache(self):
         available_memory, slot_bytes_per_layer = self._get_available_slots_info()
         config = self.config
-        dtype_size = torch.tensor([], dtype=self.hf_config.torch_dtype).element_size()
+        dtype_size = torch.tensor([], dtype=self.hf_config.dtype).element_size()
         self.deltakv_prefill_staging_num_slots = self._deltakv_prefill_staging_capacity()
         prefill_staging_bytes = int(self.deltakv_prefill_staging_num_slots) * int(slot_bytes_per_layer)
         persistent_memory = int(available_memory) - int(prefill_staging_bytes)
@@ -588,7 +588,7 @@ class DeltaKVCacheManager(CacheManager):
             self.full_num_slots,
             self.num_kv_heads,
             self.head_dim,
-            dtype=self.hf_config.torch_dtype,
+            dtype=self.hf_config.dtype,
             device=self.device,
         )
 
@@ -598,7 +598,7 @@ class DeltaKVCacheManager(CacheManager):
             self.deltakv_full_num_slots,
             self.num_kv_heads,
             self.head_dim,
-            dtype=self.hf_config.torch_dtype,
+            dtype=self.hf_config.dtype,
             device=self.device,
         )
         self._deltakv_postrope_slot_marker = torch.zeros(
@@ -612,14 +612,14 @@ class DeltaKVCacheManager(CacheManager):
             self.deltakv_prefill_staging_num_slots,
             self.num_kv_heads,
             self.head_dim,
-            dtype=self.hf_config.torch_dtype,
+            dtype=self.hf_config.dtype,
             device=self.device,
         )
         self.deltakv_latent_cache = torch.empty(
             num_deltakv_layers,
             self.deltakv_latent_num_slots,
             latent_payload_dim,
-            dtype=self.hf_config.torch_dtype,
+            dtype=self.hf_config.dtype,
             device=self.device,
         )
         self.deltakv_latent_to_full_slots = torch.full(
@@ -671,7 +671,11 @@ class DeltaKVCacheManager(CacheManager):
             k_norm = getattr(attn, "k_norm", None)
             if k_norm is None:
                 return None, None
-            weights.append(k_norm.weight.detach().to(device=self.device, dtype=self.hf_config.torch_dtype).clone())
+            weights.append(
+                k_norm.weight.detach()
+                .to(device=self.device, dtype=self.hf_config.dtype)
+                .clone()
+            )
             eps = float(getattr(k_norm, "eps", 1e-6))
         return torch.stack(weights, dim=0) if weights else None, eps
 
@@ -1740,7 +1744,7 @@ class DeltaKVCacheManager(CacheManager):
         if slots.numel() == 0:
             return torch.empty(
                 (0, 2 * self.num_kv_heads * self.head_dim),
-                dtype=self.hf_config.torch_dtype,
+                dtype=self.hf_config.dtype,
                 device=self.device,
             )
         slots_i64 = slots.to(torch.long)
@@ -3122,7 +3126,7 @@ class DeltaKVCacheTritonManagerV4(DeltaKVCacheManager):
                 return torch.empty(
                     (0, 2 * self.num_kv_heads * self.head_dim),
                     device=self.device,
-                    dtype=self.hf_config.torch_dtype,
+                    dtype=self.hf_config.dtype,
                 )
 
             assert layer_idx in self.deltakv_layer_to_idx

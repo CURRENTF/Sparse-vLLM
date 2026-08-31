@@ -30,7 +30,7 @@ def build_gated_delta_rule_op(
     recurrent_state_dtype = getattr(
         config,
         "runtime_recurrent_state_dtype",
-        getattr(config, "torch_dtype", None),
+        config.dtype,
     )
     if not isinstance(recurrent_state_dtype, torch.dtype):
         raise TypeError(

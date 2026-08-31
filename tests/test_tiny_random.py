@@ -43,7 +43,7 @@ def _qwen3_config():
         head_dim=16,
         vocab_size=256,
         max_position_embeddings=256,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
     )
 
 

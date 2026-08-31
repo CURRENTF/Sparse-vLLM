@@ -90,7 +90,7 @@ def _manager_with_layer_rows(
     manager.max_model_len = 64
     manager.num_kv_heads = 2
     manager.head_dim = 2
-    manager.hf_config = SimpleNamespace(torch_dtype=torch.float32)
+    manager.hf_config = SimpleNamespace(dtype=torch.float32)
     manager._h2o_scores = {}
     manager._h2o_active_decode_seq_ids = set()
     manager._h2o_counters = {
@@ -137,7 +137,7 @@ def _manager_with_layer_rows(
             manager.num_kv_heads,
             manager.head_dim,
         ),
-        dtype=manager.hf_config.torch_dtype,
+        dtype=manager.hf_config.dtype,
     )
     return manager
 
@@ -1442,7 +1442,7 @@ def test_h2o_controller_batches_raw_decode_logits_for_cache_manager():
             hidden_size=2,
             num_attention_heads=2,
             head_dim=1,
-            torch_dtype=torch.float32,
+            dtype=torch.float32,
         ),
         tensor_parallel_size=1,
         sink_keep_tokens=0,
@@ -1479,7 +1479,7 @@ def test_h2o_prepare_uses_one_contiguous_snapkv_style_buffer_for_all_kv_layers()
             hidden_size=2,
             num_attention_heads=2,
             head_dim=1,
-            torch_dtype=torch.float32,
+            dtype=torch.float32,
         ),
         tensor_parallel_size=1,
         sink_keep_tokens=0,
@@ -1544,7 +1544,7 @@ def test_h2o_layer_end_keeps_fused_2d_logits_for_batched_normalization():
             hidden_size=2,
             num_attention_heads=2,
             head_dim=1,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
         ),
         tensor_parallel_size=1,
         sink_keep_tokens=0,
@@ -1854,7 +1854,7 @@ def test_h2o_multilayer_reduced_decode_context_bounds_are_checked_together():
             hidden_size=1,
             num_attention_heads=1,
             head_dim=1,
-            torch_dtype=torch.float32,
+            dtype=torch.float32,
         ),
         tensor_parallel_size=1,
         sink_keep_tokens=0,
@@ -1936,7 +1936,7 @@ def test_h2o_contiguous_decode_buffer_handles_padded_graph_batch_and_low_dtype()
             hidden_size=2,
             num_attention_heads=2,
             head_dim=1,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
         ),
         tensor_parallel_size=1,
         sink_keep_tokens=0,

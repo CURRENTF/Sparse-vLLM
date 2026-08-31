@@ -99,7 +99,7 @@ def _latent_quest_manager(*, page_size: int, num_pages: int):
         quest_skip_layers=0,
         quest_token_budget=3 * page_size,
     )
-    manager.hf_config = SimpleNamespace(torch_dtype=torch.bfloat16)
+    manager.hf_config = SimpleNamespace(dtype=torch.bfloat16)
     manager.device = torch.device("cpu")
     manager.validate_runtime_invariants = False
     manager.platform = SimpleNamespace(

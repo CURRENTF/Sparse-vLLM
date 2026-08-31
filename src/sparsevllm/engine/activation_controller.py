@@ -93,14 +93,16 @@ class SkipKVActivationController(ActivationController):
                     break
         if not isinstance(vector, torch.Tensor):
             raise TypeError(f"skipkv steering vector at {path!r} did not contain a tensor.")
-        vector = vector.detach().flatten().to(device="cuda", dtype=self.config.hf_config.torch_dtype)
+        vector = vector.detach().flatten().to(
+            device="cuda", dtype=self.config.hf_config.dtype
+        )
         hidden_size = int(getattr(self.config.hf_config, "hidden_size", vector.numel()))
         if int(vector.numel()) != hidden_size:
             raise ValueError(
                 "skipkv steering vector hidden size mismatch: "
                 f"vector={int(vector.numel())}, model={hidden_size}."
             )
-        self._steering_vector = vector.to(dtype=self.config.hf_config.torch_dtype)
+        self._steering_vector = vector.to(dtype=self.config.hf_config.dtype)
 
     def _ensure_decode_buffers(self, hidden_size: int, device: torch.device, dtype: torch.dtype):
         capacity = max(1, int(getattr(self.config, "max_decoding_seqs", 1) or 1))
@@ -119,7 +121,7 @@ class SkipKVActivationController(ActivationController):
         ):
             self._steering_alpha = torch.zeros(
                 (capacity,),
-                dtype=self.config.hf_config.torch_dtype,
+                dtype=self.config.hf_config.dtype,
                 device=device,
             )
 
@@ -148,7 +150,7 @@ class SkipKVActivationController(ActivationController):
             capacity = max(1, int(getattr(self.config, "max_decoding_seqs", 1) or 1))
             self._steering_alpha = torch.zeros(
                 (capacity,),
-                dtype=self.config.hf_config.torch_dtype,
+                dtype=self.config.hf_config.dtype,
                 device="cuda",
             )
         if is_prefill or self._steering_alpha is None:

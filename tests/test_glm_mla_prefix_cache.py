@@ -29,7 +29,7 @@ def _latent_chain_manager(manager_type, method: str):
         model="/models/glm-chain-test",
         hf_config=SimpleNamespace(
             model_type="glm4_moe_lite",
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             num_attention_heads=2,
             num_key_value_heads=1,
         ),

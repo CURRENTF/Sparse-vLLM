@@ -692,7 +692,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
     def hf_config(self):
         return SimpleNamespace(
             model_type="qwen2",
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
             max_position_embeddings=32768,
             hidden_size=8,
             intermediate_size=32,

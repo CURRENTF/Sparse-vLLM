@@ -410,7 +410,7 @@ class Qwen35LinearAttention(nn.Module):
         self.recurrent_state_dtype = getattr(
             config,
             "runtime_recurrent_state_dtype",
-            getattr(config, "torch_dtype", torch.bfloat16),
+            config.dtype,
         )
         if not isinstance(self.recurrent_state_dtype, torch.dtype):
             raise TypeError(
@@ -876,9 +876,7 @@ class Qwen35MLP(nn.Module):
         )
         if getattr(config, "hidden_act", "silu") != "silu":
             raise NotImplementedError(f"qwen3_5 supports hidden_act='silu', got {config.hidden_act!r}.")
-        activation_dtype = getattr(config, "dtype", None) or getattr(
-            config, "torch_dtype", torch.bfloat16
-        )
+        activation_dtype = config.dtype
         self.gate_up_swiglu_spec = GateUpSwiGLUOpSpec(
             hidden_size=int(config.hidden_size),
             intermediate_size=intermediate_size,
@@ -1129,12 +1127,12 @@ class Qwen35ForCausalLM(nn.Module):
                 RecurrentTensorSpec(
                     "conv_state",
                     (conv_dim, int(config.linear_conv_kernel_dim) - 1),
-                    config.torch_dtype,
+                    config.dtype,
                 ),
                 RecurrentTensorSpec(
                     "recurrent_state",
                     (num_v_heads, key_head_dim, value_head_dim),
-                    config.torch_dtype,
+                    config.dtype,
                 ),
             ),
         )

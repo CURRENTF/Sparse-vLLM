@@ -59,7 +59,7 @@ def test_h2o_runtime_decode_spec_is_score_free_while_eviction_is_disabled():
         num_attention_heads=32,
         num_key_value_heads=8,
         head_dim=128,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
     )
 
     spec = build_mha_decode_attention_spec(
@@ -92,7 +92,7 @@ def test_batch_only_decode_spec_carries_static_context_capacity():
         num_attention_heads=32,
         num_key_value_heads=8,
         head_dim=128,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
     )
     runtime_config = SimpleNamespace(
         decode_graph_shape_policy="batch_only",
@@ -117,7 +117,7 @@ def test_quest_decode_spec_uses_physical_cache_page_size():
         num_attention_heads=32,
         num_key_value_heads=8,
         head_dim=128,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
     )
     runtime_config = SimpleNamespace(
         decode_graph_shape_policy="batch_only",
@@ -142,7 +142,7 @@ def test_deltakv_kivi_decode_spec_carries_mixed_storage_contract():
         num_attention_heads=32,
         num_key_value_heads=8,
         head_dim=128,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
     )
     runtime_config = SimpleNamespace(
         decode_graph_shape_policy="batch_only",

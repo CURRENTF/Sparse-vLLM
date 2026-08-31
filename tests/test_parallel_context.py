@@ -75,7 +75,7 @@ class _MinimalCacheManager(CacheManager):
 def _hf_config(model_type: str = "qwen3_moe", *, num_experts: int = 8):
     return SimpleNamespace(
         model_type=model_type,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         max_position_embeddings=32768,
         hidden_size=16,
         intermediate_size=32,
@@ -280,7 +280,7 @@ def test_qwen3_moe_parallel_config_validation(tmp_path):
             Config(model=str(tmp_path), tensor_parallel_size=4)
 
     fp16 = _hf_config()
-    fp16.torch_dtype = torch.float16
+    fp16.dtype = torch.float16
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=fp16):
         with pytest.raises(NotImplementedError, match="outer TP supports BF16"):
             Config(model=str(tmp_path), tensor_parallel_size=2)
@@ -300,16 +300,19 @@ def test_qwen3_moe_parallel_config_validation(tmp_path):
             Config(model=str(tmp_path))
 
     invalid_dtype = _hf_config()
-    invalid_dtype.torch_dtype = torch.float32
+    invalid_dtype.dtype = torch.float32
     with patch("sparsevllm.configs.runtime.AutoConfig.from_pretrained", return_value=invalid_dtype):
         with pytest.raises(NotImplementedError, match="BF16/FP16 checkpoints"):
             Config(model=str(tmp_path))
 
 
 def test_qwen3_moe_snapkv_tp_supports_chain_cache_with_decode_graph(tmp_path):
-    with patch(
-        "sparsevllm.configs.runtime.AutoConfig.from_pretrained",
-        return_value=_hf_config(),
+    with (
+        patch(
+            "sparsevllm.configs.runtime.AutoConfig.from_pretrained",
+            return_value=_hf_config(),
+        ),
+        patch("sparsevllm.configs.cuda_graph.log_once") as log_once,
     ):
         config = Config(
             model=str(tmp_path),
@@ -324,6 +327,34 @@ def test_qwen3_moe_snapkv_tp_supports_chain_cache_with_decode_graph(tmp_path):
     assert config.parallel_topology.mode is ParallelMode.OUTER_TP_MOE
     assert config.resolved_prefix_cache_mode == "chain"
     assert config.enable_prefix_caching is True
+    assert any(
+        "TP-local sparse selection" in call.args[0]
+        for call in log_once.call_args_list
+    )
+
+
+def test_qwen3_moe_vanilla_tp_decode_graph_omits_sparse_selection_warning(
+    tmp_path,
+):
+    with (
+        patch(
+            "sparsevllm.configs.runtime.AutoConfig.from_pretrained",
+            return_value=_hf_config(),
+        ),
+        patch("sparsevllm.configs.cuda_graph.log_once") as log_once,
+    ):
+        config = Config(
+            model=str(tmp_path),
+            sparse_method="vanilla",
+            tensor_parallel_size=2,
+            decode_graph=True,
+        )
+
+    assert config.sparse_method == ""
+    assert not any(
+        "TP-local sparse selection" in call.args[0]
+        for call in log_once.call_args_list
+    )
 
 
 def test_qwen3_moe_fp8_config_validation(tmp_path):

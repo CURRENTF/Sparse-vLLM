@@ -9,6 +9,7 @@ from enum import Enum
 from typing import Any, Callable, Protocol
 
 
+
 def usable_prefix_cache_tokens(prompt_len: int, block_size: int) -> int:
     """Return the largest cache-hit prefix that still leaves logits work."""
     prompt_len = int(prompt_len)
@@ -65,7 +66,7 @@ def build_prefix_cache_fingerprint(config: Any, block_size: int) -> bytes:
     payload = {
         "model": getattr(config, "model", None),
         "model_type": getattr(hf_config, "model_type", None),
-        "dtype": str(getattr(hf_config, "torch_dtype", None)),
+        "dtype": str(hf_config.dtype),
         "tp_size": int(getattr(config, "tensor_parallel_size", 1)),
         "method": str(getattr(config, "sparse_method", "") or ""),
         "block_size": int(block_size),

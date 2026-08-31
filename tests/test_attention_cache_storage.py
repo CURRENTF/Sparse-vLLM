@@ -162,12 +162,12 @@ def test_mla_storage_uses_576_bf16_values_per_slot_per_layer():
 def test_storage_factory_uses_configured_layout():
     explicit_config = SimpleNamespace(
         attention_cache_layout="explicit_kv",
-        hf_config=SimpleNamespace(torch_dtype=torch.float16),
+        hf_config=SimpleNamespace(dtype=torch.float16),
     )
     mla_config = SimpleNamespace(
         attention_cache_layout="mla_latent",
         hf_config=SimpleNamespace(
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             kv_lora_rank=512,
             qk_rope_head_dim=64,
         ),
@@ -665,7 +665,7 @@ def test_standard_manager_accounts_storage_tensors_explicitly(
         memory_expected_savings=None,
     )
     manager.hf_config = SimpleNamespace(
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         num_attention_heads=20,
         qk_nope_head_dim=192,
         qk_rope_head_dim=64,

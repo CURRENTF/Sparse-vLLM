@@ -326,7 +326,7 @@ def _make_glm_graph_lane(
             num_attention_heads=20,
             hidden_size=64,
             head_dim=256,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
         ),
         obs_layer_ids=[],
         full_attention_layers=[],

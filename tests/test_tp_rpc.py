@@ -17,6 +17,7 @@ from sparsevllm.engine.model_runner import (
     TP_RUN_STATUS_SUCCESS,
     TP_SHM_NAME_PREFIX,
     _create_model,
+    _init_process_group,
     make_tp_shm_name,
 )
 from sparsevllm.engine.startup import (
@@ -25,6 +26,51 @@ from sparsevllm.engine.startup import (
 )
 from sparsevllm.models.spec import ModelSpec
 from sparsevllm.operators import registry as operator_registry
+
+
+def test_init_process_group_binds_the_current_device():
+    device = torch.device("cuda", 2)
+
+    with patch("sparsevllm.engine.model_runner.dist.init_process_group") as init:
+        _init_process_group(
+            backend="nccl",
+            init_method="tcp://localhost:1234",
+            world_size=4,
+            rank=2,
+            device=device,
+        )
+
+    init.assert_called_once_with(
+        backend="nccl",
+        init_method="tcp://localhost:1234",
+        world_size=4,
+        rank=2,
+        device_id=device,
+    )
+
+
+def test_init_process_group_omits_device_id_for_legacy_torch():
+    with (
+        patch(
+            "sparsevllm.engine.model_runner._INIT_PROCESS_GROUP_SUPPORTS_DEVICE_ID",
+            False,
+        ),
+        patch("sparsevllm.engine.model_runner.dist.init_process_group") as init,
+    ):
+        _init_process_group(
+            backend="nccl",
+            init_method="tcp://localhost:1234",
+            world_size=2,
+            rank=0,
+            device=torch.device("cuda", 0),
+        )
+
+    init.assert_called_once_with(
+        backend="nccl",
+        init_method="tcp://localhost:1234",
+        world_size=2,
+        rank=0,
+    )
 
 
 def test_create_model_delegates_optional_runtime_binding():

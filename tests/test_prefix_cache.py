@@ -47,7 +47,7 @@ from sparsevllm.platforms import device_runtime
 def _cfg(method="", salt="", block_size=4):
     return SimpleNamespace(
         model="/models/qwen",
-        hf_config=SimpleNamespace(model_type="qwen2", torch_dtype=torch.float16),
+        hf_config=SimpleNamespace(model_type="qwen2", dtype=torch.float16),
         tensor_parallel_size=1,
         expert_parallel_size=1,
         data_parallel_size=1,
@@ -88,7 +88,7 @@ def _insert_tokens(index: RadixPrefixIndex, token_ids: list[int]) -> bytes:
 def _hf_config():
     return SimpleNamespace(
         model_type="qwen2",
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         max_position_embeddings=32768,
         hidden_size=8,
         intermediate_size=32,

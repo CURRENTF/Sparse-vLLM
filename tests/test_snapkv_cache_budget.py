@@ -36,7 +36,7 @@ def _manager_config(*, method: str, compression_interval: int = 1):
             num_attention_heads=2,
             hidden_size=10,
             head_dim=5,
-            torch_dtype=torch.float32,
+            dtype=torch.float32,
         ),
         runtime_layout=RuntimeLayout.dense(2),
         attention_cache_layout="explicit_kv",

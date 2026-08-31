@@ -179,7 +179,7 @@ def _qwen35_outer_config(*, num_layers: int = 64, full_layers: tuple[int, ...] |
         linear_value_head_dim=32,
         linear_conv_kernel_dim=4,
         max_position_embeddings=131072,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         tie_word_embeddings=False,
         quantization_config={
             "quant_method": "fp8",
@@ -608,7 +608,7 @@ def test_qwen36_recurrent_spec_has_exact_tp_local_bytes(
         linear_key_head_dim=128,
         linear_value_head_dim=128,
         linear_conv_kernel_dim=4,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
     )
 
     spec = Qwen35ForCausalLM.recurrent_state_spec(config, world_size)
@@ -629,7 +629,7 @@ def test_qwen36_recurrent_pool_rejects_explicit_cap_below_required_bytes():
             linear_key_head_dim=128,
             linear_value_head_dim=128,
             linear_conv_kernel_dim=4,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
         ),
         world_size=1,
     )
@@ -659,7 +659,7 @@ def test_qwen36_recurrent_capacity_counts_rows_and_scratch_exactly():
             linear_key_head_dim=128,
             linear_value_head_dim=128,
             linear_conv_kernel_dim=4,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
         ),
         world_size=1,
     )
@@ -847,7 +847,7 @@ def _budget_test_manager(
         hf_config=SimpleNamespace(
             hidden_size=10,
             intermediate_size=10,
-            torch_dtype=torch.float16,
+            dtype=torch.float16,
         ),
         gpu_memory_utilization=0.9,
         max_num_batched_tokens=1,
@@ -969,7 +969,7 @@ def test_model_runner_resets_inherited_allocator_peak_before_model_construction(
         decode_graph_capture_sizes=None,
         max_decoding_seqs=64,
         max_num_seqs_in_batch=32,
-        hf_config=SimpleNamespace(model_type="qwen2", torch_dtype=torch.float32),
+        hf_config=SimpleNamespace(model_type="qwen2", dtype=torch.float32),
         model_spec=resolve_model_spec("qwen2"),
     )
     with (
@@ -1035,7 +1035,7 @@ def test_quest_joint_prefix_kv_bytes_include_page_metadata():
     manager.num_kv_layers = 16
     manager.num_kv_heads = 4
     manager.head_dim = 256
-    manager.hf_config = SimpleNamespace(torch_dtype=torch.bfloat16)
+    manager.hf_config = SimpleNamespace(dtype=torch.bfloat16)
     payload = QuestPrefixBlockPayload(
         block_slot=None,
         token_slots=torch.arange(4096, dtype=torch.int32),
@@ -1239,7 +1239,7 @@ def test_qwen35_deltakv_requires_compatible_checkpoint_even_when_missing_allowed
 def test_qwen35_raw_config_fallback_when_transformers_autoconfig_is_unknown(tmp_path):
     outer_config = _qwen35_outer_config()
     text_config = dict(vars(outer_config.text_config))
-    text_config["torch_dtype"] = "float16"
+    text_config["dtype"] = "float16"
     with open(tmp_path / "config.json", "w", encoding="utf-8") as f:
         json.dump(
             {
@@ -1989,7 +1989,7 @@ def test_mixed_prefix_warmup_reset_clears_dummy_blocks_and_accounting():
         prefix_recurrent_capacity_bytes=8,
         prefix_cache_max_blocks=2,
         model="test",
-        hf_config=SimpleNamespace(model_type="test", torch_dtype=torch.float16),
+        hf_config=SimpleNamespace(model_type="test", dtype=torch.float16),
         tensor_parallel_size=1,
         sparse_method="",
         prefix_cache_salt="",
@@ -2052,7 +2052,7 @@ def test_mixed_offload_reset_drains_and_rebinds_controller():
         prefix_cache_block_size=4,
         prefix_cache_max_blocks=2,
         model="test",
-        hf_config=SimpleNamespace(model_type="test", torch_dtype=torch.float16),
+        hf_config=SimpleNamespace(model_type="test", dtype=torch.float16),
         tensor_parallel_size=1,
         sparse_method="",
         prefix_cache_salt="",

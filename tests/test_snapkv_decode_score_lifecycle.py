@@ -87,7 +87,7 @@ def make_controller(
             num_hidden_layers=layers,
             hidden_size=8,
             num_attention_heads=2,
-            torch_dtype=torch.float32,
+            dtype=torch.float32,
         ),
         runtime_layout=layout,
         sink_keep_tokens=sink,

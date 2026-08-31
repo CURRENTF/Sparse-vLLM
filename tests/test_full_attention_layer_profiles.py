@@ -97,7 +97,7 @@ def test_config_auto_resolution_consumes_packaged_profile(tmp_path, sparse_metho
     model_dir.mkdir()
     hf_config = SimpleNamespace(
         model_type="qwen2",
-        torch_dtype="float16",
+        dtype="float16",
         max_position_embeddings=32768,
         hidden_size=8,
         intermediate_size=32,

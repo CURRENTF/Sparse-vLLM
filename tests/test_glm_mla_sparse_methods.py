@@ -66,7 +66,7 @@ def test_glm_rkv_query_cache_allocates_and_records_full_qk_head_width():
         num_key_value_heads=20,
         qk_nope_head_dim=192,
         qk_rope_head_dim=64,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
     )
     config = SimpleNamespace(
         hf_config=hf_config,
@@ -271,7 +271,7 @@ def test_omnikv_observation_selects_mla_latent_active_slots():
         num_key_value_heads=20,
         qk_nope_head_dim=192,
         qk_rope_head_dim=64,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
     )
     controller = SparseController(
         SimpleNamespace(

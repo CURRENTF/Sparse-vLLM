@@ -271,7 +271,7 @@ class SparseMethodRuntime(ABC):
         )
         candidate_token_scores = torch.softmax(logits, dim=-1).max(dim=1).values
 
-        model_dtype = getattr(self.config.hf_config, "torch_dtype", None)
+        model_dtype = self.config.hf_config.dtype
         if isinstance(model_dtype, str):
             model_dtype = {
                 "float16": torch.float16,

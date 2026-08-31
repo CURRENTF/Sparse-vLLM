@@ -5,6 +5,7 @@ import os
 from types import SimpleNamespace
 from typing import Any
 
+import torch
 from transformers import AutoConfig
 
 from sparsevllm.method_registry import (
@@ -71,6 +72,31 @@ def _extract_text_config(config: Any) -> Any:
     return text_config
 
 
+def _normalize_hf_config_dtype(config: Any, fallback: Any = None) -> torch.dtype:
+    dtype = config_get(config, "dtype", None)
+    if dtype is None:
+        legacy_values = config if isinstance(config, dict) else vars(config)
+        dtype = legacy_values.get("torch_dtype", fallback)
+    if isinstance(dtype, str):
+        normalized = dtype.strip().lower().replace("torch.", "")
+        dtype = {
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+            "float16": torch.float16,
+            "fp16": torch.float16,
+            "half": torch.float16,
+            "float32": torch.float32,
+            "fp32": torch.float32,
+        }.get(normalized)
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"Model config dtype must be a torch.dtype, got {dtype!r}.")
+    if isinstance(config, dict):
+        config["dtype"] = dtype
+    else:
+        setattr(config, "dtype", dtype)
+    return dtype
+
+
 def _model_context_length(hf_config: Any) -> int:
     rope_scaling = config_get(hf_config, "rope_scaling", None) or config_get(
         hf_config, "rope_parameters", None
@@ -135,6 +161,8 @@ def load_and_validate_model(config) -> None:
     model_type = str(config_get(config.outer_hf_config, "model_type", "") or "")
     model_spec = resolve_model_spec(model_type)
     config.hf_config = _extract_text_config(config.outer_hf_config)
+    outer_dtype = _normalize_hf_config_dtype(config.outer_hf_config, torch.bfloat16)
+    _normalize_hf_config_dtype(config.hf_config, outer_dtype)
     config.model_spec = model_spec
     config.parallel_topology = model_spec.topology(
         config.tensor_parallel_size,
@@ -173,10 +201,7 @@ def load_and_validate_model(config) -> None:
         raw_quantization_config,
         required_fp8=model_spec.requires_fp8,
         model_name=model_spec.name,
-        activation_dtype=(
-            config_get(config.hf_config, "torch_dtype", None)
-            or config_get(config.outer_hf_config, "torch_dtype", "bfloat16")
-        ),
+        activation_dtype=config.hf_config.dtype,
     )
     if (
         config.tiny_random
