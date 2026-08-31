@@ -278,15 +278,34 @@ def _validate_synthetic_rows(
         if row.get("status") != "success":
             errors.append(f"failed synthetic row {system}[{index}]: {row}")
             continue
-        for field in (
-            "request_throughput_rps",
-            "input_token_throughput_tps",
-            "output_token_throughput_tps",
-            "total_token_throughput_tps",
-            "output_tps_pct_of_observed_sweep_peak",
-            "output_tps_scaling_efficiency_pct_vs_min_concurrency",
-        ):
+        for field in ("request_throughput_rps", "prefill_token_throughput_tps"):
             if not isinstance(row.get(field), (int, float)) or float(row[field]) <= 0:
+                errors.append(f"invalid {field} in synthetic row {system}[{index}]")
+        decode_status = row.get("decode_metric_status")
+        decode_tps = row.get("decode_token_throughput_tps")
+        if decode_status == "success":
+            if not isinstance(decode_tps, (int, float)) or float(decode_tps) <= 0:
+                errors.append(
+                    f"invalid decode_token_throughput_tps in synthetic row {system}[{index}]"
+                )
+        elif decode_status == "skipped_by_policy":
+            if decode_tps is not None:
+                errors.append(
+                    f"decode throughput must be null when skipped in {system}[{index}]"
+                )
+        else:
+            errors.append(f"invalid decode metric status in {system}[{index}]")
+        for field in (
+            "decode_tps_pct_of_observed_sweep_peak",
+            "decode_tps_scaling_efficiency_pct_vs_min_concurrency",
+        ):
+            value = row.get(field)
+            if decode_tps is None:
+                if value is not None:
+                    errors.append(
+                        f"{field} must be null without decode throughput in {system}[{index}]"
+                    )
+            elif not isinstance(value, (int, float)) or float(value) <= 0:
                 errors.append(f"invalid {field} in synthetic row {system}[{index}]")
         if row.get("saturation_analysis_status") not in {
             "success",
@@ -311,6 +330,13 @@ def _validate_synthetic_rows(
                 errors.append(f"churn row is not oversubscribed in {system}[{index}]")
             if row.get("fixed_batch_comparison_status") != "success":
                 errors.append(f"churn row lacks fixed-batch comparison in {system}[{index}]")
+            expected_decode_comparison = (
+                "skipped_by_policy" if decode_tps is None else "success"
+            )
+            if row.get("churn_decode_tps_comparison_status") != expected_decode_comparison:
+                errors.append(
+                    f"invalid churn decode comparison status in {system}[{index}]"
+                )
 
 
 def _synthetic_trace_map(

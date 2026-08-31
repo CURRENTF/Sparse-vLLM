@@ -254,9 +254,16 @@ benchmark mode in this entrypoint.
 
 ## Metrics and Interpretation
 
-- Request, input-token, output-token, and total-token throughput are computed
-  from directly timed measured requests.
-- Observed sweep saturation is relative to the best output throughput in the
+- Request throughput is computed over the complete measured workload. Prefill
+  token throughput divides all prompt tokens by the wall-time window from
+  submission through the last first token. Decode token throughput excludes
+  each request's first generated token (which is produced by prefill) and divides
+  the remaining generated tokens by the wall-time window from the first first
+  token through the last completion. In churn workloads these phase windows can
+  overlap because prefill and decode are interleaved. With `output_len=1`, the
+  probe still reports TTFT and prefill throughput; decode throughput and its
+  dependent comparisons are `skipped_by_policy`.
+- Observed sweep saturation is relative to the best decode throughput in the
   configured concurrency ladder. It is not proof of absolute hardware
   saturation.
 - GPU compute activity and memory I/O activity are directly sampled from

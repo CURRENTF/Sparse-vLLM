@@ -302,14 +302,24 @@ def _attach_churn_comparisons(rows: list[dict[str, Any]]) -> None:
         if fixed is None:
             row["fixed_batch_comparison_status"] = "skipped_by_policy"
             continue
-        fixed_output_tps = float(fixed["output_token_throughput_tps"])
+        fixed_decode_tps = fixed.get("decode_token_throughput_tps")
         fixed_request_rps = float(fixed["request_throughput_rps"])
-        if fixed_output_tps <= 0 or fixed_request_rps <= 0:
+        if fixed_request_rps <= 0:
             raise ValueError(f"Fixed-batch throughput must be positive for comparison: {fixed}")
         row["fixed_batch_comparison_status"] = "success"
-        row["churn_output_tps_ratio_vs_fixed_batch"] = (
-            float(row["output_token_throughput_tps"]) / fixed_output_tps
-        )
+        row_decode_tps = row.get("decode_token_throughput_tps")
+        if fixed_decode_tps is None or row_decode_tps is None:
+            row["churn_decode_tps_comparison_status"] = "skipped_by_policy"
+            row["churn_decode_tps_ratio_vs_fixed_batch"] = None
+        else:
+            if float(fixed_decode_tps) <= 0 or float(row_decode_tps) <= 0:
+                raise ValueError(
+                    f"Decode throughput must be positive for comparison: fixed={fixed}, row={row}"
+                )
+            row["churn_decode_tps_comparison_status"] = "success"
+            row["churn_decode_tps_ratio_vs_fixed_batch"] = (
+                float(row_decode_tps) / float(fixed_decode_tps)
+            )
         row["churn_request_rps_ratio_vs_fixed_batch"] = (
             float(row["request_throughput_rps"]) / fixed_request_rps
         )
@@ -339,7 +349,17 @@ def _attach_saturation_metrics(rows: list[dict[str, Any]]) -> None:
             raise ValueError(
                 f"Saturation sweep contains duplicate concurrency values: {concurrencies}."
             )
-        rates = [float(row["output_token_throughput_tps"]) for row in ordered]
+        raw_rates = [row.get("decode_token_throughput_tps") for row in ordered]
+        if any(rate is None for rate in raw_rates):
+            for row in ordered:
+                row["saturation_analysis_status"] = "skipped_by_policy"
+                row["decode_tps_pct_of_observed_sweep_peak"] = None
+                row["decode_tps_scaling_efficiency_pct_vs_min_concurrency"] = None
+                row["marginal_decode_tps_gain_pct_vs_previous_concurrency"] = None
+                row["observed_decode_saturation_threshold_pct"] = None
+                row["observed_decode_saturation_concurrency"] = None
+            continue
+        rates = [float(rate) for rate in raw_rates]
         if any(rate <= 0 for rate in rates):
             raise ValueError(f"Saturation sweep throughput must be positive: {rates}.")
 
@@ -357,15 +377,17 @@ def _attach_saturation_metrics(rows: list[dict[str, Any]]) -> None:
             zip(ordered, concurrencies, rates)
         ):
             row["saturation_analysis_status"] = analysis_status
-            row["output_tps_pct_of_observed_sweep_peak"] = rate / observed_peak * 100.0
-            row["output_tps_scaling_efficiency_pct_vs_min_concurrency"] = (
+            row["decode_tps_pct_of_observed_sweep_peak"] = (
+                rate / observed_peak * 100.0
+            )
+            row["decode_tps_scaling_efficiency_pct_vs_min_concurrency"] = (
                 (rate / base_rate) / (concurrency / base_concurrency) * 100.0
             )
-            row["marginal_output_tps_gain_pct_vs_previous_concurrency"] = (
+            row["marginal_decode_tps_gain_pct_vs_previous_concurrency"] = (
                 None if index == 0 else (rate / rates[index - 1] - 1.0) * 100.0
             )
-            row["observed_output_saturation_threshold_pct"] = 95.0
-            row["observed_output_saturation_concurrency"] = (
+            row["observed_decode_saturation_threshold_pct"] = 95.0
+            row["observed_decode_saturation_concurrency"] = (
                 saturation_concurrency if analysis_status == "success" else None
             )
 
@@ -460,6 +482,108 @@ def _vllm_phase_metrics(outputs: list[Any], expected_output_len: int) -> tuple[f
                 raise RuntimeError(f"vLLM reported non-positive decode duration {decode_ms} ms.")
             tpot_values.append(decode_ms / (token_count - 1))
     return max(ttft_values), (sum(tpot_values) / len(tpot_values) if tpot_values else None)
+
+
+def _vllm_batch_phase_seconds(outputs: list[Any]) -> tuple[float, float]:
+    """Return prefill and decode wall-time windows for one submitted workload."""
+    if not outputs:
+        raise RuntimeError("vLLM returned no request outputs.")
+
+    ttft_values = []
+    decode_starts = []
+    decode_finishes = []
+    timing_sources = set()
+    for output in outputs:
+        metrics = getattr(output, "metrics", None)
+        if metrics is None:
+            raise RuntimeError(
+                "vLLM request metrics are unavailable; phase throughput requires request timing."
+            )
+        ttft_s, decode_s, source = _vllm_request_phase_seconds(metrics)
+        timing_sources.add(source)
+        decode_start = float(
+            metrics.first_token_time
+            if source == "vllm_legacy_wall_timestamps"
+            else metrics.first_token_ts
+        )
+        ttft_values.append(ttft_s)
+        decode_starts.append(decode_start)
+        decode_finishes.append(decode_start + decode_s)
+
+    if len(timing_sources) != 1:
+        raise RuntimeError(
+            f"vLLM returned mixed request timing contracts: {sorted(timing_sources)}."
+        )
+    return max(ttft_values), max(decode_finishes) - min(decode_starts)
+
+
+def _phase_throughput_metrics(
+    *,
+    total_input_tokens: int,
+    total_output_tokens: int,
+    request_count: int,
+    prefill_elapsed_s: float,
+    decode_elapsed_s: float,
+) -> dict[str, Any]:
+    """Build phase-local token throughput metrics.
+
+    The first generated token is produced by the final prefill step, so decode
+    throughput counts only the remaining output tokens.
+    """
+    if total_input_tokens <= 0 or request_count <= 0 or prefill_elapsed_s <= 0:
+        raise RuntimeError(
+            "Invalid prefill throughput inputs: "
+            f"tokens={total_input_tokens}, requests={request_count}, "
+            f"elapsed_s={prefill_elapsed_s}."
+        )
+    decode_tokens = total_output_tokens - request_count
+    if decode_tokens < 0:
+        raise RuntimeError(
+            f"Output token count {total_output_tokens} is smaller than request count "
+            f"{request_count}."
+        )
+    if decode_tokens > 0 and decode_elapsed_s <= 0:
+        raise RuntimeError(
+            "Decode tokens were generated without a positive decode window: "
+            f"tokens={decode_tokens}, elapsed_s={decode_elapsed_s}."
+        )
+    return {
+        "phase_timing_scope": "request_event_wall_time_windows",
+        "prefill_elapsed_s": prefill_elapsed_s,
+        "decode_elapsed_s": decode_elapsed_s if decode_tokens > 0 else None,
+        "prefill_token_count": total_input_tokens,
+        "decode_token_count": decode_tokens,
+        "prefill_token_throughput_tps": total_input_tokens / prefill_elapsed_s,
+        "decode_token_throughput_tps": (
+            decode_tokens / decode_elapsed_s if decode_tokens > 0 else None
+        ),
+    }
+
+
+def _mean_phase_throughput_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
+    decode_rates = [
+        record["decode_token_throughput_tps"]
+        for record in records
+        if record["decode_token_throughput_tps"] is not None
+    ]
+    decode_times = [
+        record["decode_elapsed_s"]
+        for record in records
+        if record["decode_elapsed_s"] is not None
+    ]
+    return {
+        "phase_timing_scope": "request_event_wall_time_windows",
+        "prefill_token_throughput_tps": statistics.fmean(
+            record["prefill_token_throughput_tps"] for record in records
+        ),
+        "decode_token_throughput_tps": (
+            statistics.fmean(decode_rates) if decode_rates else None
+        ),
+        "prefill_elapsed_s_mean": statistics.fmean(
+            record["prefill_elapsed_s"] for record in records
+        ),
+        "decode_elapsed_s_mean": statistics.fmean(decode_times) if decode_times else None,
+    }
 
 
 def _record_batch_first_tokens(
@@ -579,11 +703,14 @@ def _format_markdown_report(
         "- **GPU metrics**: directly sampled activity; no theoretical MFU/MBU estimates",
         f"- **Timestamp**: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`",
         "",
-        "| System / Method | Scenario | Prompt Range | Output Range | Concurrency | Req/s | Output tok/s | Observed peak | Scaling efficiency | TTFT p50/p99 (ms) | GPU compute activity | GPU memory I/O activity | Peak VRAM (GB) | Status |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        "| System / Method | Scenario | Prompt Range | Output Range | Concurrency | Req/s | Prefill tok/s | Decode tok/s | Observed decode peak | Decode scaling efficiency | TTFT p50/p99 (ms) | GPU compute activity | GPU memory I/O activity | Peak VRAM (GB) | Status |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
     ]
     def _number(value: Any, precision: int) -> str:
         return "n/a" if value is None else f"{float(value):.{precision}f}"
+
+    def _percentage(value: Any, precision: int) -> str:
+        return "n/a" if value is None else f"{float(value):.{precision}f}%"
 
     for r in summary_rows:
         fallback_label = f"{r['engine']}-{r.get('sparse_method', 'vanilla')}"
@@ -593,9 +720,10 @@ def _format_markdown_report(
         lines.append(
             f"| {sys_label} | {r['scenario']} | {prompt_range} | {output_range} "
             f"| {r['concurrency']} | {_number(r.get('request_throughput_rps'), 2)} "
-            f"| {_number(r.get('output_token_throughput_tps'), 2)} "
-            f"| {_number(r.get('output_tps_pct_of_observed_sweep_peak'), 1)}% "
-            f"| {_number(r.get('output_tps_scaling_efficiency_pct_vs_min_concurrency'), 1)}% "
+            f"| {_number(r.get('prefill_token_throughput_tps'), 2)} "
+            f"| {_number(r.get('decode_token_throughput_tps'), 2)} "
+            f"| {_percentage(r.get('decode_tps_pct_of_observed_sweep_peak'), 1)} "
+            f"| {_percentage(r.get('decode_tps_scaling_efficiency_pct_vs_min_concurrency'), 1)} "
             f"| {_number(r.get('ttft_ms_p50'), 2)}/{_number(r.get('ttft_ms_p99'), 2)} "
             f"| {_number(r.get('gpu_compute_activity_pct_mean'), 1)}% "
             f"| {_number(r.get('gpu_memory_io_activity_pct_mean'), 1)}% "
@@ -696,6 +824,7 @@ def run_sparsevllm_probe(
                         )
                         decode_times = []
                         ttft_ms = None
+                        decode_started_at = None
                         t_start = time.perf_counter()
 
                         seq_to_request: dict[int, Any] = {}
@@ -731,12 +860,19 @@ def run_sparsevllm_probe(
 
                             if num_tokens < 0:
                                 decode_times.append(step_dt)
-                            if ttft_ms is None and _record_batch_first_tokens(
+                            observed_before = len(first_token_seq_ids)
+                            all_first_tokens_observed = _record_batch_first_tokens(
                                 request_seq_ids,
                                 first_token_seq_ids,
                                 getattr(llm, "last_step_token_outputs", []),
                                 finished_outputs,
+                            )
+                            if (
+                                len(first_token_seq_ids) > observed_before
+                                and decode_started_at is None
                             ):
+                                decode_started_at = now
+                            if ttft_ms is None and all_first_tokens_observed:
                                 ttft_ms = (now - t_start) * 1000.0
                             for seq_id, token_ids, _token_logprobs, _top_logprobs in finished_outputs:
                                 finished_by_seq[int(seq_id)] = len(token_ids)
@@ -767,6 +903,17 @@ def run_sparsevllm_probe(
                         )
                         total_input = sum(request.prompt_len for request in trace)
                         total_output = sum(request.output_len for request in trace)
+                        phase_metrics = _phase_throughput_metrics(
+                            total_input_tokens=total_input,
+                            total_output_tokens=total_output,
+                            request_count=bs,
+                            prefill_elapsed_s=ttft_ms / 1000.0,
+                            decode_elapsed_s=(
+                                0.0
+                                if decode_started_at is None
+                                else t_start + elapsed_s - decode_started_at
+                            ),
+                        )
                         profiler_snap = profiler.snapshot()
 
                         rec = {
@@ -782,9 +929,7 @@ def run_sparsevllm_probe(
                             "ttft_ms": round(ttft_ms, 2),
                             "tpot_ms": None if tpot_ms is None else round(tpot_ms, 2),
                             "request_throughput_rps": bs / elapsed_s,
-                            "input_token_throughput_tps": total_input / elapsed_s,
-                            "output_token_throughput_tps": total_output / elapsed_s,
-                            "total_token_throughput_tps": (total_input + total_output) / elapsed_s,
+                            **phase_metrics,
                             "profiler_breakdown": profiler_snap,
                             "profiler_status": "success" if profiler_snap else "skipped_by_policy",
                             "protocol": protocol,
@@ -810,7 +955,8 @@ def run_sparsevllm_probe(
                         print(
                             f"  Iter {it + 1}/{args.num_iters}: TTFT={ttft_ms:.1f}ms | "
                             f"TPOT={tpot_ms if tpot_ms is not None else 'n/a'}ms | "
-                            f"Output={total_output / elapsed_s:.1f} tok/s"
+                            f"Prefill={phase_metrics['prefill_token_throughput_tps']:.1f} tok/s | "
+                            f"Decode={phase_metrics['decode_token_throughput_tps'] or 0.0:.1f} tok/s"
                         )
                 finally:
                     hardware_summary = monitor.stop()
@@ -820,9 +966,6 @@ def run_sparsevllm_probe(
                 ttft_vals = [r["ttft_ms"] for r in iter_records]
                 tpot_vals = [r["tpot_ms"] for r in iter_records if r["tpot_ms"] is not None]
                 request_rates = [r["request_throughput_rps"] for r in iter_records]
-                input_rates = [r["input_token_throughput_tps"] for r in iter_records]
-                output_rates = [r["output_token_throughput_tps"] for r in iter_records]
-                total_rates = [r["total_token_throughput_tps"] for r in iter_records]
                 prompt_lengths = [
                     length for record in iter_records for length in record["trace"]["prompt_lengths"]
                 ]
@@ -847,9 +990,7 @@ def run_sparsevllm_probe(
                     "ttft_ms_p99": round(_percentile(ttft_vals, 0.99), 2),
                     "tpot_ms_mean": round(statistics.fmean(tpot_vals), 2) if tpot_vals else None,
                     "request_throughput_rps": statistics.fmean(request_rates),
-                    "input_token_throughput_tps": statistics.fmean(input_rates),
-                    "output_token_throughput_tps": statistics.fmean(output_rates),
-                    "total_token_throughput_tps": statistics.fmean(total_rates),
+                    **_mean_phase_throughput_metrics(iter_records),
                     "sequence_replacements": 0,
                     "status": "success",
                     "protocol": protocol,
@@ -1058,6 +1199,15 @@ def run_sparsevllm_churn(
 
                             total_input = sum(request.prompt_len for request in trace)
                             total_output = sum(request.output_len for request in trace)
+                            phase_metrics = _phase_throughput_metrics(
+                                total_input_tokens=total_input,
+                                total_output_tokens=total_output,
+                                request_count=request_count,
+                                prefill_elapsed_s=max(first_token_times.values()) - started,
+                                decode_elapsed_s=(
+                                    max(finished_times.values()) - min(first_token_times.values())
+                                ),
+                            )
                             profiler_snap = profiler.snapshot()
                             record = {
                                 "engine": "sparsevllm",
@@ -1080,9 +1230,12 @@ def run_sparsevllm_churn(
                                     _decode_graph_counter_delta(graph_before, graph_after)
                                 ),
                                 "request_throughput_rps": request_count / elapsed_s,
-                                "input_token_throughput_tps": total_input / elapsed_s,
-                                "output_token_throughput_tps": total_output / elapsed_s,
-                                "total_token_throughput_tps": (total_input + total_output) / elapsed_s,
+                                **phase_metrics,
+                                "decode_metric_status": (
+                                    "success"
+                                    if phase_metrics["decode_token_throughput_tps"] is not None
+                                    else "skipped_by_policy"
+                                ),
                                 "profiler_breakdown": profiler_snap,
                                 "profiler_status": "success" if profiler_snap else "skipped_by_policy",
                                 "protocol": protocol,
@@ -1147,21 +1300,16 @@ def run_sparsevllm_churn(
                             "request_throughput_rps": statistics.fmean(
                                 record["request_throughput_rps"] for record in iter_records
                             ),
-                            "input_token_throughput_tps": statistics.fmean(
-                                record["input_token_throughput_tps"] for record in iter_records
-                            ),
-                            "output_token_throughput_tps": statistics.fmean(
-                                record["output_token_throughput_tps"] for record in iter_records
-                            ),
-                            "total_token_throughput_tps": statistics.fmean(
-                                record["total_token_throughput_tps"] for record in iter_records
-                            ),
+                            **_mean_phase_throughput_metrics(iter_records),
                             "ttft_ms_mean": statistics.fmean(ttfts),
                             "ttft_ms_p50": _percentile(ttfts, 0.50),
                             "ttft_ms_p99": _percentile(ttfts, 0.99),
                             "latency_ms_p50": _percentile(latencies, 0.50),
                             "latency_ms_p99": _percentile(latencies, 0.99),
                             "tpot_ms_mean": statistics.fmean(tpots) if tpots else None,
+                            "decode_metric_status": (
+                                "success" if tpots else "skipped_by_policy"
+                            ),
                             "status": "success",
                             "protocol": protocol,
                             "protocol_label": protocol_label,
@@ -1276,8 +1424,16 @@ def run_vllm_probe(
                             raise RuntimeError(f"vLLM returned {len(outputs)} outputs for batch_size={bs}.")
 
                         ttft_ms, tpot_ms = _vllm_phase_metrics(outputs, o_len)
+                        prefill_elapsed_s, decode_elapsed_s = _vllm_batch_phase_seconds(outputs)
                         total_input = sum(request.prompt_len for request in trace)
                         total_output = sum(request.output_len for request in trace)
+                        phase_metrics = _phase_throughput_metrics(
+                            total_input_tokens=total_input,
+                            total_output_tokens=total_output,
+                            request_count=bs,
+                            prefill_elapsed_s=prefill_elapsed_s,
+                            decode_elapsed_s=decode_elapsed_s,
+                        )
                         rec = {
                             "engine": "vllm",
                             "sparse_method": "vanilla",
@@ -1291,9 +1447,7 @@ def run_vllm_probe(
                             "ttft_ms": round(ttft_ms, 2),
                             "tpot_ms": None if tpot_ms is None else round(tpot_ms, 2),
                             "request_throughput_rps": bs / elapsed_s,
-                            "input_token_throughput_tps": total_input / elapsed_s,
-                            "output_token_throughput_tps": total_output / elapsed_s,
-                            "total_token_throughput_tps": (total_input + total_output) / elapsed_s,
+                            **phase_metrics,
                             "decode_metric_status": "success" if tpot_ms is not None else "skipped_by_policy",
                             "protocol_label": "vllm-vanilla",
                             "trace": trace_metadata(trace),
@@ -1316,7 +1470,8 @@ def run_vllm_probe(
                         print(
                             f"  Iter {it + 1}/{args.num_iters}: TTFT={ttft_ms:.1f}ms | "
                             f"TPOT={tpot_ms if tpot_ms is not None else 'n/a'}ms | "
-                            f"Output={total_output / elapsed_s:.1f} tok/s"
+                            f"Prefill={phase_metrics['prefill_token_throughput_tps']:.1f} tok/s | "
+                            f"Decode={phase_metrics['decode_token_throughput_tps'] or 0.0:.1f} tok/s"
                         )
                 finally:
                     hardware_summary = monitor.stop()
@@ -1325,9 +1480,6 @@ def run_vllm_probe(
                 ttft_vals = [r["ttft_ms"] for r in iter_records]
                 tpot_vals = [r["tpot_ms"] for r in iter_records if r["tpot_ms"] is not None]
                 request_rates = [r["request_throughput_rps"] for r in iter_records]
-                input_rates = [r["input_token_throughput_tps"] for r in iter_records]
-                output_rates = [r["output_token_throughput_tps"] for r in iter_records]
-                total_rates = [r["total_token_throughput_tps"] for r in iter_records]
                 prompt_lengths = [
                     length for record in iter_records for length in record["trace"]["prompt_lengths"]
                 ]
@@ -1352,9 +1504,7 @@ def run_vllm_probe(
                     "ttft_ms_p99": round(_percentile(ttft_vals, 0.99), 2),
                     "tpot_ms_mean": round(statistics.fmean(tpot_vals), 2) if tpot_vals else None,
                     "request_throughput_rps": statistics.fmean(request_rates),
-                    "input_token_throughput_tps": statistics.fmean(input_rates),
-                    "output_token_throughput_tps": statistics.fmean(output_rates),
-                    "total_token_throughput_tps": statistics.fmean(total_rates),
+                    **_mean_phase_throughput_metrics(iter_records),
                     "sequence_replacements": 0,
                     "status": "success",
                     "decode_metric_status": "success" if tpot_vals else "skipped_by_policy",
@@ -1521,6 +1671,16 @@ def run_vllm_churn(
 
                             total_input = sum(request.prompt_len for request in trace)
                             total_output = sum(request.output_len for request in trace)
+                            prefill_elapsed_s, decode_elapsed_s = _vllm_batch_phase_seconds(
+                                outputs
+                            )
+                            phase_metrics = _phase_throughput_metrics(
+                                total_input_tokens=total_input,
+                                total_output_tokens=total_output,
+                                request_count=request_count,
+                                prefill_elapsed_s=prefill_elapsed_s,
+                                decode_elapsed_s=decode_elapsed_s,
+                            )
                             record = {
                                 "engine": "vllm",
                                 "sparse_method": "vanilla",
@@ -1534,9 +1694,12 @@ def run_vllm_churn(
                                 "status": "success",
                                 "elapsed_s": elapsed_s,
                                 "request_throughput_rps": request_count / elapsed_s,
-                                "input_token_throughput_tps": total_input / elapsed_s,
-                                "output_token_throughput_tps": total_output / elapsed_s,
-                                "total_token_throughput_tps": (total_input + total_output) / elapsed_s,
+                                **phase_metrics,
+                                "decode_metric_status": (
+                                    "success"
+                                    if phase_metrics["decode_token_throughput_tps"] is not None
+                                    else "skipped_by_policy"
+                                ),
                                 "protocol_label": "vllm-vanilla",
                                 "trace": trace_metadata(trace),
                                 "request_results": request_results,
@@ -1598,21 +1761,16 @@ def run_vllm_churn(
                             "request_throughput_rps": statistics.fmean(
                                 record["request_throughput_rps"] for record in iter_records
                             ),
-                            "input_token_throughput_tps": statistics.fmean(
-                                record["input_token_throughput_tps"] for record in iter_records
-                            ),
-                            "output_token_throughput_tps": statistics.fmean(
-                                record["output_token_throughput_tps"] for record in iter_records
-                            ),
-                            "total_token_throughput_tps": statistics.fmean(
-                                record["total_token_throughput_tps"] for record in iter_records
-                            ),
+                            **_mean_phase_throughput_metrics(iter_records),
                             "ttft_ms_mean": statistics.fmean(ttfts),
                             "ttft_ms_p50": _percentile(ttfts, 0.50),
                             "ttft_ms_p99": _percentile(ttfts, 0.99),
                             "latency_ms_p50": _percentile(latencies, 0.50),
                             "latency_ms_p99": _percentile(latencies, 0.99),
                             "tpot_ms_mean": statistics.fmean(tpots) if tpots else None,
+                            "decode_metric_status": (
+                                "success" if tpots else "skipped_by_policy"
+                            ),
                             "status": "success",
                             "protocol_label": "vllm-vanilla",
                             "actual_hardware_metrics": hardware,
@@ -1813,6 +1971,11 @@ def main():
             "prefix_caching_enabled": False,
             "cross_engine_trace_contract": "same seed, token IDs, and per-request lengths",
             "iteration_prompt_reuse_allowed": False,
+            "phase_throughput_contract": (
+                "prefill: prompt tokens / submission-to-last-first-token window; "
+                "decode: generated tokens after each first token / "
+                "first-first-token-to-last-completion window"
+            ),
         },
         "model_specs": {
             "hidden_size": model_specs.hidden_size,

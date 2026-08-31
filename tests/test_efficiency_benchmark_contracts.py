@@ -15,7 +15,9 @@ from benchmark.efficiency.bench_probe import (
     _physical_gpu_metadata,
     _decode_graph_counter_delta,
     _record_batch_first_tokens,
+    _phase_throughput_metrics,
     _resolve_sparse_probe_protocol,
+    _vllm_batch_phase_seconds,
     _vllm_phase_metrics,
     _vllm_request_phase_seconds,
 )
@@ -321,6 +323,60 @@ def test_vllm_single_token_request_has_no_tpot():
     assert tpot_ms is None
 
 
+def test_phase_throughput_uses_separate_prefill_and_decode_windows():
+    metrics = _phase_throughput_metrics(
+        total_input_tokens=200,
+        total_output_tokens=10,
+        request_count=2,
+        prefill_elapsed_s=0.5,
+        decode_elapsed_s=0.2,
+    )
+
+    assert metrics["prefill_token_count"] == 200
+    assert metrics["decode_token_count"] == 8
+    assert metrics["prefill_token_throughput_tps"] == pytest.approx(400.0)
+    assert metrics["decode_token_throughput_tps"] == pytest.approx(40.0)
+
+
+def test_phase_throughput_allows_ttft_only_workload():
+    metrics = _phase_throughput_metrics(
+        total_input_tokens=200,
+        total_output_tokens=2,
+        request_count=2,
+        prefill_elapsed_s=0.5,
+        decode_elapsed_s=0.0,
+    )
+
+    assert metrics["prefill_token_throughput_tps"] == pytest.approx(400.0)
+    assert metrics["decode_token_count"] == 0
+    assert metrics["decode_elapsed_s"] is None
+    assert metrics["decode_token_throughput_tps"] is None
+
+
+def test_vllm_batch_phase_windows_span_request_events():
+    outputs = [
+        SimpleNamespace(
+            metrics=SimpleNamespace(
+                arrival_time=10.0,
+                first_token_time=10.2,
+                finished_time=10.5,
+            )
+        ),
+        SimpleNamespace(
+            metrics=SimpleNamespace(
+                arrival_time=10.0,
+                first_token_time=10.3,
+                finished_time=10.6,
+            )
+        ),
+    ]
+
+    prefill_s, decode_s = _vllm_batch_phase_seconds(outputs)
+
+    assert prefill_s == pytest.approx(0.3)
+    assert decode_s == pytest.approx(0.4)
+
+
 def test_vllm_v1_phase_metrics_use_latency_and_monotonic_timestamps():
     ttft_s, decode_s, source = _vllm_request_phase_seconds(
         SimpleNamespace(
@@ -607,7 +663,7 @@ def test_churn_summary_is_compared_to_matched_fixed_batch():
             "prompt_len": 100,
             "output_len": 16,
             "concurrency": 4,
-            "output_token_throughput_tps": 100.0,
+            "decode_token_throughput_tps": 100.0,
             "request_throughput_rps": 10.0,
             "ttft_ms_p99": 20.0,
         },
@@ -619,7 +675,7 @@ def test_churn_summary_is_compared_to_matched_fixed_batch():
             "prompt_len": 100,
             "output_len": 16,
             "concurrency": 4,
-            "output_token_throughput_tps": 80.0,
+            "decode_token_throughput_tps": 80.0,
             "request_throughput_rps": 8.0,
             "ttft_ms_p99": 50.0,
         },
@@ -628,7 +684,7 @@ def test_churn_summary_is_compared_to_matched_fixed_batch():
     _attach_churn_comparisons(rows)
 
     assert rows[1]["fixed_batch_comparison_status"] == "success"
-    assert rows[1]["churn_output_tps_ratio_vs_fixed_batch"] == pytest.approx(0.8)
+    assert rows[1]["churn_decode_tps_ratio_vs_fixed_batch"] == pytest.approx(0.8)
     assert rows[1]["churn_ttft_p99_delta_ms_vs_fixed_batch"] == pytest.approx(30.0)
 
 
@@ -642,22 +698,53 @@ def test_saturation_metrics_use_observed_concurrency_ladder():
             "prompt_len": 100,
             "output_len": 16,
             "concurrency": concurrency,
-            "output_token_throughput_tps": rate,
+            "decode_token_throughput_tps": rate,
         }
         for concurrency, rate in ((1, 100.0), (4, 300.0), (8, 310.0))
     ]
 
     _attach_saturation_metrics(rows)
 
-    assert rows[0]["output_tps_pct_of_observed_sweep_peak"] == pytest.approx(
+    assert rows[0]["decode_tps_pct_of_observed_sweep_peak"] == pytest.approx(
         100.0 / 310.0 * 100.0
     )
-    assert rows[1]["output_tps_scaling_efficiency_pct_vs_min_concurrency"] == pytest.approx(75.0)
-    assert rows[2]["marginal_output_tps_gain_pct_vs_previous_concurrency"] == pytest.approx(
+    assert rows[1]["decode_tps_scaling_efficiency_pct_vs_min_concurrency"] == pytest.approx(75.0)
+    assert rows[2]["marginal_decode_tps_gain_pct_vs_previous_concurrency"] == pytest.approx(
         (310.0 / 300.0 - 1.0) * 100.0
     )
-    assert rows[2]["observed_output_saturation_concurrency"] == 4
+    assert rows[2]["observed_decode_saturation_concurrency"] == 4
     assert all(row["saturation_analysis_status"] == "success" for row in rows)
+
+
+def test_decode_comparisons_skip_ttft_only_workload():
+    rows = [
+        {
+            "engine": "sparsevllm",
+            "sparse_method": "vanilla",
+            "protocol_label": "sparsevllm-vanilla",
+            "scenario": scenario,
+            "prompt_len": 100,
+            "output_len": 1,
+            "concurrency": 4,
+            "decode_token_throughput_tps": None,
+            "request_throughput_rps": request_rate,
+            "ttft_ms_p99": ttft,
+        }
+        for scenario, request_rate, ttft in (
+            ("fixed_batch", 10.0, 20.0),
+            ("oversubscribed_churn", 8.0, 50.0),
+        )
+    ]
+
+    _attach_churn_comparisons(rows)
+    _attach_saturation_metrics(rows)
+
+    assert rows[1]["fixed_batch_comparison_status"] == "success"
+    assert rows[1]["churn_decode_tps_comparison_status"] == "skipped_by_policy"
+    assert rows[1]["churn_decode_tps_ratio_vs_fixed_batch"] is None
+    assert rows[1]["churn_request_rps_ratio_vs_fixed_batch"] == pytest.approx(0.8)
+    assert all(row["saturation_analysis_status"] == "skipped_by_policy" for row in rows)
+    assert all(row["decode_tps_pct_of_observed_sweep_peak"] is None for row in rows)
 
 
 def test_longbench_scorer_rejects_missing_status(tmp_path):
@@ -720,11 +807,11 @@ def _write_valid_suite_fixture(root: Path, systems: list[str]) -> None:
                     "concurrency": 2,
                     "request_count": 2,
                     "request_throughput_rps": 2.0,
-                    "input_token_throughput_tps": 200.0,
-                    "output_token_throughput_tps": 32.0,
-                    "total_token_throughput_tps": 232.0,
-                    "output_tps_pct_of_observed_sweep_peak": 100.0,
-                    "output_tps_scaling_efficiency_pct_vs_min_concurrency": 100.0,
+                    "prefill_token_throughput_tps": 200.0,
+                    "decode_token_throughput_tps": 30.0,
+                    "decode_metric_status": "success",
+                    "decode_tps_pct_of_observed_sweep_peak": 100.0,
+                    "decode_tps_scaling_efficiency_pct_vs_min_concurrency": 100.0,
                     "saturation_analysis_status": "skipped_by_policy",
                     "actual_hardware_metrics": hardware,
                 }
@@ -734,6 +821,7 @@ def _write_valid_suite_fixture(root: Path, systems: list[str]) -> None:
                     "output_len_min": 12,
                     "request_count": 8,
                     "fixed_batch_comparison_status": "success",
+                    "churn_decode_tps_comparison_status": "success",
                 }
                 (system_dir / "summary.json").write_text(
                     json.dumps({"status": "success", "summary": [fixed, churn]})
@@ -882,6 +970,37 @@ def test_unified_suite_validator_rejects_any_failed_system(tmp_path):
 
     assert report["status"] == "failed"
     assert any("failed stage scenario_a_synthetic/vllm-vanilla" in error for error in report["errors"])
+
+
+def test_unified_suite_validator_accepts_ttft_only_probe(tmp_path):
+    systems = ["svllm-vanilla"]
+    _write_valid_suite_fixture(tmp_path, systems)
+    system_dir = tmp_path / "scenario_a_synthetic/svllm-vanilla"
+    summary_path = system_dir / "summary.json"
+    summary = json.loads(summary_path.read_text())
+    for row in summary["summary"]:
+        row["output_len"] = 1
+        row["output_len_min"] = 1
+        row["output_len_max"] = 1
+        row["decode_token_throughput_tps"] = None
+        row["decode_metric_status"] = "skipped_by_policy"
+        row["decode_tps_pct_of_observed_sweep_peak"] = None
+        row["decode_tps_scaling_efficiency_pct_vs_min_concurrency"] = None
+        row["saturation_analysis_status"] = "skipped_by_policy"
+        if row["scenario"] == "oversubscribed_churn":
+            row["churn_decode_tps_comparison_status"] = "skipped_by_policy"
+    summary_path.write_text(json.dumps(summary) + "\n")
+
+    raw_path = system_dir / "raw_samples.jsonl"
+    raw_rows = [json.loads(line) for line in raw_path.read_text().splitlines()]
+    for row in raw_rows:
+        row["output_len"] = 1
+        row["trace"]["output_lengths"] = [1, 1]
+    raw_path.write_text("".join(json.dumps(row) + "\n" for row in raw_rows))
+
+    report = validate_suite(tmp_path, systems, ["task"], 1)
+
+    assert report["status"] == "success", report["errors"]
 
 
 def test_longbench_worker_outputs_merge_without_shared_append(tmp_path):
