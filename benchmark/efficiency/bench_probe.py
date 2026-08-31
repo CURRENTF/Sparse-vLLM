@@ -483,6 +483,7 @@ def _resolve_sparse_probe_protocol(
 ) -> tuple[dict[str, Any], int | None, dict[str, Any], str]:
     hyper_params = _parse_json_arg(args.hyper_params)
     hyper_params.setdefault("tensor_parallel_size", args.tensor_parallel_size)
+    hyper_params.setdefault("expert_parallel_size", getattr(args, "expert_parallel_size", 1))
     hyper_params.setdefault("gpu_memory_utilization", args.gpu_memory_utilization)
     hyper_params.setdefault("decode_graph", True)
     hyper_params.setdefault("max_num_batched_tokens", args.max_num_batched_tokens)
@@ -567,12 +568,14 @@ def _format_markdown_report(
     summary_rows: list[dict[str, Any]],
     model_name: str,
     tp_size: int,
+    ep_size: int,
 ) -> str:
     lines = [
         "# Standardized LLM Efficiency Benchmark Report",
         "",
         f"- **Model**: `{model_name}`",
         f"- **Tensor parallel size**: `{tp_size}`",
+        f"- **Expert parallel size**: `{ep_size}`",
         "- **GPU metrics**: directly sampled activity; no theoretical MFU/MBU estimates",
         f"- **Timestamp**: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`",
         "",
@@ -1656,6 +1659,12 @@ def parse_args():
     )
     parser.add_argument("--tensor-parallel-size", type=int, default=2)
     parser.add_argument(
+        "--expert-parallel-size",
+        type=int,
+        default=1,
+        help="Sparse-vLLM expert parallel size.",
+    )
+    parser.add_argument(
         "--max-num-batched-tokens",
         type=int,
         default=8192,
@@ -1705,12 +1714,14 @@ def main():
             raise ValueError(f"--{name.replace('_', '-')} requires positive integers, got {values}.")
     if (
         args.tensor_parallel_size <= 0
+        or args.expert_parallel_size <= 0
         or args.max_num_batched_tokens <= 0
         or args.num_warmups < 0
         or args.num_iters <= 0
     ):
         raise ValueError(
-            "tensor parallel size, max batched tokens, and iterations must be positive, "
+            "tensor parallel size, expert parallel size, max batched tokens, "
+            "and iterations must be positive, "
             "and warmups must be non-negative."
         )
     if not 0.0 <= args.prompt_length_jitter < 1.0:
@@ -1857,6 +1868,7 @@ def main():
         summary_rows,
         Path(args.model_path).name,
         args.tensor_parallel_size,
+        args.expert_parallel_size,
     )
     with open(output_dir / "comparison_report.md", "w", encoding="utf-8") as f:
         f.write(md_report)

@@ -48,6 +48,8 @@ def test_probe_cli_parser_builds_with_new_workload_options(monkeypatch):
             "all",
             "--batch-sizes",
             "1,4",
+            "--expert-parallel-size",
+            "4",
         ],
     )
 
@@ -55,6 +57,7 @@ def test_probe_cli_parser_builds_with_new_workload_options(monkeypatch):
 
     assert args.scenario == "all"
     assert args.batch_sizes == [1, 4]
+    assert args.expert_parallel_size == 4
     assert args.churn_request_multiplier == 4
 
 
@@ -79,6 +82,7 @@ def test_fixed_probe_sets_engine_capacity_from_largest_batch_size(
         output_dir=str(tmp_path),
         hyper_params="{}",
         tensor_parallel_size=1,
+        expert_parallel_size=1,
         gpu_memory_utilization=0.8,
         max_num_batched_tokens=8192,
         model_path="model",
@@ -96,6 +100,7 @@ def test_fixed_probe_sets_engine_capacity_from_largest_batch_size(
     assert captured["max_num_seqs_in_batch"] == 16
     assert captured["max_decoding_seqs"] == 16
     assert captured["max_num_seqs_in_gpu"] == 16
+    assert captured["expert_parallel_size"] == 1
 
 
 def test_physical_gpu_metadata_uses_nvidia_smi_without_cuda_init(monkeypatch):
