@@ -29,6 +29,7 @@ from sparsevllm.layers.linear import (
 from sparsevllm.layers.mla_attention import MLAAttention
 from sparsevllm.layers.packed_moe import PackedMoeExperts
 from sparsevllm.layers.rotary_embedding import RotaryEmbedding, get_rope
+from sparsevllm.kernels.triton.glm_mla_decode import fuse_glm_mla_decode_rope
 from sparsevllm.method_registry import sparse_decode_attention_score_kind
 from sparsevllm.operators.attention_capabilities import AttentionScoreKind
 from sparsevllm.models.qwen3 import Qwen3MLP
@@ -259,13 +260,23 @@ class Glm4MoeLiteAttention(nn.Module):
             dim=-1,
         )
         latent = self.kv_a_layernorm(latent)
-        q_rope, k_rope = rotary_emb(
-            positions,
-            q_rope,
-            k_rope.unsqueeze(1),
-        )
-        k_rope = k_rope.squeeze(1)
-        q = torch.cat((q_nope, q_rope), dim=-1)
+        if get_context().is_prefill:
+            q_rope, k_rope = rotary_emb(
+                positions,
+                q_rope,
+                k_rope.unsqueeze(1),
+            )
+            k_rope = k_rope.squeeze(1)
+            q = torch.cat((q_nope, q_rope), dim=-1)
+        else:
+            q, k_rope = fuse_glm_mla_decode_rope(
+                q_nope,
+                q_rope,
+                k_rope,
+                positions,
+                rotary_emb.cos_sin_cache,
+            )
+            q_rope = q[..., self.qk_nope_head_dim :]
         value_output = self.mla_attention.run_cached_attention(
             q,
             q_nope,

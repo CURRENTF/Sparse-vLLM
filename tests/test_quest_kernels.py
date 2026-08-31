@@ -3,9 +3,11 @@ from __future__ import annotations
 import pytest
 import torch
 
+from sparsevllm.layers.rotary_embedding import RotaryEmbedding
 from sparsevllm.kernels.external.flashinfer.topk import (
     flashinfer_top_k_page_table_transform_support,
 )
+from sparsevllm.kernels.triton.glm_mla_decode import fuse_glm_mla_decode_rope
 from sparsevllm.kernels.triton.mla.copy_latent import (
     copy_latent_to_cache_with_quest_metadata,
 )
@@ -35,6 +37,78 @@ CUDA_REQUIRED = pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="CUDA is required for QuEST kernel tests",
 )
+
+
+@CUDA_REQUIRED
+def test_glm_mla_decode_rope_fusion_matches_reference_and_graph() -> None:
+    """Catches decode-only RoPE layout or precision drift in the fused query."""
+
+    torch.manual_seed(20260831)
+    batch_size, num_heads = 4, 10
+    q_nope = torch.randn(
+        batch_size,
+        num_heads,
+        192,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    q_rope = torch.randn(
+        batch_size,
+        num_heads,
+        64,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k_rope = torch.randn(
+        batch_size,
+        64,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    positions = torch.tensor(
+        [32768, 32769, 32770, 32771],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    rotary = RotaryEmbedding(
+        64,
+        64,
+        33000,
+        1_000_000.0,
+        backend="torch",
+        interleaved=True,
+    ).to("cuda")
+
+    expected_q_rope, expected_k = rotary(
+        positions,
+        q_rope,
+        k_rope.unsqueeze(1),
+    )
+    expected_q = torch.cat((q_nope, expected_q_rope), dim=-1)
+    expected_k = expected_k.squeeze(1)
+    actual_q, actual_k = fuse_glm_mla_decode_rope(
+        q_nope,
+        q_rope,
+        k_rope,
+        positions,
+        rotary.cos_sin_cache,
+    )
+    torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=0)
+    torch.testing.assert_close(actual_k, expected_k, rtol=0, atol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_q, captured_k = fuse_glm_mla_decode_rope(
+            q_nope,
+            q_rope,
+            k_rope,
+            positions,
+            rotary.cos_sin_cache,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured_q, expected_q, rtol=0, atol=0)
+    torch.testing.assert_close(captured_k, expected_k, rtol=0, atol=0)
 
 
 def _stable_small_index_topk(
