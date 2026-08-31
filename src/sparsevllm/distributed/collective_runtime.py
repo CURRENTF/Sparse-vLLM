@@ -364,6 +364,22 @@ class ParallelCollectiveRuntime:
                 f"registered, got state={self.state.value}."
             )
 
+    def reset_for_cuda_graph_recapture(self) -> None:
+        if self.state is not ParallelCollectiveState.REPLAYABLE:
+            raise RuntimeError(
+                "Parallel collective runtime can reset only after a complete CUDA "
+                f"Graph lifecycle, got state={self.state.value}."
+            )
+        for binding in reversed(self._bindings):
+            if binding.op is not None:
+                binding.op.close()
+                binding.op = None
+            binding.local_metadata = None
+            binding.local_metadata_summary = None
+            binding.gathered_metadata = None
+        self.state = ParallelCollectiveState.OPEN
+        self.prepare()
+
     def close(self) -> None:
         if self.state is ParallelCollectiveState.CLOSED:
             return

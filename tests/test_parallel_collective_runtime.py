@@ -249,6 +249,43 @@ def test_cuda_graph_replay_is_blocked_until_registration_finishes():
     op.register_cuda_graph_buffers.assert_called_once_with([None, None])
 
 
+def test_completed_collectives_can_reset_for_production_graph_recapture():
+    world = _group((0, 1), process_group=object())
+    context = _context(world=world, attention=world)
+    runtime = ParallelCollectiveRuntime(context, cuda_graph=True, device_index=0)
+    handle = runtime.request_decode_collectives(
+        attention_max_rows=8,
+        moe_max_rows=8,
+        hidden_size=128,
+        dtype=torch.float16,
+    ).attention
+    profiling_op = _prepared_op("profiling")
+    production_op = _prepared_op("production")
+    with patch(
+        "sparsevllm.distributed.collective_runtime.prepare_parallel_all_reduce",
+        side_effect=(profiling_op, production_op),
+    ) as prepare:
+        runtime.prepare()
+        runtime.begin_cuda_graph_capture()
+        runtime.collect_local_cuda_graph_metadata()
+        with patch.object(
+            runtime,
+            "_all_gather_object",
+            side_effect=lambda local, group: [local] * group.size,
+        ):
+            runtime.exchange_cuda_graph_metadata()
+        runtime.register_cuda_graph_buffers()
+        runtime.mark_cuda_graph_replayable()
+
+        runtime.reset_for_cuda_graph_recapture()
+
+    assert runtime.state is ParallelCollectiveState.PREPARED
+    assert handle.name == "production"
+    assert prepare.call_count == 2
+    profiling_op.close.assert_called_once_with()
+    production_op.close.assert_not_called()
+
+
 def test_handle_uses_plain_collective_for_prefill_and_prepared_op_for_decode():
     world = _group((0, 1), process_group=object())
     context = _context(world=world, attention=world)
