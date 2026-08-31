@@ -67,7 +67,7 @@ class Config(
     mlp_chunk_size: int = 16384
     mla_prefill_workspace_bytes: int = 2 * 1024**3
     prefill_schedule_policy: str = PREFILL_POLICY_AUTO
-    gpu_memory_utilization: float = 0.8
+    gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     expert_parallel_size: int = 1
     data_parallel_size: int = 1
