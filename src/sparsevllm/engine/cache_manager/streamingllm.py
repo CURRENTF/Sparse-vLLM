@@ -15,8 +15,18 @@ class StreamingLLMCacheManager(SnapKVCacheManager):
     score-based top-k eviction.
     """
 
-    def __init__(self, config: Config, parallel_context: ParallelContext):
-        super().__init__(config, parallel_context)
+    def __init__(
+        self,
+        config: Config,
+        parallel_context: ParallelContext,
+        *,
+        allocation_budget_bytes: int | None = None,
+    ):
+        super().__init__(
+            config,
+            parallel_context,
+            allocation_budget_bytes=allocation_budget_bytes,
+        )
         # StreamingLLM applies the same prefix/recent window on every layer, so
         # decode metadata stays layer-uniform even after compaction.
         self._uniform_decode_metadata = True

@@ -33,8 +33,18 @@ class H2OCacheManager(SnapKVCacheManager):
     it on the same per-query mass scale.
     """
 
-    def __init__(self, config, parallel_context):
-        super().__init__(config, parallel_context)
+    def __init__(
+        self,
+        config,
+        parallel_context,
+        *,
+        allocation_budget_bytes: int | None = None,
+    ):
+        super().__init__(
+            config,
+            parallel_context,
+            allocation_budget_bytes=allocation_budget_bytes,
+        )
         self._h2o_scores: dict[tuple[int, int], torch.Tensor] = {}
         # Decode rows remain reclaimable while temporarily absent from a
         # scheduled batch. Keep only ids here: caching full Sequence objects

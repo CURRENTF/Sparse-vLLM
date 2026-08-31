@@ -82,8 +82,18 @@ class DeltaKVCacheManager(CacheManager):
                 return tuple(sorted(rope_scaling.items()))
         raise NotImplementedError(f"Unsupported DeltaKV cache RoPE scaling: {rope_scaling!r}.")
 
-    def __init__(self, config: Config, parallel_context: ParallelContext):
-        super().__init__(config, parallel_context)
+    def __init__(
+        self,
+        config: Config,
+        parallel_context: ParallelContext,
+        *,
+        allocation_budget_bytes: int | None = None,
+    ):
+        super().__init__(
+            config,
+            parallel_context,
+            allocation_budget_bytes=allocation_budget_bytes,
+        )
         assert self.tp_size == 1, "DeltaKVCacheManager currently does not support TP compressors"
 
         self.full_attention_layers = config.full_attention_layers

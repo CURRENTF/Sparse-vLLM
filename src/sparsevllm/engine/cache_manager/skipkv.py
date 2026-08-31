@@ -35,8 +35,18 @@ class SkipKVSequenceState:
 class SkipKVCacheManager(RKVCacheManager):
     """SkipKV sentence-aware KV storage skipping."""
 
-    def __init__(self, config: Config, parallel_context: ParallelContext):
-        super().__init__(config, parallel_context)
+    def __init__(
+        self,
+        config: Config,
+        parallel_context: ParallelContext,
+        *,
+        allocation_budget_bytes: int | None = None,
+    ):
+        super().__init__(
+            config,
+            parallel_context,
+            allocation_budget_bytes=allocation_budget_bytes,
+        )
         self._rkv_vectorized_prefill_query_cache = False
         self._rkv_batch_clear_query_cache_rows = False
         self._skipkv_delimiter_token_ids: set[int] = set()

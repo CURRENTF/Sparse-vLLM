@@ -14,9 +14,19 @@ from .snapkv import SnapKVCacheManager
 class RKVCacheManager(SnapKVCacheManager):
     """SnapKV-style physical cache with R-KV decode-time joint eviction scoring."""
 
-    def __init__(self, config: Config, parallel_context: ParallelContext):
+    def __init__(
+        self,
+        config: Config,
+        parallel_context: ParallelContext,
+        *,
+        allocation_budget_bytes: int | None = None,
+    ):
         self._rkv_query_cache_enabled = self._query_cache_needed_for_config(config)
-        super().__init__(config, parallel_context)
+        super().__init__(
+            config,
+            parallel_context,
+            allocation_budget_bytes=allocation_budget_bytes,
+        )
         self._rkv_observation_tokens = int(config.rkv_observation_tokens)
         self._rkv_vectorized_prefill_query_cache = True
         self._rkv_batch_clear_query_cache_rows = True

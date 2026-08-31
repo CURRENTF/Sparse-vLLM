@@ -86,8 +86,18 @@ class QuestDecodeGraphState(CacheDecodeGraphState):
 class QuestCacheManager(PrefixCacheMixin, CacheManager):
     """Paged KV cache + page metadata cache for QuEST."""
 
-    def __init__(self, config: Config, parallel_context: ParallelContext):
-        super().__init__(config, parallel_context)
+    def __init__(
+        self,
+        config: Config,
+        parallel_context: ParallelContext,
+        *,
+        allocation_budget_bytes: int | None = None,
+    ):
+        super().__init__(
+            config,
+            parallel_context,
+            allocation_budget_bytes=allocation_budget_bytes,
+        )
         self.page_size = int(config.quest_chunk_size)
         self.max_pages_per_row = (self.max_model_len + self.page_size - 1) // self.page_size
         self.page_offsets_i32 = torch.arange(self.page_size, dtype=torch.int32, device=self.device)

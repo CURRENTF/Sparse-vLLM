@@ -1,3 +1,9 @@
+from .capacity import (
+    KVCapacityPlan,
+    StartupMemoryProfile,
+    profiling_kv_budget_bytes,
+    profiling_kv_slots,
+)
 from .memory import (
     DeviceMemorySnapshot,
     MemoryProfileMeasurement,
@@ -6,6 +12,10 @@ from .memory import (
 
 __all__ = [
     "DeviceMemorySnapshot",
+    "KVCapacityPlan",
     "MemoryProfileMeasurement",
+    "StartupMemoryProfile",
+    "profiling_kv_budget_bytes",
+    "profiling_kv_slots",
     "release_unused_device_memory",
 ]

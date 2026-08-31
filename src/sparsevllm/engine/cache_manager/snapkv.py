@@ -111,8 +111,18 @@ def resolve_snapkv_cache_capacity(
 
 
 class SnapKVCacheManager(CacheManager):
-    def __init__(self, config: Config, parallel_context: ParallelContext):
-        super().__init__(config, parallel_context)
+    def __init__(
+        self,
+        config: Config,
+        parallel_context: ParallelContext,
+        *,
+        allocation_budget_bytes: int | None = None,
+    ):
+        super().__init__(
+            config,
+            parallel_context,
+            allocation_budget_bytes=allocation_budget_bytes,
+        )
         self.attention_cache_storage = (
             create_attention_cache_storage(
                 config,

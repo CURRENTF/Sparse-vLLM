@@ -92,8 +92,18 @@ def _complement_ranges(start: int, end: int, ranges: list[tuple[int, int]]) -> l
 
 class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
-    def __init__(self, config: Config, parallel_context: ParallelContext):
-        super().__init__(config, parallel_context)
+    def __init__(
+        self,
+        config: Config,
+        parallel_context: ParallelContext,
+        *,
+        allocation_budget_bytes: int | None = None,
+    ):
+        super().__init__(
+            config,
+            parallel_context,
+            allocation_budget_bytes=allocation_budget_bytes,
+        )
         self.attention_cache_storage = create_attention_cache_storage(
             config,
             num_kv_heads=self.num_kv_heads,

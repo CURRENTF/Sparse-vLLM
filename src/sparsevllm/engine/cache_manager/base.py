@@ -304,7 +304,13 @@ class CacheManager(ABC):
 
     validate_runtime_invariants = False
 
-    def __init__(self, config: Config, parallel_context: ParallelContext):
+    def __init__(
+        self,
+        config: Config,
+        parallel_context: ParallelContext,
+        *,
+        allocation_budget_bytes: int | None = None,
+    ):
         self.config = config
         self.validate_runtime_invariants = bool(
             getattr(config, "validate_runtime_invariants", False)
@@ -326,6 +332,19 @@ class CacheManager(ABC):
         if self.runtime_layout is None:
             raise ValueError("CacheManager requires config.runtime_layout.")
         self.num_kv_layers = int(self.runtime_layout.num_kv_layers)
+        self.allocation_budget_bytes = (
+            None
+            if allocation_budget_bytes is None
+            else int(allocation_budget_bytes)
+        )
+        if (
+            self.allocation_budget_bytes is not None
+            and self.allocation_budget_bytes <= 0
+        ):
+            raise ValueError(
+                "Cache allocation budget must be positive, got "
+                f"{self.allocation_budget_bytes}."
+            )
 
         layout_heads = tuple(getattr(self.runtime_layout, "kv_num_heads", ()))
         layout_dims = tuple(getattr(self.runtime_layout, "kv_head_dims", ()))
@@ -401,51 +420,67 @@ class CacheManager(ABC):
         return bool(torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
 
     @staticmethod
-    def create(config: Config, parallel_context: ParallelContext) -> "CacheManager":
+    def create(
+        config: Config,
+        parallel_context: ParallelContext,
+        *,
+        allocation_budget_bytes: int | None = None,
+    ) -> "CacheManager":
+        def create_manager(manager_cls):
+            return manager_cls(
+                config,
+                parallel_context,
+                allocation_budget_bytes=allocation_budget_bytes,
+            )
+
         sparse_method = normalize_sparse_method(config.sparse_method)
         if sparse_method not in SUPPORTED_SPARSE_METHODS:
             raise ValueError(f"Unsupported sparse_method={sparse_method!r}.")
         if sparse_method == "deltakv":
             from .deltakv_runtime import DeltaKVCacheManager
 
-            return DeltaKVCacheManager(config, parallel_context)
+            return create_manager(DeltaKVCacheManager)
         if sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
             from .streamingllm import StreamingLLMCacheManager
 
-            return StreamingLLMCacheManager(config, parallel_context)
+            return create_manager(StreamingLLMCacheManager)
         if sparse_method in ("snapkv", "pyramidkv"):
             from .snapkv import SnapKVCacheManager
 
-            return SnapKVCacheManager(config, parallel_context)
+            return create_manager(SnapKVCacheManager)
         if sparse_method == "h2o":
             from .h2o import H2OCacheManager
 
-            return H2OCacheManager(config, parallel_context)
+            return create_manager(H2OCacheManager)
         if sparse_method == "rkv":
             from .rkv import RKVCacheManager
 
-            return RKVCacheManager(config, parallel_context)
+            return create_manager(RKVCacheManager)
         if sparse_method == "skipkv":
             from .skipkv import SkipKVCacheManager
 
-            return SkipKVCacheManager(config, parallel_context)
+            return create_manager(SkipKVCacheManager)
         if sparse_method == "quest":
             from .quest import QuestCacheManager
 
-            return QuestCacheManager(config, parallel_context)
+            return create_manager(QuestCacheManager)
         if sparse_method == "omnikv":
             from .omnikv import OmniKVCacheManager
 
-            return OmniKVCacheManager(config, parallel_context)
+            return create_manager(OmniKVCacheManager)
 
         from .standard import StandardCacheManager
 
-        return StandardCacheManager(config, parallel_context)
+        return create_manager(StandardCacheManager)
 
     def _get_available_slots_info(self) -> tuple[int, int]:
         """返回 (可用显存字节数, 每层每 token 的字节数)"""
         config = self.config
         hf_config = config.hf_config
+        slot_bytes_per_layer = self.attention_cache_bytes_per_slot_per_layer()
+        if self.allocation_budget_bytes is not None:
+            return self.allocation_budget_bytes, slot_bytes_per_layer
+
         free, total = self.platform.get_available_memory(self.device.index or 0)
 
         # 动态估计 max_num_batched_tokens
@@ -554,8 +589,6 @@ class CacheManager(ABC):
             + current
             - recurrent_explicit_deduction
         )
-        slot_bytes_per_layer = self.attention_cache_bytes_per_slot_per_layer()
-
         recurrent_bytes_per_block = int(
             getattr(config, "prefix_recurrent_bytes_per_block", 0) or 0
         )
