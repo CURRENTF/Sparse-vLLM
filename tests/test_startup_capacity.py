@@ -9,6 +9,7 @@ from sparsevllm.engine.startup import (
     KVCapacityPlan,
     StartupMemoryProfile,
     profiling_kv_budget_bytes,
+    profiling_kv_slots,
     profiling_prefill_prompt_lengths,
 )
 from sparsevllm.models.layout import RuntimeLayout
@@ -42,6 +43,7 @@ def _config(*, sparse_method: str = ""):
         max_decoding_seqs=4,
         engine_prefill_chunk_size=8,
         max_model_len=32,
+        decode_graph_startup_capture=False,
     )
 
 
@@ -98,3 +100,10 @@ def test_prefill_profile_fills_token_chunk_and_batch_limits_together():
 
     assert lengths == (8, 6, 1, 1)
     assert sum(lengths) == 16
+
+
+def test_profiling_kv_slots_cover_runtime_steps_not_maximum_context():
+    config = _config()
+    config.max_model_len = 1_000_000
+
+    assert profiling_kv_slots(config) == 24

@@ -438,8 +438,10 @@ class ModelRunner:
             config,
             self.profiling_kv_slots,
         )
+        profiling_config = copy.copy(config)
+        profiling_config.startup_cache_phase = "profiling"
         self._build_cache_runtime(
-            copy.copy(config),
+            profiling_config,
             allocation_budget_bytes=self.profiling_kv_budget_bytes,
         )
         self.cache_runtime_phase = "profiling"

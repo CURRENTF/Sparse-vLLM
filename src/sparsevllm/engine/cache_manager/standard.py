@@ -230,7 +230,12 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             available_memory -= self.max_model_len * row_bytes_per_token
 
         self.config.num_kvcache_slots = available_memory // slot_bytes
-        if getattr(self, "max_model_len", None) is not None and self.config.num_kvcache_slots < self.max_model_len:
+        if (
+            getattr(self.config, "startup_cache_phase", "production")
+            != "profiling"
+            and getattr(self, "max_model_len", None) is not None
+            and self.config.num_kvcache_slots < self.max_model_len
+        ):
             raise RuntimeError(
                 "KV cache capacity is smaller than max_model_len after reserving runtime metadata: "
                 f"capacity={self.config.num_kvcache_slots} max_model_len={self.max_model_len}."

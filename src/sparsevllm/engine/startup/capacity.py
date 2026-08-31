@@ -81,7 +81,6 @@ def profiling_kv_slots(config) -> int:
     max_prefill_tokens = int(config.max_num_batched_tokens)
     max_prefill_batch = int(config.max_num_seqs_in_batch)
     required = max(
-        int(config.max_model_len),
         max_prefill_tokens + 2 * max_prefill_batch,
         3 * int(config.max_decoding_seqs),
     )
