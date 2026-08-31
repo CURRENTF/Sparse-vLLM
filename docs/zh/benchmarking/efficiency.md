@@ -246,9 +246,7 @@ run_efficiency_probe.sh SYSTEMS MODEL_NAME_OR_PATH PHYSICAL_GPU_IDS
   的首个生成 token，并用剩余生成 token 数除以“最早首 token 到最后完成”的
   wall-time 窗口。Churn workload 中 prefill/decode 交错执行，这两个阶段窗口可能重叠。
   当 `output_len=1` 时，probe 仍报告 TTFT 和 prefill throughput；decode throughput
-  及依赖它的比较指标标记为 `skipped_by_policy`。
-- Observed sweep saturation 只相对于当前并发度阶梯中的最佳 decode throughput，
-  不能证明已经达到绝对硬件饱和。
+  和 TPOT 标记为 `skipped_by_policy`。
 - GPU compute activity 和 memory I/O activity 直接来自 `nvidia-smi` 采样，不是
   理论 MFU/MBU、achieved FLOP/s 或 achieved HBM GB/s。
 - Coarse active duty 是 GPU utilization 大于 10% 的采样比例。它的补集不能把

@@ -221,17 +221,17 @@ for s in sys_names:
 def fmt(value, precision):
     return "n/a" if value is None else f"{float(value):.{precision}f}"
 
-print("\n" + "=" * 120)
+print("\n" + "=" * 140)
 print(f"MASTER STANDARDIZED EFFICIENCY COMPARISON REPORT ({base_out.name})")
-print("=" * 120)
-print(f"{'System':<16} | {'Scenario':<22} | {'Prompt':<12} | {'Out':<9} | {'Conc':<5} | {'Req/s':<9} | {'Prefill tps':<12} | {'Decode tps':<12} | {'Peak %':<7} | {'Scale %':<7} | {'TTFT p99':<10} | {'GPU act':<8} | {'Mem I/O':<8} | {'Peak VRAM':<10}")
-print("-" * 120)
+print("=" * 140)
+print(f"{'System':<16} | {'Scenario':<22} | {'Prompt':<12} | {'Out':<9} | {'Conc':<5} | {'Req/s':<9} | {'Prefill tps':<12} | {'Decode tps':<12} | {'TTFT p99':<10} | {'TPOT mean':<10} | {'GPU act':<8} | {'Mem I/O':<8} | {'Peak VRAM':<10}")
+print("-" * 140)
 for r in rows:
     label = f"{r.get('engine')}-{r.get('sparse_method')}"
     prompt_range = f"{r.get('prompt_len_min')}-{r.get('prompt_len_max')}"
     output_range = f"{r.get('output_len_min')}-{r.get('output_len_max')}"
-    print(f"{label:<16} | {r.get('scenario')!s:<22} | {prompt_range:<12} | {output_range:<9} | {r.get('concurrency')!s:<5} | {fmt(r.get('request_throughput_rps'), 2):<9} | {fmt(r.get('prefill_token_throughput_tps'), 1):<12} | {fmt(r.get('decode_token_throughput_tps'), 1):<12} | {fmt(r.get('decode_tps_pct_of_observed_sweep_peak'), 1):<7} | {fmt(r.get('decode_tps_scaling_efficiency_pct_vs_min_concurrency'), 1):<7} | {fmt(r.get('ttft_ms_p99'), 1):<10} | {fmt(r.get('gpu_compute_activity_pct_mean'), 1):<7}% | {fmt(r.get('gpu_memory_io_activity_pct_mean'), 1):<7}% | {fmt(r.get('peak_vram_gb_max'), 2):<8}GB")
-print("=" * 120 + "\n")
+    print(f"{label:<16} | {r.get('scenario')!s:<22} | {prompt_range:<12} | {output_range:<9} | {r.get('concurrency')!s:<5} | {fmt(r.get('request_throughput_rps'), 2):<9} | {fmt(r.get('prefill_token_throughput_tps'), 1):<12} | {fmt(r.get('decode_token_throughput_tps'), 1):<12} | {fmt(r.get('ttft_ms_p99'), 1):<10} | {fmt(r.get('tpot_ms_mean'), 2):<10} | {fmt(r.get('gpu_compute_activity_pct_mean'), 1):<7}% | {fmt(r.get('gpu_memory_io_activity_pct_mean'), 1):<7}% | {fmt(r.get('peak_vram_gb_max'), 2):<8}GB")
+print("=" * 140 + "\n")
 PY
 
 echo "Master Report and individual logs saved under: ${BASE_OUT}"

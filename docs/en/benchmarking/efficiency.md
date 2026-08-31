@@ -261,11 +261,8 @@ benchmark mode in this entrypoint.
   the remaining generated tokens by the wall-time window from the first first
   token through the last completion. In churn workloads these phase windows can
   overlap because prefill and decode are interleaved. With `output_len=1`, the
-  probe still reports TTFT and prefill throughput; decode throughput and its
-  dependent comparisons are `skipped_by_policy`.
-- Observed sweep saturation is relative to the best decode throughput in the
-  configured concurrency ladder. It is not proof of absolute hardware
-  saturation.
+  probe still reports TTFT and prefill throughput; decode throughput and TPOT
+  are `skipped_by_policy`.
 - GPU compute activity and memory I/O activity are directly sampled from
   `nvidia-smi`. They are not theoretical MFU/MBU, achieved FLOP/s, or achieved
   HBM GB/s.

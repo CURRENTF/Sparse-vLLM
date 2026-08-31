@@ -328,70 +328,6 @@ def _attach_churn_comparisons(rows: list[dict[str, Any]]) -> None:
         )
 
 
-def _attach_saturation_metrics(rows: list[dict[str, Any]]) -> None:
-    """Attach finite-concurrency-sweep scaling metrics without claiming a hard limit."""
-    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
-    for row in rows:
-        key = (
-            row.get("engine"),
-            row.get("sparse_method"),
-            row.get("protocol_label"),
-            row.get("scenario"),
-            row.get("prompt_len"),
-            row.get("output_len"),
-        )
-        groups.setdefault(key, []).append(row)
-
-    for group_rows in groups.values():
-        ordered = sorted(group_rows, key=lambda row: int(row["concurrency"]))
-        concurrencies = [int(row["concurrency"]) for row in ordered]
-        if len(concurrencies) != len(set(concurrencies)):
-            raise ValueError(
-                f"Saturation sweep contains duplicate concurrency values: {concurrencies}."
-            )
-        raw_rates = [row.get("decode_token_throughput_tps") for row in ordered]
-        if any(rate is None for rate in raw_rates):
-            for row in ordered:
-                row["saturation_analysis_status"] = "skipped_by_policy"
-                row["decode_tps_pct_of_observed_sweep_peak"] = None
-                row["decode_tps_scaling_efficiency_pct_vs_min_concurrency"] = None
-                row["marginal_decode_tps_gain_pct_vs_previous_concurrency"] = None
-                row["observed_decode_saturation_threshold_pct"] = None
-                row["observed_decode_saturation_concurrency"] = None
-            continue
-        rates = [float(rate) for rate in raw_rates]
-        if any(rate <= 0 for rate in rates):
-            raise ValueError(f"Saturation sweep throughput must be positive: {rates}.")
-
-        observed_peak = max(rates)
-        base_concurrency = concurrencies[0]
-        base_rate = rates[0]
-        saturation_concurrency = next(
-            concurrency
-            for concurrency, rate in zip(concurrencies, rates)
-            if rate >= 0.95 * observed_peak
-        )
-        analysis_status = "success" if len(ordered) > 1 else "skipped_by_policy"
-
-        for index, (row, concurrency, rate) in enumerate(
-            zip(ordered, concurrencies, rates)
-        ):
-            row["saturation_analysis_status"] = analysis_status
-            row["decode_tps_pct_of_observed_sweep_peak"] = (
-                rate / observed_peak * 100.0
-            )
-            row["decode_tps_scaling_efficiency_pct_vs_min_concurrency"] = (
-                (rate / base_rate) / (concurrency / base_concurrency) * 100.0
-            )
-            row["marginal_decode_tps_gain_pct_vs_previous_concurrency"] = (
-                None if index == 0 else (rate / rates[index - 1] - 1.0) * 100.0
-            )
-            row["observed_decode_saturation_threshold_pct"] = 95.0
-            row["observed_decode_saturation_concurrency"] = (
-                saturation_concurrency if analysis_status == "success" else None
-            )
-
-
 def _append_request_samples(
     output_dir: Path,
     *,
@@ -703,14 +639,11 @@ def _format_markdown_report(
         "- **GPU metrics**: directly sampled activity; no theoretical MFU/MBU estimates",
         f"- **Timestamp**: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`",
         "",
-        "| System / Method | Scenario | Prompt Range | Output Range | Concurrency | Req/s | Prefill tok/s | Decode tok/s | Observed decode peak | Decode scaling efficiency | TTFT p50/p99 (ms) | GPU compute activity | GPU memory I/O activity | Peak VRAM (GB) | Status |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        "| System / Method | Scenario | Prompt Range | Output Range | Concurrency | Req/s | Prefill tok/s | Decode tok/s | TTFT p50/p99 (ms) | TPOT mean (ms) | GPU compute activity | GPU memory I/O activity | Peak VRAM (GB) | Status |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
     ]
     def _number(value: Any, precision: int) -> str:
         return "n/a" if value is None else f"{float(value):.{precision}f}"
-
-    def _percentage(value: Any, precision: int) -> str:
-        return "n/a" if value is None else f"{float(value):.{precision}f}%"
 
     for r in summary_rows:
         fallback_label = f"{r['engine']}-{r.get('sparse_method', 'vanilla')}"
@@ -722,9 +655,8 @@ def _format_markdown_report(
             f"| {r['concurrency']} | {_number(r.get('request_throughput_rps'), 2)} "
             f"| {_number(r.get('prefill_token_throughput_tps'), 2)} "
             f"| {_number(r.get('decode_token_throughput_tps'), 2)} "
-            f"| {_percentage(r.get('decode_tps_pct_of_observed_sweep_peak'), 1)} "
-            f"| {_percentage(r.get('decode_tps_scaling_efficiency_pct_vs_min_concurrency'), 1)} "
             f"| {_number(r.get('ttft_ms_p50'), 2)}/{_number(r.get('ttft_ms_p99'), 2)} "
+            f"| {_number(r.get('tpot_ms_mean'), 2)} "
             f"| {_number(r.get('gpu_compute_activity_pct_mean'), 1)}% "
             f"| {_number(r.get('gpu_memory_io_activity_pct_mean'), 1)}% "
             f"| {_number(r.get('peak_vram_gb_max'), 2)} | {r.get('status', 'success')} |"
@@ -2006,7 +1938,6 @@ def main():
                 summary_rows.extend(run_vllm_probe(args, model_specs))
         args.scenario = requested_scenario
         _attach_churn_comparisons(summary_rows)
-        _attach_saturation_metrics(summary_rows)
     except Exception as exc:
         failure_status = "metric_failed" if isinstance(exc, HardwareMetricError) else "model_failed"
         failure = {

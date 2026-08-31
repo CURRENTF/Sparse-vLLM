@@ -283,35 +283,23 @@ def _validate_synthetic_rows(
                 errors.append(f"invalid {field} in synthetic row {system}[{index}]")
         decode_status = row.get("decode_metric_status")
         decode_tps = row.get("decode_token_throughput_tps")
+        tpot_ms = row.get("tpot_ms_mean")
         if decode_status == "success":
             if not isinstance(decode_tps, (int, float)) or float(decode_tps) <= 0:
                 errors.append(
                     f"invalid decode_token_throughput_tps in synthetic row {system}[{index}]"
                 )
+            if not isinstance(tpot_ms, (int, float)) or float(tpot_ms) <= 0:
+                errors.append(f"invalid tpot_ms_mean in synthetic row {system}[{index}]")
         elif decode_status == "skipped_by_policy":
             if decode_tps is not None:
                 errors.append(
                     f"decode throughput must be null when skipped in {system}[{index}]"
                 )
+            if tpot_ms is not None:
+                errors.append(f"TPOT must be null when skipped in {system}[{index}]")
         else:
             errors.append(f"invalid decode metric status in {system}[{index}]")
-        for field in (
-            "decode_tps_pct_of_observed_sweep_peak",
-            "decode_tps_scaling_efficiency_pct_vs_min_concurrency",
-        ):
-            value = row.get(field)
-            if decode_tps is None:
-                if value is not None:
-                    errors.append(
-                        f"{field} must be null without decode throughput in {system}[{index}]"
-                    )
-            elif not isinstance(value, (int, float)) or float(value) <= 0:
-                errors.append(f"invalid {field} in synthetic row {system}[{index}]")
-        if row.get("saturation_analysis_status") not in {
-            "success",
-            "skipped_by_policy",
-        }:
-            errors.append(f"missing saturation analysis status in {system}[{index}]")
         actual = row.get("actual_hardware_metrics")
         if not isinstance(actual, dict) or actual.get("metric_source") != "nvidia-smi sampled activity":
             errors.append(f"missing directly sampled hardware metrics in {system}[{index}]")
