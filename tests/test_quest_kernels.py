@@ -7,7 +7,10 @@ from sparsevllm.layers.rotary_embedding import RotaryEmbedding
 from sparsevllm.kernels.external.flashinfer.topk import (
     flashinfer_top_k_page_table_transform_support,
 )
-from sparsevllm.kernels.triton.glm_mla_decode import fuse_glm_mla_decode_rope
+from sparsevllm.kernels.triton.glm_mla_decode import (
+    fuse_glm_mla_decode_rope,
+    project_and_fuse_glm_mla_decode_rope,
+)
 from sparsevllm.kernels.triton.mla.copy_latent import (
     copy_latent_to_cache_with_quest_metadata,
 )
@@ -107,6 +110,80 @@ def test_glm_mla_decode_rope_fusion_matches_reference_and_graph() -> None:
         )
     graph.replay()
     torch.cuda.synchronize()
+    torch.testing.assert_close(captured_q, expected_q, rtol=0, atol=0)
+    torch.testing.assert_close(captured_k, expected_k, rtol=0, atol=0)
+
+
+@CUDA_REQUIRED
+def test_glm_mla_decode_projection_rope_matches_reference_and_graph() -> None:
+    torch.manual_seed(20260831)
+    rows, rank, heads, nope_dim, rope_dim = 4, 768, 10, 192, 64
+    q_lora = torch.randn(rows, rank, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(
+        heads * (nope_dim + rope_dim),
+        rank,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k_rope = torch.randn(rows, rope_dim, dtype=torch.bfloat16, device="cuda")
+    positions_storage = torch.tensor(
+        [32768, -1, 32769, -1, 32770, -1, 32771, -1],
+        device="cuda",
+    )
+    positions = positions_storage[::2]
+    assert positions.stride(0) == 2
+    rotary = RotaryEmbedding(
+        rope_dim,
+        rope_dim,
+        33000,
+        1_000_000.0,
+        backend="torch",
+        interleaved=True,
+    ).to("cuda")
+
+    def reference() -> tuple[torch.Tensor, torch.Tensor]:
+        raw = torch.nn.functional.linear(q_lora, weight).view(
+            rows,
+            heads,
+            nope_dim + rope_dim,
+        )
+        q_nope, q_rope = raw.split((nope_dim, rope_dim), dim=-1)
+        q_rope, expected_k = rotary(
+            positions,
+            q_rope,
+            k_rope.unsqueeze(1),
+        )
+        return torch.cat((q_nope, q_rope), dim=-1), expected_k.squeeze(1)
+
+    expected_q, expected_k = reference()
+    actual_q, actual_k = project_and_fuse_glm_mla_decode_rope(
+        q_lora,
+        weight,
+        k_rope,
+        positions,
+        rotary.cos_sin_cache,
+        num_heads=heads,
+        nope_dim=nope_dim,
+    )
+    torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=0)
+    torch.testing.assert_close(actual_k, expected_k, rtol=0, atol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_q, captured_k = project_and_fuse_glm_mla_decode_rope(
+            q_lora,
+            weight,
+            k_rope,
+            positions,
+            rotary.cos_sin_cache,
+            num_heads=heads,
+            nope_dim=nope_dim,
+        )
+    q_lora.copy_(torch.flip(q_lora, dims=(0,)))
+    k_rope.copy_(torch.flip(k_rope, dims=(0,)))
+    positions.copy_(torch.tensor([1024, 2048, 4096, 8192], device="cuda"))
+    graph.replay()
+    expected_q, expected_k = reference()
     torch.testing.assert_close(captured_q, expected_q, rtol=0, atol=0)
     torch.testing.assert_close(captured_k, expected_k, rtol=0, atol=0)
 

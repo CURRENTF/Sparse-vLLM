@@ -29,7 +29,9 @@ from sparsevllm.layers.linear import (
 from sparsevllm.layers.mla_attention import MLAAttention
 from sparsevllm.layers.packed_moe import PackedMoeExperts
 from sparsevllm.layers.rotary_embedding import RotaryEmbedding, get_rope
-from sparsevllm.kernels.triton.glm_mla_decode import fuse_glm_mla_decode_rope
+from sparsevllm.kernels.triton.glm_mla_decode import (
+    project_and_fuse_glm_mla_decode_rope,
+)
 from sparsevllm.method_registry import sparse_decode_attention_score_kind
 from sparsevllm.operators.attention_capabilities import AttentionScoreKind
 from sparsevllm.models.qwen3 import Qwen3MLP
@@ -248,12 +250,7 @@ class Glm4MoeLiteAttention(nn.Module):
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
             dim=-1,
         )
-        q = self.q_b_proj(self.q_a_layernorm(compressed_q))
-        q = q.view(-1, self.local_heads, self.qk_head_dim)
-        q_nope, q_rope = q.split(
-            [self.qk_nope_head_dim, self.qk_rope_head_dim],
-            dim=-1,
-        )
+        normalized_q = self.q_a_layernorm(compressed_q)
 
         latent, k_rope = compressed_kv.split(
             [self.kv_lora_rank, self.qk_rope_head_dim],
@@ -261,6 +258,15 @@ class Glm4MoeLiteAttention(nn.Module):
         )
         latent = self.kv_a_layernorm(latent)
         if get_context().is_prefill:
+            q = self.q_b_proj(normalized_q).view(
+                -1,
+                self.local_heads,
+                self.qk_head_dim,
+            )
+            q_nope, q_rope = q.split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim],
+                dim=-1,
+            )
             q_rope, k_rope = rotary_emb(
                 positions,
                 q_rope,
@@ -269,14 +275,19 @@ class Glm4MoeLiteAttention(nn.Module):
             k_rope = k_rope.squeeze(1)
             q = torch.cat((q_nope, q_rope), dim=-1)
         else:
-            q, k_rope = fuse_glm_mla_decode_rope(
-                q_nope,
-                q_rope,
+            q, k_rope = project_and_fuse_glm_mla_decode_rope(
+                normalized_q,
+                self.q_b_proj.weight,
                 k_rope,
                 positions,
                 rotary_emb.cos_sin_cache,
+                num_heads=self.local_heads,
+                nope_dim=self.qk_nope_head_dim,
             )
-            q_rope = q[..., self.qk_nope_head_dim :]
+            q_nope, q_rope = q.split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim],
+                dim=-1,
+            )
         value_output = self.mla_attention.run_cached_attention(
             q,
             q_nope,
