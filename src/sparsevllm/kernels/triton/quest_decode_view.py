@@ -514,7 +514,11 @@ def score_quest_pages(
         NUM_METADATA_HEADS=num_metadata_heads,
         HEAD_DIM=head_dim,
         BLOCK_D=block_d,
-        num_warps=min(max(block_d // 256, 1), 8),
+        num_warps=(
+            1
+            if num_query_heads == 1 and num_metadata_heads == 1
+            else min(max(block_d // 256, 1), 8)
+        ),
         num_stages=1,
     )
     return output
