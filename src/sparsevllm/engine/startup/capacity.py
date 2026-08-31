@@ -78,11 +78,19 @@ class KVCapacityPlan:
 
 
 def profiling_kv_slots(config) -> int:
-    max_prefill_tokens = int(config.max_num_batched_tokens)
-    max_prefill_batch = int(config.max_num_seqs_in_batch)
+    method = normalize_sparse_method(config.sparse_method)
+    page_size = int(config.quest_chunk_size) if method == "quest" else 1
+
+    def batch_slots(prompt_lengths: tuple[int, ...], output_tokens: int) -> int:
+        return sum(
+            ceil((int(prompt_len) + int(output_tokens)) / page_size) * page_size
+            for prompt_len in prompt_lengths
+        )
+
+    prefill_lengths = profiling_prefill_prompt_lengths(config)
     required = max(
-        max_prefill_tokens + 2 * max_prefill_batch,
-        3 * int(config.max_decoding_seqs),
+        batch_slots(prefill_lengths, 2),
+        batch_slots((1,) * int(config.max_decoding_seqs), 2),
     )
     if not bool(config.decode_graph_startup_capture):
         return required
@@ -95,7 +103,10 @@ def profiling_kv_slots(config) -> int:
     )
     for batch_size, _, is_long_text in build_decode_cuda_graph_startup_family_plan(config):
         prompt_tokens = int(threshold) if is_long_text else 1
-        required = max(required, int(batch_size) * (prompt_tokens + 2))
+        required = max(
+            required,
+            batch_slots((prompt_tokens,) * int(batch_size), 2),
+        )
     return required
 
 

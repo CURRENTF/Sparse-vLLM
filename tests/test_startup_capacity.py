@@ -107,3 +107,9 @@ def test_profiling_kv_slots_cover_runtime_steps_not_maximum_context():
     config.max_model_len = 1_000_000
 
     assert profiling_kv_slots(config) == 24
+
+
+def test_quest_profiling_slots_round_each_request_to_a_page():
+    config = _config(sparse_method="quest")
+
+    assert profiling_kv_slots(config) == 64
