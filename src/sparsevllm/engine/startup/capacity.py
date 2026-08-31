@@ -82,6 +82,7 @@ def profiling_kv_slots(config) -> int:
     required = max(
         int(config.max_model_len),
         max_prefill_tokens + 2 * max_prefill_batch,
+        3 * int(config.max_decoding_seqs),
     )
     if not bool(config.decode_graph_startup_capture):
         return required
@@ -96,6 +97,33 @@ def profiling_kv_slots(config) -> int:
         prompt_tokens = int(threshold) if is_long_text else 1
         required = max(required, int(batch_size) * (prompt_tokens + 2))
     return required
+
+
+def profiling_prefill_prompt_lengths(config) -> tuple[int, ...]:
+    token_budget = int(config.max_num_batched_tokens)
+    batch_size = min(int(config.max_num_seqs_in_batch), token_budget)
+    per_prompt_limit = min(
+        int(config.engine_prefill_chunk_size),
+        int(config.max_model_len) - 1,
+    )
+    if batch_size <= 0 or per_prompt_limit <= 0:
+        raise ValueError(
+            "Startup prefill profiling requires positive batch and prompt limits: "
+            f"batch_size={batch_size} per_prompt_limit={per_prompt_limit}."
+        )
+    target_tokens = min(token_budget, batch_size * per_prompt_limit)
+    prompt_lengths = [1] * batch_size
+    remaining = target_tokens - batch_size
+    for index in range(batch_size):
+        extra = min(per_prompt_limit - 1, remaining)
+        prompt_lengths[index] += extra
+        remaining -= extra
+    if remaining != 0:
+        raise RuntimeError(
+            "Startup prefill profiling could not fill its scheduler token budget: "
+            f"remaining={remaining}."
+        )
+    return tuple(prompt_lengths)
 
 
 def profiling_kv_budget_bytes(config, num_slots: int) -> int:
@@ -157,4 +185,5 @@ __all__ = [
     "StartupMemoryProfile",
     "profiling_kv_budget_bytes",
     "profiling_kv_slots",
+    "profiling_prefill_prompt_lengths",
 ]
