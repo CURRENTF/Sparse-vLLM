@@ -424,13 +424,13 @@ class LLMEngine:
         short_graphs = sum(not is_long for _, _, is_long in startup_plan)
         logger.info(
             "Startup CUDA Graph capture: graphs={} short={} long={} "
-            "skipped_for_kv_capacity={} plan={}.",
+            "skipped_for_kv_capacity={}.",
             len(startup_plan),
             short_graphs,
             len(startup_plan) - short_graphs,
             len(skipped_plan),
-            startup_plan,
         )
+        logger.debug("Startup CUDA Graph capture plan: {}.", startup_plan)
         capture_params = SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True)
         threshold = self.scheduler._long_text_threshold(is_prefill=False)
         for (batch_size, is_long_text), context_capacities in capture_groups.items():
@@ -601,8 +601,7 @@ class LLMEngine:
         if not token_counts:
             return
         logger.info(
-            "Post-allocation MoE workspace warmup token counts: {}. "
-            "An OOM here is fatal so gpu_memory_utilization can be tuned before serving.",
+            "Startup persistent MoE workspace warmup: token_counts={}.",
             token_counts,
         )
         for num_tokens in token_counts:

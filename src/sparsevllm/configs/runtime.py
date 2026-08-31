@@ -122,7 +122,12 @@ class Config(
             raise RuntimeError(f"Runtime capacity must be positive, got {capacity}.")
         if resolved == self.max_model_len:
             return
-        logger.info(
+        log = (
+            logger.debug
+            if getattr(self, "startup_cache_phase", "production") == "profiling"
+            else logger.info
+        )
+        log(
             "Limiting auto max_model_len from model capacity {} to runtime capacity {}.",
             self.max_model_len,
             resolved,
@@ -148,5 +153,24 @@ class Config(
         resolve_auto_full_attention_layers(self)
         finalize_sparse_layout(self)
 
-        logger.info(f"LLM Config: {self}".replace('\n', ' '))
+        logger.info(
+            "Runtime config: model={} sparse_method={} tp={} ep={} dp={} "
+            "max_model_len={} max_batched_tokens={} prefill_chunk={} "
+            "max_prefill_batch={} max_decode_batch={} gpu_utilization={:.3f} "
+            "decode_graph={} graph_policy={}.",
+            self.model,
+            self.sparse_method or "vanilla",
+            self.tensor_parallel_size,
+            self.expert_parallel_size,
+            self.data_parallel_size,
+            self.max_model_len,
+            self.max_num_batched_tokens,
+            self.engine_prefill_chunk_size,
+            self.max_num_seqs_in_batch,
+            self.max_decoding_seqs,
+            self.gpu_memory_utilization,
+            self.decode_graph,
+            self.decode_graph_shape_policy,
+        )
+        logger.debug("Full runtime config: {}", str(self).replace("\n", " "))
         setattr(self.hf_config, "runtime_layout", self.runtime_layout)
