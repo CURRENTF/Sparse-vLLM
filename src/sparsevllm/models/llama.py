@@ -15,46 +15,22 @@ from sparsevllm.models.attention_runtime import (
     bind_mha_full_attention_provider,
     build_mha_full_attention_provider,
 )
+from sparsevllm.models.rope import (
+    resolve_rope_max_position,
+    resolve_rope_scaling,
+    resolve_rope_theta,
+)
 from sparsevllm.operators.full_attention import FullAttentionProvider
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger
 
 
 def _get_rope_theta(config: Any) -> float:
-    if hasattr(config, "rope_theta"):
-        return float(config.rope_theta)
-    rope_parameters = getattr(config, "rope_parameters", None)
-    if isinstance(rope_parameters, dict) and "rope_theta" in rope_parameters:
-        return float(rope_parameters["rope_theta"])
-    return 10000.0
+    return resolve_rope_theta(config)
 
 
 def _get_rope_scaling(config: Any) -> tuple[tuple[str, object], ...] | None:
-    rope_scaling = getattr(config, "rope_scaling", None)
-    if rope_scaling is None:
-        rope_scaling = getattr(config, "rope_parameters", None)
-    if rope_scaling is None:
-        return None
-
-    if isinstance(rope_scaling, dict):
-        rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
-        is_default_rope = rope_type in (None, "default")
-        allowed_default_keys = {"rope_type", "type", "rope_theta"}
-        if is_default_rope and set(rope_scaling).issubset(allowed_default_keys):
-            return None
-        if rope_type == "llama3":
-            required = {
-                "factor",
-                "low_freq_factor",
-                "high_freq_factor",
-                "original_max_position_embeddings",
-            }
-            missing = sorted(required.difference(rope_scaling))
-            if missing:
-                raise ValueError(f"Llama3 rope_scaling missing required keys: {missing}.")
-            return tuple(sorted(rope_scaling.items()))
-
-    raise NotImplementedError(f"Unsupported Llama rope_scaling={rope_scaling!r}.")
+    return resolve_rope_scaling(config, model_name="Llama")
 
 
 class LlamaAttention(nn.Module):
@@ -204,7 +180,7 @@ class LlamaDecoderLayer(nn.Module):
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
-            max_position=config.max_position_embeddings,
+            max_position=resolve_rope_max_position(config, model_name="Llama"),
             head_dim=head_dim,
             qkv_bias=getattr(config, "attention_bias", False),
             rope_theta=_get_rope_theta(config),

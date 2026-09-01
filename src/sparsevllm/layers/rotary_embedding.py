@@ -5,6 +5,102 @@ import torch
 from torch import nn
 
 
+def yarn_get_mscale(factor: float, multiplier: float = 1.0) -> float:
+    factor = float(factor)
+    if factor <= 1.0:
+        return 1.0
+    return 0.1 * float(multiplier) * math.log(factor) + 1.0
+
+
+def _compute_rope_parameters(
+    rotary_dim: int,
+    base: float,
+    rope_scaling: tuple[tuple[str, object], ...] | None,
+) -> tuple[torch.Tensor, float]:
+    inv_freq = 1.0 / (
+        base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim)
+    )
+    if rope_scaling is None:
+        return inv_freq, 1.0
+
+    scaling = dict(rope_scaling)
+    rope_type = str(scaling.get("rope_type", scaling.get("type", "default"))).lower()
+    factor = float(scaling["factor"])
+    if rope_type == "linear":
+        return inv_freq / factor, 1.0
+    if rope_type == "llama3":
+        low_freq_factor = float(scaling["low_freq_factor"])
+        high_freq_factor = float(scaling["high_freq_factor"])
+        old_context_len = float(scaling["original_max_position_embeddings"])
+
+        low_freq_wavelen = old_context_len / low_freq_factor
+        high_freq_wavelen = old_context_len / high_freq_factor
+        wavelen = 2 * math.pi / inv_freq
+        inv_freq_llama = torch.where(
+            wavelen > low_freq_wavelen,
+            inv_freq / factor,
+            inv_freq,
+        )
+        smooth_factor = (old_context_len / wavelen - low_freq_factor) / (
+            high_freq_factor - low_freq_factor
+        )
+        smoothed_inv_freq = (
+            (1 - smooth_factor) * inv_freq_llama / factor
+            + smooth_factor * inv_freq_llama
+        )
+        is_medium_freq = ~(
+            (wavelen < high_freq_wavelen) | (wavelen > low_freq_wavelen)
+        )
+        return torch.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama), 1.0
+    if rope_type == "yarn":
+        beta_fast = float(scaling.get("beta_fast", 32.0))
+        beta_slow = float(scaling.get("beta_slow", 1.0))
+        old_context_len = float(scaling["original_max_position_embeddings"])
+        truncate = bool(scaling.get("truncate", True))
+
+        def correction_dim(num_rotations: float) -> float:
+            return (
+                rotary_dim
+                * math.log(old_context_len / (num_rotations * 2 * math.pi))
+                / (2 * math.log(base))
+            )
+
+        low = correction_dim(beta_fast)
+        high = correction_dim(beta_slow)
+        if truncate:
+            low = math.floor(low)
+            high = math.ceil(high)
+        low = max(low, 0)
+        high = min(high, rotary_dim - 1)
+        if low == high:
+            high += 0.001
+        ramp = torch.clamp(
+            (torch.arange(rotary_dim // 2, dtype=torch.float32) - low)
+            / (high - low),
+            0,
+            1,
+        )
+        extrapolation_weight = 1 - ramp
+        inv_freq = (
+            inv_freq / factor * (1 - extrapolation_weight)
+            + inv_freq * extrapolation_weight
+        )
+
+        attention_factor = scaling.get("attention_factor")
+        if attention_factor is None:
+            mscale = scaling.get("mscale")
+            mscale_all_dim = scaling.get("mscale_all_dim")
+            if mscale and mscale_all_dim:
+                attention_factor = yarn_get_mscale(factor, float(mscale)) / yarn_get_mscale(
+                    factor,
+                    float(mscale_all_dim),
+                )
+            else:
+                attention_factor = yarn_get_mscale(factor)
+        return inv_freq, float(attention_factor)
+    raise NotImplementedError(f"Unsupported rope_scaling={scaling!r}.")
+
+
 def apply_rotary_emb(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -77,13 +173,17 @@ def reverse_rotary_emb(
     sin: torch.Tensor,
 ) -> torch.Tensor:
     """对已应用 RoPE 的向量执行逆操作，恢复到位置无关状态。
-    
+
     RoPE 公式:     y1 = x1*cos - x2*sin,  y2 = x2*cos + x1*sin
-    De-RoPE 公式:  x1 = y1*cos + y2*sin,  x2 = y2*cos - y1*sin
+    De-RoPE 分子:  x1 = y1*cos + y2*sin,  x2 = y2*cos - y1*sin
+
+    YaRN 可以给 cos/sin 缓存施加非单位幅值，因此逆变换需要再除以
+    cos²+sin²。普通单位 RoPE 下该分母为 1。
     """
     y1, y2 = torch.chunk(x.float(), 2, dim=-1)
-    x1 = y1 * cos + y2 * sin
-    x2 = y2 * cos - y1 * sin
+    norm = cos.float().square() + sin.float().square()
+    x1 = (y1 * cos + y2 * sin) / norm
+    x2 = (y2 * cos - y1 * sin) / norm
     return torch.cat((x1, x2), dim=-1).to(x.dtype)
 
 
@@ -108,31 +208,16 @@ class RotaryEmbedding(nn.Module):
         self.interleaved = bool(interleaved)
         self.head_size = head_size
         assert rotary_dim == head_size
-        inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
-        if rope_scaling is not None:
-            scaling = dict(rope_scaling)
-            rope_type = scaling.get("rope_type", scaling.get("type"))
-            if rope_type != "llama3":
-                raise NotImplementedError(f"Unsupported rope_scaling={scaling!r}.")
-            factor = float(scaling["factor"])
-            low_freq_factor = float(scaling["low_freq_factor"])
-            high_freq_factor = float(scaling["high_freq_factor"])
-            old_context_len = float(scaling["original_max_position_embeddings"])
-
-            low_freq_wavelen = old_context_len / low_freq_factor
-            high_freq_wavelen = old_context_len / high_freq_factor
-            wavelen = 2 * math.pi / inv_freq
-            inv_freq_llama = torch.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
-            smooth_factor = (old_context_len / wavelen - low_freq_factor) / (
-                high_freq_factor - low_freq_factor
-            )
-            smoothed_inv_freq = (1 - smooth_factor) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
-            is_medium_freq = ~(wavelen < high_freq_wavelen) * ~(wavelen > low_freq_wavelen)
-            inv_freq = torch.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
+        inv_freq, attention_scaling = _compute_rope_parameters(
+            rotary_dim,
+            base,
+            rope_scaling,
+        )
+        self.attention_scaling = float(attention_scaling)
         t = torch.arange(max_position_embeddings, dtype=torch.float)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
-        cos = freqs.cos()
-        sin = freqs.sin()
+        cos = freqs.cos() * self.attention_scaling
+        sin = freqs.sin() * self.attention_scaling
         cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 

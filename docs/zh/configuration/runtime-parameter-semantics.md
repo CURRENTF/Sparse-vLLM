@@ -71,6 +71,29 @@ prefill KV 压缩。CacheManager 拥有这套物理生命周期，prepared prefi
 kernel 契约和必须校准的参数见
 [FlashPrefill V2](../features/flashprefill-v2.md)。
 
+## RoPE scaling
+
+Sparse-vLLM 读取 checkpoint 中 Transformers 规范的 `rope_parameters`，并兼容
+旧字段名 `rope_scaling`。统一的一维 RotaryEmbedding 在普通 MHA/GQA 模型路径
+上支持 `default`、`linear`、`yarn` 和 `llama3`。YaRN 实现 Transformers
+标准的 cache amplitude 与 `mscale`/`mscale_all_dim` 处理。GLM-4.7-Flash
+MLA 保留现有的未 scaling RoPE 实现。
+YaRN 的上下文 admission 与静态 RoPE cache 统一使用有效长度
+`original_max_position_embeddings * factor`。Sparse-vLLM 同时接受
+`max_position_embeddings` 已经等于扩展长度的规范配置，以及声明长度仍等于
+原始长度的旧式配置；其他不一致组合会在模型配置阶段明确失败。优先级更高的
+显式上下文字段（例如 `max_sequence_length`）可以限制该有效长度，但不能超过它。
+其他已支持的静态 RoPE 类型保留现有的上下文 admission 语义。
+
+DeltaKV 保留现有的 `default`/`llama3` RoPE 重建契约。由于它的专用
+de-RoPE/re-RoPE CUDA kernel 还没有验证其他 scaling mode，模型配置阶段
+会明确拒绝 DeltaKV 与 `linear` 或 `yarn` 的组合。
+
+`dynamic` 和 `longrope` 会在模型构造时明确拒绝。它们需要 server-level 策略，
+才能在 continuous batching 中选择或切换频率而不使已经旋转并写入的 KV cache
+失效。Qwen3.5 多模态 MRoPE、GLM-4.7-Flash MLA 与 Gemma4 per-layer
+proportional RoPE 保留各自的坐标语义，不接受普通一维 scaling 参数。
+
 ## DeltaKV
 
 可报告的 DeltaKV 推理必须使用兼容 compressor checkpoint。对于已登记模型，

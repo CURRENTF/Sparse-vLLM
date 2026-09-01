@@ -2,27 +2,87 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 
-from sparsevllm.configs.model import _finalize_model_config, _model_context_length
+from sparsevllm.configs.model import (
+    _finalize_model_config,
+    _model_context_length,
+    _validate_sparse_method_rope_compatibility,
+)
 from sparsevllm.configs.runtime import Config
 from sparsevllm.engine.cache_manager.standard import StandardCacheManager
+from sparsevllm.models.rope import resolve_rope_max_position
 
 
-def test_model_context_length_applies_rope_scaling():
+def test_extended_linear_rope_uses_declared_length_for_admission_and_cache():
+    hf_config = SimpleNamespace(
+        max_position_embeddings=202752,
+        rope_parameters={
+            "rope_type": "linear",
+            "factor": 4.0,
+            "original_max_position_embeddings": 32768,
+        },
+    )
+
+    assert _model_context_length(hf_config) == 202752
+    assert resolve_rope_max_position(hf_config, model_name="test") == 202752
+
+
+def test_model_context_length_preserves_legacy_linear_scaling():
     hf_config = SimpleNamespace(
         max_position_embeddings=32768,
-        rope_scaling={"rope_type": "linear", "factor": 4.0},
+        rope_parameters={"rope_type": "linear", "factor": 4.0},
     )
 
     assert _model_context_length(hf_config) == 131072
 
 
-def test_model_context_length_accepts_rope_parameters():
+@pytest.mark.parametrize("declared", [32768, 131072])
+def test_yarn_context_length_is_shared_by_admission_and_rope_cache(declared):
     hf_config = SimpleNamespace(
-        max_position_embeddings=32768,
-        rope_parameters={"rope_type": "linear", "factor": 2.0},
+        max_position_embeddings=declared,
+        rope_parameters={
+            "rope_type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 32768,
+        },
     )
 
-    assert _model_context_length(hf_config) == 65536
+    assert _model_context_length(hf_config) == 131072
+    assert resolve_rope_max_position(hf_config, model_name="test") == 131072
+
+
+def test_yarn_rejects_inconsistent_declared_and_scaled_lengths():
+    hf_config = SimpleNamespace(
+        max_position_embeddings=202752,
+        rope_parameters={
+            "rope_type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 32768,
+        },
+    )
+
+    with pytest.raises(ValueError, match="yarn context lengths are inconsistent"):
+        _model_context_length(hf_config)
+
+
+@pytest.mark.parametrize("max_sequence_length", [65536, 131073])
+def test_yarn_explicit_context_cap_cannot_exceed_effective_limit(
+    max_sequence_length,
+):
+    hf_config = SimpleNamespace(
+        max_sequence_length=max_sequence_length,
+        max_position_embeddings=32768,
+        rope_parameters={
+            "rope_type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 32768,
+        },
+    )
+
+    if max_sequence_length <= 131072:
+        assert _model_context_length(hf_config) == max_sequence_length
+    else:
+        with pytest.raises(ValueError, match="exceeds the YaRN context length"):
+            _model_context_length(hf_config)
 
 
 def test_model_context_length_accepts_per_layer_rope_parameters():
@@ -35,6 +95,19 @@ def test_model_context_length_accepts_per_layer_rope_parameters():
     )
 
     assert _model_context_length(hf_config) == 262144
+
+
+@pytest.mark.parametrize("rope_type", ["linear", "yarn"])
+def test_deltakv_rejects_unvalidated_rope_reconstruction(rope_type):
+    config = SimpleNamespace(
+        sparse_method="deltakv",
+        hf_config=SimpleNamespace(
+            rope_parameters={"rope_type": rope_type},
+        ),
+    )
+
+    with pytest.raises(NotImplementedError, match="DeltaKV reconstruction"):
+        _validate_sparse_method_rope_compatibility(config)
 
 
 @pytest.mark.parametrize(
@@ -67,6 +140,30 @@ def test_auto_max_model_len_uses_model_context_length(monkeypatch):
     _finalize_model_config(config, SimpleNamespace(mixed_attention=False))
 
     assert config.max_model_len == 32768
+    assert config.max_model_len_auto is True
+
+
+def test_auto_max_model_len_uses_effective_yarn_context_length(monkeypatch):
+    config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            max_position_embeddings=32768,
+            rope_parameters={
+                "rope_type": "yarn",
+                "factor": 4.0,
+                "original_max_position_embeddings": 32768,
+            },
+        ),
+        max_model_len=None,
+        max_num_seqs_in_batch=32,
+    )
+    monkeypatch.setattr(
+        "sparsevllm.configs.model.RuntimeLayout.from_config",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    _finalize_model_config(config, SimpleNamespace(mixed_attention=False))
+
+    assert config.max_model_len == 131072
     assert config.max_model_len_auto is True
 
 

@@ -24,6 +24,11 @@ from sparsevllm.layers.rotary_embedding import (
     get_rope,
 )
 from sparsevllm.models.qwen3 import Qwen3ModelBase
+from sparsevllm.models.rope import (
+    resolve_rope_max_position,
+    resolve_rope_scaling,
+    resolve_rope_theta,
+)
 from sparsevllm.models.attention_runtime import (
     bind_mha_full_attention_provider,
     build_mha_full_attention_provider,
@@ -295,9 +300,9 @@ class MiniMaxM2Attention(nn.Module):
         self.rotary_emb = get_rope(
             self.rotary_dim,
             rotary_dim=self.rotary_dim,
-            max_position=int(config.max_position_embeddings),
-            base=float(config.rope_theta),
-            rope_scaling=None,
+            max_position=resolve_rope_max_position(config, model_name="MiniMax M2"),
+            base=resolve_rope_theta(config),
+            rope_scaling=resolve_rope_scaling(config, model_name="MiniMax M2"),
         )
         self.attn = Attention(
             self.num_heads,

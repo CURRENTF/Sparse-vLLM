@@ -9,11 +9,16 @@ import torch
 from transformers import AutoConfig
 
 from sparsevllm.method_registry import (
+    is_deltakv_method,
     validate_model_runtime_compatibility,
     validate_sparse_method_assets,
 )
 from sparsevllm.models.checkpoint import validate_checkpoint
 from sparsevllm.models.layout import RuntimeLayout
+from sparsevllm.models.rope import (
+    resolve_rope_max_position,
+    resolve_rope_parameters,
+)
 from sparsevllm.models.spec import ModelSpec, resolve_model_spec
 from sparsevllm.quantization import QuantizationConfig
 from sparsevllm.utils.config import config_get
@@ -98,29 +103,65 @@ def _normalize_hf_config_dtype(config: Any, fallback: Any = None) -> torch.dtype
 
 
 def _model_context_length(hf_config: Any) -> int:
-    rope_scaling = config_get(hf_config, "rope_scaling", None) or config_get(
-        hf_config, "rope_parameters", None
-    )
-    factor = 1.0
-    if isinstance(rope_scaling, dict):
-        rope_type = str(rope_scaling.get("rope_type", rope_scaling.get("type", ""))).lower()
-        if "original_max_position_embeddings" not in rope_scaling and rope_type != "llama3":
-            factor = float(rope_scaling.get("factor", 1.0))
-
     for key in _CONTEXT_LENGTH_KEYS:
         value = config_get(hf_config, key, None)
         if value is not None:
-            context_length = int(float(value) * factor)
+            context_length = int(value)
             if context_length <= 0:
                 raise ValueError(f"Model config {key} must be positive, got {value!r}.")
-            return context_length
-    raise ValueError(
-        "Model config does not declare a supported context length; expected one of "
-        f"{', '.join(_CONTEXT_LENGTH_KEYS)}. Set max_model_len explicitly."
+            break
+    else:
+        raise ValueError(
+            "Model config does not declare a supported context length; expected one of "
+            f"{', '.join(_CONTEXT_LENGTH_KEYS)}. Set max_model_len explicitly."
+        )
+
+    rope_parameters = resolve_rope_parameters(hf_config)
+    rope_type = str(rope_parameters["rope_type"])
+    if rope_type != "yarn":
+        if (
+            rope_type == "linear"
+            and "original_max_position_embeddings" not in rope_parameters
+        ):
+            context_length = int(
+                context_length * float(rope_parameters.get("factor", 1.0))
+            )
+            if context_length <= 0:
+                raise ValueError(
+                    "Model config linear RoPE context length must be positive, "
+                    f"got {context_length}."
+                )
+        return context_length
+
+    rope_context_length = resolve_rope_max_position(
+        hf_config,
+        model_name="Model config",
     )
+    if key == "max_position_embeddings":
+        return rope_context_length
+    if context_length > rope_context_length:
+        raise ValueError(
+            f"Model config {key} exceeds the YaRN context length: "
+            f"declared={context_length} supported={rope_context_length}."
+        )
+    return context_length
+
+
+def _validate_sparse_method_rope_compatibility(config: Any) -> None:
+    if not is_deltakv_method(config_get(config, "sparse_method", None)):
+        return
+
+    rope_type = str(resolve_rope_parameters(config.hf_config)["rope_type"])
+    if rope_type not in {"default", "llama3"}:
+        raise NotImplementedError(
+            "DeltaKV reconstruction supports only default and llama3 RoPE; "
+            f"got rope_type={rope_type!r}. Its de-RoPE/re-RoPE CUDA kernels need "
+            "separate correctness validation before enabling other scaling types."
+        )
 
 
 def _finalize_model_config(config, model_spec: ModelSpec) -> None:
+    _validate_sparse_method_rope_compatibility(config)
     model_context_length = _model_context_length(config.hf_config)
     config.max_model_len_auto = config.max_model_len is None
     if config.max_model_len_auto:

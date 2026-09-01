@@ -77,6 +77,34 @@ prefill provider consumes its view without inspecting the cache method name. See
 [FlashPrefill V2](../features/flashprefill-v2.md) for the validated kernel
 contract and required calibration parameters.
 
+## RoPE scaling
+
+Sparse-vLLM consumes the checkpoint's canonical Transformers
+`rope_parameters` (and the legacy `rope_scaling` spelling). The shared
+one-dimensional rotary implementation supports `default`, `linear`, `yarn`,
+and `llama3` for the ordinary MHA/GQA model paths. YaRN includes the standard
+Transformers cache amplitude and `mscale`/`mscale_all_dim` handling. The
+GLM-4.7-Flash MLA path retains its existing unscaled RoPE implementation.
+For YaRN, context admission and the static RoPE cache share the effective
+length `original_max_position_embeddings * factor`. Sparse-vLLM accepts both
+canonical configs whose `max_position_embeddings` already equals that scaled
+length and legacy configs whose declared length still equals the original
+length. Any other mismatch fails during model configuration. A higher-priority
+explicit context field such as `max_sequence_length` may cap the effective
+length but may not exceed it. Other supported static RoPE types retain their
+existing context-admission semantics.
+
+DeltaKV retains its existing `default`/`llama3` RoPE reconstruction contract.
+It rejects `linear` and `yarn` during model configuration because its dedicated
+de-RoPE/re-RoPE CUDA kernels have not been validated for those scaling modes.
+
+`dynamic` and `longrope` are rejected at model construction. They require a
+server-level policy for choosing or changing frequencies without invalidating
+already-rotated KV cache entries in continuous batches. Qwen3.5 multimodal
+MRoPE, GLM-4.7-Flash MLA, and Gemma4 per-layer proportional RoPE retain their
+dedicated coordinate systems and do not accept one-dimensional scaling
+parameters.
+
 ## Runtime invariant validation
 
 `validate_runtime_invariants=False` is the serving fast-path default. Set it to

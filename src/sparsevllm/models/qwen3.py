@@ -18,6 +18,11 @@ from sparsevllm.models.attention_runtime import (
     build_mha_full_attention_provider,
     build_mha_prefill_attention_op,
 )
+from sparsevllm.models.rope import (
+    resolve_rope_max_position,
+    resolve_rope_scaling,
+    resolve_rope_theta,
+)
 from sparsevllm.operators.full_attention import FullAttentionProvider
 from sparsevllm.operators.prefill_attention import PreparedPrefillAttentionOp
 
@@ -41,27 +46,11 @@ def build_qwen3_prefill_attention_op(
 
 
 def _get_rope_theta(config: Qwen3Config) -> float:
-    if hasattr(config, "rope_theta"):
-        return config.rope_theta
-    rope_parameters = getattr(config, "rope_parameters", None)
-    if isinstance(rope_parameters, dict) and "rope_theta" in rope_parameters:
-        return rope_parameters["rope_theta"]
-    return 10000
+    return resolve_rope_theta(config)
 
 
 def _get_rope_scaling(config: Qwen3Config):
-    rope_scaling = getattr(config, "rope_scaling", None)
-    if rope_scaling is None:
-        return None
-
-    if isinstance(rope_scaling, dict):
-        rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
-        is_default_rope = rope_type in (None, "default")
-        allowed_default_keys = {"rope_type", "type", "rope_theta"}
-        if is_default_rope and set(rope_scaling).issubset(allowed_default_keys):
-            return None
-
-    raise NotImplementedError(f"Unsupported Qwen3 rope_scaling={rope_scaling!r}.")
+    return resolve_rope_scaling(config, model_name="Qwen3")
 
 
 class Qwen3Attention(nn.Module):
@@ -247,7 +236,7 @@ class Qwen3DecoderLayerBase(nn.Module):
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
-            max_position=config.max_position_embeddings,
+            max_position=resolve_rope_max_position(config, model_name="Qwen3"),
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=config.attention_bias,
             head_dim=config.head_dim,
