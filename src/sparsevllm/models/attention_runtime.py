@@ -5,6 +5,7 @@ from torch import nn
 
 from sparsevllm.method_registry import (
     normalize_sparse_method,
+    resolve_prefill_sparse_method,
     resolve_sparse_prefill_score_mode,
     sparse_decode_attention_requires_scores,
     sparse_prefill_attention_contract,
@@ -21,6 +22,7 @@ from sparsevllm.operators.full_attention import (
 )
 from sparsevllm.operators.moe import model_activation_dtype
 from sparsevllm.operators.prefill_attention import (
+    FlashPrefillV2Semantics,
     PreparedPrefillAttentionOp,
     PrefillAttentionOpSpec,
     prepare_prefill_attention_op,
@@ -83,13 +85,38 @@ def build_mha_prefill_attention_spec(
         normalized_method,
         getattr(score_config, "sparse_prefill_score_mode", None),
     )
+    prefill_sparse_method = resolve_prefill_sparse_method(
+        getattr(score_config, "prefill_sparse_method", ""),
+        sparse_method=normalized_method,
+    )
     contract = sparse_prefill_attention_contract(
         normalized_method,
+        prefill_sparse_method=prefill_sparse_method,
         sparse_prefill_score_mode=score_mode,
         h2o_prefill_score_window=getattr(
             score_config, "h2o_prefill_score_window", 0
         ),
     )
+    flashprefill_v2 = None
+    if prefill_sparse_method == "flashprefill_v2":
+        flashprefill_v2 = FlashPrefillV2Semantics(
+            k_block_m=int(score_config.flashprefill_v2_k_block_m),
+            k_block_n=int(score_config.flashprefill_v2_k_block_n),
+            abs_threshold=float(score_config.flashprefill_v2_abs_threshold),
+            attention_sink_blocks=int(
+                score_config.flashprefill_v2_attention_sink_blocks
+            ),
+            window_blocks=int(score_config.flashprefill_v2_window_blocks),
+            last_query_blocks=int(
+                score_config.flashprefill_v2_last_query_blocks
+            ),
+            min_sparse_q_len=int(
+                score_config.flashprefill_v2_min_sparse_q_len
+            ),
+            use_mean_correction=bool(
+                score_config.flashprefill_v2_use_mean_correction
+            ),
+        )
     return PrefillAttentionOpSpec(
         num_query_heads=query_heads,
         num_kv_heads=kv_heads,
@@ -101,13 +128,15 @@ def build_mha_prefill_attention_spec(
         score_output=contract.main_score_kind,
         layer_varying_page_table=bool(normalized_method),
         return_softmax_lse=(
-            normalized_method == "h2o"
+            prefill_sparse_method == "h2o_prefill"
             and score_mode == "probability"
         ),
         allow_softmax_lse_fallback=(
-            normalized_method == "h2o"
+            prefill_sparse_method == "h2o_prefill"
             and score_mode == "probability"
         ),
+        prefill_sparse_method=prefill_sparse_method,
+        flashprefill_v2=flashprefill_v2,
     )
 
 

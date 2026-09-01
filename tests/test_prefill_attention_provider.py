@@ -90,6 +90,7 @@ def test_optional_h2o_lse_falls_back_during_provider_resolution(
         layer_varying_page_table=True,
         return_softmax_lse=True,
         allow_softmax_lse_fallback=True,
+        prefill_sparse_method="h2o_prefill",
     )
     platform = SimpleNamespace(get_device_caps=lambda _index: caps)
 
@@ -192,6 +193,21 @@ def test_h2o_full_query_logits_request_fused_reduced_prefill_score():
     assert (
         contract.score_collection
         is PrefillScoreCollectionKind.MAIN_ATTENTION_REDUCED
+    )
+
+
+def test_h2o_flashprefill_uses_method_owned_posthoc_prefill_scoring():
+    contract = sparse_prefill_attention_contract(
+        "h2o",
+        prefill_sparse_method="flashprefill_v2",
+        sparse_prefill_score_mode="logits",
+        h2o_prefill_score_window=0,
+    )
+
+    assert contract.main_score_kind is AttentionScoreKind.NONE
+    assert (
+        contract.score_collection
+        is PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED
     )
 
 

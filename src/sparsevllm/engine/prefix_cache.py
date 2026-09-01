@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Protocol
 
+from sparsevllm.method_registry import prefill_sparse_method_fingerprint
+
 
 
 def usable_prefix_cache_tokens(prompt_len: int, block_size: int) -> int:
@@ -82,6 +84,12 @@ def build_prefix_cache_fingerprint(config: Any, block_size: int) -> bytes:
         "quest_chunk_size": _jsonable(getattr(config, "quest_chunk_size", None)),
         "quest_skip_layers": _jsonable(getattr(config, "quest_skip_layers", None)),
     }
+    payload.update(
+        {
+            key: _jsonable(value)
+            for key, value in prefill_sparse_method_fingerprint(config).items()
+        }
+    )
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).digest()
 

@@ -1,14 +1,18 @@
 """Sparse-method normalization and layout-dependent validation."""
 
 from sparsevllm.configs.common import (
+    _coerce_bool_config,
     _normalize_float_attr,
     _normalize_int_attr,
     _normalize_positive_int,
 )
 from sparsevllm.method_registry import (
+    CANONICAL_PREFILL_SPARSE_METHODS,
+    PREFILL_SPARSE_METHOD_COMPATIBILITY,
     SKIPKV_ASSET_MODEL_NAMES,
     SUPPORTED_SPARSE_METHODS,
     normalize_sparse_method,
+    resolve_prefill_sparse_method,
     resolve_sparse_prefill_score_mode,
 )
 from sparsevllm.utils.log import logger, log_once
@@ -28,6 +32,79 @@ def normalize_sparse_method_name(config) -> None:
             raise ValueError(
                 f"{name} must be a non-negative integer token count, got {value!r}."
             )
+
+
+def normalize_prefill_sparse_method(config) -> None:
+    sparse_method = normalize_sparse_method(getattr(config, "sparse_method", ""))
+    method = resolve_prefill_sparse_method(
+        getattr(config, "prefill_sparse_method", ""),
+        sparse_method=sparse_method,
+    )
+    if method not in CANONICAL_PREFILL_SPARSE_METHODS:
+        supported = ", ".join(
+            repr(name) for name in sorted(CANONICAL_PREFILL_SPARSE_METHODS) if name
+        )
+        raise ValueError(
+            f"Unsupported prefill_sparse_method={method!r}. "
+            f"Supported methods: '', {supported}."
+        )
+    compatible_sparse_methods = PREFILL_SPARSE_METHOD_COMPATIBILITY[method]
+    if sparse_method not in compatible_sparse_methods:
+        choices = ", ".join(
+            "'vanilla'" if name == "" else repr(name)
+            for name in sorted(compatible_sparse_methods)
+        )
+        raise ValueError(
+            f"prefill_sparse_method={method!r} is incompatible with "
+            f"sparse_method={sparse_method!r}; supported cache/decode methods: "
+            f"{choices}."
+        )
+    config.prefill_sparse_method = method
+
+    for name in (
+        "flashprefill_v2_k_block_m",
+        "flashprefill_v2_k_block_n",
+    ):
+        _normalize_positive_int(config, name, fallback=0)
+    if config.flashprefill_v2_k_block_m % 16:
+        raise ValueError(
+            "flashprefill_v2_k_block_m must be a multiple of 16, got "
+            f"{config.flashprefill_v2_k_block_m}."
+        )
+    block_n = int(config.flashprefill_v2_k_block_n)
+    if block_n % 64 or block_n & (block_n - 1):
+        raise ValueError(
+            "flashprefill_v2_k_block_n must be a power-of-two multiple of 64, "
+            f"got {block_n}."
+        )
+    threshold = config.flashprefill_v2_abs_threshold
+    if threshold is None:
+        if method == "flashprefill_v2":
+            raise ValueError(
+                "prefill_sparse_method='flashprefill_v2' requires an explicit "
+                "flashprefill_v2_abs_threshold calibrated for the model."
+            )
+    else:
+        _normalize_float_attr(config, "flashprefill_v2_abs_threshold")
+        if not 0.0 <= config.flashprefill_v2_abs_threshold <= 1.0:
+            raise ValueError(
+                "flashprefill_v2_abs_threshold must be in [0, 1], got "
+                f"{config.flashprefill_v2_abs_threshold}."
+            )
+    for name in (
+        "flashprefill_v2_attention_sink_blocks",
+        "flashprefill_v2_window_blocks",
+        "flashprefill_v2_last_query_blocks",
+        "flashprefill_v2_min_sparse_q_len",
+    ):
+        _normalize_int_attr(config, name, fallback=0)
+        if getattr(config, name) < 0:
+            raise ValueError(f"{name} must be non-negative, got {getattr(config, name)}.")
+    config.flashprefill_v2_use_mean_correction = _coerce_bool_config(
+        "flashprefill_v2_use_mean_correction",
+        config.flashprefill_v2_use_mean_correction,
+    )
+
 
 def _normalize_quest(config) -> None:
     if isinstance(config.full_attention_layers, str):
@@ -219,7 +296,21 @@ def _normalize_skipkv(config) -> None:
             f"{', '.join(sorted(SKIPKV_ASSET_MODEL_NAMES))}."
         )
 
+
+def _validate_prefill_sparse_method_model_compatibility(config) -> None:
+    if config.prefill_sparse_method != "flashprefill_v2":
+        return
+    cache_layout = str(config.attention_cache_layout)
+    if cache_layout != "explicit_kv":
+        raise NotImplementedError(
+            "prefill_sparse_method='flashprefill_v2' requires explicit KV cache "
+            f"storage; model {config.model_spec.name!r} uses "
+            f"attention_cache_layout={cache_layout!r}."
+        )
+
+
 def normalize_sparse_methods(config) -> None:
+    _validate_prefill_sparse_method_model_compatibility(config)
     if (
         getattr(config.hf_config, "model_type", "") == "gemma4_text"
         and int(getattr(config.hf_config, "num_kv_shared_layers", 0) or 0)

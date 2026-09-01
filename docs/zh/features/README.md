@@ -4,5 +4,6 @@
 
 - [支持的模型](supported-models.md)
 - [核心稀疏方法](sparse-methods.md)
+- [FlashPrefill V2](flashprefill-v2.md)
 - [DeltaKV](deltakv.md)
 - [Tiny Random 调试模式](tiny-random-debug.md)

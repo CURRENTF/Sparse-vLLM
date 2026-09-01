@@ -20,6 +20,7 @@ from sparsevllm.configs.groups import (
     DecodeCudaGraphConfig,
     DeltaKVConfig,
     ObservabilityConfig,
+    PrefillSparseMethodConfig,
     PrefixCacheConfig,
     SparseMethodConfig,
 )
@@ -35,6 +36,7 @@ from sparsevllm.configs.prefix_cache import (
 from sparsevllm.configs.scheduling import normalize_scheduling
 from sparsevllm.configs.sparse import (
     finalize_sparse_layout,
+    normalize_prefill_sparse_method,
     normalize_sparse_method_name,
     normalize_sparse_methods,
 )
@@ -51,6 +53,7 @@ class Config(
     PrefixCacheConfig,
     DecodeCudaGraphConfig,
     SparseMethodConfig,
+    PrefillSparseMethodConfig,
     DeltaKVConfig,
     ObservabilityConfig,
 ):
@@ -141,6 +144,7 @@ class Config(
     def __post_init__(self):
         normalize_bootstrap(self)
         normalize_sparse_method_name(self)
+        normalize_prefill_sparse_method(self)
         normalize_prefix_cache(self)
         normalize_scheduling(self)
         normalize_deltakv_storage(self)

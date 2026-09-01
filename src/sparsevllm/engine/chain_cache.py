@@ -11,6 +11,8 @@ from dataclasses import field
 from enum import Enum
 from typing import Any, Iterable
 
+from sparsevllm.method_registry import prefill_sparse_method_fingerprint
+
 
 
 CHAIN_PREFIX_METHODS = frozenset(
@@ -285,6 +287,12 @@ def build_chain_cache_fingerprint(config: Any) -> bytes:
     }
     for field_name in method_fields.get(method, ()):
         payload[field_name] = _jsonable(getattr(config, field_name, None))
+    payload.update(
+        {
+            key: _jsonable(value)
+            for key, value in prefill_sparse_method_fingerprint(config).items()
+        }
+    )
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).digest()

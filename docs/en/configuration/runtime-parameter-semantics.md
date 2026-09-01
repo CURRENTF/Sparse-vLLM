@@ -12,6 +12,7 @@ Use semantic public names in commands, JSON configs, and benchmark manifests:
 | Canonical name | Meaning |
 | --- | --- |
 | `sparse_method` | Sparse method selector. |
+| `prefill_sparse_method` | Orthogonal prefill-attention algorithm selector. It does not replace the cache/decode `sparse_method`. |
 | `deltakv_checkpoint_path` | DeltaKV compressor checkpoint path. |
 | `engine_prefill_chunk_size` | Maximum scheduled prefill chunk. |
 | `sink_keep_tokens` | Fixed sink-token budget. |
@@ -61,6 +62,21 @@ Do not duplicate method policy decisions in benchmark scripts. Runtime reports
 should record the resolved method, policy, chunk size, context length, batch
 size, and checkpoint path.
 
+## Prefill sparsity
+
+`prefill_sparse_method` selects the prefill attention algorithm independently
+from `sparse_method`. `flashprefill_v2` supports `vanilla`, `omnikv`, `quest`,
+`snapkv`, and `h2o` on explicit-KV MHA models, including their supported
+prefix-cache modes. MLA latent models reject this prefill method during
+configuration. H2O defaults to `prefill_sparse_method="h2o_prefill"`;
+explicitly selecting `flashprefill_v2` changes only the prefill attention
+computation. H2O still
+collects its method-owned posthoc scores and performs its normal prefill KV
+compaction. The cache manager owns that physical lifecycle, while the prepared
+prefill provider consumes its view without inspecting the cache method name. See
+[FlashPrefill V2](../features/flashprefill-v2.md) for the validated kernel
+contract and required calibration parameters.
+
 ## Runtime invariant validation
 
 `validate_runtime_invariants=False` is the serving fast-path default. Set it to
@@ -99,5 +115,5 @@ The native implementation, cache metadata, loader, and kernels live under
 
 Text benchmarks share `benchmark/model_adapters/sparsevllm.py`. It accepts the
 same public parameter names, constructs the native engine, and exposes a small
-generation callable for LongBench, MathBench, NIAH, and RULER-VT. SCBench uses
+generation callable for LongBench, MathBench, NIAH, and RULER core. SCBench uses
 its native `sparsevllm` attention type. There is no `--backend hf` option.

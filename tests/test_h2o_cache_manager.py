@@ -288,6 +288,27 @@ def test_h2o_decode_does_not_request_scores_or_run_eviction():
     runtime.cache_manager.evict_after_decode.assert_not_called()
 
 
+def test_h2o_flashprefill_uses_posthoc_scoring_and_preserves_eviction():
+    runtime = object.__new__(H2ORuntime)
+    runtime.config = SimpleNamespace(
+        sparse_method="h2o",
+        prefill_sparse_method="flashprefill_v2",
+        sparse_prefill_score_mode="logits",
+        h2o_prefill_score_window=0,
+    )
+    runtime.cache_manager = Mock()
+    prefill = SparseStepContext(
+        seqs=[],
+        is_prefill=True,
+        forward_context=SimpleNamespace(is_prefill=True, is_long_text=True),
+    )
+
+    assert runtime.needs_attention_score(0, prefill) is False
+    runtime.finish_step(prefill)
+
+    runtime.cache_manager.evict_after_prefill.assert_called_once_with([])
+
+
 def test_h2o_cache_manager_factory_routes_first_class_method():
     expected = object()
     config = SimpleNamespace(

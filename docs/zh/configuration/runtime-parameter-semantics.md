@@ -11,6 +11,7 @@ Sparse-vLLM 只有一个推理后端：`src/sparsevllm/` 下的原生引擎。
 | 规范名称 | 含义 |
 | --- | --- |
 | `sparse_method` | 稀疏方法选择器。 |
+| `prefill_sparse_method` | 与 cache/decode `sparse_method` 正交的 prefill attention 算法选择器。 |
 | `deltakv_checkpoint_path` | DeltaKV compressor checkpoint 路径。 |
 | `engine_prefill_chunk_size` | Prefill 最大调度 chunk。 |
 | `sink_keep_tokens` | Sink token 预算。 |
@@ -57,6 +58,19 @@ Prefill policy 的唯一事实来源是 `src/sparsevllm/method_registry.py`：
 不要在 benchmark script 中复制 method policy。运行报告应记录解析后的
 method、policy、chunk size、context length、batch size 和 checkpoint 路径。
 
+## Prefill 稀疏
+
+`prefill_sparse_method` 独立选择 prefill attention 算法，不替代
+`sparse_method`。`flashprefill_v2` 支持 `vanilla`、`omnikv`、`quest`、
+`snapkv` 和 `h2o`，但仅限 explicit-KV MHA 模型；MLA latent 模型会在配置阶段拒绝
+该 prefill 方法。这些组合也支持各方法已经支持的 prefix-cache mode。H2O 默认解析为
+`prefill_sparse_method="h2o_prefill"`；显式选择 `flashprefill_v2` 只改变 prefill
+attention 计算。H2O 仍然通过 method-owned posthoc scorer 收集分数，并执行原有的
+prefill KV 压缩。CacheManager 拥有这套物理生命周期，prepared prefill Provider
+只消费其 view，不检查 cache method 名称。已验证的
+kernel 契约和必须校准的参数见
+[FlashPrefill V2](../features/flashprefill-v2.md)。
+
 ## DeltaKV
 
 可报告的 DeltaKV 推理必须使用兼容 compressor checkpoint。对于已登记模型，
@@ -84,6 +98,6 @@ Compressor 训练由 [CURRENTF/DeltaKV](https://github.com/CURRENTF/DeltaKV)
 ## Benchmark adapter
 
 文本 benchmark 共用 `benchmark/model_adapters/sparsevllm.py`。它接收相同的
-public 参数，构造原生 engine，并为 LongBench、MathBench、NIAH 和 RULER-VT
+public 参数，构造原生 engine，并为 LongBench、MathBench、NIAH 和 RULER core
 提供轻量 generation callable。SCBench 使用原生 `sparsevllm` attention
 type，不存在 `--backend hf` 选项。

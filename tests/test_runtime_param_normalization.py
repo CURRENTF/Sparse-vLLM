@@ -9,6 +9,7 @@ class RuntimeParamNamingTest(unittest.TestCase):
         config_fields = {field.name for field in fields(Config) if field.init}
         canonical = {
             "sparse_method",
+            "prefill_sparse_method",
             "deltakv_checkpoint_path",
             "decode_keep_tokens",
             "sink_keep_tokens",

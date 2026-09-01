@@ -4,6 +4,7 @@ from sparsevllm.configs.groups import (
     DecodeCudaGraphConfig,
     DeltaKVConfig,
     ObservabilityConfig,
+    PrefillSparseMethodConfig,
     PrefixCacheConfig,
     SparseMethodConfig,
 )
@@ -14,6 +15,7 @@ __all__ = [
     "DecodeCudaGraphConfig",
     "DeltaKVConfig",
     "ObservabilityConfig",
+    "PrefillSparseMethodConfig",
     "PrefixCacheConfig",
     "QuantizationConfig",
     "RuntimeLayout",

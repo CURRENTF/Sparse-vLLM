@@ -1272,6 +1272,15 @@ class LLMEngine:
             "snapkv_window_size",
             "snapkv_num_full_layers",
             "sparse_prefill_score_mode",
+            "prefill_sparse_method",
+            "flashprefill_v2_k_block_m",
+            "flashprefill_v2_k_block_n",
+            "flashprefill_v2_abs_threshold",
+            "flashprefill_v2_attention_sink_blocks",
+            "flashprefill_v2_window_blocks",
+            "flashprefill_v2_last_query_blocks",
+            "flashprefill_v2_min_sparse_q_len",
+            "flashprefill_v2_use_mean_correction",
             "h2o_decode_budget",
             "h2o_prefill_budget",
             "h2o_recent_ratio",
@@ -1344,6 +1353,9 @@ class LLMEngine:
                 getattr(config.hf_config, "vocab_size", 0) or 0
             ),
             "sparse_method": str(getattr(config, "sparse_method", "") or ""),
+            "prefill_sparse_method": str(
+                getattr(config, "prefill_sparse_method", "") or ""
+            ),
             "world_size": int(getattr(config, "world_size", 1)),
             "tensor_parallel_size": int(getattr(config, "tensor_parallel_size", 1)),
             "expert_parallel_size": int(getattr(config, "expert_parallel_size", 1)),

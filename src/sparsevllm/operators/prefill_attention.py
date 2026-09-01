@@ -15,6 +15,13 @@ from sparsevllm.kernels.external.flashinfer.prefill import (
     flashinfer_paged_prefill_support,
     make_flashinfer_paged_prefill_wrapper,
 )
+from sparsevllm.kernels.external.flashprefill_v2.prefill import (
+    build_flashprefill_v2_page_table,
+    make_flashprefill_v2,
+)
+from sparsevllm.kernels.external.flashprefill_v2.support import (
+    flashprefill_v2_support,
+)
 from sparsevllm.operators.attention_capabilities import (
     AttentionKernelCapabilities,
     AttentionKernelRequest,
@@ -33,6 +40,39 @@ from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
 from sparsevllm.utils.log import logger
 
 
+@dataclass(frozen=True, kw_only=True)
+class FlashPrefillV2Semantics:
+    abs_threshold: float
+    k_block_m: int = 128
+    k_block_n: int = 128
+    attention_sink_blocks: int = 2
+    window_blocks: int = 4
+    last_query_blocks: int = 8
+    min_sparse_q_len: int = 4096
+    use_mean_correction: bool = True
+
+    def __post_init__(self) -> None:
+        if self.k_block_m <= 0 or self.k_block_m % 16:
+            raise ValueError("FlashPrefill V2 k_block_m must be a positive multiple of 16.")
+        if (
+            self.k_block_n <= 0
+            or self.k_block_n % 64
+            or self.k_block_n & (self.k_block_n - 1)
+        ):
+            raise ValueError(
+                "FlashPrefill V2 k_block_n must be a power-of-two multiple of 64."
+            )
+        if not 0.0 <= self.abs_threshold <= 1.0:
+            raise ValueError("FlashPrefill V2 abs_threshold must be in [0, 1].")
+        if min(
+            self.attention_sink_blocks,
+            self.window_blocks,
+            self.last_query_blocks,
+            self.min_sparse_q_len,
+        ) < 0:
+            raise ValueError("FlashPrefill V2 block-retention counts must be non-negative.")
+
+
 @dataclass(frozen=True)
 class PrefillAttentionOpSpec:
     num_query_heads: int
@@ -48,6 +88,8 @@ class PrefillAttentionOpSpec:
     cuda_graph: bool = False
     return_softmax_lse: bool = False
     allow_softmax_lse_fallback: bool = False
+    prefill_sparse_method: str = ""
+    flashprefill_v2: FlashPrefillV2Semantics | None = None
 
     def __post_init__(self) -> None:
         if self.num_query_heads <= 0 or self.num_kv_heads <= 0:
@@ -58,6 +100,18 @@ class PrefillAttentionOpSpec:
             raise ValueError("Prefill attention dimensions must be positive.")
         if self.softmax_scale <= 0:
             raise ValueError("Prefill attention softmax_scale must be positive.")
+        if self.prefill_sparse_method not in {"", "h2o_prefill", "flashprefill_v2"}:
+            raise ValueError(
+                "Unknown prefill sparse method in operator spec: "
+                f"{self.prefill_sparse_method!r}."
+            )
+        if (self.prefill_sparse_method == "flashprefill_v2") != (
+            self.flashprefill_v2 is not None
+        ):
+            raise ValueError(
+                "FlashPrefill V2 operator semantics must be present exactly when "
+                "prefill_sparse_method='flashprefill_v2'."
+            )
 
     @property
     def kernel_request(self) -> AttentionKernelRequest:
@@ -121,6 +175,17 @@ def _validate_token_page_table(view: Any) -> None:
         )
 
 
+def _require_dense_prefill_semantics(
+    spec: PrefillAttentionOpSpec,
+) -> SupportResult:
+    if spec.prefill_sparse_method == "flashprefill_v2":
+        return SupportResult.unsupported(
+            "provider implements dense prefill semantics, got "
+            f"prefill_sparse_method={spec.prefill_sparse_method!r}"
+        )
+    return SupportResult.yes()
+
+
 PREFILL_ATTENTION_REGISTRY: OpRegistry[
     PrefillAttentionOpSpec, PrefillAttentionProvider
 ] = OpRegistry(
@@ -132,7 +197,10 @@ PREFILL_ATTENTION_REGISTRY: OpRegistry[
             "flashinfer_paged_prefill_fa2_sm120",
         ),
         repo_portable=("triton_paged_prefill",),
-        repo_nonstandard=("tilelang_gqa_paged_prefill",),
+        repo_nonstandard=(
+            "flashprefill_v2",
+            "tilelang_gqa_paged_prefill",
+        ),
     ),
 )
 
@@ -178,6 +246,9 @@ class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
     def supports(
         cls, spec: PrefillAttentionOpSpec, caps: DeviceCaps
     ) -> SupportResult:
+        semantics = _require_dense_prefill_semantics(spec)
+        if not semantics.supported:
+            return semantics
         common = match_attention_capabilities(
             spec.kernel_request, caps, cls.capabilities
         )
@@ -376,6 +447,9 @@ class FlashInferFa2Sm120PagedPrefillAttentionProvider(
     def supports(
         cls, spec: PrefillAttentionOpSpec, caps: DeviceCaps
     ) -> SupportResult:
+        semantics = _require_dense_prefill_semantics(spec)
+        if not semantics.supported:
+            return semantics
         common = match_attention_capabilities(
             spec.kernel_request, caps, cls.capabilities
         )
@@ -409,6 +483,9 @@ class SglFa3PagedPrefillAttentionProvider(PrefillAttentionProvider):
     def supports(
         cls, spec: PrefillAttentionOpSpec, caps: DeviceCaps
     ) -> SupportResult:
+        semantics = _require_dense_prefill_semantics(spec)
+        if not semantics.supported:
+            return semantics
         common = match_attention_capabilities(
             spec.kernel_request, caps, cls.capabilities
         )
@@ -511,6 +588,151 @@ class SglFa3PagedPrefillAttentionProvider(PrefillAttentionProvider):
         return PrefillAttentionRunResult(output=output, softmax_lse=softmax_lse)
 
 
+@PREFILL_ATTENTION_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
+class FlashPrefillV2Provider(PrefillAttentionProvider):
+    """FlashPrefill V2 sparse-prefill semantics over explicit paged KV."""
+
+    name = "flashprefill_v2"
+    capabilities = AttentionKernelCapabilities(
+        platforms=frozenset({PlatformEnum.CUDA}),
+        compute_capabilities=frozenset({(9, 0)}),
+        activation_dtypes=frozenset({torch.bfloat16}),
+        head_dims=frozenset({128}),
+        page_sizes=frozenset({1}),
+        score_outputs=frozenset({AttentionScoreKind.NONE}),
+        layer_varying_page_table=True,
+        varlen=True,
+        minimum_runtime_version=(12, 3),
+    )
+
+    def __init__(self) -> None:
+        self._pipeline = None
+        self._query_plan_scope: object | None = None
+        self._host_query_lens: tuple[int, ...] = ()
+
+    @classmethod
+    def supports(
+        cls, spec: PrefillAttentionOpSpec, caps: DeviceCaps
+    ) -> SupportResult:
+        if spec.prefill_sparse_method != "flashprefill_v2":
+            return SupportResult.unsupported(
+                "provider requires prefill_sparse_method='flashprefill_v2'"
+            )
+        common = match_attention_capabilities(
+            spec.kernel_request, caps, cls.capabilities
+        )
+        if not common.supported:
+            return common
+        if not spec.causal:
+            return SupportResult.unsupported("FlashPrefill V2 requires causal attention")
+        if spec.flashprefill_v2 is None:
+            return SupportResult.unsupported("FlashPrefill V2 semantics are missing")
+        supported, reason = flashprefill_v2_support()
+        return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
+
+    def prepare(
+        self,
+        spec: PrefillAttentionOpSpec,
+        *,
+        device_index: int | None = None,
+    ) -> None:
+        if self._pipeline is not None:
+            return
+        current_device = torch.cuda.current_device()
+        if device_index is None:
+            device_index = current_device
+        if int(device_index) != current_device:
+            raise RuntimeError(
+                "FlashPrefill V2 must be prepared on the selected CUDA device: "
+                f"selected={device_index} current={current_device}."
+            )
+        if spec.flashprefill_v2 is None:
+            raise RuntimeError("FlashPrefill V2 semantics are missing during prepare.")
+        self._pipeline = make_flashprefill_v2(
+            semantics=spec.flashprefill_v2,
+            softmax_scale=spec.softmax_scale,
+        )
+
+    def binding_metadata(self) -> dict[str, object]:
+        return {
+            "implementation_kind": "atomic_provider",
+            "source": "FlashPrefillv2",
+            "validated_upstream_revision": "75b58f2ecdba1c269a87dd34d8f1ae57bef50c57",
+            "kv_layout": "NHD",
+            "page_size": 1,
+            "prefill_sparse_method": "flashprefill_v2",
+        }
+
+    def close(self) -> None:
+        pipeline = self._pipeline
+        if pipeline is not None:
+            clear = getattr(pipeline, "clear_workspaces", None)
+            if callable(clear):
+                clear()
+        self._pipeline = None
+        self._query_plan_scope = None
+        self._host_query_lens = ()
+
+    def run(
+        self,
+        spec,
+        q,
+        view,
+        *,
+        qo_indptr,
+        chunk_lens,
+        max_context_len,
+        layer_idx,
+    ):
+        del layer_idx
+        payload, meta = _view_parts(view)
+        _validate_token_page_table(meta)
+        if self._pipeline is None:
+            raise RuntimeError("FlashPrefill V2 provider was not prepared.")
+        if q.dtype != spec.activation_dtype:
+            raise TypeError(
+                f"FlashPrefill V2 expected {spec.activation_dtype} Q, got {q.dtype}."
+            )
+        if payload.k_cache.dtype != q.dtype or payload.v_cache.dtype != q.dtype:
+            raise TypeError(
+                "FlashPrefill V2 requires Q/K/V with the same dtype, got "
+                f"{q.dtype}/{payload.k_cache.dtype}/{payload.v_cache.dtype}."
+            )
+        if qo_indptr.dtype != torch.int32 or chunk_lens.dtype != torch.int32:
+            raise TypeError("FlashPrefill V2 requires int32 query sequence metadata.")
+        if meta.context_lens.dtype != torch.int32:
+            raise TypeError("FlashPrefill V2 requires int32 cache sequence lengths.")
+
+        from sparsevllm.utils.context import get_context
+
+        validation_scope = get_context().attention_validation_scope
+        if self._query_plan_scope is not validation_scope:
+            self._host_query_lens = tuple(int(value) for value in chunk_lens.tolist())
+            if sum(self._host_query_lens) != int(q.shape[0]):
+                raise ValueError(
+                    "FlashPrefill V2 query lengths do not sum to the flattened Q rows: "
+                    f"q_lens={self._host_query_lens} q_rows={int(q.shape[0])}."
+                )
+            self._query_plan_scope = validation_scope
+        page_table = build_flashprefill_v2_page_table(
+            meta.active_slots,
+            meta.req_indices,
+            meta.context_lens,
+            max_context_len=int(max_context_len),
+        )
+        return self._pipeline(
+            q,
+            payload.k_cache.unsqueeze(1),
+            payload.v_cache.unsqueeze(1),
+            page_table,
+            meta.context_lens,
+            qo_indptr,
+            q_lens=self._host_query_lens,
+            max_cache_seqlen=int(max_context_len),
+            softmax_scale=spec.softmax_scale,
+        )
+
+
 @PREFILL_ATTENTION_REGISTRY.register_atomic(
     ProviderRole.REPO_NONSTANDARD,
 )
@@ -544,6 +766,9 @@ class TilelangGqaPagedPrefillAttentionProvider(PrefillAttentionProvider):
     def supports(
         cls, spec: PrefillAttentionOpSpec, caps: DeviceCaps
     ) -> SupportResult:
+        semantics = _require_dense_prefill_semantics(spec)
+        if not semantics.supported:
+            return semantics
         common = match_attention_capabilities(
             spec.kernel_request, caps, cls.capabilities
         )
@@ -646,6 +871,9 @@ class TritonPagedPrefillAttentionProvider(PrefillAttentionProvider):
     def supports(
         cls, spec: PrefillAttentionOpSpec, caps: DeviceCaps
     ) -> SupportResult:
+        semantics = _require_dense_prefill_semantics(spec)
+        if not semantics.supported:
+            return semantics
         common = match_attention_capabilities(
             spec.kernel_request, caps, cls.capabilities
         )

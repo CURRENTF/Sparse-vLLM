@@ -28,6 +28,18 @@ def test_glm_config_accepts_latent_quest_without_prefix_cache():
     assert config.enable_prefix_caching is False
 
 
+def test_glm_config_rejects_flashprefill_v2_for_mla_latent_storage():
+    with pytest.raises(
+        NotImplementedError,
+        match="flashprefill_v2.*requires explicit KV cache storage",
+    ):
+        _glm_config(
+            sparse_method="quest",
+            prefill_sparse_method="flashprefill_v2",
+            flashprefill_v2_abs_threshold=0.1,
+        )
+
+
 def test_glm_config_rejects_latent_quest_prefix_cache():
     with pytest.raises(ValueError, match="prefix caching is validated only"):
         _glm_config(

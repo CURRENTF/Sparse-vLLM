@@ -50,6 +50,72 @@ CANONICAL_SPARSE_METHODS = {
 SUPPORTED_SPARSE_METHODS = set(CANONICAL_SPARSE_METHODS)
 SUPPORTED_SPARSE_METHOD_ALIASES = {str(k) for k in METHOD_ALIASES if k is not None and str(k)}
 
+PREFILL_SPARSE_METHOD_ALIASES = {
+    None: "",
+    "": "",
+    "dense": "",
+    "h2o-prefill": "h2o_prefill",
+    "h2o_prefill": "h2o_prefill",
+    "flash-prefill-v2": "flashprefill_v2",
+    "flash_prefill_v2": "flashprefill_v2",
+    "flashprefill-v2": "flashprefill_v2",
+    "flashprefill_v2": "flashprefill_v2",
+}
+
+CANONICAL_PREFILL_SPARSE_METHODS = {
+    "",
+    "h2o_prefill",
+    "flashprefill_v2",
+}
+
+PREFILL_SPARSE_METHOD_COMPATIBILITY = {
+    "": frozenset(CANONICAL_SPARSE_METHODS),
+    "h2o_prefill": frozenset({"h2o"}),
+    "flashprefill_v2": frozenset({"", "omnikv", "quest", "snapkv", "h2o"}),
+}
+
+
+def normalize_prefill_sparse_method(method: str | None) -> str:
+    if method in PREFILL_SPARSE_METHOD_ALIASES:
+        return PREFILL_SPARSE_METHOD_ALIASES[method]
+    return str(method).strip().lower().replace("-", "_")
+
+
+def resolve_prefill_sparse_method(
+    method: str | None,
+    *,
+    sparse_method: str | None,
+) -> str:
+    """Resolve the prefill algorithm, including cache-method defaults."""
+
+    normalized = normalize_prefill_sparse_method(method)
+    if not normalized and normalize_sparse_method(sparse_method) == "h2o":
+        return "h2o_prefill"
+    return normalized
+
+
+def prefill_sparse_method_fingerprint(config) -> dict[str, object]:
+    """Return prefill semantics that can change cached hidden-state-derived KV."""
+
+    method = resolve_prefill_sparse_method(
+        getattr(config, "prefill_sparse_method", ""),
+        sparse_method=getattr(config, "sparse_method", ""),
+    )
+    payload: dict[str, object] = {"prefill_sparse_method": method}
+    if method == "flashprefill_v2":
+        for field_name in (
+            "flashprefill_v2_k_block_m",
+            "flashprefill_v2_k_block_n",
+            "flashprefill_v2_abs_threshold",
+            "flashprefill_v2_attention_sink_blocks",
+            "flashprefill_v2_window_blocks",
+            "flashprefill_v2_last_query_blocks",
+            "flashprefill_v2_min_sparse_q_len",
+            "flashprefill_v2_use_mean_correction",
+        ):
+            payload[field_name] = getattr(config, field_name, None)
+    return payload
+
 PREFIX_CACHE_SUPPORTED_METHODS = {
     "",
     "streamingllm",
@@ -121,14 +187,22 @@ def resolve_sparse_prefill_score_mode(
 def sparse_prefill_attention_contract(
     method: str | None,
     *,
+    prefill_sparse_method: str | None = None,
     sparse_prefill_score_mode: str | None = None,
     h2o_prefill_score_window: int = 0,
 ) -> SparsePrefillAttentionContract:
     normalized = normalize_sparse_method(method)
     if normalized not in CANONICAL_SPARSE_METHODS:
         raise ValueError(f"Unknown sparse method {normalized!r}.")
+    resolved_prefill_method = resolve_prefill_sparse_method(
+        prefill_sparse_method,
+        sparse_method=normalized,
+    )
+    h2o_prefill = (
+        normalized == "h2o" and resolved_prefill_method == "h2o_prefill"
+    )
     fused_h2o_score = (
-        normalized == "h2o"
+        h2o_prefill
         and resolve_sparse_prefill_score_mode(
             normalized,
             sparse_prefill_score_mode,
@@ -155,6 +229,11 @@ def sparse_prefill_attention_contract(
 def h2o_uses_fused_prefill_score(config) -> bool:
     return (
         normalize_sparse_method(getattr(config, "sparse_method", None)) == "h2o"
+        and resolve_prefill_sparse_method(
+            getattr(config, "prefill_sparse_method", ""),
+            sparse_method="h2o",
+        )
+        == "h2o_prefill"
         and resolve_sparse_prefill_score_mode(
             "h2o",
             getattr(config, "sparse_prefill_score_mode", None),

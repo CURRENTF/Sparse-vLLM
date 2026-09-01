@@ -215,6 +215,47 @@ def test_qwen3_moe_builds_real_prefill_shape_spec(
     assert spec.score_output is AttentionScoreKind.NONE
 
 
+@pytest.mark.parametrize("sparse_method", ["", "omnikv", "quest", "snapkv", "h2o"])
+def test_qwen3_prefill_builder_preserves_orthogonal_flashprefill_semantics(
+    sparse_method,
+):
+    engine_config = SimpleNamespace(
+        sparse_method=sparse_method,
+        sparse_prefill_score_mode=None,
+        h2o_prefill_score_window=0,
+        prefill_sparse_method="flashprefill_v2",
+        flashprefill_v2_k_block_m=128,
+        flashprefill_v2_k_block_n=128,
+        flashprefill_v2_abs_threshold=0.1,
+        flashprefill_v2_attention_sink_blocks=2,
+        flashprefill_v2_window_blocks=4,
+        flashprefill_v2_last_query_blocks=8,
+        flashprefill_v2_min_sparse_q_len=4096,
+        flashprefill_v2_use_mean_correction=True,
+    )
+    prepared = SimpleNamespace(name="flashprefill_v2")
+    with patch(
+        "sparsevllm.models.attention_runtime.prepare_prefill_attention_op",
+        return_value=prepared,
+    ) as prepare:
+        actual = build_qwen3_prefill_attention_op(
+            _config(),
+            engine_config=engine_config,
+            parallel_context=_tp_context(0, 1),
+            device=torch.device("cuda", 0),
+        )
+
+    spec = prepare.call_args.args[0]
+    assert actual is prepared
+    assert spec.prefill_sparse_method == "flashprefill_v2"
+    assert spec.flashprefill_v2 is not None
+    assert spec.flashprefill_v2.k_block_n == 128
+    assert spec.flashprefill_v2.min_sparse_q_len == 4096
+    assert spec.layer_varying_page_table is bool(sparse_method)
+    assert spec.score_output is AttentionScoreKind.NONE
+    assert spec.return_softmax_lse is False
+
+
 def test_qwen3_moe_shares_and_closes_full_attention_provider():
     prepared = SimpleNamespace(name="sgl_fa3")
     decode = SimpleNamespace(name="triton_decode")

@@ -471,6 +471,23 @@ def test_prefix_cache_fingerprint_isolates_salt_and_method():
     assert omnikv != quest
 
 
+def test_prefix_cache_fingerprint_isolates_prefill_semantics():
+    dense = _cfg()
+    flash = _cfg()
+    flash.prefill_sparse_method = "flashprefill_v2"
+    flash.flashprefill_v2_abs_threshold = 0.1
+    retuned = _cfg()
+    retuned.prefill_sparse_method = "flashprefill_v2"
+    retuned.flashprefill_v2_abs_threshold = 0.2
+
+    dense_fingerprint = build_prefix_cache_fingerprint(dense, 4)
+    flash_fingerprint = build_prefix_cache_fingerprint(flash, 4)
+    retuned_fingerprint = build_prefix_cache_fingerprint(retuned, 4)
+
+    assert dense_fingerprint != flash_fingerprint
+    assert flash_fingerprint != retuned_fingerprint
+
+
 def test_prefix_cache_fingerprint_ignores_world_and_ep_rank():
     rank0 = _cfg()
     rank0.world_rank = 0

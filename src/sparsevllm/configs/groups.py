@@ -98,6 +98,21 @@ class SparseMethodConfig:
 
 
 @dataclass(kw_only=True)
+class PrefillSparseMethodConfig:
+    """Prefill-attention algorithm settings, independent of KV/decode methods."""
+
+    prefill_sparse_method: str = ""
+    flashprefill_v2_k_block_m: int = 128
+    flashprefill_v2_k_block_n: int = 128
+    flashprefill_v2_abs_threshold: float | None = None
+    flashprefill_v2_attention_sink_blocks: int = 2
+    flashprefill_v2_window_blocks: int = 4
+    flashprefill_v2_last_query_blocks: int = 8
+    flashprefill_v2_min_sparse_q_len: int = 4096
+    flashprefill_v2_use_mean_correction: bool = True
+
+
+@dataclass(kw_only=True)
 class DeltaKVConfig:
     """DeltaKV compressor, quantization, and kernel settings."""
 
