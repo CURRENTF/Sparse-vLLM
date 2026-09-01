@@ -6,7 +6,9 @@
 
 harness 用于对以下层进行可复现的方法/模型检查：
 
-- `quality`：LongBench-mini generation quality。
+- `quality`：LongBench v1 mini、LongBench v2 与按上下文长度分桶的 RULER core generation quality。
+- `longbench_v2`：只运行 LongBench v2 quality gate。
+- `ruler`：只运行 RULER core quality gate。
 - `perf`：prefill/decode throughput 和 memory accounting。
 - `stress`：固定长度、高并发的 SparseVLLM admission/decode stress。
 - `stress_v2`：带 shared-prefix 和 multi-turn workload、可变 prompt length，并对支持方法验证 prefix-cache hit 的 synthetic serving trace stress。
@@ -22,6 +24,7 @@ test plan 由 `benchmark/sparsevllm_regression/manifest.json` 控制。
 - Conda env：`<CONDA_ENV>`
 - Output root：`<OUTPUT_ROOT>`
 - LongBench data：`<LONGBENCH_ROOT>`
+- LongBench v2 JSON/JSONL export：`<LONGBENCH_V2_DATA>`
 - 模型：
   - `<MODEL_ROOT>/Qwen2.5-7B-Instruct-1M`
   - `<MODEL_ROOT>/Qwen3-4B-Instruct-2507`
@@ -38,6 +41,7 @@ cd <REPO_ROOT>
 
 export SPARSEVLLM_OUTPUT_DIR=<OUTPUT_ROOT>
 export SPARSEVLLM_LONGBENCH_DATA_DIR=<LONGBENCH_ROOT>
+export SPARSEVLLM_LONGBENCH_V2_DATA=<LONGBENCH_V2_DATA>
 
 export DELTAKV_MODEL_QWEN25_7B=<MODEL_ROOT>/Qwen2.5-7B-Instruct-1M
 export DELTAKV_MODEL_QWEN3_4B=<MODEL_ROOT>/Qwen3-4B-Instruct-2507
@@ -50,18 +54,32 @@ export DELTAKV_COMPRESSOR_LLAMA31_8B=<CHECKPOINT_ROOT>/Llama-3.1-8B-Instruct-Com
 export PYTHONPATH=<REPO_ROOT>:<REPO_ROOT>/src:${PYTHONPATH:-}
 ```
 
+第一次运行 V2 前初始化固定版本的官方 LongBench submodule：
+
+```bash
+git submodule update --init benchmark/long_bench_v2/upstream
+```
+
+submodule 提供官方 prompt、参考实现和版本 provenance。官方
+`THUDM/LongBench-v2` 数据集独立分发；将 train split 导出为一个本地 `.json`
+或 `.jsonl` 文件，并让 `SPARSEVLLM_LONGBENCH_V2_DATA` 指向这个不可变输入。
+
 manifest 还包含 `qwen25_32b`；除非 GPU memory 足够且设置了相应 model/checkpoint 环境变量，否则省略它。
 
 ## 快速 Unit Test
 
-运行保护 regression harness、grading、manifest policy 和 OmniKV full-layer selector 的 unit test：
+运行保护 regression harness、RULER generator/grading、manifest policy 和 OmniKV
+full-layer selector 的 unit test：
 
 ```bash
 conda run -n <CONDA_ENV> --no-capture-output \
-  python -m unittest \
-  tests.test_sparsevllm_regression_grading \
-  tests.test_omnikv_full_layer_selector \
-  -v
+  python -m pytest \
+  tests/test_sparsevllm_regression_grading.py \
+  tests/test_omnikv_full_layer_selector.py \
+  tests/test_ruler_tasks.py \
+  tests/test_ruler_vt_regression.py \
+  tests/test_longbench_v2.py \
+  -q
 ```
 
 当前 harness 的预期结果：所有 test 通过。
@@ -92,7 +110,11 @@ conda run -n <CONDA_ENV> --no-capture-output \
 
 ### Quality
 
-Quality 使用 LongBench-mini：
+默认情况下，`--layer quality` 同时运行 LongBench v1 mini、LongBench v2 和
+RULER core。只有明确需要缩小范围时，才传入如
+`--quality_benchmarks longbench_v2` 的子集。
+
+LongBench-mini 使用：
 
 - task：`qasper,hotpotqa,multi_news,trec,passage_retrieval_en,lcc`
 - LongBench batch size：`100`
@@ -145,6 +167,7 @@ conda run -n <CONDA_ENV> --no-capture-output \
 conda run -n <CONDA_ENV> --no-capture-output \
   python benchmark/sparsevllm_regression/run_suite.py \
   --layer quality \
+  --quality_benchmarks longbench \
   --models qwen3_4b \
   --methods vanilla,omnikv,quest \
   --tensor_parallel_size 2 \
@@ -203,6 +226,107 @@ conda run -n <CONDA_ENV> --no-capture-output \
   --run_id tp_prefix_graph_stress_quick_$(date -u +%Y%m%d_%H%M%S) \
   --output_root <OUTPUT_ROOT>
 ```
+
+### LongBench V2 Quality
+
+LongBench v2 是新增项，不替换现有 LongBench v1 mini gate。原始 benchmark
+覆盖约 8K 到 2M words。标准 regression profile 使用 120 个自然样本，按应用
+chat template 后的 token 数分为 `32K-64K`、`64K-96K`、`96K-127K` 三桶，
+每桶 40 个样本，
+`max_model_len=131072`；因此既能支持 128K-class 模型，也超过 V1 runner 的
+121K 上限。给定 dataset、tokenizer 和 seed，选样完全确定。
+
+runner 使用 submodule 中的官方 zero-shot direct-answer prompt，但不复制上游 API
+client，也不采用上游的 head/tail truncation。超出配置容量的 prompt 在确定性选样
+前排除；任一桶样本不足会直接失败。gate 还要求同一 run 的 vanilla/sparse 样本
+完全对齐、source-data hash 一致，并为每个样本保留显式状态。非空 response 若没有
+包含官方答案格式，会保留为 `parse_failed` 并按错误答案计分，与官方 evaluator
+一致；model/runtime 执行失败仍会使整个 run 无效。
+
+该固定 120-sample profile 使用 greedy decoding 以减少 run-to-run noise。它是 repo
+quality regression gate，不是官方完整 503-sample leaderboard protocol 的复现。
+
+只运行标准 V2 gate：
+
+```bash
+conda run -n <CONDA_ENV> --no-capture-output \
+  python benchmark/sparsevllm_regression/run_suite.py \
+  --layer longbench_v2 \
+  --models qwen25_7b \
+  --methods vanilla,omnikv \
+  --command_timeout_s 7200 \
+  --run_id longbench_v2_quality_$(date -u +%Y%m%d_%H%M%S) \
+  --output_root <OUTPUT_ROOT>
+```
+
+对于已经验证支持 128K 以上上下文的模型，应同时显式扩展 runtime limit 和 token
+bucket。这是独立 profile，不会静默改变标准 gate：
+
+```bash
+python benchmark/sparsevllm_regression/run_suite.py \
+  --layer longbench_v2 \
+  --models qwen25_7b \
+  --methods vanilla,omnikv \
+  --longbench_v2_max_model_len 262144 \
+  --longbench_v2_token_buckets_json \
+  '[{"name":"128k-192k","min_prompt_tokens":131072,"max_prompt_tokens":196607,"samples":4},{"name":"192k-255k","min_prompt_tokens":196608,"max_prompt_tokens":261888,"samples":4}]' \
+  --output_root <OUTPUT_ROOT>
+```
+
+### RULER Core Quality
+
+固定的自包含集合运行 `niah_single_1`、`niah_multikey_2`、`vt`、`cwe` 和
+`fwe`，覆盖 retrieval、multi-hop tracing 和两种 aggregation contract。matrix
+使用 `16K,32K,64K,98K` target context length，并在每个 task、每个长度上用
+同一 run 中完全对齐的 vanilla dataset 独立评分，因此单个 task/length 回归不会被
+平均分掩盖。每个 sample 必须至少达到目标 sequence length 的 90%。runner 保留
+raw、parsed、per-sample、dataset、aggregate 和 grade artifact。
+默认每个 task/length bucket 取 10 个 sample，即每个 model/method 运行 200 次
+generation。
+
+task contract 和 prompt 对齐 NVIDIA RULER；确定性 synthetic word pool 替代可选的
+`wonderwords` 和大型 word asset，因此这是 repo regression set，不是官方
+leaderboard dataset。依赖外部语料的 essay-based NIAH 和 `qa_1`/`qa_2` 不包含。
+
+只运行 RULER core、不运行 LongBench-mini：
+
+```bash
+conda run -n <CONDA_ENV> --no-capture-output \
+  python benchmark/sparsevllm_regression/run_suite.py \
+  --layer ruler \
+  --models qwen25_7b \
+  --methods vanilla,omnikv \
+  --ruler_tasks niah_single_1,niah_multikey_2,vt,cwe,fwe \
+  --ruler_context_lengths 16384,32768,65536,98304 \
+  --ruler_samples_per_length 10 \
+  --command_timeout_s 7200 \
+  --run_id ruler_quality_$(date -u +%Y%m%d_%H%M%S) \
+  --output_root <OUTPUT_ROOT>
+```
+
+对于支持 prefix cache 的方法，启用后会在同一 engine 中立即原样重放每个
+deterministic batch。gate 要求 cache hit request 和 hit token 都非零，并要求
+重放输出和得分与 primary pass 完全一致：
+
+```bash
+conda run -n <CONDA_ENV> --no-capture-output \
+  python benchmark/sparsevllm_regression/run_suite.py \
+  --layer ruler \
+  --models qwen3_4b \
+  --methods vanilla,omnikv,quest \
+  --ruler_tasks vt \
+  --enable_prefix_caching \
+  --prefix_cache_block_size 16 \
+  --ruler_context_lengths 16384,32768 \
+  --ruler_samples_per_length 2 \
+  --command_timeout_s 1800 \
+  --run_id ruler_prefix_quality_$(date -u +%Y%m%d_%H%M%S) \
+  --output_root <OUTPUT_ROOT>
+```
+
+检查 `ruler.json`、`grade_summary.json`，以及各 task/method 目录中的
+`prefix_cache_summary.json`。这是 quality 与 cache-correctness gate，不是
+prefix-cache performance benchmark。
 
 ### Performance
 
@@ -379,9 +503,15 @@ llama31_8b: 0,2,7,13,16,26
 - `memory.json`：根据 performance row 得到的 memory grade。
 - `stress.json`：stress row 和 stress grade。
 - `stress_v2.json`：serving-trace stress row 和 stress_v2 grade。
+- `ruler.json`：按 task、model 和 method 保存的 RULER aggregate record。
+- `longbench_v2.json`：按 model 和 method 保存的 LongBench v2 aggregate record。
 - `raw_outputs.jsonl`、`parsed_outputs.jsonl`、`sample_results.jsonl`：运行 quality 时的 generation artifact。
 - Layer-specific log：
   - `quality/<model>/<method>/run.log`
+  - `ruler/<task>/<model>/<method>/run.log`；同目录保存 dataset、aggregate 和可选的
+    prefix-cache replay artifact
+  - `longbench_v2/<model>/<method>/run.log`；同目录保存选样、source hash、
+    per-sample result 和 aggregate metric
   - `perf/<model>/<method>.log`
   - `stress/<model>/<method>.log`
 
@@ -397,7 +527,7 @@ data = json.loads((root / "grade_summary.json").read_text())
 print("status:", data["status"])
 print("worst_required_grade:", data.get("worst_required_grade"))
 for grade in data.get("grades", []):
-    print(grade.get("model"), grade.get("method"), grade["name"], grade["grade"], grade["status"], grade["metrics"])
+    print(grade.get("task"), grade.get("model"), grade.get("method"), grade.get("context_length"), grade["name"], grade["grade"], grade["status"], grade["metrics"])
 PY
 ```
 

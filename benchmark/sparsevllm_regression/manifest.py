@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from benchmark.ruler_vt.tasks import SUPPORTED_TASKS, resolve_task_config
 from sparsevllm.method_registry import (
     PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
     get_default_prefill_schedule_policy,
@@ -46,6 +47,8 @@ REQUIRED_ARTIFACTS = [
     "stress.json",
     "stress_v2.json",
     "scbench.json",
+    "ruler.json",
+    "longbench_v2.json",
     "grade_summary.json",
 ]
 OMNIKV_REQUIRED_BENCHMARK_PARAMS = {
@@ -125,7 +128,18 @@ def load_manifest(path: str | Path | None = None) -> dict[str, Any]:
 def validate_manifest(manifest: dict[str, Any]) -> None:
     if not isinstance(manifest, dict):
         raise ManifestError("manifest must be a JSON object.")
-    for key in ("models", "methods", "quality", "performance", "stress", "stress_v2", "scbench", "outputs"):
+    for key in (
+        "models",
+        "methods",
+        "quality",
+        "longbench_v2",
+        "ruler",
+        "performance",
+        "stress",
+        "stress_v2",
+        "scbench",
+        "outputs",
+    ):
         if key not in manifest:
             raise ManifestError(f"manifest is missing required key: {key}")
 
@@ -147,6 +161,158 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
     minimum_vanilla_score = quality.get("minimum_vanilla_score")
     if not isinstance(minimum_vanilla_score, (int, float)) or minimum_vanilla_score <= 0:
         raise ManifestError("quality minimum_vanilla_score must be a positive number.")
+
+    longbench_v2 = manifest["longbench_v2"]
+    if not isinstance(longbench_v2, dict):
+        raise ManifestError("manifest longbench_v2 must be a JSON object.")
+    data_path_env = longbench_v2.get("data_path_env")
+    if not isinstance(data_path_env, str) or not data_path_env:
+        raise ManifestError("longbench_v2 data_path_env must be a non-empty string.")
+    for score_key in ("minimum_vanilla_score", "maximum_score_loss"):
+        value = longbench_v2.get(score_key)
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or not 0.0 < float(value) <= 100.0
+        ):
+            raise ManifestError(f"longbench_v2 {score_key} must be in (0, 100].")
+    for int_key in ("max_model_len", "max_new_tokens", "batch_size", "seed"):
+        value = longbench_v2.get(int_key)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ManifestError(f"longbench_v2 {int_key} must be a positive integer.")
+    for float_key in ("temperature", "top_p"):
+        value = longbench_v2.get(float_key)
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            raise ManifestError(
+                f"longbench_v2 {float_key} must be a finite non-negative number."
+            )
+    top_k = longbench_v2.get("top_k")
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 0:
+        raise ManifestError("longbench_v2 top_k must be a non-negative integer.")
+    token_buckets = longbench_v2.get("token_buckets")
+    try:
+        from benchmark.long_bench_v2.contracts import parse_token_buckets
+
+        resolved_buckets = parse_token_buckets(token_buckets)
+    except (TypeError, ValueError) as exc:
+        raise ManifestError(f"invalid longbench_v2 token_buckets: {exc}") from exc
+    prompt_budget = int(longbench_v2["max_model_len"]) - int(
+        longbench_v2["max_new_tokens"]
+    )
+    if prompt_budget <= 0:
+        raise ManifestError("longbench_v2 max_new_tokens leaves no prompt budget.")
+    oversized_buckets = [
+        bucket.name
+        for bucket in resolved_buckets
+        if bucket.max_prompt_tokens > prompt_budget
+    ]
+    if oversized_buckets:
+        raise ManifestError(
+            "longbench_v2 token buckets exceed the untruncated prompt budget: "
+            f"{oversized_buckets}."
+        )
+
+    ruler = manifest["ruler"]
+    if not isinstance(ruler, dict):
+        raise ManifestError("manifest ruler must be a JSON object.")
+    ruler_tasks = ruler.get("tasks")
+    if (
+        not isinstance(ruler_tasks, list)
+        or not ruler_tasks
+        or any(not isinstance(task, str) for task in ruler_tasks)
+        or len(set(ruler_tasks)) != len(ruler_tasks)
+    ):
+        raise ManifestError("ruler tasks must be a non-empty list of unique strings.")
+    unsupported_tasks = sorted(set(ruler_tasks) - set(SUPPORTED_TASKS))
+    if unsupported_tasks:
+        raise ManifestError(f"ruler tasks are unsupported: {unsupported_tasks}.")
+    task_configs = ruler.get("task_configs")
+    if not isinstance(task_configs, dict):
+        raise ManifestError("ruler task_configs must be a JSON object.")
+    missing_task_configs = sorted(set(ruler_tasks) - set(task_configs))
+    if missing_task_configs:
+        raise ManifestError(
+            f"ruler task_configs are missing selected tasks: {missing_task_configs}."
+        )
+    for task in ruler_tasks:
+        task_config = task_configs[task]
+        if not isinstance(task_config, dict):
+            raise ManifestError(f"ruler task_configs.{task} must be a JSON object.")
+        for key in ("tokens_to_generate", "max_new_tokens"):
+            value = task_config.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ManifestError(
+                    f"ruler task_configs.{task}.{key} must be a positive integer."
+                )
+        try:
+            resolve_task_config(task, task_config)
+        except (TypeError, ValueError) as exc:
+            raise ManifestError(f"invalid ruler task_configs.{task}: {exc}") from exc
+    context_lengths = ruler.get("context_lengths")
+    if (
+        not isinstance(context_lengths, list)
+        or not context_lengths
+        or any(
+            not isinstance(length, int)
+            or isinstance(length, bool)
+            or length <= 0
+            for length in context_lengths
+        )
+        or len(set(context_lengths)) != len(context_lengths)
+    ):
+        raise ManifestError(
+            "ruler context_lengths must be a non-empty list of unique positive integers."
+        )
+    for int_key in (
+        "samples_per_length",
+        "batch_size",
+        "worker_world_size",
+    ):
+        value = ruler.get(int_key)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ManifestError(f"ruler {int_key} must be a positive integer.")
+    for score_key in ("minimum_vanilla_score", "maximum_score_loss"):
+        value = ruler.get(score_key)
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or not 0.0 < float(value) <= 100.0
+        ):
+            raise ManifestError(f"ruler {score_key} must be in (0, 100].")
+    minimum_context_utilization = ruler.get("minimum_context_utilization")
+    if (
+        not isinstance(minimum_context_utilization, (int, float))
+        or isinstance(minimum_context_utilization, bool)
+        or not math.isfinite(float(minimum_context_utilization))
+        or not 0.0 < float(minimum_context_utilization) <= 1.0
+    ):
+        raise ManifestError(
+            "ruler minimum_context_utilization must be a finite number in (0, 1]."
+        )
+    temperature = ruler.get("temperature")
+    if (
+        not isinstance(temperature, (int, float))
+        or isinstance(temperature, bool)
+        or not math.isfinite(float(temperature))
+        or float(temperature) < 0.0
+    ):
+        raise ManifestError("ruler temperature must be a finite non-negative number.")
+    max_model_len = ruler.get("max_model_len")
+    if max_model_len is not None and (
+        not isinstance(max_model_len, int)
+        or isinstance(max_model_len, bool)
+        or max_model_len < max(context_lengths)
+    ):
+        raise ManifestError(
+            "ruler max_model_len must be an integer covering the largest context length."
+        )
 
     for model_id, model in models.items():
         if "model_path_env" not in model:
@@ -428,6 +594,8 @@ def resolve_manifest_paths(manifest: dict[str, Any]) -> dict[str, Any]:
     for method in resolved["methods"].values():
         env_key = method.get("deltakv_checkpoint_path_env")
         method["deltakv_checkpoint_path"] = os.getenv(env_key) if env_key else None
+    data_env = resolved["longbench_v2"]["data_path_env"]
+    resolved["longbench_v2"]["data_path"] = os.getenv(data_env)
     return resolved
 
 

@@ -22,12 +22,15 @@ if str(SRC_ROOT) not in sys.path:
 from benchmark.sparsevllm_regression.grading import (
     GateGrade,
     grade_memory,
+    grade_longbench_v2_quality,
     grade_perf,
     grade_quality,
+    grade_ruler_quality,
     grade_stress,
     grade_stress_v2,
     worst_required_grade,
 )
+from benchmark.ruler_vt.tasks import SUPPORTED_TASKS
 from benchmark.sparsevllm_regression.manifest import (
     deltakv_checkpoint_path_for,
     load_manifest,
@@ -332,19 +335,34 @@ def _runtime_tensor_parallel_sizes(
     quality_tp = _tensor_parallel_size_from_config(
         resolved.get("quality"), resolved.get("performance")
     )
+    longbench_v2_tp = _tensor_parallel_size_from_config(
+        resolved.get("longbench_v2"), resolved.get("performance")
+    )
+    ruler_tp = _tensor_parallel_size_from_config(
+        resolved.get("ruler"), resolved.get("performance")
+    )
     perf_tp = _tensor_parallel_size_from_config(resolved.get("performance"))
     stress_tp = _tensor_parallel_size_from_config(
         resolved.get("stress"), resolved.get("performance")
     )
     sizes_by_layer = {
         "validate": (),
-        "quality": (quality_tp,),
+        "quality": (quality_tp, longbench_v2_tp, ruler_tp),
+        "longbench_v2": (longbench_v2_tp,),
+        "ruler": (ruler_tp,),
         "perf": (perf_tp,),
         "stress": (stress_tp,),
         "stress_v2": (_tensor_parallel_size_from_config(resolved.get("stress_v2")),),
         "scbench": (_tensor_parallel_size_from_config(resolved.get("scbench")),),
-        "nightly": (quality_tp, 1, perf_tp),
-        "pre-refactor": (quality_tp, 1, perf_tp, stress_tp),
+        "nightly": (quality_tp, longbench_v2_tp, ruler_tp, 1, perf_tp),
+        "pre-refactor": (
+            quality_tp,
+            longbench_v2_tp,
+            ruler_tp,
+            1,
+            perf_tp,
+            stress_tp,
+        ),
     }
     return tuple(sorted(set(sizes_by_layer[layer])))
 
@@ -487,6 +505,189 @@ def _quality_command(
             str(output_root),
         ]
     )
+    return cmd
+
+
+def _longbench_v2_command(
+    *,
+    model_id: str,
+    method_id: str,
+    model: dict[str, Any],
+    method: dict[str, Any],
+    longbench_v2: dict[str, Any],
+    performance: dict[str, Any] | None,
+    output_root: Path,
+) -> list[str]:
+    data_path = longbench_v2.get("data_path")
+    if not data_path:
+        raise FileNotFoundError(
+            "LongBench v2 data is not configured; set "
+            f"{longbench_v2['data_path_env']} to an official JSON/JSONL export."
+        )
+    if not Path(data_path).is_file():
+        raise FileNotFoundError(f"LongBench v2 data file does not exist: {data_path}")
+
+    cfg = _method_config(method, model=model, model_id=model_id)
+    tensor_parallel_size = _tensor_parallel_size_from_config(
+        longbench_v2, performance
+    )
+    cfg["tensor_parallel_size"] = int(tensor_parallel_size)
+    cfg["decode_graph"] = _decode_cuda_graph_for_method(
+        method,
+        bool((performance or {}).get("decode_graph", False)),
+        tensor_parallel_size=tensor_parallel_size,
+    )
+    _apply_prefix_cache_config(
+        cfg,
+        method,
+        longbench_v2,
+        performance,
+        default_salt=f"regression-longbench-v2:{model_id}:{method_id}",
+    )
+    _apply_profiler_config(cfg, longbench_v2, performance)
+    if tensor_parallel_size > 1:
+        cfg["decode_graph_capture_sampling"] = False
+    if "sparsevllm_max_num_seqs_in_batch" in longbench_v2:
+        cfg["max_num_seqs_in_batch"] = int(
+            longbench_v2["sparsevllm_max_num_seqs_in_batch"]
+        )
+    if "sparsevllm_max_decoding_seqs" in longbench_v2:
+        cfg["max_decoding_seqs"] = int(
+            longbench_v2["sparsevllm_max_decoding_seqs"]
+        )
+
+    cmd = [
+        sys.executable,
+        "benchmark/long_bench_v2/pred.py",
+        "--model-path",
+        model["model_path"],
+        "--tokenizer-path",
+        model["tokenizer_path"],
+        "--sparse-method",
+        method["sparse_method"],
+        "--hyper-param-json",
+        json.dumps(cfg, sort_keys=True),
+        "--output-dir",
+        str(output_root),
+        "--data-path",
+        str(data_path),
+        "--max-model-len",
+        str(int(longbench_v2["max_model_len"])),
+        "--max-new-tokens",
+        str(int(longbench_v2["max_new_tokens"])),
+        "--batch-size",
+        str(int(longbench_v2["batch_size"])),
+        "--temperature",
+        str(float(longbench_v2["temperature"])),
+        "--top-p",
+        str(float(longbench_v2["top_p"])),
+        "--top-k",
+        str(int(longbench_v2["top_k"])),
+        "--seed",
+        str(int(longbench_v2["seed"])),
+        "--token-buckets-json",
+        json.dumps(longbench_v2["token_buckets"], sort_keys=True),
+    ]
+    checkpoint_path = deltakv_checkpoint_path_for(model, method)
+    if checkpoint_path:
+        cmd.extend(["--deltakv-checkpoint-path", checkpoint_path])
+    if bool(cfg.get("enable_prefix_caching", False)):
+        cmd.append("--allow-prefix-caching")
+    return cmd
+
+
+def _ruler_command(
+    *,
+    task: str,
+    task_config: dict[str, Any],
+    model_id: str,
+    method_id: str,
+    model: dict[str, Any],
+    method: dict[str, Any],
+    ruler: dict[str, Any],
+    performance: dict[str, Any] | None,
+    output_root: Path,
+) -> list[str]:
+    cfg = _method_config(method, model=model, model_id=model_id)
+    tensor_parallel_size = _tensor_parallel_size_from_config(ruler, performance)
+    worker_world_size = int(ruler.get("worker_world_size", ruler.get("ws", 1)))
+    if worker_world_size > 1 and tensor_parallel_size > 1:
+        raise ValueError(
+            "RULER does not support data-parallel worker_world_size > 1 together "
+            "with tensor_parallel_size > 1 because each data-parallel worker is "
+            "assigned exactly one visible GPU; got "
+            f"worker_world_size={worker_world_size}, "
+            f"tensor_parallel_size={tensor_parallel_size}."
+        )
+    cfg["tensor_parallel_size"] = int(tensor_parallel_size)
+    cfg["decode_graph"] = _decode_cuda_graph_for_method(
+        method,
+        bool((performance or {}).get("decode_graph", False)),
+        tensor_parallel_size=tensor_parallel_size,
+    )
+    _apply_prefix_cache_config(
+        cfg,
+        method,
+        ruler,
+        performance,
+        default_salt=f"regression-ruler:{task}:{model_id}:{method_id}",
+    )
+    _apply_profiler_config(cfg, ruler, performance)
+    if tensor_parallel_size > 1:
+        cfg["decode_graph_capture_sampling"] = False
+    if "sparsevllm_max_num_seqs_in_batch" in ruler:
+        cfg["max_num_seqs_in_batch"] = int(
+            ruler["sparsevllm_max_num_seqs_in_batch"]
+        )
+    if "sparsevllm_max_decoding_seqs" in ruler:
+        cfg["max_decoding_seqs"] = int(ruler["sparsevllm_max_decoding_seqs"])
+
+    cmd = [
+        sys.executable,
+        "benchmark/ruler_vt/pred.py",
+        "--model-path",
+        model["model_path"],
+        "--tokenizer-path",
+        model["tokenizer_path"],
+        "--output-dir",
+        str(output_root),
+        "--task",
+        task,
+        "--task-config-json",
+        json.dumps(task_config, sort_keys=True),
+        "--hyper-param-json",
+        json.dumps(cfg, sort_keys=True),
+        "--sparse-method",
+        method["sparse_method"],
+        "--context-lengths",
+        ",".join(str(int(length)) for length in ruler["context_lengths"]),
+        "--samples-per-length",
+        str(int(ruler["samples_per_length"])),
+        "--tokens-to-generate",
+        str(int(task_config["tokens_to_generate"])),
+        "--max-new-tokens",
+        str(int(task_config["max_new_tokens"])),
+        "--minimum-context-utilization",
+        str(float(ruler["minimum_context_utilization"])),
+        "--batch-size",
+        str(int(ruler["batch_size"])),
+        "--temperature",
+        str(float(ruler["temperature"])),
+        "--seed",
+        str(int(ruler.get("seed", 20260608))),
+        "--ws",
+        str(worker_world_size),
+    ]
+    if "max_model_len" in ruler:
+        cmd.extend(["--max-model-len", str(int(ruler["max_model_len"]))])
+    if bool(cfg.get("enable_prefix_caching", False)):
+        cmd.extend(
+            [
+                "--allow-prefix-caching",
+                "--prefix-cache-replay",
+                "--require-prefix-cache-hit",
+            ]
+        )
     return cmd
 
 
@@ -849,10 +1050,272 @@ def _grade_quality_pair(
     )
 
 
+def _validated_longbench_v2_metrics(
+    output_root: Path,
+    *,
+    token_buckets: list[dict[str, Any]],
+) -> dict[str, Any]:
+    rows = _read_jsonl(output_root / "sample_results.jsonl")
+    expected_count = sum(int(bucket["samples"]) for bucket in token_buckets)
+    if len(rows) != expected_count:
+        raise RuntimeError(
+            f"LongBench v2 artifact {output_root} has incomplete coverage: "
+            f"expected={expected_count} actual={len(rows)}."
+        )
+    if [int(row.get("index", -1)) for row in rows] != list(range(expected_count)):
+        raise RuntimeError(
+            f"LongBench v2 artifact {output_root} has invalid sample identities."
+        )
+    failed = [
+        row
+        for row in rows
+        if row.get("status") not in {"success", "parse_failed"}
+    ]
+    if failed:
+        raise RuntimeError(
+            f"LongBench v2 artifact {output_root} contains {len(failed)} "
+            "execution-failed samples."
+        )
+    invalid_parse_rows = [
+        row
+        for row in rows
+        if row.get("status") == "parse_failed"
+        and (row.get("predicted_answer") is not None or bool(row.get("correct")))
+    ]
+    if invalid_parse_rows:
+        raise RuntimeError(
+            f"LongBench v2 artifact {output_root} has invalid parse-failure rows."
+        )
+    for bucket in token_buckets:
+        bucket_rows = [
+            row for row in rows if row.get("token_bucket") == bucket["name"]
+        ]
+        if len(bucket_rows) != int(bucket["samples"]):
+            raise RuntimeError(
+                f"LongBench v2 artifact {output_root} has incomplete bucket "
+                f"{bucket['name']!r}: expected={bucket['samples']} "
+                f"actual={len(bucket_rows)}."
+            )
+        outside = [
+            row
+            for row in bucket_rows
+            if not int(bucket["min_prompt_tokens"])
+            <= int(row["prompt_tokens"])
+            <= int(bucket["max_prompt_tokens"])
+        ]
+        if outside:
+            raise RuntimeError(
+                f"LongBench v2 artifact {output_root} has {len(outside)} rows outside "
+                f"bucket {bucket['name']!r}."
+            )
+    aggregate = _read_json(output_root / "aggregate_metrics.json")
+    if aggregate.get("status") != "success":
+        raise RuntimeError(
+            f"LongBench v2 aggregate is not successful: {output_root}."
+        )
+    if int(aggregate.get("samples", -1)) != expected_count:
+        raise RuntimeError(
+            f"LongBench v2 aggregate count mismatch at {output_root}."
+        )
+    if int(aggregate.get("evaluated_samples", -1)) != expected_count:
+        raise RuntimeError(
+            f"LongBench v2 evaluated count mismatch at {output_root}."
+        )
+    if int(aggregate.get("failed_samples", -1)) != 0:
+        raise RuntimeError(
+            f"LongBench v2 aggregate records execution failures at {output_root}."
+        )
+    accuracy = aggregate.get("accuracy")
+    if not isinstance(accuracy, (int, float)) or isinstance(accuracy, bool):
+        raise RuntimeError(
+            f"LongBench v2 aggregate lacks numeric accuracy: {output_root}."
+        )
+    return aggregate
+
+
+def _grade_longbench_v2_pair(
+    vanilla_root: Path,
+    sparse_root: Path,
+    *,
+    longbench_v2: dict[str, Any],
+) -> GateGrade:
+    vanilla_dataset = _read_jsonl(vanilla_root / "dataset.jsonl")
+    sparse_dataset = _read_jsonl(sparse_root / "dataset.jsonl")
+    if vanilla_dataset != sparse_dataset:
+        raise RuntimeError(
+            "LongBench v2 vanilla and sparse runs did not use exactly aligned samples: "
+            f"vanilla={vanilla_root / 'dataset.jsonl'} "
+            f"sparse={sparse_root / 'dataset.jsonl'}."
+        )
+    token_buckets = list(longbench_v2["token_buckets"])
+    vanilla = _validated_longbench_v2_metrics(
+        vanilla_root, token_buckets=token_buckets
+    )
+    sparse = _validated_longbench_v2_metrics(
+        sparse_root, token_buckets=token_buckets
+    )
+    if vanilla.get("data_sha256") != sparse.get("data_sha256"):
+        raise RuntimeError(
+            "LongBench v2 vanilla and sparse runs used different source dataset hashes."
+        )
+    grade = grade_longbench_v2_quality(
+        float(vanilla["accuracy"]),
+        float(sparse["accuracy"]),
+        minimum_vanilla_score=float(longbench_v2["minimum_vanilla_score"]),
+        maximum_score_loss=float(longbench_v2["maximum_score_loss"]),
+    )
+    metrics = dict(grade.metrics)
+    metrics["vanilla_by_token_bucket"] = vanilla["by_token_bucket"]
+    metrics["sparse_by_token_bucket"] = sparse["by_token_bucket"]
+    return GateGrade(grade.name, grade.grade, grade.status, metrics, grade.reason)
+
+
+def _validated_ruler_scores(
+    output_root: Path,
+    *,
+    task: str | None = None,
+    context_lengths: list[int],
+    samples_per_length: int,
+    minimum_context_utilization: float,
+) -> dict[int, float]:
+    rows = _read_jsonl(output_root / "per_sample_results.jsonl")
+    expected_count = len(context_lengths) * int(samples_per_length)
+    if len(rows) != expected_count:
+        raise RuntimeError(
+            f"RULER artifact {output_root} has incomplete coverage: "
+            f"expected={expected_count} actual={len(rows)}."
+        )
+    observed_indices = [int(row["index"]) for row in rows]
+    if observed_indices != list(range(expected_count)):
+        raise RuntimeError(
+            f"RULER artifact {output_root} has invalid sample identities: "
+            f"{observed_indices}."
+        )
+    failed = [row for row in rows if row.get("status") != "success"]
+    if failed:
+        raise RuntimeError(
+            f"RULER artifact {output_root} contains {len(failed)} failed samples."
+        )
+    if task is not None:
+        wrong_task = [row for row in rows if row.get("task", "vt") != task]
+        if wrong_task:
+            raise RuntimeError(
+                f"RULER artifact {output_root} contains {len(wrong_task)} rows "
+                f"outside task={task}."
+            )
+    scores: dict[int, float] = {}
+    for context_length in context_lengths:
+        length_rows = [
+            row for row in rows if int(row["context_length"]) == int(context_length)
+        ]
+        if len(length_rows) != int(samples_per_length):
+            raise RuntimeError(
+                f"RULER artifact {output_root} has incomplete context_length="
+                f"{context_length}: expected={samples_per_length} actual={len(length_rows)}."
+            )
+        underfilled = [
+            row
+            for row in length_rows
+            if float(row["length"]) / context_length
+            < float(minimum_context_utilization)
+        ]
+        if underfilled:
+            raise RuntimeError(
+                f"RULER artifact {output_root} does not exercise context_length="
+                f"{context_length} at minimum utilization="
+                f"{minimum_context_utilization}."
+            )
+        scores[int(context_length)] = 100.0 * sum(
+            float(row["score"]) for row in length_rows
+        ) / len(length_rows)
+    return scores
+
+
+def _require_aligned_ruler_datasets(vanilla_root: Path, sparse_root: Path) -> None:
+    vanilla = _read_jsonl(vanilla_root / "dataset.jsonl")
+    sparse = _read_jsonl(sparse_root / "dataset.jsonl")
+    identity_keys = (
+        "index",
+        "context_length",
+        "input",
+        "outputs",
+        "length",
+        "answer_prefix",
+        "others",
+    )
+    vanilla_identity = [tuple(row.get(key) for key in identity_keys) for row in vanilla]
+    sparse_identity = [tuple(row.get(key) for key in identity_keys) for row in sparse]
+    if vanilla_identity != sparse_identity:
+        raise RuntimeError(
+            "RULER vanilla and sparse runs did not use exactly aligned generated samples: "
+            f"vanilla={vanilla_root / 'dataset.jsonl'} sparse={sparse_root / 'dataset.jsonl'}."
+        )
+
+
+def _grade_ruler_pair(
+    vanilla_root: Path,
+    sparse_root: Path,
+    *,
+    ruler: dict[str, Any],
+    task: str | None = None,
+) -> list[tuple[int, GateGrade]]:
+    _require_aligned_ruler_datasets(vanilla_root, sparse_root)
+    context_lengths = [int(value) for value in ruler["context_lengths"]]
+    samples_per_length = int(ruler["samples_per_length"])
+    vanilla_scores = _validated_ruler_scores(
+        vanilla_root,
+        task=task,
+        context_lengths=context_lengths,
+        samples_per_length=samples_per_length,
+        minimum_context_utilization=float(ruler["minimum_context_utilization"]),
+    )
+    sparse_scores = _validated_ruler_scores(
+        sparse_root,
+        task=task,
+        context_lengths=context_lengths,
+        samples_per_length=samples_per_length,
+        minimum_context_utilization=float(ruler["minimum_context_utilization"]),
+    )
+    task_config = (ruler.get("task_configs") or {}).get(task or "", {})
+    minimum_vanilla_score = float(
+        task_config.get("minimum_vanilla_score", ruler["minimum_vanilla_score"])
+    )
+    maximum_score_loss = float(
+        task_config.get("maximum_score_loss", ruler["maximum_score_loss"])
+    )
+    return [
+        (
+            context_length,
+            grade_ruler_quality(
+                vanilla_scores[context_length],
+                sparse_scores[context_length],
+                minimum_vanilla_score=minimum_vanilla_score,
+                maximum_score_loss=maximum_score_loss,
+            ),
+        )
+        for context_length in context_lengths
+    ]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run fixed Sparse-VLLM regression gates.")
     parser.add_argument("--manifest", default=None)
-    parser.add_argument("--layer", default="validate", choices=["validate", "quality", "perf", "stress", "stress_v2", "scbench", "nightly", "pre-refactor"])
+    parser.add_argument(
+        "--layer",
+        default="validate",
+        choices=[
+            "validate",
+            "quality",
+            "longbench_v2",
+            "ruler",
+            "perf",
+            "stress",
+            "stress_v2",
+            "scbench",
+            "nightly",
+            "pre-refactor",
+        ],
+    )
     parser.add_argument("--models", default=None, help="Comma-separated model ids from the manifest.")
     parser.add_argument("--methods", default=None, help="Comma-separated method ids from the manifest.")
     parser.add_argument("--run_id", default=None)
@@ -906,6 +1369,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--quality_min_prompt_tokens", type=int, default=None)
     parser.add_argument("--quality_sparsevllm_max_num_seqs_in_batch", type=int, default=None)
     parser.add_argument("--quality_sparsevllm_max_decoding_seqs", type=int, default=None)
+    parser.add_argument(
+        "--quality_benchmarks",
+        default="longbench,longbench_v2,ruler",
+        help="Comma-separated quality benchmarks: longbench,longbench_v2,ruler.",
+    )
+    parser.add_argument("--longbench_v2_data_path", default=None)
+    parser.add_argument("--longbench_v2_max_model_len", type=int, default=None)
+    parser.add_argument("--longbench_v2_batch_size", type=int, default=None)
+    parser.add_argument(
+        "--longbench_v2_token_buckets_json",
+        default=None,
+        help="Override LongBench v2 token buckets with a JSON list.",
+    )
+    parser.add_argument(
+        "--ruler_tasks",
+        default=None,
+        help="Override RULER core tasks with a comma list.",
+    )
+    parser.add_argument("--ruler_context_lengths", default=None)
+    parser.add_argument("--ruler_samples_per_length", type=int, default=None)
+    parser.add_argument("--ruler_batch_size", type=int, default=None)
+    parser.add_argument("--ruler_worker_world_size", type=int, default=None)
+    parser.add_argument("--ruler_max_model_len", type=int, default=None)
     parser.add_argument("--scbench_tasks", default=None, help="Override SCBench tasks with a comma list.")
     parser.add_argument("--scbench_num_eval_examples", type=int, default=None)
     parser.add_argument("--scbench_max_turns", type=int, default=None)
@@ -942,6 +1428,15 @@ def main() -> int:
     args = parse_args()
     manifest = load_manifest(args.manifest)
     resolved = resolve_manifest_paths(manifest)
+    quality_benchmarks = set(_parse_csv(args.quality_benchmarks))
+    unknown_quality_benchmarks = sorted(
+        quality_benchmarks - {"longbench", "longbench_v2", "ruler"}
+    )
+    if unknown_quality_benchmarks or not quality_benchmarks:
+        raise ValueError(
+            "--quality_benchmarks must select longbench, longbench_v2, and/or ruler; "
+            f"got {sorted(quality_benchmarks)}."
+        )
     quality_overrides: dict[str, Any] = {}
     if args.quality_tasks is not None:
         quality_overrides["tasks"] = _parse_csv(args.quality_tasks)
@@ -971,6 +1466,100 @@ def main() -> int:
             if key in quality_cfg and int(quality_cfg[key]) <= 0:
                 raise ValueError(f"quality {key} must be > 0, got {quality_cfg[key]}.")
         resolved["quality"] = quality_cfg
+
+    longbench_v2_overrides: dict[str, Any] = {}
+    if args.longbench_v2_data_path is not None:
+        longbench_v2_overrides["data_path"] = args.longbench_v2_data_path
+    if args.longbench_v2_max_model_len is not None:
+        longbench_v2_overrides["max_model_len"] = args.longbench_v2_max_model_len
+    if args.longbench_v2_batch_size is not None:
+        longbench_v2_overrides["batch_size"] = args.longbench_v2_batch_size
+    if args.longbench_v2_token_buckets_json is not None:
+        try:
+            token_buckets_override = json.loads(args.longbench_v2_token_buckets_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"--longbench_v2_token_buckets_json is invalid JSON: {exc}"
+            ) from exc
+        longbench_v2_overrides["token_buckets"] = token_buckets_override
+    if longbench_v2_overrides:
+        longbench_v2_cfg = dict(resolved.get("longbench_v2") or {})
+        longbench_v2_cfg.update(longbench_v2_overrides)
+        from benchmark.long_bench_v2.contracts import parse_token_buckets
+
+        buckets = parse_token_buckets(longbench_v2_cfg.get("token_buckets"))
+        for key in ("max_model_len", "max_new_tokens", "batch_size"):
+            if int(longbench_v2_cfg[key]) <= 0:
+                raise ValueError(
+                    f"longbench_v2 {key} must be > 0, got {longbench_v2_cfg[key]}."
+                )
+        prompt_budget = int(longbench_v2_cfg["max_model_len"]) - int(
+            longbench_v2_cfg["max_new_tokens"]
+        )
+        oversized = [
+            bucket.name
+            for bucket in buckets
+            if bucket.max_prompt_tokens > prompt_budget
+        ]
+        if oversized:
+            raise ValueError(
+                "LongBench v2 override token buckets exceed the prompt budget: "
+                f"{oversized}."
+            )
+        resolved["longbench_v2"] = longbench_v2_cfg
+
+    ruler_overrides: dict[str, Any] = {}
+    if args.ruler_tasks is not None:
+        ruler_overrides["tasks"] = _parse_csv(args.ruler_tasks)
+    if args.ruler_context_lengths is not None:
+        ruler_overrides["context_lengths"] = _parse_int_csv(
+            args.ruler_context_lengths
+        )
+    for arg_name, cfg_key in (
+        ("ruler_samples_per_length", "samples_per_length"),
+        ("ruler_batch_size", "batch_size"),
+        ("ruler_worker_world_size", "worker_world_size"),
+        ("ruler_max_model_len", "max_model_len"),
+    ):
+        value = getattr(args, arg_name)
+        if value is not None:
+            ruler_overrides[cfg_key] = int(value)
+    if ruler_overrides:
+        ruler_cfg = dict(resolved.get("ruler") or {})
+        ruler_cfg.update(ruler_overrides)
+        tasks = ruler_cfg.get("tasks") or []
+        unsupported_tasks = sorted(set(tasks) - set(SUPPORTED_TASKS))
+        if not tasks or unsupported_tasks:
+            raise ValueError(
+                "--ruler_tasks must select supported tasks; "
+                f"supported={SUPPORTED_TASKS} got={tasks}."
+            )
+        missing_configs = sorted(
+            set(tasks) - set(ruler_cfg.get("task_configs") or {})
+        )
+        if missing_configs:
+            raise ValueError(
+                f"RULER selected tasks are missing task_configs: {missing_configs}."
+            )
+        if len(set(ruler_cfg["context_lengths"])) != len(
+            ruler_cfg["context_lengths"]
+        ):
+            raise ValueError(
+                f"ruler context_lengths must be unique, got {ruler_cfg['context_lengths']}."
+            )
+        for key in (
+            "samples_per_length",
+            "batch_size",
+            "worker_world_size",
+            "max_model_len",
+        ):
+            if key in ruler_cfg and int(ruler_cfg[key]) <= 0:
+                raise ValueError(f"ruler {key} must be > 0, got {ruler_cfg[key]}.")
+        if any(int(value) <= 0 for value in ruler_cfg["context_lengths"]):
+            raise ValueError(
+                "ruler context_lengths must contain only positive integers."
+            )
+        resolved["ruler"] = ruler_cfg
 
     scbench_overrides: dict[str, Any] = {}
     if args.scbench_tasks is not None:
@@ -1078,7 +1667,7 @@ def main() -> int:
         scbench_cfg["decode_graph"] = True
         resolved["scbench"] = scbench_cfg
     if args.enable_prefix_caching:
-        for section in ("quality", "performance", "stress"):
+        for section in ("quality", "longbench_v2", "ruler", "performance", "stress"):
             section_cfg = dict(resolved.get(section) or {})
             section_cfg["enable_prefix_caching"] = True
             if args.prefix_cache_block_size is not None:
@@ -1097,7 +1686,7 @@ def main() -> int:
         stress_cfg["require_prefix_cache_hit"] = True
         resolved["stress"] = stress_cfg
     if args.enable_profiler:
-        for section in ("quality", "performance", "stress"):
+        for section in ("quality", "longbench_v2", "ruler", "performance", "stress"):
             section_cfg = dict(resolved.get(section) or {})
             section_cfg["enable_profiler"] = True
             resolved[section] = section_cfg
@@ -1143,6 +1732,8 @@ def main() -> int:
     stress_records: list[dict[str, Any]] = []
     stress_v2_records: list[dict[str, Any]] = []
     scbench_records: list[dict[str, Any]] = []
+    ruler_records: list[dict[str, Any]] = []
+    longbench_v2_records: list[dict[str, Any]] = []
 
     cwd = Path.cwd()
     try:
@@ -1153,6 +1744,8 @@ def main() -> int:
             _write_json(output_root / "stress.json", {"records": stress_records})
             _write_json(output_root / "stress_v2.json", {"records": stress_v2_records})
             _write_json(output_root / "scbench.json", {"records": scbench_records})
+            _write_json(output_root / "ruler.json", {"records": []})
+            _write_json(output_root / "longbench_v2.json", {"records": []})
             _write_json(output_root / "grade_summary.json", summary)
             _ensure_artifacts(output_root, list(resolved["outputs"]))
             print(f"[validate] manifest ok: {output_root}")
@@ -1195,14 +1788,23 @@ def main() -> int:
                     continue
                 selected_pairs.append((model_id, method_id))
 
-        run_quality = args.layer in {"quality", "nightly", "pre-refactor"}
+        run_quality_layer = args.layer in {"quality", "nightly", "pre-refactor"}
+        run_longbench_quality = run_quality_layer and "longbench" in quality_benchmarks
+        run_longbench_v2_quality = (
+            args.layer == "longbench_v2"
+            or (run_quality_layer and "longbench_v2" in quality_benchmarks)
+        )
+        run_ruler_quality = (
+            args.layer == "ruler"
+            or (run_quality_layer and "ruler" in quality_benchmarks)
+        )
         run_perf = args.layer in {"perf", "nightly", "pre-refactor"}
         run_stress = args.layer in {"stress", "pre-refactor"}
         run_stress_v2 = args.layer == "stress_v2"
         run_scbench = args.layer == "scbench"
 
         quality_roots: dict[tuple[str, str], Path] = {}
-        if run_quality:
+        if run_longbench_quality:
             for model_id, method_id in selected_pairs:
                 model = resolved["models"][model_id]
                 method = resolved["methods"][method_id]
@@ -1224,6 +1826,8 @@ def main() -> int:
                     log_path=out_dir / "run.log",
                     timeout_s=args.command_timeout_s,
                 )
+                if args.dry_run:
+                    continue
                 quality_roots[(model_id, method_id)] = out_dir
                 _append_jsonl_file(
                     output_root / "raw_outputs.jsonl",
@@ -1242,7 +1846,14 @@ def main() -> int:
                 )
                 result = _load_result_json(out_dir)
                 if result is not None:
-                    metrics_records.append({"model": model_id, "method": method_id, "result": result})
+                    metrics_records.append(
+                        {
+                            "benchmark": "longbench",
+                            "model": model_id,
+                            "method": method_id,
+                            "result": result,
+                        }
+                    )
 
             for model_id in model_ids:
                 vanilla_root = quality_roots.get((model_id, "vanilla"))
@@ -1257,6 +1868,206 @@ def main() -> int:
                         minimum_vanilla_score=float(resolved["quality"]["minimum_vanilla_score"]),
                     )
                     summary["grades"].append({**grade.to_dict(), "model": model_id, "method": method_id})
+
+        longbench_v2_roots: dict[tuple[str, str], Path] = {}
+        if run_longbench_v2_quality:
+            selected_pair_set = set(selected_pairs)
+            for model_id in model_ids:
+                sparse_methods = [
+                    method_id
+                    for pair_model_id, method_id in selected_pairs
+                    if pair_model_id == model_id and method_id != "vanilla"
+                ]
+                if sparse_methods and (model_id, "vanilla") not in selected_pair_set:
+                    raise ValueError(
+                        "LongBench v2 sparse quality requires a vanilla baseline in the "
+                        f"same run: model={model_id} sparse_methods={sparse_methods}."
+                    )
+            for model_id, method_id in selected_pairs:
+                model = resolved["models"][model_id]
+                method = resolved["methods"][method_id]
+                out_dir = output_root / "longbench_v2" / model_id / method_id
+                cmd = _longbench_v2_command(
+                    model_id=model_id,
+                    method_id=method_id,
+                    model=model,
+                    method=method,
+                    longbench_v2=resolved["longbench_v2"],
+                    performance=resolved["performance"],
+                    output_root=out_dir,
+                )
+                _run_and_record(
+                    summary,
+                    cmd,
+                    cwd=cwd,
+                    dry_run=args.dry_run,
+                    log_path=out_dir / "run.log",
+                    timeout_s=args.command_timeout_s,
+                )
+                if args.dry_run:
+                    continue
+                longbench_v2_roots[(model_id, method_id)] = out_dir
+                artifact_metadata = {
+                    "benchmark": "longbench_v2",
+                    "model": model_id,
+                    "method": method_id,
+                }
+                _append_jsonl_file(
+                    output_root / "raw_outputs.jsonl",
+                    out_dir / "raw_outputs.jsonl",
+                    artifact_metadata,
+                )
+                _append_jsonl_file(
+                    output_root / "parsed_outputs.jsonl",
+                    out_dir / "parsed_outputs.jsonl",
+                    artifact_metadata,
+                )
+                _append_jsonl_file(
+                    output_root / "sample_results.jsonl",
+                    out_dir / "sample_results.jsonl",
+                    artifact_metadata,
+                )
+                aggregate = _read_json(out_dir / "aggregate_metrics.json")
+                record = {
+                    "model": model_id,
+                    "method": method_id,
+                    "result": aggregate,
+                }
+                longbench_v2_records.append(record)
+                metrics_records.append({"benchmark": "longbench_v2", **record})
+
+            for model_id in model_ids:
+                vanilla_root = longbench_v2_roots.get((model_id, "vanilla"))
+                if vanilla_root is None:
+                    continue
+                for method_id in method_ids:
+                    sparse_root = longbench_v2_roots.get((model_id, method_id))
+                    if method_id == "vanilla" or sparse_root is None:
+                        continue
+                    grade = _grade_longbench_v2_pair(
+                        vanilla_root,
+                        sparse_root,
+                        longbench_v2=resolved["longbench_v2"],
+                    )
+                    summary["grades"].append(
+                        {
+                            **grade.to_dict(),
+                            "model": model_id,
+                            "method": method_id,
+                        }
+                    )
+
+        ruler_roots: dict[tuple[str, str, str], Path] = {}
+        if run_ruler_quality:
+            selected_pair_set = set(selected_pairs)
+            for model_id in model_ids:
+                sparse_methods = [
+                    method_id
+                    for pair_model_id, method_id in selected_pairs
+                    if pair_model_id == model_id and method_id != "vanilla"
+                ]
+                if sparse_methods and (model_id, "vanilla") not in selected_pair_set:
+                    raise ValueError(
+                        "RULER sparse quality requires a vanilla baseline in the same run: "
+                        f"model={model_id} sparse_methods={sparse_methods}."
+                    )
+            for task in resolved["ruler"]["tasks"]:
+                task_config = resolved["ruler"]["task_configs"][task]
+                for model_id, method_id in selected_pairs:
+                    model = resolved["models"][model_id]
+                    method = resolved["methods"][method_id]
+                    out_dir = output_root / "ruler" / task / model_id / method_id
+                    cmd = _ruler_command(
+                        task=task,
+                        task_config=task_config,
+                        model_id=model_id,
+                        method_id=method_id,
+                        model=model,
+                        method=method,
+                        ruler=resolved["ruler"],
+                        performance=resolved["performance"],
+                        output_root=out_dir,
+                    )
+                    _run_and_record(
+                        summary,
+                        cmd,
+                        cwd=cwd,
+                        dry_run=args.dry_run,
+                        log_path=out_dir / "run.log",
+                        timeout_s=args.command_timeout_s,
+                    )
+                    if args.dry_run:
+                        continue
+                    ruler_roots[(task, model_id, method_id)] = out_dir
+                    artifact_metadata = {
+                        "benchmark": "ruler",
+                        "task": task,
+                        "model": model_id,
+                        "method": method_id,
+                        "evaluation_pass": "primary",
+                    }
+                    _append_jsonl_file(
+                        output_root / "raw_outputs.jsonl",
+                        out_dir / "raw_outputs.jsonl",
+                        artifact_metadata,
+                    )
+                    _append_jsonl_file(
+                        output_root / "parsed_outputs.jsonl",
+                        out_dir / "parsed_outputs.jsonl",
+                        artifact_metadata,
+                    )
+                    _append_jsonl_file(
+                        output_root / "sample_results.jsonl",
+                        out_dir / "per_sample_results.jsonl",
+                        artifact_metadata,
+                    )
+                    for artifact_name, destination in (
+                        ("raw_outputs_prefix_cache_replay.jsonl", "raw_outputs.jsonl"),
+                        ("parsed_outputs_prefix_cache_replay.jsonl", "parsed_outputs.jsonl"),
+                        ("per_sample_results_prefix_cache_replay.jsonl", "sample_results.jsonl"),
+                    ):
+                        _append_jsonl_file(
+                            output_root / destination,
+                            out_dir / artifact_name,
+                            {
+                                **artifact_metadata,
+                                "evaluation_pass": "prefix_cache_replay",
+                            },
+                        )
+                    aggregate = _read_json(out_dir / "aggregate_metrics.json")
+                    record = {
+                        "task": task,
+                        "model": model_id,
+                        "method": method_id,
+                        "result": aggregate,
+                    }
+                    ruler_records.append(record)
+                    metrics_records.append({"benchmark": "ruler", **record})
+
+            for task in resolved["ruler"]["tasks"]:
+                for model_id in model_ids:
+                    vanilla_root = ruler_roots.get((task, model_id, "vanilla"))
+                    if vanilla_root is None:
+                        continue
+                    for method_id in method_ids:
+                        sparse_root = ruler_roots.get((task, model_id, method_id))
+                        if method_id == "vanilla" or sparse_root is None:
+                            continue
+                        for context_length, grade in _grade_ruler_pair(
+                            vanilla_root,
+                            sparse_root,
+                            ruler=resolved["ruler"],
+                            task=task,
+                        ):
+                            summary["grades"].append(
+                                {
+                                    **grade.to_dict(),
+                                    "task": task,
+                                    "model": model_id,
+                                    "method": method_id,
+                                    "context_length": context_length,
+                                }
+                            )
 
         if run_perf:
             for model_id in model_ids:
@@ -1566,7 +2377,15 @@ def main() -> int:
             failed_gates = [
                 "/".join(
                     str(item[key])
-                    for key in ("name", "model", "method", "length", "batch_size")
+                    for key in (
+                        "name",
+                        "task",
+                        "model",
+                        "method",
+                        "context_length",
+                        "length",
+                        "batch_size",
+                    )
                     if item.get(key) is not None
                 )
                 for item in summary["grades"]
@@ -1582,6 +2401,11 @@ def main() -> int:
         _write_json(output_root / "stress.json", {"records": stress_records})
         _write_json(output_root / "stress_v2.json", {"records": stress_v2_records})
         _write_json(output_root / "scbench.json", {"records": scbench_records})
+        _write_json(output_root / "ruler.json", {"records": ruler_records})
+        _write_json(
+            output_root / "longbench_v2.json",
+            {"records": longbench_v2_records},
+        )
         _write_json(output_root / "grade_summary.json", summary)
         _ensure_artifacts(output_root, list(resolved["outputs"]))
         print(f"[done] wrote {output_root}")
@@ -1594,6 +2418,11 @@ def main() -> int:
         _write_json(output_root / "stress.json", {"records": stress_records})
         _write_json(output_root / "stress_v2.json", {"records": stress_v2_records})
         _write_json(output_root / "scbench.json", {"records": scbench_records})
+        _write_json(output_root / "ruler.json", {"records": ruler_records})
+        _write_json(
+            output_root / "longbench_v2.json",
+            {"records": longbench_v2_records},
+        )
         _write_json(output_root / "grade_summary.json", summary)
         _ensure_artifacts(output_root, list(resolved["outputs"]))
         raise

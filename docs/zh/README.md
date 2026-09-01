@@ -13,7 +13,7 @@
 - [设计](design/README.md)：仓库布局、运行时流程和方法所有权边界。
 - [配置](configuration/README.md)：规范的运行时参数和原生运行时语义。
 - [基准测试](benchmarking/README.md)：吞吐量、LongBench、MathBench / AIME /
-  MATH-500、SCBench、Claw-Eval、多模态、RULER-VT、NIAH 和回归基准入口。
+  MATH-500、SCBench、Claw-Eval、多模态、RULER core、NIAH 和回归基准入口。
 - [治理](governance/README.md)：研究代码可靠性规则。
 
 ## 参考文档

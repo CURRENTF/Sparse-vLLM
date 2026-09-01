@@ -18,9 +18,9 @@
 | Claw-Eval | `benchmark/claw_eval/run_sparsevllm_claw_eval.sh` | 通过共享 Sparse-vLLM OpenAI-compatible server 驱动外部 Claw-Eval checkout。 |
 | SWE-bench Lite | [`swe-bench-lite.md`](swe-bench-lite.md) | 外部 mini-SWE-agent generation 加官方 SWE-bench Docker harness。 |
 | 多模态 | [`multimodal/README.md`](multimodal/README.md) | Video QA 和 image QA runner，以及当前方法支持限制。 |
-| RULER-VT | `benchmark/ruler_vt/pred.py` | 使用原生 benchmark adapter、自包含的 RULER variable-tracking generator/evaluator。 |
+| RULER core | `benchmark/ruler_vt/pred.py` | 使用原生 benchmark adapter、自包含地评测 NIAH retrieval、variable tracking、CWE 和 FWE。 |
 | NIAH | `benchmark/niah/test_niah.py` | 原生 Sparse-vLLM needle-in-a-haystack 长上下文 runner。 |
-| Regression harness | [`sparsevllm-regression-tests.md`](sparsevllm-regression-tests.md) | 固定的 quality/performance/stress 检查。 |
+| Regression harness | [`sparsevllm-regression-tests.md`](sparsevllm-regression-tests.md) | 固定的 LongBench/RULER quality、performance 和 stress 检查。 |
 
 ## 吞吐量 Benchmark
 
@@ -190,12 +190,20 @@ bash benchmark/claw_eval/run_sparsevllm_claw_eval.sh
 
 当前多模态 benchmark 入口和方法支持记录在 [`docs/zh/benchmarking/multimodal/`](multimodal/)。
 
-## RULER-VT 与 NIAH
+## RULER core 与独立 NIAH
 
-`benchmark/ruler_vt/pred.py` 是自包含 RULER variable-tracking runner。它生成 `dataset.jsonl`，保存 raw output、parsed output、per-sample result、`run_info.json` 和 `aggregate_metrics.json`。
+`benchmark/ruler_vt/pred.py` 是自包含 RULER core runner，支持
+`niah_single_1`、`niah_multikey_2`、`vt`、`cwe` 和 `fwe`，通过 `--task`
+选择。task contract 和 prompt 对齐
+[NVIDIA RULER](https://github.com/NVIDIA/RULER)；为了不新增 `wonderwords` 和
+大型 word asset 依赖，使用确定性的 synthetic word pool。因此这些 artifact 适用于
+Sparse-vLLM 回归比较，但不是官方 leaderboard dataset。依赖外部 essay 的 NIAH
+以及 `qa_1`/`qa_2` 暂不包含。runner 生成 `dataset.jsonl`，保存 raw output、
+parsed output、per-sample result、`run_info.json` 和 `aggregate_metrics.json`。
 
 ```bash
 python benchmark/ruler_vt/pred.py \
+  --task vt \
   --model-path <MODEL_ROOT>/Qwen2.5-7B-Instruct-1M \
   --output-dir <OUTPUT_ROOT>/ruler_vt/qwen25_7b_vanilla \
   --sparse-method vanilla \
@@ -203,6 +211,12 @@ python benchmark/ruler_vt/pred.py \
   --samples-per-length 20 \
   --hyper-param <ENGINE_PARAMS_JSON>
 ```
+
+如需验证 prefix-cache correctness，请在 engine params 中设置
+`enable_prefix_caching=true`，并增加 `--allow-prefix-caching
+--prefix-cache-replay --require-prefix-cache-hit`。runner 会立即原样重放每个
+deterministic batch，并要求 hit request/token 非零且输出完全一致。需要 matched
+vanilla 对比和逐长度 quality grade 时，使用下文的 regression harness。
 
 `benchmark/niah/test_niah.py` 是 needle-in-a-haystack utility runner。它可以在线生成 synthetic data，也可以使用 `--online_test=False` 加载 JSONL 文件。
 

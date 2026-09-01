@@ -81,6 +81,116 @@ def grade_quality(
     )
 
 
+def grade_ruler_quality(
+    vanilla_score: float,
+    sparse_score: float,
+    *,
+    minimum_vanilla_score: float,
+    maximum_score_loss: float,
+) -> GateGrade:
+    vanilla = _require_number(vanilla_score, "vanilla_score")
+    sparse = _require_number(sparse_score, "sparse_score")
+    minimum_vanilla = _require_number(
+        minimum_vanilla_score, "minimum_vanilla_score"
+    )
+    maximum_loss = _require_number(maximum_score_loss, "maximum_score_loss")
+    if maximum_loss <= 0.0:
+        raise ValueError(f"maximum_score_loss must be positive, got {maximum_loss}.")
+    metrics = {
+        "vanilla_score": vanilla,
+        "sparse_score": sparse,
+        "score_loss": max(0.0, vanilla - sparse),
+        "minimum_vanilla_score": minimum_vanilla,
+        "maximum_score_loss": maximum_loss,
+    }
+    if vanilla < minimum_vanilla:
+        return GateGrade(
+            name="ruler_quality",
+            grade="D",
+            status="failed",
+            metrics=metrics,
+            reason=(
+                "Vanilla RULER score is below the required baseline floor: "
+                f"vanilla_score={vanilla} minimum_vanilla_score={minimum_vanilla}."
+            ),
+        )
+    score_loss = metrics["score_loss"]
+    if score_loss == 0.0:
+        grade = "A"
+    elif score_loss <= maximum_loss / 2.0:
+        grade = "B"
+    elif score_loss <= maximum_loss:
+        grade = "C"
+    else:
+        grade = "D"
+    return GateGrade(
+        name="ruler_quality",
+        grade=grade,
+        status="success" if grade != "D" else "failed",
+        metrics=metrics,
+        reason=(
+            "Sparse RULER score loss exceeds the configured per-context limit."
+            if grade == "D"
+            else ""
+        ),
+    )
+
+
+def grade_longbench_v2_quality(
+    vanilla_score: float,
+    sparse_score: float,
+    *,
+    minimum_vanilla_score: float,
+    maximum_score_loss: float,
+) -> GateGrade:
+    vanilla = _require_number(vanilla_score, "vanilla_score")
+    sparse = _require_number(sparse_score, "sparse_score")
+    minimum_vanilla = _require_number(
+        minimum_vanilla_score, "minimum_vanilla_score"
+    )
+    maximum_loss = _require_number(maximum_score_loss, "maximum_score_loss")
+    if maximum_loss <= 0.0:
+        raise ValueError(f"maximum_score_loss must be positive, got {maximum_loss}.")
+    score_loss = max(0.0, vanilla - sparse)
+    metrics = {
+        "vanilla_score": vanilla,
+        "sparse_score": sparse,
+        "score_loss": score_loss,
+        "minimum_vanilla_score": minimum_vanilla,
+        "maximum_score_loss": maximum_loss,
+    }
+    if vanilla < minimum_vanilla:
+        return GateGrade(
+            name="longbench_v2_quality",
+            grade="D",
+            status="failed",
+            metrics=metrics,
+            reason=(
+                "Vanilla LongBench v2 score is below the required baseline floor: "
+                f"vanilla_score={vanilla} minimum_vanilla_score={minimum_vanilla}."
+            ),
+        )
+    if score_loss == 0.0:
+        grade = "A"
+    elif score_loss <= maximum_loss / 2.0:
+        grade = "B"
+    elif score_loss <= maximum_loss:
+        grade = "C"
+    else:
+        grade = "D"
+    return GateGrade(
+        name="longbench_v2_quality",
+        grade=grade,
+        status="success" if grade != "D" else "failed",
+        metrics=metrics,
+        reason=(
+            "Sparse LongBench v2 score loss exceeds the configured limit."
+            if grade == "D"
+            else ""
+        ),
+    )
+
+
 def grade_perf(
     speedup: float,
     *,

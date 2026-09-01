@@ -7,7 +7,10 @@ This document describes how to run the fixed SparseVLLM regression harness under
 
 The harness is intended for reproducible method/model checks across:
 
-- `quality`: LongBench-mini generation quality.
+- `quality`: LongBench v1 mini, LongBench v2, and the length-stratified RULER
+  core set.
+- `longbench_v2`: focused LongBench v2 quality only.
+- `ruler`: focused RULER core quality only.
 - `perf`: prefill/decode throughput and memory accounting.
 - `stress`: fixed-length high-concurrency SparseVLLM admission/decode stress.
 - `stress_v2`: synthetic serving-trace stress with shared-prefix and multi-turn
@@ -26,6 +29,7 @@ Configure these paths for the machine running the suite:
 - Conda env: `<CONDA_ENV>`
 - Output root: `<OUTPUT_ROOT>`
 - LongBench data: `<LONGBENCH_ROOT>`
+- LongBench v2 JSON/JSONL export: `<LONGBENCH_V2_DATA>`
 - Models:
   - `<MODEL_ROOT>/Qwen2.5-7B-Instruct-1M`
   - `<MODEL_ROOT>/Qwen3-4B-Instruct-2507`
@@ -42,6 +46,7 @@ cd <REPO_ROOT>
 
 export SPARSEVLLM_OUTPUT_DIR=<OUTPUT_ROOT>
 export SPARSEVLLM_LONGBENCH_DATA_DIR=<LONGBENCH_ROOT>
+export SPARSEVLLM_LONGBENCH_V2_DATA=<LONGBENCH_V2_DATA>
 
 export DELTAKV_MODEL_QWEN25_7B=<MODEL_ROOT>/Qwen2.5-7B-Instruct-1M
 export DELTAKV_MODEL_QWEN3_4B=<MODEL_ROOT>/Qwen3-4B-Instruct-2507
@@ -54,20 +59,34 @@ export DELTAKV_COMPRESSOR_LLAMA31_8B=<CHECKPOINT_ROOT>/Llama-3.1-8B-Instruct-Com
 export PYTHONPATH=<REPO_ROOT>:<REPO_ROOT>/src:${PYTHONPATH:-}
 ```
 
+Initialize the pinned official LongBench repository before the first v2 run:
+
+```bash
+git submodule update --init benchmark/long_bench_v2/upstream
+```
+
+The submodule supplies the official prompt and implementation provenance. The
+official `THUDM/LongBench-v2` dataset is distributed separately; export its
+train split to one local `.json` or `.jsonl` file and point
+`SPARSEVLLM_LONGBENCH_V2_DATA` to that immutable input.
+
 The manifest also contains `qwen25_32b`; omit it unless there is enough GPU
 memory and the corresponding model/checkpoint environment variables are set.
 
 ## Quick Unit Tests
 
-Run the unit tests that protect the regression harness, grading, manifest
-policy, and OmniKV full-layer selector:
+Run the unit tests that protect the regression harness, RULER generators and
+grading, manifest policy, and OmniKV full-layer selector:
 
 ```bash
 conda run -n <CONDA_ENV> --no-capture-output \
-  python -m unittest \
-  tests.test_sparsevllm_regression_grading \
-  tests.test_omnikv_full_layer_selector \
-  -v
+  python -m pytest \
+  tests/test_sparsevllm_regression_grading.py \
+  tests/test_omnikv_full_layer_selector.py \
+  tests/test_ruler_tasks.py \
+  tests/test_ruler_vt_regression.py \
+  tests/test_longbench_v2.py \
+  -q
 ```
 
 Expected result for the current harness: all tests pass.
@@ -100,7 +119,11 @@ All commands write to:
 
 ### Quality
 
-Quality is LongBench-mini with:
+By default, `--layer quality` runs LongBench v1 mini, LongBench v2, and RULER
+core. Pass a subset such as `--quality_benchmarks longbench_v2` only when a
+focused run is intentional.
+
+LongBench-mini uses:
 
 - tasks: `qasper,hotpotqa,multi_news,trec,passage_retrieval_en,lcc`
 - LongBench batch size: `100`
@@ -160,6 +183,7 @@ quality suite:
 conda run -n <CONDA_ENV> --no-capture-output \
   python benchmark/sparsevllm_regression/run_suite.py \
   --layer quality \
+  --quality_benchmarks longbench \
   --models qwen3_4b \
   --methods vanilla,omnikv,quest \
   --tensor_parallel_size 2 \
@@ -218,6 +242,118 @@ conda run -n <CONDA_ENV> --no-capture-output \
   --run_id tp_prefix_graph_stress_quick_$(date -u +%Y%m%d_%H%M%S) \
   --output_root <OUTPUT_ROOT>
 ```
+
+### LongBench V2 Quality
+
+LongBench v2 is additive: it does not replace the existing LongBench v1 mini
+gate. The source benchmark covers roughly 8K to 2M words. The canonical
+regression profile uses 120 natural samples across post-chat-template token
+buckets `32K-64K`, `64K-96K`, and `96K-127K` (40 samples per bucket), with
+`max_model_len=131072`, so it
+remains runnable on 128K-class models while extending beyond the v1 runner's
+121K limit. Selection is deterministic for a dataset, tokenizer, and seed.
+
+The runner uses the official zero-shot direct-answer prompt from the pinned
+submodule. It does not copy the upstream API client and does not use upstream's
+head/tail truncation: prompts outside the configured capacity are excluded
+before deterministic selection, and an underfilled bucket fails. The gate also
+requires exact vanilla/sparse sample alignment, an identical source-data hash,
+and complete explicit sample statuses. A non-empty response that does not
+contain the official answer pattern is retained as `parse_failed` and scored as
+incorrect, matching the official evaluator; model/runtime execution failures
+still invalidate the run.
+
+This fixed 120-sample profile uses greedy decoding to reduce run-to-run noise. It
+is a repository regression gate, not a reproduction of the official full
+503-sample leaderboard protocol.
+
+Run only the canonical v2 gate:
+
+```bash
+conda run -n <CONDA_ENV> --no-capture-output \
+  python benchmark/sparsevllm_regression/run_suite.py \
+  --layer longbench_v2 \
+  --models qwen25_7b \
+  --methods vanilla,omnikv \
+  --command_timeout_s 7200 \
+  --run_id longbench_v2_quality_$(date -u +%Y%m%d_%H%M%S) \
+  --output_root <OUTPUT_ROOT>
+```
+
+For a model with a verified context window above 128K, extend both the runtime
+limit and the token buckets explicitly; this is a separate profile, not a silent
+change to the canonical gate:
+
+```bash
+python benchmark/sparsevllm_regression/run_suite.py \
+  --layer longbench_v2 \
+  --models qwen25_7b \
+  --methods vanilla,omnikv \
+  --longbench_v2_max_model_len 262144 \
+  --longbench_v2_token_buckets_json \
+  '[{"name":"128k-192k","min_prompt_tokens":131072,"max_prompt_tokens":196607,"samples":4},{"name":"192k-255k","min_prompt_tokens":196608,"max_prompt_tokens":261888,"samples":4}]' \
+  --output_root <OUTPUT_ROOT>
+```
+
+### RULER Core Quality
+
+The fixed self-contained set runs `niah_single_1`, `niah_multikey_2`, `vt`,
+`cwe`, and `fwe`, covering retrieval, multi-hop tracing, and two aggregation
+contracts. It uses `16K,32K,64K,98K` target context lengths and grades every
+task and context length independently against the exactly aligned vanilla
+dataset from the same run. A failure in one task/length bucket therefore cannot
+be hidden by an average. Every sample must reach at least 90% of its target
+sequence length. Raw, parsed, per-sample, dataset, aggregate, and grade
+artifacts are retained.
+With 10 samples per task/length bucket, the default matrix runs 200 generations
+per model/method pair.
+
+The task contracts and prompts follow NVIDIA RULER. Deterministic synthetic
+word pools replace optional `wonderwords` and large word assets, so this is a
+repository regression set rather than an official leaderboard dataset.
+Essay-based NIAH and `qa_1`/`qa_2` are excluded because they require downloaded
+external corpora.
+
+Run the RULER core set without also running LongBench-mini:
+
+```bash
+conda run -n <CONDA_ENV> --no-capture-output \
+  python benchmark/sparsevllm_regression/run_suite.py \
+  --layer ruler \
+  --models qwen25_7b \
+  --methods vanilla,omnikv \
+  --ruler_tasks niah_single_1,niah_multikey_2,vt,cwe,fwe \
+  --ruler_context_lengths 16384,32768,65536,98304 \
+  --ruler_samples_per_length 10 \
+  --command_timeout_s 7200 \
+  --run_id ruler_quality_$(date -u +%Y%m%d_%H%M%S) \
+  --output_root <OUTPUT_ROOT>
+```
+
+For supported methods, prefix-cache validation immediately replays each
+deterministic batch in the same engine. The gate requires nonzero hit requests
+and hit tokens and requires replay outputs and scores to equal the primary
+pass exactly:
+
+```bash
+conda run -n <CONDA_ENV> --no-capture-output \
+  python benchmark/sparsevllm_regression/run_suite.py \
+  --layer ruler \
+  --models qwen3_4b \
+  --methods vanilla,omnikv,quest \
+  --ruler_tasks vt \
+  --enable_prefix_caching \
+  --prefix_cache_block_size 16 \
+  --ruler_context_lengths 16384,32768 \
+  --ruler_samples_per_length 2 \
+  --command_timeout_s 1800 \
+  --run_id ruler_prefix_quality_$(date -u +%Y%m%d_%H%M%S) \
+  --output_root <OUTPUT_ROOT>
+```
+
+Inspect `ruler.json`, `grade_summary.json`, and each task/method directory's
+`prefix_cache_summary.json`. This is a quality and cache-correctness gate, not
+a prefix-cache performance benchmark.
 
 ### Performance
 
@@ -417,10 +553,16 @@ Each run writes:
 - `memory.json`: memory grades derived from performance rows.
 - `stress.json`: stress rows and stress grades.
 - `stress_v2.json`: serving-trace stress rows and stress_v2 grades.
+- `ruler.json`: RULER aggregate records by task, model, and method.
+- `longbench_v2.json`: LongBench v2 aggregate records by model and method.
 - `raw_outputs.jsonl`, `parsed_outputs.jsonl`, `sample_results.jsonl`: quality
   generation artifacts, when quality is run.
 - Layer-specific logs:
   - `quality/<model>/<method>/run.log`
+  - `ruler/<task>/<model>/<method>/run.log`, with dataset, aggregate, and optional
+    prefix-cache replay artifacts in the same directory
+  - `longbench_v2/<model>/<method>/run.log`, with selection, source hashes,
+    per-sample results, and aggregate metrics in the same directory
   - `perf/<model>/<method>.log`
   - `stress/<model>/<method>.log`
 
@@ -436,7 +578,7 @@ data = json.loads((root / "grade_summary.json").read_text())
 print("status:", data["status"])
 print("worst_required_grade:", data.get("worst_required_grade"))
 for grade in data.get("grades", []):
-    print(grade.get("model"), grade.get("method"), grade["name"], grade["grade"], grade["status"], grade["metrics"])
+    print(grade.get("task"), grade.get("model"), grade.get("method"), grade.get("context_length"), grade["name"], grade["grade"], grade["status"], grade["metrics"])
 PY
 ```
 

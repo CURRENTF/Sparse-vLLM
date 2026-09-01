@@ -21,7 +21,7 @@ repo-facing result claim needs evidence.
 - [Configuration](configuration/README.md): canonical runtime parameters and
   native runtime semantics.
 - [Benchmarking](benchmarking/README.md): throughput, LongBench, MathBench /
-  AIME / MATH-500, SCBench, Claw-Eval, multimodal, RULER-VT, NIAH, and
+  AIME / MATH-500, SCBench, Claw-Eval, multimodal, RULER core, NIAH, and
   regression benchmark entrypoints.
 - [Governance](governance/README.md): reliability rules for research code.
 

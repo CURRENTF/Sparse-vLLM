@@ -329,6 +329,79 @@
     "top_p": 1.0,
     "top_k": 1
   },
+  "longbench_v2": {
+    "data_path_env": "SPARSEVLLM_LONGBENCH_V2_DATA",
+    "minimum_vanilla_score": 25.0,
+    "maximum_score_loss": 10.0,
+    "max_model_len": 131072,
+    "max_new_tokens": 128,
+    "batch_size": 1,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "top_k": 1,
+    "seed": 20260901,
+    "token_buckets": [
+      {
+        "name": "32k-64k",
+        "min_prompt_tokens": 32768,
+        "max_prompt_tokens": 65535,
+        "samples": 40
+      },
+      {
+        "name": "64k-96k",
+        "min_prompt_tokens": 65536,
+        "max_prompt_tokens": 98303,
+        "samples": 40
+      },
+      {
+        "name": "96k-127k",
+        "min_prompt_tokens": 98304,
+        "max_prompt_tokens": 126976,
+        "samples": 40
+      }
+    ]
+  },
+  "ruler": {
+    "minimum_vanilla_score": 80.0,
+    "maximum_score_loss": 5.0,
+    "tasks": ["niah_single_1", "niah_multikey_2", "vt", "cwe", "fwe"],
+    "task_configs": {
+      "niah_single_1": {
+        "tokens_to_generate": 128,
+        "max_new_tokens": 128,
+        "type_haystack": "noise"
+      },
+      "niah_multikey_2": {
+        "tokens_to_generate": 128,
+        "max_new_tokens": 128,
+        "type_haystack": "needle"
+      },
+      "vt": {
+        "tokens_to_generate": 30,
+        "max_new_tokens": 30,
+        "num_chains": 1,
+        "num_hops": 4
+      },
+      "cwe": {
+        "tokens_to_generate": 120,
+        "max_new_tokens": 120,
+        "freq_cw": 30,
+        "freq_ucw": 3,
+        "num_cw": 10
+      },
+      "fwe": {
+        "tokens_to_generate": 50,
+        "max_new_tokens": 50,
+        "alpha": 2.0
+      }
+    },
+    "context_lengths": [16384, 32768, 65536, 98304],
+    "samples_per_length": 10,
+    "batch_size": 1,
+    "worker_world_size": 1,
+    "minimum_context_utilization": 0.9,
+    "temperature": 0.0
+  },
   "performance": {
     "lengths": [32000, 64000],
     "batch_sizes": [4, 8],
@@ -402,6 +475,8 @@
     "stress.json",
     "stress_v2.json",
     "scbench.json",
+    "ruler.json",
+    "longbench_v2.json",
     "grade_summary.json"
   ]
 }

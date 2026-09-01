@@ -10,3 +10,6 @@
 [submodule "baselines/VisionZip"]
 	path = baselines/VisionZip
 	url = https://github.com/dvlab-research/VisionZip.git
+[submodule "benchmark/long_bench_v2/upstream"]
+	path = benchmark/long_bench_v2/upstream
+	url = https://github.com/THUDM/LongBench.git

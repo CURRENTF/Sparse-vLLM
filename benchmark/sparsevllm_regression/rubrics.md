@@ -30,6 +30,41 @@ same run.
 | `C` | Sparse score loss `<= 1.0`. |
 | `D` | Vanilla is below the absolute baseline floor, sparse score loss `> 1.0`, missing aggregate score, or failed quality run. |
 
+## RULER Core Quality
+
+Every configured RULER task is graded independently at every configured context
+length. Vanilla must meet the manifest baseline floor in every task/length
+bucket. Sparse score loss is compared with the exactly aligned vanilla samples
+from the same run. The default self-contained tasks are `niah_single_1`,
+`niah_multikey_2`, `vt`, `cwe`, and `fwe`.
+
+| Grade | Rule |
+| --- | --- |
+| `A` | No score loss vs vanilla at this context length. |
+| `B` | Score loss is at most half of `maximum_score_loss`. |
+| `C` | Score loss is at most `maximum_score_loss`. |
+| `D` | Vanilla is below its floor, sparse loss exceeds `maximum_score_loss`, samples are incomplete/misaligned, or generation fails. |
+
+When prefix caching is enabled, the RULER runner also requires nonzero replay
+hit requests and tokens plus exact deterministic output equality. These are
+cache-correctness conditions and do not grade cache performance.
+
+## LongBench V2 Quality
+
+LongBench v2 uses exactly aligned vanilla and sparse samples selected by the
+model tokenizer in fixed prompt-token buckets. Prompts are never truncated.
+Every selected sample must reach an explicit evaluated terminal state, and the
+source dataset hash must match between the paired runs. An unparseable non-empty
+model response is retained as `parse_failed` and scored as incorrect; it is not
+an execution failure.
+
+| Grade | Rule |
+| --- | --- |
+| `A` | No score loss vs vanilla. |
+| `B` | Score loss is at most half of `maximum_score_loss`. |
+| `C` | Score loss is at most `maximum_score_loss`. |
+| `D` | Vanilla is below its floor, sparse loss exceeds `maximum_score_loss`, samples are incomplete/misaligned, source hashes differ, or generation fails. |
+
 ## Performance
 
 Performance grades decode speedup and, when required, decode CUDA graph
