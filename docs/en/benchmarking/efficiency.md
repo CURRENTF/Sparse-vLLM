@@ -256,20 +256,29 @@ benchmark mode in this entrypoint.
 
 - Request throughput is computed over the complete measured workload. Prefill
   token throughput divides all prompt tokens by the wall-time window from
-  submission through the last first token. Decode token throughput excludes
-  each request's first generated token (which is produced by prefill) and divides
-  the remaining generated tokens by the wall-time window from the first first
-  token through the last completion. In churn workloads these phase windows can
-  overlap because prefill and decode are interleaved. With `output_len=1`, the
-  probe still reports TTFT and prefill throughput; decode throughput and TPOT
-  are `skipped_by_policy`.
+  submission through the last first token. `batch_decode_token_throughput_tps`
+  excludes each request's first generated token (which is produced by prefill)
+  and divides the remaining generated tokens by the wall-time window from the
+  earliest first token through the latest completion. The legacy
+  `decode_token_throughput_tps` field is an equal-valued compatibility alias.
+  In churn workloads these phase windows can overlap because prefill and decode
+  are interleaved. With `output_len=1`, the probe still reports TTFT and prefill
+  throughput; decode throughput and TPOT are `skipped_by_policy`.
 - GPU compute activity and memory I/O activity are directly sampled from
   `nvidia-smi`. They are not theoretical MFU/MBU, achieved FLOP/s, or achieved
   HBM GB/s.
 - Coarse active duty is the fraction of samples above 10% GPU utilization. Its
   complement cannot attribute idle time to CPU scheduling or kernel launches.
 - TTFT and TPOT are end-to-end request wall-clock metrics and include host
-  scheduling, synchronization, and engine overhead.
+  scheduling, synchronization, and engine overhead. Both engines compute TPOT
+  per request as `(completion - first_token) / (generated_tokens - 1)`, then
+  average requests. For fixed batches,
+  `tpot_concurrency_proxy_tps = concurrency * 1000 / tpot_ms_mean`; its speedup
+  is algebraically identical to TPOT speedup at matched concurrency. This proxy
+  is not observed batch throughput. The observed batch decode-window throughput
+  can differ when requests enter decode at different times or finish with tail
+  skew, so compare it only with the same batch-window metric from the other
+  engine.
 - Churn metrics compare the oversubscribed workload with its matched fixed-batch
   setting, including throughput ratio and tail-TTFT change.
 

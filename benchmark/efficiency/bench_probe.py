@@ -41,6 +41,11 @@ class HardwareMetricError(RuntimeError):
     """Raised when directly sampled GPU metrics are unavailable or incomplete."""
 
 
+REQUEST_TPOT_SCOPE = "mean_per_request_first_token_to_finish_v2"
+BATCH_DECODE_WINDOW_SCOPE = "earliest_first_token_to_latest_completion_v2"
+TPOT_CONCURRENCY_PROXY_SCOPE = "concurrency_times_1000_over_request_tpot_ms_v1"
+
+
 def _installed_distribution_version(name: str) -> str | None:
     try:
         return importlib.metadata.version(name)
@@ -453,6 +458,100 @@ def _vllm_batch_phase_seconds(outputs: list[Any]) -> tuple[float, float]:
     return max(ttft_values), max(decode_finishes) - min(decode_starts)
 
 
+def _request_phase_metrics_from_timestamps(
+    *,
+    arrival_times: dict[int, float],
+    first_token_times: dict[int, float],
+    finished_times: dict[int, float],
+    generated_counts: dict[int, int],
+) -> dict[str, Any]:
+    """Build matched request TPOT and batch phase windows from one timeline."""
+    expected = set(arrival_times)
+    if not expected:
+        raise RuntimeError("Request timing requires at least one request.")
+    for name, values in (
+        ("first-token", first_token_times),
+        ("completion", finished_times),
+        ("generated-count", generated_counts),
+    ):
+        actual = set(values)
+        if actual != expected:
+            raise RuntimeError(
+                f"Request timing {name} coverage mismatch: "
+                f"missing={sorted(expected - actual)}, "
+                f"unexpected={sorted(actual - expected)}."
+            )
+
+    request_timings = []
+    tpot_values = []
+    for request_id in sorted(expected):
+        arrival = float(arrival_times[request_id])
+        first = float(first_token_times[request_id])
+        finished = float(finished_times[request_id])
+        generated = int(generated_counts[request_id])
+        if generated <= 0:
+            raise RuntimeError(
+                f"Request {request_id} has non-positive generated token count {generated}."
+            )
+        if first < arrival or finished < first:
+            raise RuntimeError(
+                f"Request {request_id} has invalid timing order: "
+                f"arrival={arrival}, first={first}, finished={finished}."
+            )
+        decode_s = finished - first
+        tpot_ms = None
+        if generated > 1:
+            if decode_s <= 0:
+                raise RuntimeError(
+                    f"Request {request_id} generated {generated} tokens without a "
+                    f"positive decode duration: {decode_s}."
+                )
+            tpot_ms = decode_s * 1000.0 / (generated - 1)
+            tpot_values.append(tpot_ms)
+        request_timings.append(
+            {
+                "request_id": request_id,
+                "ttft_ms": (first - arrival) * 1000.0,
+                "latency_ms": (finished - arrival) * 1000.0,
+                "tpot_ms": tpot_ms,
+                "generated_tokens": generated,
+            }
+        )
+
+    return {
+        "ttft_ms": max(row["ttft_ms"] for row in request_timings),
+        "tpot_ms": statistics.fmean(tpot_values) if tpot_values else None,
+        "tpot_timing_scope": REQUEST_TPOT_SCOPE,
+        "prefill_elapsed_s": max(
+            first_token_times[request_id] - arrival_times[request_id]
+            for request_id in expected
+        ),
+        "decode_elapsed_s": (
+            max(finished_times.values()) - min(first_token_times.values())
+        ),
+        "request_timings": request_timings,
+    }
+
+
+def _tpot_concurrency_proxy_tps(
+    *,
+    concurrency: int,
+    tpot_ms: float | None,
+) -> float | None:
+    """Return the TPOT-equivalent concurrent token-rate proxy.
+
+    This is intentionally distinct from observed batch decode-window throughput.
+    For matched concurrency it is algebraically equivalent to TPOT speedup.
+    """
+    if tpot_ms is None:
+        return None
+    if concurrency <= 0 or tpot_ms <= 0:
+        raise RuntimeError(
+            f"Invalid TPOT proxy inputs: concurrency={concurrency}, tpot_ms={tpot_ms}."
+        )
+    return concurrency * 1000.0 / tpot_ms
+
+
 def _phase_throughput_metrics(
     *,
     total_input_tokens: int,
@@ -483,16 +582,17 @@ def _phase_throughput_metrics(
             "Decode tokens were generated without a positive decode window: "
             f"tokens={decode_tokens}, elapsed_s={decode_elapsed_s}."
         )
+    batch_decode_tps = decode_tokens / decode_elapsed_s if decode_tokens > 0 else None
     return {
-        "phase_timing_scope": "request_event_wall_time_windows",
+        "phase_timing_scope": "matched_request_event_wall_time_windows_v2",
+        "batch_decode_window_scope": BATCH_DECODE_WINDOW_SCOPE,
         "prefill_elapsed_s": prefill_elapsed_s,
         "decode_elapsed_s": decode_elapsed_s if decode_tokens > 0 else None,
         "prefill_token_count": total_input_tokens,
         "decode_token_count": decode_tokens,
         "prefill_token_throughput_tps": total_input_tokens / prefill_elapsed_s,
-        "decode_token_throughput_tps": (
-            decode_tokens / decode_elapsed_s if decode_tokens > 0 else None
-        ),
+        "batch_decode_token_throughput_tps": batch_decode_tps,
+        "decode_token_throughput_tps": batch_decode_tps,
     }
 
 
@@ -508,11 +608,15 @@ def _mean_phase_throughput_metrics(records: list[dict[str, Any]]) -> dict[str, A
         if record["decode_elapsed_s"] is not None
     ]
     return {
-        "phase_timing_scope": "request_event_wall_time_windows",
+        "phase_timing_scope": "matched_request_event_wall_time_windows_v2",
+        "batch_decode_window_scope": BATCH_DECODE_WINDOW_SCOPE,
         "prefill_token_throughput_tps": statistics.fmean(
             record["prefill_token_throughput_tps"] for record in records
         ),
         "decode_token_throughput_tps": (
+            statistics.fmean(decode_rates) if decode_rates else None
+        ),
+        "batch_decode_token_throughput_tps": (
             statistics.fmean(decode_rates) if decode_rates else None
         ),
         "prefill_elapsed_s_mean": statistics.fmean(
@@ -639,8 +743,8 @@ def _format_markdown_report(
         "- **GPU metrics**: directly sampled activity; no theoretical MFU/MBU estimates",
         f"- **Timestamp**: `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`",
         "",
-        "| System / Method | Scenario | Prompt Range | Output Range | Concurrency | Req/s | Prefill tok/s | Decode tok/s | TTFT p50/p99 (ms) | TPOT mean (ms) | GPU compute activity | GPU memory I/O activity | Peak VRAM (GB) | Status |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        "| System / Method | Scenario | Prompt Range | Output Range | Concurrency | Req/s | Prefill tok/s | Batch decode-window tok/s | TTFT p50/p99 (ms) | Request TPOT mean (ms) | TPOT-equivalent concurrent tok/s | GPU compute activity | GPU memory I/O activity | Peak VRAM (GB) | Status |",
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
     ]
     def _number(value: Any, precision: int) -> str:
         return "n/a" if value is None else f"{float(value):.{precision}f}"
@@ -657,6 +761,7 @@ def _format_markdown_report(
             f"| {_number(r.get('decode_token_throughput_tps'), 2)} "
             f"| {_number(r.get('ttft_ms_p50'), 2)}/{_number(r.get('ttft_ms_p99'), 2)} "
             f"| {_number(r.get('tpot_ms_mean'), 2)} "
+            f"| {_number(r.get('tpot_concurrency_proxy_tps'), 2)} "
             f"| {_number(r.get('gpu_compute_activity_pct_mean'), 1)}% "
             f"| {_number(r.get('gpu_memory_io_activity_pct_mean'), 1)}% "
             f"| {_number(r.get('peak_vram_gb_max'), 2)} | {r.get('status', 'success')} |"
@@ -754,13 +859,15 @@ def run_sparsevllm_probe(
                             request_count=bs,
                             vary_output_lengths=False,
                         )
-                        decode_times = []
-                        ttft_ms = None
-                        decode_started_at = None
                         t_start = time.perf_counter()
 
                         seq_to_request: dict[int, Any] = {}
+                        arrival_times: dict[int, float] = {}
+                        first_token_times: dict[int, float] = {}
+                        finished_times: dict[int, float] = {}
+                        generated_counts: dict[int, int] = {}
                         for request in trace:
+                            arrival = time.perf_counter()
                             seq_id = int(
                                 llm.add_request(
                                     request.prompt_token_ids,
@@ -779,73 +886,62 @@ def run_sparsevllm_probe(
                                     f"seq_id={seq_id}."
                                 )
                             seq_to_request[seq_id] = request
+                            arrival_times[seq_id] = arrival
                         request_seq_ids = set(seq_to_request)
-                        first_token_seq_ids: set[int] = set()
-                        finished_by_seq: dict[int, int] = {}
 
                         while not llm.is_finished():
-                            step_s = time.perf_counter()
-                            finished_outputs, num_tokens = llm.step()
+                            finished_outputs, _num_tokens = llm.step()
                             torch.cuda.synchronize()
-                            step_dt = time.perf_counter() - step_s
                             now = time.perf_counter()
-
-                            if num_tokens < 0:
-                                decode_times.append(step_dt)
-                            observed_before = len(first_token_seq_ids)
-                            all_first_tokens_observed = _record_batch_first_tokens(
-                                request_seq_ids,
-                                first_token_seq_ids,
-                                getattr(llm, "last_step_token_outputs", []),
-                                finished_outputs,
-                            )
-                            if (
-                                len(first_token_seq_ids) > observed_before
-                                and decode_started_at is None
+                            for seq_id, token_ids in getattr(
+                                llm, "last_step_token_outputs", []
                             ):
-                                decode_started_at = now
-                            if ttft_ms is None and all_first_tokens_observed:
-                                ttft_ms = (now - t_start) * 1000.0
+                                seq_id = int(seq_id)
+                                if token_ids and seq_id in request_seq_ids:
+                                    first_token_times.setdefault(seq_id, now)
                             for seq_id, token_ids, _token_logprobs, _top_logprobs in finished_outputs:
-                                finished_by_seq[int(seq_id)] = len(token_ids)
+                                seq_id = int(seq_id)
+                                if token_ids and seq_id in request_seq_ids:
+                                    first_token_times.setdefault(seq_id, now)
+                                finished_times[seq_id] = now
+                                generated_counts[seq_id] = len(token_ids)
 
                         elapsed_s = time.perf_counter() - t_start
-                        if ttft_ms is None:
-                            missing = sorted(request_seq_ids - first_token_seq_ids)
-                            raise RuntimeError(
-                                "Sparse-vLLM finished without publishing a first token for every "
-                                f"request; missing_seq_ids={missing}."
-                            )
-                        if set(finished_by_seq) != request_seq_ids:
-                            raise RuntimeError(
-                                "Sparse-vLLM fixed-batch completion coverage mismatch: "
-                                f"expected={sorted(request_seq_ids)}, actual={sorted(finished_by_seq)}."
-                            )
-                        for seq_id, generated in finished_by_seq.items():
+                        timing_metrics = _request_phase_metrics_from_timestamps(
+                            arrival_times=arrival_times,
+                            first_token_times=first_token_times,
+                            finished_times=finished_times,
+                            generated_counts=generated_counts,
+                        )
+                        for seq_id, generated in generated_counts.items():
                             expected = int(seq_to_request[seq_id].output_len)
                             if generated != expected:
                                 raise RuntimeError(
                                     f"Sparse-vLLM generated {generated} tokens for seq_id={seq_id}, "
                                     f"expected {expected}."
                                 )
-                        tpot_ms = (
-                            statistics.fmean(decode_times) * 1000.0
-                            if decode_times
-                            else None
-                        )
+                        ttft_ms = float(timing_metrics["ttft_ms"])
+                        tpot_ms = timing_metrics["tpot_ms"]
                         total_input = sum(request.prompt_len for request in trace)
                         total_output = sum(request.output_len for request in trace)
                         phase_metrics = _phase_throughput_metrics(
                             total_input_tokens=total_input,
                             total_output_tokens=total_output,
                             request_count=bs,
-                            prefill_elapsed_s=ttft_ms / 1000.0,
-                            decode_elapsed_s=(
-                                0.0
-                                if decode_started_at is None
-                                else t_start + elapsed_s - decode_started_at
-                            ),
+                            prefill_elapsed_s=float(timing_metrics["prefill_elapsed_s"]),
+                            decode_elapsed_s=float(timing_metrics["decode_elapsed_s"]),
                         )
+                        request_results = []
+                        for timing in timing_metrics["request_timings"]:
+                            seq_id = int(timing["request_id"])
+                            request_results.append(
+                                {
+                                    **seq_to_request[seq_id].metadata(),
+                                    **timing,
+                                    "seq_id": seq_id,
+                                    "timing_source": "sparsevllm_step_completion_events",
+                                }
+                            )
                         profiler_snap = profiler.snapshot()
 
                         rec = {
@@ -860,6 +956,12 @@ def run_sparsevllm_probe(
                             "elapsed_s": elapsed_s,
                             "ttft_ms": round(ttft_ms, 2),
                             "tpot_ms": None if tpot_ms is None else round(tpot_ms, 2),
+                            "tpot_timing_scope": REQUEST_TPOT_SCOPE,
+                            "tpot_concurrency_proxy_tps": _tpot_concurrency_proxy_tps(
+                                concurrency=bs,
+                                tpot_ms=tpot_ms,
+                            ),
+                            "tpot_concurrency_proxy_scope": TPOT_CONCURRENCY_PROXY_SCOPE,
                             "request_throughput_rps": bs / elapsed_s,
                             **phase_metrics,
                             "profiler_breakdown": profiler_snap,
@@ -868,6 +970,7 @@ def run_sparsevllm_probe(
                             "protocol_label": protocol_label,
                             "decode_metric_status": "success" if tpot_ms is not None else "skipped_by_policy",
                             "trace": trace_metadata(trace),
+                            "request_results": request_results,
                         }
                         iter_records.append(rec)
                         with open(raw_samples_file, "a", encoding="utf-8") as f:
@@ -881,14 +984,14 @@ def run_sparsevllm_probe(
                             output_len=o_len,
                             concurrency=bs,
                             iteration=it,
-                            requests=rec["trace"]["requests"],
+                            requests=request_results,
                         )
 
                         print(
                             f"  Iter {it + 1}/{args.num_iters}: TTFT={ttft_ms:.1f}ms | "
                             f"TPOT={tpot_ms if tpot_ms is not None else 'n/a'}ms | "
                             f"Prefill={phase_metrics['prefill_token_throughput_tps']:.1f} tok/s | "
-                            f"Decode={phase_metrics['decode_token_throughput_tps'] or 0.0:.1f} tok/s"
+                            f"BatchDecodeWindow={phase_metrics['decode_token_throughput_tps'] or 0.0:.1f} tok/s"
                         )
                 finally:
                     hardware_summary = monitor.stop()
@@ -921,6 +1024,14 @@ def run_sparsevllm_probe(
                     "ttft_ms_p50": round(_percentile(ttft_vals, 0.50), 2),
                     "ttft_ms_p99": round(_percentile(ttft_vals, 0.99), 2),
                     "tpot_ms_mean": round(statistics.fmean(tpot_vals), 2) if tpot_vals else None,
+                    "tpot_timing_scope": REQUEST_TPOT_SCOPE,
+                    "tpot_concurrency_proxy_tps": _tpot_concurrency_proxy_tps(
+                        concurrency=bs,
+                        tpot_ms=(
+                            round(statistics.fmean(tpot_vals), 2) if tpot_vals else None
+                        ),
+                    ),
+                    "tpot_concurrency_proxy_scope": TPOT_CONCURRENCY_PROXY_SCOPE,
                     "request_throughput_rps": statistics.fmean(request_rates),
                     **_mean_phase_throughput_metrics(iter_records),
                     "sequence_replacements": 0,
@@ -1239,6 +1350,7 @@ def run_sparsevllm_churn(
                             "latency_ms_p50": _percentile(latencies, 0.50),
                             "latency_ms_p99": _percentile(latencies, 0.99),
                             "tpot_ms_mean": statistics.fmean(tpots) if tpots else None,
+                            "tpot_timing_scope": REQUEST_TPOT_SCOPE,
                             "decode_metric_status": (
                                 "success" if tpots else "skipped_by_policy"
                             ),
@@ -1357,6 +1469,32 @@ def run_vllm_probe(
 
                         ttft_ms, tpot_ms = _vllm_phase_metrics(outputs, o_len)
                         prefill_elapsed_s, decode_elapsed_s = _vllm_batch_phase_seconds(outputs)
+                        request_results = []
+                        for request, output in zip(trace, outputs):
+                            metrics = getattr(output, "metrics", None)
+                            if metrics is None or len(output.outputs) != 1:
+                                raise RuntimeError(
+                                    "vLLM fixed-batch request timing requires one timed candidate."
+                                )
+                            generated = len(output.outputs[0].token_ids)
+                            ttft_s, decode_s, timing_source = _vllm_request_phase_seconds(
+                                metrics
+                            )
+                            request_results.append(
+                                {
+                                    **request.metadata(),
+                                    "request_id": str(output.request_id),
+                                    "ttft_ms": ttft_s * 1000.0,
+                                    "latency_ms": (ttft_s + decode_s) * 1000.0,
+                                    "tpot_ms": (
+                                        decode_s * 1000.0 / (generated - 1)
+                                        if generated > 1
+                                        else None
+                                    ),
+                                    "generated_tokens": generated,
+                                    "timing_source": timing_source,
+                                }
+                            )
                         total_input = sum(request.prompt_len for request in trace)
                         total_output = sum(request.output_len for request in trace)
                         phase_metrics = _phase_throughput_metrics(
@@ -1378,11 +1516,18 @@ def run_vllm_probe(
                             "elapsed_s": elapsed_s,
                             "ttft_ms": round(ttft_ms, 2),
                             "tpot_ms": None if tpot_ms is None else round(tpot_ms, 2),
+                            "tpot_timing_scope": REQUEST_TPOT_SCOPE,
+                            "tpot_concurrency_proxy_tps": _tpot_concurrency_proxy_tps(
+                                concurrency=bs,
+                                tpot_ms=tpot_ms,
+                            ),
+                            "tpot_concurrency_proxy_scope": TPOT_CONCURRENCY_PROXY_SCOPE,
                             "request_throughput_rps": bs / elapsed_s,
                             **phase_metrics,
                             "decode_metric_status": "success" if tpot_ms is not None else "skipped_by_policy",
                             "protocol_label": "vllm-vanilla",
                             "trace": trace_metadata(trace),
+                            "request_results": request_results,
                         }
                         iter_records.append(rec)
                         with open(raw_samples_file, "a", encoding="utf-8") as f:
@@ -1396,14 +1541,14 @@ def run_vllm_probe(
                             output_len=o_len,
                             concurrency=bs,
                             iteration=it,
-                            requests=rec["trace"]["requests"],
+                            requests=request_results,
                         )
 
                         print(
                             f"  Iter {it + 1}/{args.num_iters}: TTFT={ttft_ms:.1f}ms | "
                             f"TPOT={tpot_ms if tpot_ms is not None else 'n/a'}ms | "
                             f"Prefill={phase_metrics['prefill_token_throughput_tps']:.1f} tok/s | "
-                            f"Decode={phase_metrics['decode_token_throughput_tps'] or 0.0:.1f} tok/s"
+                            f"BatchDecodeWindow={phase_metrics['decode_token_throughput_tps'] or 0.0:.1f} tok/s"
                         )
                 finally:
                     hardware_summary = monitor.stop()
@@ -1435,6 +1580,14 @@ def run_vllm_probe(
                     "ttft_ms_p50": round(_percentile(ttft_vals, 0.50), 2),
                     "ttft_ms_p99": round(_percentile(ttft_vals, 0.99), 2),
                     "tpot_ms_mean": round(statistics.fmean(tpot_vals), 2) if tpot_vals else None,
+                    "tpot_timing_scope": REQUEST_TPOT_SCOPE,
+                    "tpot_concurrency_proxy_tps": _tpot_concurrency_proxy_tps(
+                        concurrency=bs,
+                        tpot_ms=(
+                            round(statistics.fmean(tpot_vals), 2) if tpot_vals else None
+                        ),
+                    ),
+                    "tpot_concurrency_proxy_scope": TPOT_CONCURRENCY_PROXY_SCOPE,
                     "request_throughput_rps": statistics.fmean(request_rates),
                     **_mean_phase_throughput_metrics(iter_records),
                     "sequence_replacements": 0,
@@ -1700,6 +1853,7 @@ def run_vllm_churn(
                             "latency_ms_p50": _percentile(latencies, 0.50),
                             "latency_ms_p99": _percentile(latencies, 0.99),
                             "tpot_ms_mean": statistics.fmean(tpots) if tpots else None,
+                            "tpot_timing_scope": REQUEST_TPOT_SCOPE,
                             "decode_metric_status": (
                                 "success" if tpots else "skipped_by_policy"
                             ),
@@ -1905,8 +2059,10 @@ def main():
             "iteration_prompt_reuse_allowed": False,
             "phase_throughput_contract": (
                 "prefill: prompt tokens / submission-to-last-first-token window; "
-                "decode: generated tokens after each first token / "
-                "first-first-token-to-last-completion window"
+                "batch decode window: generated tokens after each first token / "
+                "first-first-token-to-last-completion window; request TPOT: mean "
+                "per-request (finish-first)/(generated-1); TPOT-equivalent concurrent "
+                "proxy: concurrency*1000/request_tpot_ms"
             ),
         },
         "model_specs": {

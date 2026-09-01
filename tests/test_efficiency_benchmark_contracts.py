@@ -15,7 +15,9 @@ from benchmark.efficiency.bench_probe import (
     _decode_graph_counter_delta,
     _record_batch_first_tokens,
     _phase_throughput_metrics,
+    _request_phase_metrics_from_timestamps,
     _resolve_sparse_probe_protocol,
+    _tpot_concurrency_proxy_tps,
     _vllm_batch_phase_seconds,
     _vllm_phase_metrics,
     _vllm_request_phase_seconds,
@@ -311,6 +313,32 @@ def test_vllm_phase_metrics_use_one_request_timeline():
     assert tpot_ms == pytest.approx(100.0)
 
 
+def test_vllm_phase_metrics_average_per_request_tpot():
+    outputs = [
+        SimpleNamespace(
+            metrics=SimpleNamespace(
+                arrival_time=10.0,
+                first_token_time=10.2,
+                finished_time=10.5,
+            ),
+            outputs=[SimpleNamespace(token_ids=[1, 2, 3, 4])],
+        ),
+        SimpleNamespace(
+            metrics=SimpleNamespace(
+                arrival_time=10.0,
+                first_token_time=10.3,
+                finished_time=10.75,
+            ),
+            outputs=[SimpleNamespace(token_ids=[1, 2, 3, 4])],
+        ),
+    ]
+
+    ttft_ms, tpot_ms = _vllm_phase_metrics(outputs, 4)
+
+    assert ttft_ms == pytest.approx(300.0)
+    assert tpot_ms == pytest.approx(125.0)
+
+
 def test_vllm_single_token_request_has_no_tpot():
     output = SimpleNamespace(
         metrics=SimpleNamespace(arrival_time=10.0, first_token_time=10.2, finished_time=10.2),
@@ -320,6 +348,49 @@ def test_vllm_single_token_request_has_no_tpot():
     _ttft_ms, tpot_ms = _vllm_phase_metrics([output], 1)
 
     assert tpot_ms is None
+
+
+def test_request_tpot_and_batch_decode_window_use_explicit_matched_scopes():
+    request_metrics = _request_phase_metrics_from_timestamps(
+        arrival_times={11: 0.0, 12: 0.05},
+        first_token_times={11: 0.2, 12: 0.35},
+        finished_times={11: 0.5, 12: 0.8},
+        generated_counts={11: 4, 12: 4},
+    )
+
+    assert request_metrics["ttft_ms"] == pytest.approx(300.0)
+    assert request_metrics["tpot_ms"] == pytest.approx(125.0)
+    assert request_metrics["prefill_elapsed_s"] == pytest.approx(0.3)
+    assert request_metrics["decode_elapsed_s"] == pytest.approx(0.6)
+
+    batch_metrics = _phase_throughput_metrics(
+        total_input_tokens=200,
+        total_output_tokens=8,
+        request_count=2,
+        prefill_elapsed_s=request_metrics["prefill_elapsed_s"],
+        decode_elapsed_s=request_metrics["decode_elapsed_s"],
+    )
+    assert batch_metrics["batch_decode_token_throughput_tps"] == pytest.approx(10.0)
+    assert batch_metrics["decode_token_throughput_tps"] == pytest.approx(10.0)
+    sparse_proxy = _tpot_concurrency_proxy_tps(
+        concurrency=2,
+        tpot_ms=request_metrics["tpot_ms"],
+    )
+    baseline_proxy = _tpot_concurrency_proxy_tps(concurrency=2, tpot_ms=250.0)
+    assert sparse_proxy == pytest.approx(16.0)
+    assert sparse_proxy / baseline_proxy == pytest.approx(
+        250.0 / request_metrics["tpot_ms"]
+    )
+
+
+def test_request_timing_rejects_incomplete_event_coverage():
+    with pytest.raises(RuntimeError, match="completion coverage mismatch"):
+        _request_phase_metrics_from_timestamps(
+            arrival_times={11: 0.0, 12: 0.0},
+            first_token_times={11: 0.1, 12: 0.2},
+            finished_times={11: 0.4},
+            generated_counts={11: 4, 12: 4},
+        )
 
 
 def test_phase_throughput_uses_separate_prefill_and_decode_windows():
@@ -335,6 +406,7 @@ def test_phase_throughput_uses_separate_prefill_and_decode_windows():
     assert metrics["decode_token_count"] == 8
     assert metrics["prefill_token_throughput_tps"] == pytest.approx(400.0)
     assert metrics["decode_token_throughput_tps"] == pytest.approx(40.0)
+    assert metrics["batch_decode_token_throughput_tps"] == pytest.approx(40.0)
 
 
 def test_phase_throughput_allows_ttft_only_workload():
@@ -371,6 +443,7 @@ def test_markdown_report_shows_tpot_without_saturation_metrics():
                 "ttft_ms_p50": 10.0,
                 "ttft_ms_p99": 12.0,
                 "tpot_ms_mean": 2.5,
+                "tpot_concurrency_proxy_tps": 1600.0,
                 "gpu_compute_activity_pct_mean": 90.0,
                 "gpu_memory_io_activity_pct_mean": 40.0,
                 "peak_vram_gb_max": 70.0,
@@ -382,7 +455,8 @@ def test_markdown_report_shows_tpot_without_saturation_metrics():
         ep_size=4,
     )
 
-    assert "TPOT mean (ms)" in report
+    assert "Request TPOT mean (ms)" in report
+    assert "TPOT-equivalent concurrent tok/s" in report
     assert "| 2.50 |" in report
     assert "scaling" not in report.lower()
     assert "observed decode peak" not in report.lower()
@@ -813,7 +887,10 @@ def _write_valid_suite_fixture(root: Path, systems: list[str]) -> None:
                     "request_throughput_rps": 2.0,
                     "prefill_token_throughput_tps": 200.0,
                     "decode_token_throughput_tps": 30.0,
+                    "batch_decode_token_throughput_tps": 30.0,
                     "tpot_ms_mean": 2.0,
+                    "tpot_timing_scope": "mean_per_request_first_token_to_finish_v2",
+                    "tpot_concurrency_proxy_tps": 1000.0,
                     "decode_metric_status": "success",
                     "actual_hardware_metrics": hardware,
                 }
@@ -985,7 +1062,9 @@ def test_unified_suite_validator_accepts_ttft_only_probe(tmp_path):
         row["output_len_min"] = 1
         row["output_len_max"] = 1
         row["decode_token_throughput_tps"] = None
+        row["batch_decode_token_throughput_tps"] = None
         row["tpot_ms_mean"] = None
+        row["tpot_concurrency_proxy_tps"] = None
         row["decode_metric_status"] = "skipped_by_policy"
         if row["scenario"] == "oversubscribed_churn":
             row["churn_decode_tps_comparison_status"] = "skipped_by_policy"

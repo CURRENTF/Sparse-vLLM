@@ -283,6 +283,7 @@ def _validate_synthetic_rows(
                 errors.append(f"invalid {field} in synthetic row {system}[{index}]")
         decode_status = row.get("decode_metric_status")
         decode_tps = row.get("decode_token_throughput_tps")
+        batch_decode_tps = row.get("batch_decode_token_throughput_tps")
         tpot_ms = row.get("tpot_ms_mean")
         if decode_status == "success":
             if not isinstance(decode_tps, (int, float)) or float(decode_tps) <= 0:
@@ -291,6 +292,29 @@ def _validate_synthetic_rows(
                 )
             if not isinstance(tpot_ms, (int, float)) or float(tpot_ms) <= 0:
                 errors.append(f"invalid tpot_ms_mean in synthetic row {system}[{index}]")
+            if not isinstance(batch_decode_tps, (int, float)) or float(batch_decode_tps) <= 0:
+                errors.append(
+                    f"invalid batch_decode_token_throughput_tps in synthetic row "
+                    f"{system}[{index}]"
+                )
+            elif isinstance(decode_tps, (int, float)) and abs(
+                float(batch_decode_tps) - float(decode_tps)
+            ) > 1e-9 * max(1.0, abs(float(decode_tps))):
+                errors.append(
+                    f"decode compatibility alias differs from batch window in "
+                    f"{system}[{index}]"
+                )
+            if row.get("tpot_timing_scope") != "mean_per_request_first_token_to_finish_v2":
+                errors.append(f"invalid TPOT timing scope in {system}[{index}]")
+            if row.get("scenario") == "fixed_batch" and isinstance(tpot_ms, (int, float)):
+                proxy = row.get("tpot_concurrency_proxy_tps")
+                expected_proxy = float(row["concurrency"]) * 1000.0 / float(tpot_ms)
+                if not isinstance(proxy, (int, float)) or abs(
+                    float(proxy) - expected_proxy
+                ) > 1e-9 * max(1.0, abs(expected_proxy)):
+                    errors.append(
+                        f"invalid TPOT concurrency proxy in {system}[{index}]"
+                    )
         elif decode_status == "skipped_by_policy":
             if decode_tps is not None:
                 errors.append(
@@ -298,6 +322,11 @@ def _validate_synthetic_rows(
                 )
             if tpot_ms is not None:
                 errors.append(f"TPOT must be null when skipped in {system}[{index}]")
+            if batch_decode_tps is not None:
+                errors.append(
+                    f"batch decode throughput must be null when skipped in "
+                    f"{system}[{index}]"
+                )
         else:
             errors.append(f"invalid decode metric status in {system}[{index}]")
         actual = row.get("actual_hardware_metrics")

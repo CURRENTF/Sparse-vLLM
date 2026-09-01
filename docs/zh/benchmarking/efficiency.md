@@ -242,17 +242,25 @@ run_efficiency_probe.sh SYSTEMS MODEL_NAME_OR_PATH PHYSICAL_GPU_IDS
 
 - Request throughput 按完整实测 workload 的耗时计算。Prefill token throughput
   使用全部 prompt token 数除以“提交请求到最后一个请求产出首 token”的 wall-time
-  窗口。首个生成 token 由 prefill 产生，因此 decode token throughput 排除每个请求
-  的首个生成 token，并用剩余生成 token 数除以“最早首 token 到最后完成”的
-  wall-time 窗口。Churn workload 中 prefill/decode 交错执行，这两个阶段窗口可能重叠。
-  当 `output_len=1` 时，probe 仍报告 TTFT 和 prefill throughput；decode throughput
-  和 TPOT 标记为 `skipped_by_policy`。
+  窗口。首个生成 token 由 prefill 产生，因此
+  `batch_decode_token_throughput_tps` 排除每个请求的首个生成 token，并用剩余生成
+  token 数除以“最早首 token 到最后完成”的 wall-time 窗口。旧字段
+  `decode_token_throughput_tps` 是数值相同的兼容别名。Churn workload 中
+  prefill/decode 交错执行，这两个阶段窗口可能重叠。当 `output_len=1` 时，probe
+  仍报告 TTFT 和 prefill throughput；decode throughput 和 TPOT 标记为
+  `skipped_by_policy`。
 - GPU compute activity 和 memory I/O activity 直接来自 `nvidia-smi` 采样，不是
   理论 MFU/MBU、achieved FLOP/s 或 achieved HBM GB/s。
 - Coarse active duty 是 GPU utilization 大于 10% 的采样比例。它的补集不能把
   idle time 归因到 CPU scheduling 或 kernel launch。
 - TTFT 和 TPOT 是端到端请求 wall-clock 指标，包含 host scheduling、同步和
-  engine overhead。
+  engine overhead。两个 engine 都先对每个请求计算
+  `(完成时间 - 首 token 时间) / (生成 token 数 - 1)`，再对请求取平均。固定 batch
+  额外报告 `tpot_concurrency_proxy_tps = concurrency * 1000 / tpot_ms_mean`；在并发
+  匹配时，它的 speedup 与 TPOT speedup 代数等价，但它不是观测到的 batch
+  throughput。请求错峰进入 decode 或存在尾部偏斜时，观测到的 batch decode-window
+  throughput 可以与 TPOT proxy 不同，因此只能与另一个 engine 的同口径 batch-window
+  指标比较。
 - Churn 指标将 oversubscribed workload 与匹配的 fixed-batch setting 比较，包括
   throughput ratio 和 tail-TTFT 变化。
 
