@@ -26,6 +26,7 @@ from sparsevllm.method_registry import (
     PrefillScoreCollectionKind,
     sparse_prefill_attention_contract,
 )
+from sparsevllm.models.attention_runtime import build_mha_prefill_attention_spec
 from sparsevllm.operators.prefill_attention import (
     PREFILL_ATTENTION_REGISTRY,
     FlashInferFa2Sm120PagedPrefillAttentionProvider,
@@ -180,6 +181,51 @@ def test_sparse_prefill_contract_separates_main_and_posthoc_scores(
 
     assert contract.main_score_kind is main_score
     assert contract.score_collection is collection
+
+
+@pytest.mark.parametrize("method", ["omnikv", "quest"])
+def test_dense_prefill_sparse_methods_share_one_physical_page_table(method):
+    contract = sparse_prefill_attention_contract(method)
+
+    assert not contract.layer_varying_page_table
+
+
+@pytest.mark.parametrize("method", ["streamingllm", "snapkv", "deltakv"])
+def test_per_layer_physical_cache_methods_keep_layer_varying_prefill(method):
+    contract = sparse_prefill_attention_contract(method)
+
+    assert contract.layer_varying_page_table
+
+
+@pytest.mark.parametrize("method", ["omnikv", "quest"])
+def test_sm120_dense_prefill_sparse_method_selects_flashinfer_fa2(method):
+    config = SimpleNamespace(
+        dtype=torch.bfloat16,
+        hidden_size=4096,
+        num_attention_heads=32,
+        num_key_value_heads=4,
+        head_dim=128,
+    )
+    runtime_config = SimpleNamespace(
+        prefill_sparse_method="",
+        sparse_prefill_score_mode=None,
+        h2o_prefill_score_window=0,
+    )
+    spec = build_mha_prefill_attention_spec(
+        config,
+        sparse_method=method,
+        attention_tp_size=1,
+        runtime_config=runtime_config,
+    )
+
+    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
+        spec,
+        _sm120_caps(),
+    )
+
+    assert not spec.layer_varying_page_table
+    assert resolved.provider.name == "flashinfer_paged_prefill_fa2_sm120"
+    assert resolved.report.selection_basis == "upstream_default"
 
 
 def test_h2o_full_query_logits_request_fused_reduced_prefill_score():
@@ -588,9 +634,17 @@ def test_flashinfer_prefill_passes_kv_cache_as_page_views_without_copying():
 
 
 def test_flashinfer_prefill_plans_on_first_full_attention_call_per_step():
-    wrapper = SimpleNamespace(plan=Mock(), run=Mock())
+    wrapper = SimpleNamespace(
+        plan=Mock(),
+        run=Mock(),
+        workspace_size=Mock(return_value=(16, 16)),
+        reset_workspace_buffer=Mock(),
+    )
     state = object.__new__(_FlashInferPagedPrefillState)
+    state.backend = "fa2"
     state.wrapper = wrapper
+    state.workspace = torch.empty(16, dtype=torch.uint8)
+    state.int_workspace = torch.empty(16, dtype=torch.uint8)
     state.plan_scope = None
     provider = FlashInferFa2Sm120PagedPrefillAttentionProvider()
     provider._state = state
@@ -647,6 +701,8 @@ def test_flashinfer_prefill_plans_on_first_full_attention_call_per_step():
         )
 
     assert wrapper.plan.call_count == 2
+    assert wrapper.workspace_size.call_count == 2
+    wrapper.reset_workspace_buffer.assert_not_called()
     torch.testing.assert_close(
         wrapper.plan.call_args_list[0].args[2],
         torch.tensor([4, 1], dtype=torch.int32),
@@ -658,6 +714,71 @@ def test_flashinfer_prefill_plans_on_first_full_attention_call_per_step():
     assert first_scope is not context.attention_validation_scope
     assert state.plan_scope is context.attention_validation_scope
     assert wrapper.run.call_count == 3
+
+
+def test_flashinfer_fa3_plans_without_workspace_sizing():
+    wrapper = SimpleNamespace(
+        plan=Mock(),
+        workspace_size=Mock(side_effect=NotImplementedError),
+        reset_workspace_buffer=Mock(),
+    )
+    state = object.__new__(_FlashInferPagedPrefillState)
+    state.backend = "fa3"
+    state.wrapper = wrapper
+    state.workspace = torch.empty(16, dtype=torch.uint8)
+    state.int_workspace = None
+    state.plan_scope = None
+
+    state.plan(
+        _spec(),
+        qo_indptr=torch.tensor([0, 1], dtype=torch.int32),
+        active_slots=torch.tensor([[4, 1]], dtype=torch.int32),
+        req_indices=torch.tensor([0], dtype=torch.int32),
+        context_lens=torch.tensor([2], dtype=torch.int32),
+        max_context_len=2,
+        plan_scope=object(),
+    )
+
+    wrapper.workspace_size.assert_not_called()
+    wrapper.reset_workspace_buffer.assert_not_called()
+    wrapper.plan.assert_called_once()
+
+
+def test_flashinfer_prefill_grows_workspace_before_planning():
+    wrapper = SimpleNamespace(
+        plan=Mock(),
+        workspace_size=Mock(side_effect=[(64, 32), (48, 16)]),
+        reset_workspace_buffer=Mock(),
+    )
+    state = object.__new__(_FlashInferPagedPrefillState)
+    state.backend = "fa2"
+    state.wrapper = wrapper
+    state.workspace = torch.empty(32, dtype=torch.uint8)
+    state.int_workspace = torch.empty(16, dtype=torch.uint8)
+    state.plan_scope = None
+    spec = _spec()
+    kwargs = {
+        "qo_indptr": torch.tensor([0, 1], dtype=torch.int32),
+        "active_slots": torch.tensor([[4, 1]], dtype=torch.int32),
+        "req_indices": torch.tensor([0], dtype=torch.int32),
+        "context_lens": torch.tensor([2], dtype=torch.int32),
+        "max_context_len": 2,
+    }
+
+    state.plan(spec, plan_scope=object(), **kwargs)
+
+    assert state.workspace.numel() == 64
+    assert state.int_workspace.numel() == 32
+    wrapper.reset_workspace_buffer.assert_called_once_with(
+        state.workspace,
+        state.int_workspace,
+    )
+
+    state.plan(spec, plan_scope=object(), **kwargs)
+
+    assert state.workspace.numel() == 64
+    assert state.int_workspace.numel() == 32
+    assert wrapper.reset_workspace_buffer.call_count == 1
 
 
 def test_sgl_fa3_prefill_passes_token_page_view_without_copying():
@@ -845,10 +966,12 @@ def test_flashinfer_page_size_one_matches_noncontiguous_torch_oracle():
         (24, 4, 256),
     ],
 )
+@pytest.mark.parametrize("sparse_method", ["", "omnikv", "quest"])
 def test_flashinfer_fa2_sm120_matches_noncontiguous_torch_oracle(
     num_query_heads,
     num_kv_heads,
     head_dim,
+    sparse_method,
 ):
     if torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("The specialized provider requires SM120.")
@@ -877,13 +1000,28 @@ def test_flashinfer_fa2_sm120_matches_noncontiguous_torch_oracle(
         context_lens=torch.tensor(kv_lens, device="cuda", dtype=torch.int32),
         attn_score=None,
     )
-    provider = FlashInferFa2Sm120PagedPrefillAttentionProvider()
-    spec = _spec(
-        num_query_heads=num_query_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        softmax_scale=head_dim**-0.5,
+    spec = build_mha_prefill_attention_spec(
+        SimpleNamespace(
+            dtype=torch.bfloat16,
+            hidden_size=num_query_heads * head_dim,
+            num_attention_heads=num_query_heads,
+            num_key_value_heads=num_kv_heads,
+            head_dim=head_dim,
+        ),
+        sparse_method=sparse_method,
+        attention_tp_size=1,
+        runtime_config=SimpleNamespace(
+            prefill_sparse_method="",
+            sparse_prefill_score_mode=None,
+            h2o_prefill_score_window=0,
+        ),
     )
+    resolved = OpResolver(PREFILL_ATTENTION_REGISTRY).resolve(
+        spec,
+        _sm120_caps(),
+    )
+    provider = resolved.provider
+    assert provider.name == "flashinfer_paged_prefill_fa2_sm120"
     provider.prepare(spec)
     actual = provider.run(
         spec,
@@ -897,6 +1035,59 @@ def test_flashinfer_fa2_sm120_matches_noncontiguous_torch_oracle(
     expected = _torch_prefill_oracle(q, logical_k, logical_v, q_lens, kv_lens)
     torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.03)
     provider.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("query_len", [64, 256])
+def test_flashinfer_fa2_sm120_grows_workspace_for_short_q_long_prefix(query_len):
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("The specialized provider requires SM120.")
+    pytest.importorskip("flashinfer")
+    context_len = 16_384
+    spec = _spec(num_query_heads=32, num_kv_heads=4)
+    q = torch.zeros(
+        query_len, 32, 128, device="cuda", dtype=torch.bfloat16
+    )
+    k_cache = torch.zeros(
+        context_len, 4, 128, device="cuda", dtype=torch.bfloat16
+    )
+    v_cache = torch.zeros_like(k_cache)
+    view = SimpleNamespace(
+        k_cache=k_cache,
+        v_cache=v_cache,
+        active_slots=torch.arange(
+            context_len, device="cuda", dtype=torch.int32
+        ).unsqueeze(0),
+        req_indices=torch.tensor([0], device="cuda", dtype=torch.int32),
+        context_lens=torch.tensor(
+            [context_len], device="cuda", dtype=torch.int32
+        ),
+        attn_score=None,
+    )
+    provider = FlashInferFa2Sm120PagedPrefillAttentionProvider()
+    provider.prepare(spec)
+    assert provider._state is not None
+    initial_workspace_bytes = provider._state.workspace.numel()
+
+    try:
+        actual = provider.run(
+            spec,
+            q,
+            view,
+            qo_indptr=torch.tensor(
+                [0, query_len], device="cuda", dtype=torch.int32
+            ),
+            chunk_lens=torch.tensor(
+                [query_len], device="cuda", dtype=torch.int32
+            ),
+            max_context_len=context_len,
+            layer_idx=0,
+        )
+
+        assert provider._state.workspace.numel() > initial_workspace_bytes
+        assert torch.count_nonzero(actual).item() == 0
+    finally:
+        provider.close()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

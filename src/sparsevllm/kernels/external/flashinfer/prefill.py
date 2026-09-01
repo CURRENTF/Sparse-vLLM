@@ -87,6 +87,34 @@ def _paged_prefill_wrapper_type(backend: str):
         feature=feature,
         entrypoint="BatchPrefillWithPagedKVCacheWrapper.plan",
     )
+    if backend == "fa2":
+        _require_parameters(
+            getattr(wrapper_type, "workspace_size", None),
+            frozenset(
+                {
+                    "qo_indptr",
+                    "paged_kv_indptr",
+                    "paged_kv_indices",
+                    "paged_kv_last_page_len",
+                    "num_qo_heads",
+                    "num_kv_heads",
+                    "head_dim_qk",
+                    "page_size",
+                    "causal",
+                    "sm_scale",
+                    "q_data_type",
+                    "kv_data_type",
+                }
+            ),
+            feature=feature,
+            entrypoint="BatchPrefillWithPagedKVCacheWrapper.workspace_size",
+        )
+        _require_parameters(
+            getattr(wrapper_type, "reset_workspace_buffer", None),
+            frozenset({"float_workspace_buffer", "int_workspace_buffer"}),
+            feature=feature,
+            entrypoint="BatchPrefillWithPagedKVCacheWrapper.reset_workspace_buffer",
+        )
     _require_parameters(
         wrapper_type.run,
         frozenset({"q", "paged_kv_cache", "out"}),

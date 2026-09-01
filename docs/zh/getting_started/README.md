@@ -39,10 +39,14 @@ Sparse-vLLM 当前支持未量化 BF16 和 block-scaled FP8 格式的
 Qwen3.5/Qwen3.6/Qwen3.8 checkpoint。三者共享 `qwen3_5` 运行时架构和支持矩阵。
 
 其 causal Conv1D 与 decode packing path 仍使用仓库自有 Triton kernel。
-GDN core 在模型准备阶段只解析一次：经验证的 H100 环境若安装
-`flashinfer-python>=0.6.17`，会绑定 FlashInfer prefill 与仓库本地 fused
-Triton decode；其他受支持契约绑定本地 Triton 实现。项目保留更低的依赖
-版本下限是合法的，因为 FlashInfer GDN Provider 会在执行前拒绝旧版本。
+GDN core 在模型准备阶段只解析一次。安装受支持的
+`flashinfer-python>=0.6.15,<0.7` 后，满足合同的
+SM90、SM100/SM103 与 SM120/SM121 环境会绑定 FlashInfer 公开 prefill dispatcher
+和仓库本地 fused Triton decode kernel；其他受支持合同绑定本地 Triton 实现。
+SM100/SM103 要求 CUDA 13，所有 Blackwell path 均要求 head dim 128，且 value
+head 数必须等于 key head 数或是其整数倍；adapter 在 FlashInfer 边界使用 FP32
+initial/final state，同时保留仓库配置的 BF16 或 FP32 runtime state。Provider
+resolution 会在执行前验证公开 dispatcher 的签名和对应架构的 kernel symbol。
 
 `flashinfer-cubin` 是可选加速 package：
 

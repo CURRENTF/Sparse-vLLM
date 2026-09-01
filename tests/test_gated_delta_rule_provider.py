@@ -1,3 +1,4 @@
+import inspect
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -6,18 +7,24 @@ import torch
 from torch import nn
 
 from sparsevllm.kernels.external.flashinfer.gdn import (
-    flashinfer_sm90_gdn_prefill_support,
+    _GDN_PREFILL_REQUIRED_ARGUMENTS,
+    _gdn_prefill_op,
+    flashinfer_chunk_gated_delta_rule,
+    flashinfer_gdn_prefill_support,
 )
 from sparsevllm.models.gdn_runtime import (
     bind_gated_delta_rule_op,
     build_gated_delta_rule_op,
 )
 from sparsevllm.operators.gated_delta_rule import (
-    FlashInferSm90GatedDeltaRuleProvider,
+    GATED_DELTA_RULE_REGISTRY,
+    FlashInferGatedDeltaRuleProvider,
     GatedDeltaRuleOpSpec,
     PreparedGatedDeltaRuleOp,
     TritonGatedDeltaRuleProvider,
 )
+from sparsevllm.operators.registry import OpResolver
+from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
 
 
 def _spec(**overrides) -> GatedDeltaRuleOpSpec:
@@ -34,8 +41,152 @@ def _spec(**overrides) -> GatedDeltaRuleOpSpec:
     return GatedDeltaRuleOpSpec(**values)
 
 
+def _cuda_caps(
+    compute_capability: tuple[int, int],
+    **overrides,
+) -> DeviceCaps:
+    values = {
+        "platform": PlatformEnum.CUDA,
+        "device_type": "cuda",
+        "device_index": 0,
+        "device_name": f"test SM{compute_capability[0]}{compute_capability[1]}",
+        "compute_capability": compute_capability,
+        "runtime_version": "13.0",
+        "supports_graph_capture": True,
+        "supports_triton": True,
+        "supports_bfloat16": True,
+    }
+    values.update(overrides)
+    return DeviceCaps(**values)
+
+
+def test_gdn_spec_rejects_nonintegral_gva_head_relationship():
+    with pytest.raises(ValueError, match="divisible by key heads"):
+        _spec(num_key_heads=16, num_value_heads=17)
+
+
+@pytest.mark.parametrize(
+    "compute_capability",
+    [(9, 0), (10, 0), (10, 3), (12, 0), (12, 1)],
+)
+def test_flashinfer_gdn_is_upstream_default_on_declared_architectures(
+    compute_capability,
+):
+    with patch(
+        "sparsevllm.operators.gated_delta_rule.flashinfer_gdn_prefill_support",
+        return_value=(True, "FlashInfer GDN available"),
+    ) as support:
+        resolved = OpResolver(GATED_DELTA_RULE_REGISTRY).resolve(
+            _spec(),
+            _cuda_caps(compute_capability),
+        )
+
+    assert resolved.provider.name == "flashinfer_gdn_prefill_triton_decode"
+    assert resolved.report.selection_basis == "upstream_default"
+    support.assert_called_once_with(compute_capability)
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_sm120_qwen35_gva_topologies_select_flashinfer(tp_size):
+    with patch(
+        "sparsevllm.operators.gated_delta_rule.flashinfer_gdn_prefill_support",
+        return_value=(True, "FlashInfer GDN available"),
+    ):
+        resolved = OpResolver(GATED_DELTA_RULE_REGISTRY).resolve(
+            _spec(
+                num_key_heads=16 // tp_size,
+                num_value_heads=48 // tp_size,
+                recurrent_state_dtype=torch.bfloat16,
+            ),
+            _cuda_caps((12, 0)),
+        )
+
+    assert resolved.provider.name == "flashinfer_gdn_prefill_triton_decode"
+    assert resolved.report.selection_basis == "upstream_default"
+
+
+@pytest.mark.parametrize(
+    ("spec", "caps", "reason"),
+    [
+        (_spec(key_head_dim=64, value_head_dim=64), _cuda_caps((12, 0)), "dim 128"),
+        (_spec(), _cuda_caps((8, 9)), "SM90, SM100, SM103, SM120, or SM121"),
+    ],
+)
+def test_flashinfer_gdn_rejects_contracts_outside_declared_support(
+    spec,
+    caps,
+    reason,
+):
+    with patch(
+        "sparsevllm.operators.gated_delta_rule.flashinfer_gdn_prefill_support",
+        return_value=(True, "FlashInfer GDN available"),
+    ):
+        resolved = OpResolver(GATED_DELTA_RULE_REGISTRY).resolve(spec, caps)
+
+    assert resolved.provider.name == "triton_gated_delta_rule"
+    assert reason in dict(resolved.rejected)["flashinfer_gdn_prefill_triton_decode"]
+
+
+def test_flashinfer_sm100_gdn_requires_cuda_13():
+    result = FlashInferGatedDeltaRuleProvider.supports(
+        _spec(),
+        _cuda_caps((10, 0), runtime_version="12.9"),
+    )
+
+    assert not result.supported
+    assert "CUDA runtime >= 13.0" in result.reason
+
+
+def test_flashinfer_gdn_project_minimum_accepts_additive_optional_parameter():
+    parameter_names = (*_GDN_PREFILL_REQUIRED_ARGUMENTS, "_cp_chunk_len")
+    public_function = Mock()
+    public_function.__signature__ = inspect.Signature(
+        [
+            inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            for name in parameter_names
+        ]
+    )
+    module = SimpleNamespace(
+        chunk_gated_delta_rule=public_function,
+        chunk_gated_delta_rule_sm100=Mock(),
+    )
+    _gdn_prefill_op.cache_clear()
+    try:
+        with (
+            patch(
+                "sparsevllm.kernels.external.flashinfer.gdn.flashinfer_kernel_support",
+                return_value=(
+                    True,
+                    "flashinfer-python 0.6.15 GDN prefill is available",
+                ),
+            ),
+            patch(
+                "sparsevllm.kernels.external.flashinfer.gdn.importlib.import_module",
+                return_value=module,
+            ),
+        ):
+            supported, reason = flashinfer_gdn_prefill_support((10, 0))
+            function, _ = _gdn_prefill_op((10, 0))
+    finally:
+        _gdn_prefill_op.cache_clear()
+
+    assert function is public_function
+    assert supported
+    assert "0.6.15" in reason
+
+
+def test_flashinfer_gdn_rejects_unsupported_activation_dtype():
+    result = FlashInferGatedDeltaRuleProvider.supports(
+        _spec(activation_dtype=torch.float32),
+        _cuda_caps((12, 0)),
+    )
+
+    assert not result.supported
+    assert "BF16 or FP16" in result.reason
+
+
 def test_flashinfer_prefill_adapter_converts_log_gate_and_state_contract():
-    provider = FlashInferSm90GatedDeltaRuleProvider()
+    provider = FlashInferGatedDeltaRuleProvider()
     packed_qk = torch.randn(1, 3, 2, 256, dtype=torch.bfloat16)
     q = packed_qk[..., :128]
     k = packed_qk[..., 128:]
@@ -55,7 +206,7 @@ def test_flashinfer_prefill_adapter_converts_log_gate_and_state_contract():
             side_effect=lambda tensor: tensor,
         ) as normalize,
         patch(
-            "sparsevllm.operators.gated_delta_rule.flashinfer_chunk_gated_delta_rule_sm90",
+            "sparsevllm.operators.gated_delta_rule.flashinfer_chunk_gated_delta_rule",
             return_value=(output, final_state),
         ) as kernel,
     ):
@@ -71,6 +222,7 @@ def test_flashinfer_prefill_adapter_converts_log_gate_and_state_contract():
         )
 
     assert actual_output.shape == (1, 3, 4, 128)
+    assert actual_state.dtype == torch.float32
     torch.testing.assert_close(actual_state, final_state.transpose(-1, -2))
     assert actual_state.is_contiguous()
     assert all(call.args[0].is_contiguous() for call in normalize.call_args_list)
@@ -85,12 +237,48 @@ def test_flashinfer_prefill_adapter_converts_log_gate_and_state_contract():
     assert call.args[6] is cu_seqlens
 
 
+def test_flashinfer_prefill_adapter_rejects_non_fp32_final_state():
+    q = torch.randn(1, 2, 128, dtype=torch.bfloat16)
+    v = torch.randn(1, 4, 128, dtype=torch.bfloat16)
+    state = torch.randn(1, 4, 128, 128, dtype=torch.float32)
+    gate = torch.randn(1, 4, dtype=torch.float32)
+    kernel = Mock(
+        return_value=(v, torch.empty_like(state, dtype=torch.bfloat16))
+    )
+
+    with (
+        patch(
+            "sparsevllm.kernels.external.flashinfer.gdn._gdn_prefill_op",
+            return_value=(kernel, "available"),
+        ),
+        patch(
+            "sparsevllm.kernels.external.flashinfer.gdn."
+            "torch.cuda.get_device_capability",
+            return_value=(12, 0),
+        ),
+        pytest.raises(RuntimeError, match="FP32 final_state"),
+    ):
+        flashinfer_chunk_gated_delta_rule(
+            q,
+            q,
+            v,
+            gate,
+            gate,
+            state,
+            torch.tensor([0, 1], dtype=torch.int32),
+        )
+
+
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
-    reason="requires CUDA SM90",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()
+    not in {(9, 0), (10, 0), (10, 3), (12, 0), (12, 1)},
+    reason="requires CUDA SM90, SM100, SM103, SM120, or SM121",
 )
 def test_flashinfer_prefill_matches_independent_triton_provider():
-    supported, reason = flashinfer_sm90_gdn_prefill_support()
+    supported, reason = flashinfer_gdn_prefill_support(
+        torch.cuda.get_device_capability()
+    )
     if not supported:
         pytest.skip(reason)
 
@@ -144,7 +332,7 @@ def test_flashinfer_prefill_matches_independent_triton_provider():
     )
 
     actual_output, actual_state = (
-        FlashInferSm90GatedDeltaRuleProvider().run_prefill(
+        FlashInferGatedDeltaRuleProvider().run_prefill(
             spec,
             q=q,
             k=k,

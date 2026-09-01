@@ -150,7 +150,7 @@ MLA_ATTENTION_REGISTRY: OpRegistry[
     "MLA attention",
     portfolio=PortfolioPolicy(
         upstream_standard=("sgl_fa3_sm90",),
-        repo_nonstandard=("triton_sm90",),
+        repo_nonstandard=("triton_mla",),
     ),
     profile_order=(
         "tilelang_output_h100_quest_bs4_profile",
@@ -161,13 +161,12 @@ MLA_ATTENTION_REGISTRY: OpRegistry[
 
 @MLA_ATTENTION_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
 class MlaTritonProvider(MlaAttentionProvider):
-    """Portable SM90 provider with caller-independent decode workspace."""
+    """Portable Triton provider with caller-independent decode workspace."""
 
-    name = "triton_sm90"
+    name = "triton_mla"
     supports_batch_only_cuda_graph = True
     capabilities = AttentionKernelCapabilities(
         platforms=frozenset({PlatformEnum.CUDA}),
-        compute_capabilities=frozenset({(9, 0)}),
         activation_dtypes=frozenset({torch.bfloat16}),
         head_dims=frozenset({_GLM_MLA_QK_HEAD_DIM}),
         score_outputs=frozenset(AttentionScoreKind),
@@ -184,6 +183,7 @@ class MlaTritonProvider(MlaAttentionProvider):
         device: torch.device | str,
         max_batch_size: int,
         launch_config: MlaDecodeLaunchConfig | None = None,
+        use_h100_tp2_launch_profile: bool = False,
     ) -> None:
         self.spec = op_spec
         requested_device = torch.device(device)
@@ -194,8 +194,13 @@ class MlaTritonProvider(MlaAttentionProvider):
                 f"{self.max_batch_size}."
             )
         self._fixed_launch_config = launch_config
+        self._use_h100_tp2_launch_profile = bool(use_h100_tp2_launch_profile)
         self.launch_config = launch_config or DEFAULT_GLM_MLA_DECODE_CONFIG
-        workspace_config = launch_config or GLM_MLA_MAX_WORKSPACE_CONFIG
+        workspace_config = launch_config or (
+            GLM_MLA_MAX_WORKSPACE_CONFIG
+            if self._use_h100_tp2_launch_profile
+            else DEFAULT_GLM_MLA_DECODE_CONFIG
+        )
         self.workspace = allocate_mla_decode_workspace(
             batch_size=self.max_batch_size,
             head_count=self.spec.local_q_heads,
@@ -218,11 +223,34 @@ class MlaTritonProvider(MlaAttentionProvider):
         self._runtime_kernel_path_counts: dict[str, dict[str, int]] = {}
         self._runtime_fallback_reasons: dict[str, int] = {}
 
+    @classmethod
+    def bind(
+        cls,
+        spec: MlaAttentionOpSpec,
+        caps: DeviceCaps,
+        **kwargs,
+    ) -> "MlaTritonProvider":
+        if cls is not MlaTritonProvider:
+            return cls(**kwargs)
+        return cls(
+            use_h100_tp2_launch_profile=(
+                caps.compute_capability == (9, 0)
+                and caps.device_name == _PROFILED_H100_NAME
+                and spec.tp_size == 2
+            ),
+            **kwargs,
+        )
+
     def binding_metadata(self) -> dict[str, object]:
         metadata = {
             "implementation_kind": "atomic_provider",
             "implementation_source": "repo_triton",
             "decode_kernel_path": "triton_mla_stage1_stage2",
+            "launch_config_source": (
+                "h100_tp2_profile"
+                if self._use_h100_tp2_launch_profile
+                else "portable_default"
+            ),
         }
         if not self.spec.batch_only_cuda_graph:
             return metadata
@@ -457,6 +485,8 @@ class MlaTritonProvider(MlaAttentionProvider):
     ) -> MlaDecodeLaunchConfig:
         if self._fixed_launch_config is not None:
             return self._fixed_launch_config
+        if not self._use_h100_tp2_launch_profile:
+            return DEFAULT_GLM_MLA_DECODE_CONFIG
         if self.spec.batch_only_cuda_graph:
             if self.spec.context_capacity is None:
                 raise RuntimeError(

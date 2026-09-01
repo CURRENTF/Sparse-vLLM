@@ -156,11 +156,33 @@ class PrefillScoreCollectionKind(Enum):
 class SparsePrefillAttentionContract:
     main_score_kind: AttentionScoreKind
     score_collection: PrefillScoreCollectionKind
+    layer_varying_page_table: bool
 
 
 _PREFILL_POSTHOC_SCORE_METHODS = frozenset(
     {"snapkv", "pyramidkv", "h2o", "rkv"}
 )
+
+# Prefill provider planning may be reused across transformer layers only when
+# every layer reads the same physical slot table. OmniKV keeps Standard's
+# shared table, and QuEST does not apply its query-aware page selection until
+# decode. SnapKV-family managers and DeltaKV own per-layer physical tables.
+_PREFILL_LAYER_VARYING_PAGE_TABLE = {
+    "": False,
+    "streamingllm": True,
+    "snapkv": True,
+    "h2o": True,
+    "pyramidkv": True,
+    "omnikv": False,
+    "quest": False,
+    "rkv": True,
+    "skipkv": True,
+    "deltakv": True,
+}
+if set(_PREFILL_LAYER_VARYING_PAGE_TABLE) != CANONICAL_SPARSE_METHODS:
+    raise RuntimeError(
+        "Prefill page-table contracts must cover every canonical sparse method."
+    )
 
 # Static method score contracts let providers bind before CUDA Graph capture
 # instead of changing the score-producing implementation during replay.
@@ -201,6 +223,7 @@ def sparse_prefill_attention_contract(
     h2o_prefill = (
         normalized == "h2o" and resolved_prefill_method == "h2o_prefill"
     )
+    layer_varying_page_table = _PREFILL_LAYER_VARYING_PAGE_TABLE[normalized]
     fused_h2o_score = (
         h2o_prefill
         and resolve_sparse_prefill_score_mode(
@@ -214,6 +237,7 @@ def sparse_prefill_attention_contract(
         return SparsePrefillAttentionContract(
             main_score_kind=AttentionScoreKind.RAW_QK_REDUCED,
             score_collection=PrefillScoreCollectionKind.MAIN_ATTENTION_REDUCED,
+            layer_varying_page_table=layer_varying_page_table,
         )
     collection = (
         PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED
@@ -223,6 +247,7 @@ def sparse_prefill_attention_contract(
     return SparsePrefillAttentionContract(
         main_score_kind=AttentionScoreKind.NONE,
         score_collection=collection,
+        layer_varying_page_table=layer_varying_page_table,
     )
 
 

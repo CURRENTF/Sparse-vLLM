@@ -13,7 +13,7 @@ from sparsevllm.engine.cache_manager import (
     MlaLatentPayload,
     PrefillComputeView,
 )
-from sparsevllm.kernels.external.sgl.fa3 import sgl_fa3_support
+from sparsevllm.kernels.external.sgl.fa3 import sgl_fa3_device_support
 from sparsevllm.kernels.triton.mla import (
     MlaDecodeWorkspace,
 )
@@ -106,6 +106,50 @@ def test_mla_triton_atomic_support_is_not_narrowed_by_device_name() -> None:
     assert result.supported
 
 
+def test_mla_triton_atomic_supports_sm120() -> None:
+    result = MlaTritonProvider.supports(
+        _spec(tp_size=1),
+        _h100_caps(
+            device_name="NVIDIA RTX PRO 6000 Blackwell Server Edition",
+            compute_capability=(12, 0),
+            runtime_version="13.0",
+        ),
+    )
+
+    assert result.supported
+
+
+def test_mla_resolver_selects_triton_on_sm120() -> None:
+    spec = _spec(tp_size=1)
+    caps = _h100_caps(
+        device_name="NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        compute_capability=(12, 0),
+        runtime_version="13.0",
+    )
+    workspace = _cpu_workspace(batch_size=1, head_count=20)
+    with (
+        patch(
+            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
+            return_value=(False, "FA3 unsupported on SM120"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+            return_value=workspace,
+        ),
+    ):
+        resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
+            spec,
+            caps,
+            op_spec=spec,
+            device="cpu",
+            max_batch_size=1,
+        )
+
+    assert type(resolved.provider) is MlaTritonProvider
+    assert resolved.provider.name == "triton_mla"
+    assert resolved.report.selection_basis == "semantic_fallback"
+
+
 def test_batch_only_mla_requires_static_capacity() -> None:
     spec = _spec(
         cuda_graph=True,
@@ -135,6 +179,7 @@ def test_batch_only_mla_launch_config_ignores_runtime_context() -> None:
             op_spec=spec,
             device="cpu",
             max_batch_size=32,
+            use_h100_tp2_launch_profile=True,
         )
     launch_config = object()
     with patch(
@@ -158,6 +203,74 @@ def test_batch_only_mla_launch_config_ignores_runtime_context() -> None:
     select.assert_called_with(
         batch_size=32,
         context_capacity=32768,
+        local_q_heads=10,
+    )
+
+
+def test_sm120_tp2_uses_portable_mla_launch_config() -> None:
+    spec = _spec(tp_size=2)
+    workspace = _cpu_workspace(batch_size=8, head_count=10)
+    with patch(
+        "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+        return_value=workspace,
+    ):
+        provider = MlaTritonProvider.bind(
+            spec,
+            _h100_caps(
+                device_name="NVIDIA RTX PRO 6000 Blackwell Server Edition",
+                compute_capability=(12, 0),
+                runtime_version="13.0",
+            ),
+            op_spec=spec,
+            device="cpu",
+            max_batch_size=8,
+        )
+
+    with patch(
+        "sparsevllm.operators.mla_attention.select_glm_mla_decode_config"
+    ) as select:
+        launch_config = provider._launch_config_for(
+            batch_size=8,
+            max_context_len=4096,
+            active_slot_width=4096,
+        )
+
+    assert launch_config is provider.launch_config
+    assert provider.binding_metadata()["launch_config_source"] == "portable_default"
+    select.assert_not_called()
+
+
+def test_exact_h100_tp2_uses_profiled_mla_launch_config() -> None:
+    spec = _spec(tp_size=2)
+    workspace = _cpu_workspace(batch_size=8, head_count=10)
+    with patch(
+        "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+        return_value=workspace,
+    ):
+        provider = MlaTritonProvider.bind(
+            spec,
+            _h100_caps(),
+            op_spec=spec,
+            device="cpu",
+            max_batch_size=8,
+        )
+
+    profiled_config = object()
+    with patch(
+        "sparsevllm.operators.mla_attention.select_glm_mla_decode_config",
+        return_value=profiled_config,
+    ) as select:
+        launch_config = provider._launch_config_for(
+            batch_size=8,
+            max_context_len=4096,
+            active_slot_width=4096,
+        )
+
+    assert launch_config is profiled_config
+    assert provider.binding_metadata()["launch_config_source"] == "h100_tp2_profile"
+    select.assert_called_once_with(
+        batch_size=8,
+        context_capacity=4096,
         local_q_heads=10,
     )
 
@@ -212,7 +325,6 @@ def test_batch_only_mla_resolver_prefers_sgl_fa3() -> None:
     ("spec_overrides", "caps_overrides", "reason"),
     [
         ({}, {"platform": PlatformEnum.CPU}, "requires platform"),
-        ({}, {"compute_capability": (8, 0)}, "compute capability"),
         ({}, {"supports_triton": False}, "does not support Triton"),
         ({}, {"supports_bfloat16": False}, "does not support BF16"),
         (
@@ -575,7 +687,8 @@ def test_mla_provider_runs_static_padded_batch() -> None:
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not sgl_fa3_support()[0],
+    not torch.cuda.is_available()
+    or not sgl_fa3_device_support(torch.cuda.current_device())[0],
     reason="CUDA and a validated sglang-kernel are required",
 )
 @torch.inference_mode()

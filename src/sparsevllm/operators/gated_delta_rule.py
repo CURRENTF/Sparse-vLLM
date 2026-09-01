@@ -6,8 +6,9 @@ import torch
 
 import sparsevllm.platforms as platforms
 from sparsevllm.kernels.external.flashinfer.gdn import (
-    flashinfer_chunk_gated_delta_rule_sm90,
-    flashinfer_sm90_gdn_prefill_support,
+    FLASHINFER_GDN_PREFILL_CAPABILITIES,
+    flashinfer_chunk_gated_delta_rule,
+    flashinfer_gdn_prefill_support,
 )
 from sparsevllm.kernels.triton.qwen3_5.fla.ops import (
     chunk_gated_delta_rule,
@@ -185,7 +186,7 @@ GATED_DELTA_RULE_REGISTRY: OpRegistry[
     "gated delta rule",
     portfolio=PortfolioPolicy(
         upstream_standard=(
-            "flashinfer_sm90_gdn_prefill_triton_decode",
+            "flashinfer_gdn_prefill_triton_decode",
         ),
         repo_nonstandard=("triton_gated_delta_rule",),
     ),
@@ -193,10 +194,10 @@ GATED_DELTA_RULE_REGISTRY: OpRegistry[
 
 
 @GATED_DELTA_RULE_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
-class FlashInferSm90GatedDeltaRuleProvider(GatedDeltaRuleProvider):
+class FlashInferGatedDeltaRuleProvider(GatedDeltaRuleProvider):
     """Fixed FlashInfer-prefill/repo-decode GDN implementation plan."""
 
-    name = "flashinfer_sm90_gdn_prefill_triton_decode"
+    name = "flashinfer_gdn_prefill_triton_decode"
 
     @classmethod
     def supports(
@@ -204,25 +205,44 @@ class FlashInferSm90GatedDeltaRuleProvider(GatedDeltaRuleProvider):
         spec: GatedDeltaRuleOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
-        if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
+        if (
+            caps.platform != PlatformEnum.CUDA
+            or caps.compute_capability not in FLASHINFER_GDN_PREFILL_CAPABILITIES
+        ):
             return SupportResult.unsupported(
-                f"requires CUDA SM90, got {caps.platform.name} {caps.compute_capability}"
+                "requires CUDA SM90, SM100, SM103, SM120, or SM121, got "
+                f"{caps.platform.name} {caps.compute_capability}"
             )
         if not caps.supports_triton:
             return SupportResult.unsupported("decode implementation requires Triton")
-        if not runtime_version_at_least(caps.runtime_version, (12, 8)):
+        minimum_runtime = (
+            (13, 0) if caps.compute_capability[0] == 10 else (12, 8)
+        )
+        if not runtime_version_at_least(caps.runtime_version, minimum_runtime):
             return SupportResult.unsupported(
-                "requires CUDA runtime >= 12.8, "
+                "requires CUDA runtime >= "
+                f"{minimum_runtime[0]}.{minimum_runtime[1]}, "
                 f"got {caps.runtime_version or 'unknown'}"
             )
-        if spec.activation_dtype != torch.bfloat16:
+        if spec.activation_dtype not in (torch.bfloat16, torch.float16):
             return SupportResult.unsupported(
-                f"requires the validated BF16 activation contract, got {spec.activation_dtype}"
+                "requires BF16 or FP16 activations, got "
+                f"{spec.activation_dtype}"
             )
-        if spec.recurrent_state_dtype not in (torch.bfloat16, torch.float32):
+        if spec.recurrent_state_dtype not in (
+            torch.bfloat16,
+            torch.float32,
+        ):
             return SupportResult.unsupported(
-                "requires BF16/FP32 recurrent state, got "
+                "FlashInfer GDN requires BF16/FP32 runtime recurrent state, got "
                 f"{spec.recurrent_state_dtype}"
+            )
+        if caps.compute_capability[0] in {10, 12} and (
+            spec.key_head_dim != 128 or spec.value_head_dim != 128
+        ):
+            return SupportResult.unsupported(
+                "FlashInfer Blackwell GDN prefill requires key/value head dim 128, got "
+                f"{spec.key_head_dim}/{spec.value_head_dim}"
             )
         if spec.key_head_dim != spec.value_head_dim:
             return SupportResult.unsupported(
@@ -233,7 +253,9 @@ class FlashInferSm90GatedDeltaRuleProvider(GatedDeltaRuleProvider):
             return SupportResult.unsupported("requires varlen prefill")
         if spec.cuda_graph_decode and not caps.supports_graph_capture:
             return SupportResult.unsupported("device does not support CUDA Graph capture")
-        supported, reason = flashinfer_sm90_gdn_prefill_support()
+        supported, reason = flashinfer_gdn_prefill_support(
+            caps.compute_capability
+        )
         return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
 
     def binding_metadata(self) -> dict[str, object]:
@@ -279,7 +301,7 @@ class FlashInferSm90GatedDeltaRuleProvider(GatedDeltaRuleProvider):
         flashinfer_initial_state = (
             initial_state.to(torch.float32).transpose(-1, -2).contiguous()
         )
-        output, final_state = flashinfer_chunk_gated_delta_rule_sm90(
+        output, final_state = flashinfer_chunk_gated_delta_rule(
             normalized_q,
             normalized_k,
             v.squeeze(0).contiguous(),
@@ -441,7 +463,7 @@ def prepare_gated_delta_rule_op(
 
 
 __all__ = [
-    "FlashInferSm90GatedDeltaRuleProvider",
+    "FlashInferGatedDeltaRuleProvider",
     "GATED_DELTA_RULE_REGISTRY",
     "GatedDeltaRuleOpSpec",
     "PreparedGatedDeltaRuleOp",

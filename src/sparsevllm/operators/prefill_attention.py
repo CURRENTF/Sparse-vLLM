@@ -347,6 +347,7 @@ class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
 
 class _FlashInferPagedPrefillState:
     def __init__(self, device: torch.device, *, backend: str) -> None:
+        self.backend = backend
         self.workspace = torch.empty(
             128 * 1024 * 1024,
             dtype=torch.uint8,
@@ -356,7 +357,70 @@ class _FlashInferPagedPrefillState:
             self.workspace,
             backend=backend,
         )
+        self.int_workspace: torch.Tensor | None = None
+        if backend == "fa2":
+            self.int_workspace = torch.empty(
+                8 * 1024 * 1024,
+                dtype=torch.uint8,
+                device=device,
+            )
+            self.wrapper.reset_workspace_buffer(
+                self.workspace,
+                self.int_workspace,
+            )
         self.plan_scope: object | None = None
+
+    def _ensure_workspace(self, *args, **kwargs) -> None:
+        if self.backend != "fa2":
+            return
+        int_workspace = self.int_workspace
+        if int_workspace is None:
+            raise RuntimeError(
+                "FlashInfer FA2 prefill requires a caller-owned integer workspace."
+            )
+        required_float, required_int = self.wrapper.workspace_size(*args, **kwargs)
+        try:
+            required_float = int(required_float)
+            required_int = int(required_int)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                "FlashInfer paged prefill returned invalid workspace sizes: "
+                f"float={required_float!r} int={required_int!r}."
+            ) from error
+        if required_float < 0 or required_int < 0:
+            raise RuntimeError(
+                "FlashInfer paged prefill returned negative workspace sizes: "
+                f"float={required_float} int={required_int}."
+            )
+
+        current_float = self.workspace.numel() * self.workspace.element_size()
+        current_int = int_workspace.numel() * int_workspace.element_size()
+        if required_float <= current_float and required_int <= current_int:
+            return
+
+        next_float = max(current_float, required_float)
+        next_int = max(current_int, required_int)
+        workspace = torch.empty(
+            next_float,
+            dtype=torch.uint8,
+            device=self.workspace.device,
+        )
+        int_workspace = torch.empty(
+            next_int,
+            dtype=torch.uint8,
+            device=int_workspace.device,
+        )
+        self.wrapper.reset_workspace_buffer(workspace, int_workspace)
+        self.workspace = workspace
+        self.int_workspace = int_workspace
+        logger.info(
+            "Grew FlashInfer paged prefill workspace: float_bytes={}->{} "
+            "int_bytes={}->{}",
+            current_float,
+            next_float,
+            current_int,
+            next_int,
+        )
 
     def plan(
         self,
@@ -405,11 +469,13 @@ class _FlashInferPagedPrefillState:
             device=context_lens.device,
             dtype=torch.int32,
         )
-        self.wrapper.plan(
+        plan_args = (
             qo_indptr,
             paged_kv_indptr,
             paged_kv_indices,
             last_page_len,
+        )
+        plan_kwargs = dict(
             num_qo_heads=spec.num_query_heads,
             num_kv_heads=spec.num_kv_heads,
             head_dim_qk=spec.head_dim,
@@ -418,6 +484,11 @@ class _FlashInferPagedPrefillState:
             sm_scale=spec.softmax_scale,
             q_data_type=spec.activation_dtype,
             kv_data_type=spec.activation_dtype,
+        )
+        self._ensure_workspace(*plan_args, **plan_kwargs)
+        self.wrapper.plan(
+            *plan_args,
+            **plan_kwargs,
             non_blocking=True,
         )
         self.plan_scope = plan_scope

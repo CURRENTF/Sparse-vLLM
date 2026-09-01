@@ -44,11 +44,16 @@ and block-scaled FP8 formats. All three share the `qwen3_5` runtime architecture
 and support matrix.
 
 Its causal Conv1D and decode packing paths remain repo-owned Triton kernels.
-The GDN core is resolved once during model preparation: validated H100 runs
-with `flashinfer-python>=0.6.17` bind FlashInfer prefill plus the repo fused
-Triton decode kernel, while other supported contracts bind the repo Triton
-implementation. The lower project dependency floor remains legal because the
-FlashInfer GDN Provider rejects older package versions before execution.
+The GDN core is resolved once during model preparation. With the supported
+`flashinfer-python>=0.6.15,<0.7` family, eligible SM90, SM100/SM103, and SM120/SM121
+contracts bind the public FlashInfer prefill dispatcher plus the repo fused
+Triton decode kernel; other supported contracts bind the repo Triton
+implementation. SM100/SM103 requires CUDA 13, and all Blackwell paths require
+head dimension 128. Value heads must equal or be an integer multiple of key
+heads. The adapter presents FP32 initial/final state at the FlashInfer boundary
+while preserving the configured BF16 or FP32 repo runtime state. Provider
+resolution validates the public dispatcher signature and the architecture-specific
+kernel symbol before execution.
 
 `flashinfer-cubin` is an optional acceleration package:
 

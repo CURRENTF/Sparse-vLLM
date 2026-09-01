@@ -57,7 +57,6 @@ def _prepared(spec, name: str):
         ("activation_dtype", torch.float16),
         ("softmax_scale", 0.5),
         ("causal", False),
-        ("layer_varying_page_table", True),
     ],
 )
 def test_full_attention_spec_rejects_incompatible_phase_contract(field, value):
@@ -81,6 +80,20 @@ def test_full_attention_spec_accepts_phase_specific_execution_page_sizes():
 
     assert spec.prefill.page_size == 1
     assert spec.decode.page_size == 16
+
+
+def test_full_attention_spec_accepts_phase_specific_page_table_variation():
+    prefill, decode = _specs()
+    decode_values = dict(decode.__dict__)
+    decode_values["layer_varying_page_table"] = True
+
+    spec = FullAttentionOpSpec(
+        prefill=prefill,
+        decode=DecodeAttentionOpSpec(**decode_values),
+    )
+
+    assert not spec.prefill.layer_varying_page_table
+    assert spec.decode.layer_varying_page_table
 
 
 def test_full_attention_provider_binds_both_phases_and_closes_once():

@@ -215,9 +215,19 @@ def test_qwen3_moe_builds_real_prefill_shape_spec(
     assert spec.score_output is AttentionScoreKind.NONE
 
 
-@pytest.mark.parametrize("sparse_method", ["", "omnikv", "quest", "snapkv", "h2o"])
+@pytest.mark.parametrize(
+    ("sparse_method", "expected_layer_varying"),
+    [
+        ("", False),
+        ("omnikv", False),
+        ("quest", False),
+        ("snapkv", True),
+        ("h2o", True),
+    ],
+)
 def test_qwen3_prefill_builder_preserves_orthogonal_flashprefill_semantics(
     sparse_method,
+    expected_layer_varying,
 ):
     engine_config = SimpleNamespace(
         sparse_method=sparse_method,
@@ -251,7 +261,7 @@ def test_qwen3_prefill_builder_preserves_orthogonal_flashprefill_semantics(
     assert spec.flashprefill_v2 is not None
     assert spec.flashprefill_v2.k_block_n == 128
     assert spec.flashprefill_v2.min_sparse_q_len == 4096
-    assert spec.layer_varying_page_table is bool(sparse_method)
+    assert spec.layer_varying_page_table is expected_layer_varying
     assert spec.score_output is AttentionScoreKind.NONE
     assert spec.return_softmax_lse is False
 

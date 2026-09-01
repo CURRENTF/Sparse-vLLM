@@ -126,7 +126,7 @@ def build_mha_prefill_attention_spec(
         causal=True,
         page_size=1,
         score_output=contract.main_score_kind,
-        layer_varying_page_table=bool(normalized_method),
+        layer_varying_page_table=contract.layer_varying_page_table,
         return_softmax_lse=(
             prefill_sparse_method == "h2o_prefill"
             and score_mode == "probability"
