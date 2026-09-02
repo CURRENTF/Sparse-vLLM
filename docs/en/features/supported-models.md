@@ -51,8 +51,11 @@ checkpoints share the `qwen3_5` runtime architecture and therefore the same
 precision, parallelism, sparse-method, and multimodal support. Qwen3.6 MoE
 uses `model_type=qwen3_5_moe`.
 
-GLM-4.7-Flash uses BF16 latent MLA on NVIDIA H100 80GB HBM3 and requires
-`DP=1`. The validated `(TP, EP)` layouts are
+GLM-4.7-Flash uses BF16 latent MLA and requires `DP=1`. MLA provider profiles
+match the normalized H100 product family rather than an exact CUDA device-name
+string; the current end-to-end validation hardware is NVIDIA H100 80GB HBM3.
+Score-free decode selects FA3, while sparse methods that require raw per-head
+QK scores select the TileLang score provider. The validated `(TP, EP)` layouts are
 `(1,1)`, `(2,1)`, `(4,1)`, `(1,2)`, `(1,4)`, `(2,2)`, `(4,2)`, and `(4,4)`.
 Across all eight layouts, vanilla, StreamingLLM, SnapKV, H2O, OmniKV, and R-KV
 support decode CUDA Graph and prefix caching together. QuEST has a latent-aware

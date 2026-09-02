@@ -11,6 +11,7 @@ from sparsevllm.distributed import (
     init_parallel_context,
     reset_parallel_context,
 )
+from sparsevllm.platforms import normalize_accelerator_identity
 from sparsevllm.utils.context import reset_context, set_context
 
 
@@ -48,7 +49,10 @@ def _cuda_graph_collective_worker(
             dtype=torch.bfloat16,
         )
         runtime.prepare()
-        if torch.cuda.get_device_name(rank) == "NVIDIA H100 80GB HBM3":
+        accelerator_family, _ = normalize_accelerator_identity(
+            torch.cuda.get_device_name(rank)
+        )
+        if accelerator_family == "h100":
             assert collectives.attention.name == (
                 "identity" if tp_size == 1 else "flashinfer_vllm_sm90"
             )
