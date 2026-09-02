@@ -5,7 +5,7 @@ from math import ceil
 
 import torch
 
-from sparsevllm.configs.cuda_graph import build_decode_cuda_graph_startup_family_plan
+from sparsevllm.configs.cuda_graph import build_decode_cuda_graph_startup_plan
 from sparsevllm.engine.cache_manager.storage import CacheLayout
 from sparsevllm.method_registry import (
     decode_sparse_long_text_threshold,
@@ -101,7 +101,7 @@ def profiling_kv_slots(config) -> int:
     if not bool(config.decode_graph_startup_capture):
         return required
 
-    for batch_size, _, is_long_text in build_decode_cuda_graph_startup_family_plan(config):
+    for batch_size, _, is_long_text in build_decode_cuda_graph_startup_plan(config):
         required = max(
             required,
             startup_graph_family_kv_slots(config, batch_size, is_long_text),

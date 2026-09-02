@@ -14,7 +14,6 @@ from torch import nn
 from sparsevllm.config import RuntimeLayout
 from sparsevllm.configs.cuda_graph import (
     _default_decode_cuda_graph_capture_sizes,
-    build_decode_cuda_graph_startup_family_plan,
     build_decode_cuda_graph_startup_plan,
 )
 from sparsevllm.models.layout import resolve_attention_qk_head_dim
@@ -69,124 +68,30 @@ def test_glm_sparse_method_declares_exact_decode_score_contract(
     assert sparse_decode_attention_score_kind(method) is expected
 
 
-def test_startup_graph_plan_captures_complete_coarse_grid_when_it_fits():
-    plan = build_decode_cuda_graph_startup_plan(
-        [1, 2, 4, 8],
-        [1024, 2048, 4096, 8192, 16384, 32768, 33280],
-        32,
-    )
-
-    assert len(plan) == 28
-    assert plan[0] == (1, 1024)
-    assert plan[-1] == (8, 33280)
-
-
-def test_startup_graph_plan_spreads_contexts_and_preserves_mandatory_graph():
-    plan = build_decode_cuda_graph_startup_plan(
-        [1, 2, 4, 8],
-        [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144],
-        12,
-        mandatory=(8, 8192),
-    )
-
-    assert len(plan) == 12
-    assert {batch for batch, _ in plan} == {1, 2, 4, 8}
-    assert (8, 8192) in plan
-    assert all(any(context == 262144 for b, context in plan if b == batch) for batch in (1, 2, 4))
-
-
-def test_startup_graph_plan_prioritizes_dense_batch_coverage():
-    batches = list(range(1, 9))
-    contexts = [1024, 2048, 4096, 8192, 16384, 32768, 65536]
-
-    plan = build_decode_cuda_graph_startup_plan(batches, contexts, 32)
-
-    assert len(plan) == 32
-    assert {batch for batch, _ in plan} == set(batches)
-    assert all((batch, 65536) in plan for batch in batches)
-    assert all(len([pair for pair in plan if pair[0] == batch]) == 4 for batch in batches)
-
-
-def test_startup_graph_plan_keeps_max_context_when_mandatory_cannot_fit():
-    plan = build_decode_cuda_graph_startup_plan(
-        [1, 2, 3],
-        [1024, 2048, 4096],
-        3,
-        mandatory=(3, 1024),
-    )
-
-    assert plan == [(1, 4096), (2, 4096), (3, 4096)]
-
-
-def test_sparse_startup_graph_plan_covers_short_and_long_families():
+def test_dense_startup_graph_plan_has_one_graph_per_batch() -> None:
     config = SimpleNamespace(
-        decode_graph_shape_policy="bucketed",
-        decode_graph_capture_sizes=list(range(1, 9)),
-        decode_graph_context_sizes=[1024, 2048, 4096, 8192, 16384, 32768],
-        decode_graph_startup_capture_limit=48,
-        decode_graph_max_cached_graphs=48,
-        sparse_method="snapkv",
+        decode_graph_capture_sizes=[1, 2, 4, 8],
+        decode_graph_startup_capture_limit=8,
+        sparse_method="",
+        max_model_len=262144,
         sink_keep_tokens=64,
         decode_keep_tokens=4096,
         recent_keep_tokens=512,
-        max_model_len=32768,
     )
 
-    plan = build_decode_cuda_graph_startup_family_plan(config)
-
-    assert len(plan) == 48
-    assert {(batch, is_long) for batch, _, is_long in plan} == {
-        (batch, is_long)
-        for batch in range(1, 9)
-        for is_long in (False, True)
-    }
-    assert all(context > 4672 for _, context, is_long in plan if is_long)
-    assert all(
-        len([key for key in plan if key[0] == batch and key[2] == is_long]) == 3
-        for batch in range(1, 9)
-        for is_long in (False, True)
-    )
+    assert build_decode_cuda_graph_startup_plan(config) == [
+        (8, 262144, False),
+        (4, 262144, False),
+        (2, 262144, False),
+        (1, 262144, False),
+    ]
 
 
-def test_h2o_startup_graph_plan_uses_normal_context_buckets():
-    config = SimpleNamespace(
-        decode_graph_shape_policy="bucketed",
-        decode_graph_capture_sizes=[1, 2, 4],
-        decode_graph_context_sizes=[1024, 2048, 4096, 8192, 16384],
-        decode_graph_startup_capture_limit=48,
-        decode_graph_max_cached_graphs=48,
-        sparse_method="h2o",
-        sink_keep_tokens=64,
-        decode_keep_tokens=4096,
-        recent_keep_tokens=512,
-        max_model_len=16384,
-    )
-
-    plan = build_decode_cuda_graph_startup_family_plan(config)
-
-    assert plan == sorted(
-        [
-            (batch, context, False)
-            for batch in (1, 2, 4)
-            for context in (1024, 2048, 4096, 8192, 16384)
-        ]
-        + [
-            (batch, context, True)
-            for batch in (1, 2, 4)
-            for context in (8192, 16384)
-        ],
-        reverse=True,
-    )
-
-
-def test_sparse_startup_graph_plan_covers_default_64_sequence_limit():
+def test_sparse_startup_graph_plan_has_one_graph_per_batch_and_path() -> None:
     batches = _default_decode_cuda_graph_capture_sizes(64)
     config = SimpleNamespace(
-        decode_graph_shape_policy="bucketed",
         decode_graph_capture_sizes=batches,
-        decode_graph_context_sizes=[1024, 2048, 4096, 8192, 16384, 32768, 65536],
         decode_graph_startup_capture_limit=48,
-        decode_graph_max_cached_graphs=48,
         sparse_method="snapkv",
         sink_keep_tokens=64,
         decode_keep_tokens=4096,
@@ -194,13 +99,20 @@ def test_sparse_startup_graph_plan_covers_default_64_sequence_limit():
         max_model_len=65536,
     )
 
-    plan = build_decode_cuda_graph_startup_family_plan(config)
+    plan = build_decode_cuda_graph_startup_plan(config)
 
     assert len(batches) == 22
-    assert len(plan) == 48
+    assert len(plan) == 44
     assert {(batch, is_long) for batch, _, is_long in plan} == {
         (batch, is_long) for batch in batches for is_long in (False, True)
     }
+    assert {
+        context for _, context, is_long in plan if not is_long
+    } == {4672}
+    assert {
+        context for _, context, is_long in plan if is_long
+    } == {65536}
+
 
 
 def _make_glm_graph_lane(
@@ -337,8 +249,6 @@ def _make_glm_graph_lane(
         tensor_parallel_size=1,
         max_model_len=128,
         decode_graph=True,
-        decode_graph_context_policy="current",
-        decode_graph_max_cached_graphs=None,
     )
     manager = object.__new__(StandardCacheManager)
     manager.config = runtime_config
@@ -648,8 +558,6 @@ def _make_glm_full_graph_lane(
         sparse_attn_score_dtype="float32",
         tensor_parallel_size=1,
         decode_graph=True,
-        decode_graph_context_policy="current",
-        decode_graph_max_cached_graphs=None,
     )
     manager = object.__new__(StandardCacheManager)
     manager.config = runtime_config
@@ -896,8 +804,6 @@ def _glm_method_runtime_config(method: str, *, num_layers: int):
         sparse_attn_score_dtype="float32",
         tensor_parallel_size=1,
         decode_graph=True,
-        decode_graph_context_policy="current",
-        decode_graph_max_cached_graphs=None,
         max_model_len=16,
         max_num_seqs_in_batch=1,
         max_num_seqs_in_gpu=1,

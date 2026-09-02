@@ -787,27 +787,6 @@ class SnapKVCacheManager(CacheManager):
             )
         return int(self.row_seq_lens[int(layer_idx)][row_idx])
 
-    def decode_graph_context_capacity(
-        self,
-        seqs: list[Sequence],
-        *,
-        requested_context_capacity: int,
-        current_context_capacity: int,
-    ) -> tuple[int, bool] | None:
-        del requested_context_capacity, current_context_capacity
-        if str(getattr(self.config, "sparse_method", "") or "") != "snapkv":
-            return None
-        # SnapKV compacts final-prefill rows to this physical budget and decode
-        # then grows without eviction.  Bucket graphs by the physical upper
-        # bound instead of the much larger logical conversation length.
-        physical_budget = (
-            int(self.config.sink_keep_tokens)
-            + int(self.config.decode_keep_tokens)
-            + int(self.config.recent_keep_tokens)
-        )
-        max_generation = max(int(seq.max_tokens) for seq in seqs)
-        return physical_budget + max_generation, True
-
     def _pyramidkv_layer_budget(self, layer_idx: int) -> int:
         decode_keep = int(self.config.decode_keep_tokens)
         ratio = float(self.config.pyramid_layer_ratios[self.kv_layer_index(layer_idx)])

@@ -126,13 +126,12 @@ def test_glm_config_defaults_to_bounded_vanilla_startup_graph_capture():
 
     assert config.decode_graph_startup_capture is True
     assert config.decode_graph_startup_capture_limit == 32
-    assert config.decode_graph_max_cached_graphs == 32
 
 
 def test_glm_config_rejects_disabling_default_startup_graph_capture():
     with pytest.raises(
         ValueError,
-        match="requires decode_graph_startup_capture=True",
+        match="requires startup capture",
     ):
         _glm_config(
             decode_graph=True,
@@ -148,7 +147,6 @@ def test_glm_config_defaults_to_larger_sparse_startup_capture_budget():
 
     assert config.decode_graph_startup_capture is True
     assert config.decode_graph_startup_capture_limit == 48
-    assert config.decode_graph_max_cached_graphs == 48
 
 
 def test_glm_config_rejects_startup_capture_without_cuda_graph():
@@ -159,7 +157,7 @@ def test_glm_config_rejects_startup_capture_without_cuda_graph():
 def test_glm_config_rejects_disabling_sparse_startup_capture():
     with pytest.raises(
         ValueError,
-        match="requires decode_graph_startup_capture=True",
+        match="requires startup capture",
     ):
         _glm_config(
             decode_graph=True,
@@ -169,11 +167,11 @@ def test_glm_config_rejects_disabling_sparse_startup_capture():
 
 
 def test_glm_config_rejects_startup_budget_smaller_than_batch_plan():
-    with pytest.raises(ValueError, match="must cover every batch/topology lane"):
+    with pytest.raises(ValueError, match="must cover every batch/topology path"):
         _glm_config(
             decode_graph=True,
             decode_graph_startup_capture=True,
             decode_graph_capture_sizes=[1, 2, 3, 4, 5],
-            decode_graph_max_cached_graphs=4,
+            decode_graph_startup_capture_limit=4,
             max_decoding_seqs=5,
         )

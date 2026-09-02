@@ -17,11 +17,10 @@ from sparsevllm.utils.log import logger
 import sys
 import time
 
-from sparsevllm.configs.cuda_graph import (
-    build_decode_cuda_graph_startup_family_plan,
-)
+from sparsevllm.configs.cuda_graph import build_decode_cuda_graph_startup_plan
 
 from sparsevllm.config import Config
+from sparsevllm.method_registry import decode_graph_path_id
 from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.scheduler import Scheduler
@@ -394,7 +393,7 @@ class LLMEngine:
     ) -> int:
         if not bool(getattr(self.config, "decode_graph_startup_capture", False)):
             return prompt_offset
-        startup_plan = build_decode_cuda_graph_startup_family_plan(self.config)
+        startup_plan = build_decode_cuda_graph_startup_plan(self.config)
         skipped_plan = []
         if respect_runtime_capacity:
             plan_records = self.model_runner.call(
@@ -418,12 +417,7 @@ class LLMEngine:
                 "Production KV capacity cannot capture any configured decode CUDA Graph."
             )
 
-        capture_groups: dict[tuple[int, bool], list[int]] = {}
-        for batch_size, context_capacity, is_long_text in startup_plan:
-            capture_groups.setdefault((batch_size, is_long_text), []).append(
-                context_capacity
-            )
-        required_prompts = sum(batch_size for batch_size, _ in capture_groups)
+        required_prompts = sum(batch_size for batch_size, _, _ in startup_plan)
         if prompt_offset + required_prompts > int(self.config.hf_config.vocab_size):
             raise ValueError(
                 "Startup CUDA Graph capture requires distinct leading tokens: "
@@ -444,7 +438,7 @@ class LLMEngine:
         logger.debug("Startup CUDA Graph capture plan: {}.", startup_plan)
         capture_params = SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True)
         threshold = self.scheduler._long_text_threshold(is_prefill=False)
-        for (batch_size, is_long_text), context_capacities in capture_groups.items():
+        for batch_size, _, is_long_text in startup_plan:
             prompt_len = int(threshold) if is_long_text else 1
             parked, prompt_offset = self._prepare_startup_capture_batch(
                 capture_params,
@@ -456,43 +450,34 @@ class LLMEngine:
                 observed_long = self.scheduler._is_long_text(parked[0], is_prefill=False)
                 if bool(observed_long) != bool(is_long_text):
                     raise RuntimeError(
-                        "Startup CUDA Graph family crossed the wrong long-text boundary: "
+                        "Startup CUDA Graph path crossed the wrong long-text boundary: "
                         f"expected={is_long_text} observed={observed_long} "
                         f"threshold={threshold} num_tokens={parked[0].num_tokens}."
                     )
-                for context_capacity in context_capacities:
-                    self.model_runner.call(
-                        "set_decode_cuda_graph_max_context_len_override",
-                        context_capacity,
-                    )
-                    self.model_runner.call("capture_decode_cuda_graph_warmup", parked)
+                self.model_runner.call("capture_decode_cuda_graph_warmup", parked)
             finally:
-                self.model_runner.call(
-                    "set_decode_cuda_graph_max_context_len_override",
-                    None,
-                )
                 self.scheduler.decoding.extend(parked)
                 for seq in parked:
                     self.abort_request(int(seq.seq_id))
 
-        self.model_runner.call("set_decode_cuda_graph_reuse_larger_context_graphs", True)
         graph_runner = self.model_runner.decode_graph_runner
         captured = {
             (
                 int(key.batch_size),
-                int(
-                    state.capture_context_capacity
-                    if key.shape_policy == "batch_only"
-                    else key.context_capacity
-                ),
-                bool(key.is_long_text),
+                int(state.capture_context_capacity),
+                key.graph_path_id,
             )
             for key, state in graph_runner._graphs.items()
             if state.graph is not None
             and key.method == str(self.config.sparse_method or "")
             and not key.capture_sampling
         }
-        missing = sorted(set(startup_plan) - captured)
+        method = str(self.config.sparse_method or "")
+        expected = {
+            (batch_size, context_capacity, decode_graph_path_id(method, is_long_text))
+            for batch_size, context_capacity, is_long_text in startup_plan
+        }
+        missing = sorted(expected - captured)
         if missing:
             raise RuntimeError(
                 "Startup CUDA Graph capture did not materialize its plan: "
@@ -1301,12 +1286,8 @@ class LLMEngine:
             "deltakv_latent_quant_bits",
             "deltakv_latent_quant_group_size",
             "decode_graph",
-            "decode_graph_shape_policy",
             "decode_graph_capture_sampling",
             "decode_graph_capture_sizes",
-            "decode_graph_context_sizes",
-            "decode_graph_context_policy",
-            "decode_graph_max_cached_graphs",
             "decode_graph_startup_capture",
             "decode_graph_startup_capture_limit",
             "enable_prefix_caching",

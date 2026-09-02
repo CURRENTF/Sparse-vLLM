@@ -198,17 +198,7 @@ def build_mha_decode_attention_spec(
         h2o_layerwise_probability_scores=(
             normalized_method == "h2o" and requires_decode_scores
         ),
-        batch_only_cuda_graph=(
-            bool(cuda_graph)
-            and str(
-                getattr(
-                    runtime_config,
-                    "decode_graph_shape_policy",
-                    "batch_only",
-                )
-            )
-            == "batch_only"
-        ),
+        batch_only_cuda_graph=bool(cuda_graph),
         context_capacity=int(getattr(runtime_config, "max_model_len", 0) or 0)
         or None,
         sparse_context_budget=(

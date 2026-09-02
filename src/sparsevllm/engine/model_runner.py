@@ -14,7 +14,6 @@ from multiprocessing.shared_memory import SharedMemory
 from sparsevllm.config import (
     Config,
     _resolve_decode_cuda_graph_capture_sizes,
-    _resolve_decode_cuda_graph_context_sizes,
 )
 from sparsevllm.configs.cuda_graph import (
     _decode_cuda_graph_max_real_batch_size,
@@ -336,17 +335,6 @@ class ModelRunner:
             "decode_graph",
             bool(getattr(config, "decode_graph", False)),
         )
-        setattr(
-            hf_config,
-            "decode_graph_shape_policy",
-            str(
-                getattr(
-                    config,
-                    "decode_graph_shape_policy",
-                    "batch_only",
-                )
-            ),
-        )
         max_real_decode_batch_size = _decode_cuda_graph_max_real_batch_size(
             max_num_seqs_in_batch=config.max_num_seqs_in_batch,
             max_decoding_seqs=config.max_decoding_seqs,
@@ -393,10 +381,7 @@ class ModelRunner:
             self.collective_runtime.close()
             close_workspace_manager()
             raise
-        if (
-            self.config.decode_graph
-            and self.config.decode_graph_shape_policy == "batch_only"
-        ):
+        if self.config.decode_graph:
             validate_batch_only_decode_graph_model(self.model)
         if config.tiny_random:
             from sparsevllm.debug.tiny_random import initialize_sparse_model
@@ -559,10 +544,6 @@ class ModelRunner:
             runtime_config.decode_graph_capture_sizes,
             max_real_decode_batch_size,
         )
-        decode_static_context_sizes = _resolve_decode_cuda_graph_context_sizes(
-            runtime_config.decode_graph_context_sizes,
-            runtime_config.max_model_len,
-        )
         # Decode graph keys are captured lazily and replayed in workload order,
         # which is not necessarily their capture order.  Do not force those
         # independent graphs into one shared allocator pool: PyTorch only
@@ -577,8 +558,6 @@ class ModelRunner:
             is_long_text_batch=self._is_long_text_batch,
             method=runtime_config.sparse_method,
             capture_sizes=decode_static_capture_sizes,
-            context_sizes=decode_static_context_sizes,
-            shape_policy=runtime_config.decode_graph_shape_policy,
             graph_pool=self.cuda_graph_pool,
             collective_runtime=self.collective_runtime,
         )
@@ -1891,12 +1870,6 @@ class ModelRunner:
                 top_logprobs[idx] = None
         return token_logprobs, top_logprobs
 
-    def set_decode_cuda_graph_max_context_len_override(self, max_context_len: int | None):
-        self.decode_graph_runner.set_max_context_len_override(max_context_len)
-
-    def set_decode_cuda_graph_reuse_larger_context_graphs(self, enabled: bool):
-        self.decode_graph_runner.set_reuse_larger_context_graphs(enabled)
-
     def seal_decode_cuda_graph_startup_plan(self):
         self.collective_runtime.mark_cuda_graph_replayable()
         self.decode_graph_runner.seal_startup_plan()
@@ -1923,9 +1896,6 @@ class ModelRunner:
             )
         finally:
             reset_context()
-
-    def set_omnikv_decode_graph_max_context_len_override(self, max_context_len: int | None):
-        self.set_decode_cuda_graph_max_context_len_override(max_context_len)
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):

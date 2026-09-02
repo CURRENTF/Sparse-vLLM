@@ -1221,14 +1221,6 @@ class CacheManager(ABC):
         with profiler.record("cache_validate_decode_slot_mappings"):
             storage.validate_slot_mappings(tuple(slot_mappings))
 
-    def decode_graph_max_cached_graphs(self) -> int | None:
-        """Optional bound for captured decode graph states.
-
-        Applies to every sparse method; individual managers may still override it.
-        """
-        value = getattr(self.config, "decode_graph_max_cached_graphs", None)
-        return None if value is None else int(value)
-
     def select_decode_cuda_graph_batch_size(
         self,
         real_batch_size: int,
@@ -1241,28 +1233,13 @@ class CacheManager(ABC):
         del real_batch_size, capture_sizes
         return None
 
-    def decode_graph_context_capacity(
-        self,
-        seqs: list[Sequence],
-        *,
-        requested_context_capacity: int,
-        current_context_capacity: int,
-    ) -> tuple[int, bool] | None:
-        """Optional method-specific graph context-capacity policy.
-
-        Returns (context_capacity, allow_larger_cached_capacity), or None to use
-        the runner's default requested-capacity graph policy.
-        """
-        del seqs, requested_context_capacity, current_context_capacity
-        return None
-
     def decode_graph_path_id(self, is_long_text: bool) -> str:
         return decode_graph_path_id(
             str(getattr(self.config, "sparse_method", "") or ""),
             bool(is_long_text),
         )
 
-    def decode_graph_batch_only_capacity(
+    def decode_graph_path_capacity(
         self, is_long_text: bool
     ) -> int:
         method = str(getattr(self.config, "sparse_method", "") or "")
@@ -1277,7 +1254,7 @@ class CacheManager(ABC):
         )
         return min(max_model_len, int(threshold))
 
-    def validate_decode_graph_batch_only_capacity(
+    def validate_decode_graph_path_capacity(
         self,
         seqs: list[Sequence],
         *,
@@ -1287,7 +1264,7 @@ class CacheManager(ABC):
         actual = max(int(seq.num_tokens) for seq in seqs)
         if int(capacity) < actual:
             raise RuntimeError(
-                "batch-only decode CUDA Graph path capacity does not cover the "
+                "decode CUDA Graph path capacity does not cover the "
                 f"request: capacity={capacity}, actual={actual}, "
                 f"is_long_text={is_long_text}."
             )

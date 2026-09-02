@@ -1244,8 +1244,6 @@ class DeltaKVFixedGridDecodeAttentionProvider(DecodeAttentionProvider):
         contract,
         inputs,
     ) -> _DeltaKVFixedGridDecodeState:
-        if contract.shape_policy != "batch_only":
-            raise ValueError("DeltaKV fixed-grid state requires a batch-only contract.")
         if int(contract.batch_capacity) > int(spec.max_batch_size):
             raise ValueError(
                 "DeltaKV graph batch exceeds the prepared operator capacity: "

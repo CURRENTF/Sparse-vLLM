@@ -95,7 +95,6 @@ def test_batch_only_decode_spec_carries_static_context_capacity():
         dtype=torch.bfloat16,
     )
     runtime_config = SimpleNamespace(
-        decode_graph_shape_policy="batch_only",
         max_model_len=40960,
     )
 
@@ -120,7 +119,6 @@ def test_quest_decode_spec_uses_physical_cache_page_size():
         dtype=torch.bfloat16,
     )
     runtime_config = SimpleNamespace(
-        decode_graph_shape_policy="batch_only",
         max_model_len=40960,
         quest_chunk_size=16,
     )
@@ -145,7 +143,6 @@ def test_deltakv_kivi_decode_spec_carries_mixed_storage_contract():
         dtype=torch.bfloat16,
     )
     runtime_config = SimpleNamespace(
-        decode_graph_shape_policy="batch_only",
         max_model_len=131072,
         full_layer_kv_quant_bits=4,
         enable_full_layer_kivi_quant=True,
@@ -294,14 +291,12 @@ def test_deltakv_fixed_grid_graph_state_owns_per_graph_workspace():
     provider = DeltaKVFixedGridDecodeAttentionProvider.bind(spec, _cuda_caps())
     long_contract = DecodeGraphContract(
         method="deltakv",
-        shape_policy="batch_only",
         topology_path_id="long",
         batch_capacity=4,
         context_capacity=131072,
     )
     short_contract = DecodeGraphContract(
         method="deltakv",
-        shape_policy="batch_only",
         topology_path_id="short",
         batch_capacity=4,
         context_capacity=8192,
@@ -912,7 +907,6 @@ def test_flashinfer_graph_decode_replans_and_replays_new_metadata():
     )
     contract = DecodeGraphContract(
         method="",
-        shape_policy="batch_only",
         topology_path_id="dense",
         batch_capacity=batch,
         context_capacity=capacity,
@@ -1034,7 +1028,6 @@ def test_flashinfer_graph_page_size_16_replans_and_replays():
     )
     contract = DecodeGraphContract(
         method="quest",
-        shape_policy="batch_only",
         topology_path_id="long",
         batch_capacity=batch,
         context_capacity=context_capacity,

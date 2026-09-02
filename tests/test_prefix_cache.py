@@ -2574,7 +2574,6 @@ def test_standard_decode_graph_state_updates_stable_typed_inputs():
 
     contract = DecodeGraphContract(
         method="",
-        shape_policy="batch_only",
         topology_path_id="dense",
         batch_capacity=4,
         context_capacity=16,
@@ -2609,7 +2608,6 @@ def test_standard_decode_graph_publishes_reserved_slot_in_graph_phase():
     seq.append_token(4)
     contract = DecodeGraphContract(
         method="",
-        shape_policy="batch_only",
         topology_path_id="dense",
         batch_capacity=4,
         context_capacity=16,
@@ -2639,7 +2637,6 @@ def test_standard_decode_graph_rejects_capacity_before_cache_mutation():
     seq.append_token(4)
     contract = DecodeGraphContract(
         method="",
-        shape_policy="batch_only",
         topology_path_id="dense",
         batch_capacity=1,
         context_capacity=3,
@@ -2671,7 +2668,6 @@ def test_standard_decode_graph_capacity_failure_does_not_claim_new_rows():
     newcomer.append_token(12)
     contract = DecodeGraphContract(
         method="",
-        shape_policy="batch_only",
         topology_path_id="dense",
         batch_capacity=2,
         context_capacity=3,
@@ -3085,7 +3081,6 @@ def test_quest_no_prefix_graph_publishes_page_boundary_in_graph_phase():
 
     contract = DecodeGraphContract(
         method="quest",
-        shape_policy="batch_only",
         topology_path_id="long",
         batch_capacity=2,
         context_capacity=16,
@@ -3129,7 +3124,6 @@ def test_quest_no_prefix_graph_capacity_failure_preserves_allocator():
     row = manager.seq_id_to_row[seq.seq_id]
     contract = DecodeGraphContract(
         method="quest",
-        shape_policy="batch_only",
         topology_path_id="long",
         batch_capacity=1,
         context_capacity=4,

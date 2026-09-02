@@ -234,17 +234,6 @@ class H2OCacheManager(SnapKVCacheManager):
             row_deficit,
         )
 
-    def decode_graph_context_capacity(
-        self,
-        seqs: list[Sequence],
-        *,
-        requested_context_capacity: int,
-        current_context_capacity: int,
-    ) -> tuple[int, bool] | None:
-        """Use normal context buckets while H2O decode eviction is disabled."""
-        del seqs, requested_context_capacity, current_context_capacity
-        return None
-
     @torch.no_grad()
     def prepare_decode_static(
         self,

@@ -8,7 +8,6 @@ module while new code may import the focused groups directly.
 from sparsevllm.configs import Config, QuantizationConfig, RuntimeLayout
 from sparsevllm.configs.runtime import (
     _resolve_decode_cuda_graph_capture_sizes,
-    _resolve_decode_cuda_graph_context_sizes,
 )
 
 __all__ = ["Config", "QuantizationConfig", "RuntimeLayout"]

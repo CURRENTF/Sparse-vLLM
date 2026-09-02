@@ -23,7 +23,6 @@ class DecodeGraphContract:
     """Capture-time facts that define one decode graph family."""
 
     method: str
-    shape_policy: str
     topology_path_id: str
     batch_capacity: int
     context_capacity: int
@@ -34,10 +33,6 @@ class DecodeGraphContract:
     )
 
     def __post_init__(self) -> None:
-        if self.shape_policy not in {"bucketed", "batch_only"}:
-            raise ValueError(
-                f"Unsupported decode graph shape policy {self.shape_policy!r}."
-            )
         if self.batch_capacity <= 0 or self.context_capacity <= 0:
             raise ValueError(
                 "Decode graph batch and context capacities must be positive, got "
@@ -45,9 +40,9 @@ class DecodeGraphContract:
             )
         if not self.topology_path_id:
             raise ValueError("Decode graph topology_path_id must be non-empty.")
-        if self.shape_policy == "batch_only" and not self.dynamic_context_lens:
+        if not self.dynamic_context_lens:
             raise ValueError(
-                "batch-only decode graphs require device-resident dynamic context lengths."
+                "decode graphs require device-resident dynamic context lengths."
             )
 
     @property

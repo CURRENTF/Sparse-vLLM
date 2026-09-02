@@ -5,8 +5,7 @@ import pytest
 import torch
 
 from sparsevllm.configs.cuda_graph import (
-    _normalize_decode_graph_shape_policy,
-    build_decode_cuda_graph_batch_only_startup_plan,
+    build_decode_cuda_graph_startup_plan,
 )
 from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphRunner
 from sparsevllm.engine.decode_graph_contract import (
@@ -43,11 +42,10 @@ def test_decode_graph_runner_blocks_replay_until_collectives_are_ready() -> None
     state = SimpleNamespace(key=object(), graph=graph, logits=None, token_ids=None)
     runner.cache_manager = SimpleNamespace()
     runner.method = ""
-    runner.shape_policy = "batch_only"
     runner._select_graph_batch_size = lambda batch_size: batch_size
     runner.is_long_text_batch = lambda seqs, is_prefill: False
     runner._graph_path_id = lambda is_long_text: ""
-    runner._batch_only_context_capacity = lambda seqs, is_long_text: 128
+    runner._graph_path_capacity = lambda seqs, is_long_text: 128
     runner._select_state = lambda **kwargs: state
     runner._prepare_static_step = lambda state, seqs, is_long_text: (None, None)
     runner._restore_sparse_state_refs = lambda state: None
@@ -78,25 +76,17 @@ def _cuda_caps() -> DeviceCaps:
     )
 
 
-def test_batch_only_policy_aliases_and_rejects_unknown_values() -> None:
-    assert _normalize_decode_graph_shape_policy("batch") == "batch_only"
-    assert _normalize_decode_graph_shape_policy(None) == "batch_only"
-    with pytest.raises(ValueError, match="shape_policy"):
-        _normalize_decode_graph_shape_policy("sequence_only")
-
-
-def test_batch_only_startup_plan_has_one_graph_per_batch_and_path() -> None:
+def test_decode_graph_startup_plan_has_one_graph_per_batch_and_path() -> None:
     config = SimpleNamespace(
         decode_graph_capture_sizes=[1, 4],
         decode_graph_startup_capture_limit=8,
-        decode_graph_max_cached_graphs=8,
         sparse_method="quest",
         max_model_len=32768,
         sink_keep_tokens=64,
         decode_keep_tokens=4096,
         recent_keep_tokens=512,
     )
-    assert build_decode_cuda_graph_batch_only_startup_plan(config) == [
+    assert build_decode_cuda_graph_startup_plan(config) == [
         (4, 32768, True),
         (4, 4672, False),
         (1, 32768, True),
@@ -104,14 +94,11 @@ def test_batch_only_startup_plan_has_one_graph_per_batch_and_path() -> None:
     ]
 
 
-def test_batch_only_state_identity_omits_context_capacity() -> None:
+def test_decode_graph_state_identity_omits_context_capacity() -> None:
     runner = object.__new__(DecodeCudaGraphRunner)
-    runner.shape_policy = "batch_only"
     runner.startup_plan_sealed = False
     runner._graphs = {}
-    runner.max_cached_graphs = None
     runner.cache_manager = SimpleNamespace(device=torch.device("cpu"))
-    runner.eviction_count = 0
 
     state = runner._select_state(
         method="quest",
@@ -130,12 +117,10 @@ def test_batch_only_state_identity_omits_context_capacity() -> None:
         graph_path_id="long",
     )
     assert reused is state
-    assert state.key.context_capacity == 0
     assert state.capture_context_capacity == 32768
     assert state.decode_state is not None
     assert state.decode_state.contract == DecodeGraphContract(
         method="quest",
-        shape_policy="batch_only",
         topology_path_id="long",
         batch_capacity=4,
         context_capacity=32768,
@@ -152,7 +137,7 @@ def test_batch_only_state_identity_omits_context_capacity() -> None:
     )
     assert reused_with_default_path is state
 
-    with pytest.raises(RuntimeError, match="exceeded captured path capacity"):
+    with pytest.raises(RuntimeError, match="exceeded captured topology-path capacity"):
         runner._select_state(
             method="quest",
             batch_size=4,
@@ -206,7 +191,6 @@ def test_typed_decode_graph_participant_delegates_to_cache_owner() -> None:
 
     contract = DecodeGraphContract(
         method="",
-        shape_policy="batch_only",
         topology_path_id="dense",
         batch_capacity=2,
         context_capacity=32,

@@ -1670,7 +1670,6 @@ def test_snapkv_decode_graph_populates_host_mirrors_for_provider_planning(
     seq = _seq(0, 5, prefilled=4, chunk=1)
     contract = DecodeGraphContract(
         method=manager.config.sparse_method,
-        shape_policy="batch_only",
         topology_path_id="short",
         batch_capacity=4,
         context_capacity=8,
@@ -2077,17 +2076,6 @@ def test_h2o_capacity_hooks_reserve_prefill_peak_and_gate_chunk_with_real_free_s
     assert manager.prefill_step_reservation_cost(seq, 4) == 4
     assert manager.decode_step_free_slots_for(seq) == 4
     assert manager.decode_step_reservation_cost(seq) == 1
-    assert manager.decode_graph_context_capacity(
-        [seq],
-        requested_context_capacity=128,
-        current_context_capacity=64,
-    ) is None
-    manager.config.max_model_len = 6
-    assert manager.decode_graph_context_capacity(
-        [seq],
-        requested_context_capacity=128,
-        current_context_capacity=64,
-    ) is None
 
     scheduler_config = SimpleNamespace(
         max_num_seqs_in_batch=4,

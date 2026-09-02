@@ -6,7 +6,6 @@ from typing import Any
 from sparsevllm.configs.bootstrap import normalize_bootstrap
 from sparsevllm.configs.cuda_graph import (
     _resolve_decode_cuda_graph_capture_sizes,
-    _resolve_decode_cuda_graph_context_sizes,
     normalize_decode_cuda_graph,
 )
 from sparsevllm.configs.delta import (
@@ -136,10 +135,6 @@ class Config(
             resolved,
         )
         self.max_model_len = resolved
-        if self.decode_graph and self.decode_graph_context_sizes_auto:
-            self.decode_graph_context_sizes = _resolve_decode_cuda_graph_context_sizes(
-                "auto", resolved
-            )
 
     def __post_init__(self):
         normalize_bootstrap(self)
@@ -161,7 +156,7 @@ class Config(
             "Runtime config: model={} sparse_method={} tp={} ep={} dp={} "
             "max_model_len={} max_batched_tokens={} prefill_chunk={} "
             "max_prefill_batch={} max_decode_batch={} gpu_utilization={:.3f} "
-            "decode_graph={} graph_policy={}.",
+            "decode_graph={}.",
             self.model,
             self.sparse_method or "vanilla",
             self.tensor_parallel_size,
@@ -174,7 +169,6 @@ class Config(
             self.max_decoding_seqs,
             self.gpu_memory_utilization,
             self.decode_graph,
-            self.decode_graph_shape_policy,
         )
         logger.debug("Full runtime config: {}", str(self).replace("\n", " "))
         setattr(self.hf_config, "runtime_layout", self.runtime_layout)

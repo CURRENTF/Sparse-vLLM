@@ -732,10 +732,8 @@ def test_model_runner_runtime_rebuild_resolves_graph_shapes_locally():
         max_num_seqs_in_batch=8,
         max_decoding_seqs=16,
         decode_graph_capture_sizes="auto",
-        decode_graph_context_sizes="auto",
         max_model_len=1024,
         sparse_method="vanilla",
-        decode_graph_shape_policy="batch_only",
     )
     graph_kwargs = {}
 
@@ -762,10 +760,6 @@ def test_model_runner_runtime_rebuild_resolves_graph_shapes_locally():
             return_value=(1, 8),
         ),
         patch(
-            "sparsevllm.engine.model_runner._resolve_decode_cuda_graph_context_sizes",
-            return_value=(128,),
-        ),
-        patch(
             "sparsevllm.engine.model_runner.DecodeCudaGraphRunner",
             side_effect=lambda **kwargs: graph_kwargs.update(kwargs) or object(),
         ),
@@ -789,7 +783,6 @@ def test_model_runner_runtime_rebuild_resolves_graph_shapes_locally():
         )
 
     assert graph_kwargs["capture_sizes"] == (1, 8)
-    assert graph_kwargs["context_sizes"] == (128,)
     assert graph_kwargs["method"] == "vanilla"
     assert runner.cache_runtime_build_measurement == CacheRuntimeBuildMeasurement(
         manager_consumed_bytes=200,
@@ -802,9 +795,6 @@ def test_model_runner_decode_graph_startup_controls_use_live_runner():
     calls = []
     runner = object.__new__(ModelRunner)
     runner.decode_graph_runner = SimpleNamespace(
-        set_reuse_larger_context_graphs=lambda enabled: calls.append(
-            ("reuse", enabled)
-        ),
         seal_startup_plan=lambda: calls.append(("seal",)),
         run=lambda seqs, capture_sampling, replay_after_capture: calls.append(
             ("capture", seqs, capture_sampling, replay_after_capture)
@@ -823,7 +813,6 @@ def test_model_runner_decode_graph_startup_controls_use_live_runner():
         "sparsevllm.engine.model_runner.reset_context",
         side_effect=lambda: calls.append(("reset",)),
     ):
-        ModelRunner.set_decode_cuda_graph_reuse_larger_context_graphs(runner, True)
         ModelRunner.begin_decode_cuda_graph_capture(runner)
         ModelRunner.collect_decode_cuda_graph_metadata(runner)
         ModelRunner.exchange_decode_cuda_graph_metadata(runner)
@@ -832,7 +821,6 @@ def test_model_runner_decode_graph_startup_controls_use_live_runner():
         ModelRunner.capture_decode_cuda_graph_warmup(runner, seqs)
 
     assert calls == [
-        ("reuse", True),
         ("begin",),
         ("collect",),
         ("exchange",),

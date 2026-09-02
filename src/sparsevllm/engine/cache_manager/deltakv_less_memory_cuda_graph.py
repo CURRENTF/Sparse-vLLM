@@ -33,44 +33,10 @@ class DeltaKVLessMemoryCudaGraphCacheManager(DeltaKVLessMemoryCacheManager):
     shared runner's bucket plan instead of DeltaKV-specific per-request policy.
     """
 
-    def decode_graph_max_cached_graphs(self) -> int | None:
-        config_limit = getattr(self.config, "decode_graph_max_cached_graphs", None)
-        if config_limit is not None:
-            return int(config_limit)
-        env_value = os.getenv("SPARSEVLLM_DELTAKV_MAX_CUDAGRAPHS")
-        if env_value is None:
-            return None
-        try:
-            max_cached_graphs = int(env_value)
-        except ValueError as exc:
-            raise ValueError(
-                "SPARSEVLLM_DELTAKV_MAX_CUDAGRAPHS must be a positive integer, "
-                f"got {env_value!r}."
-            ) from exc
-        if max_cached_graphs <= 0:
-            raise ValueError(
-                "SPARSEVLLM_DELTAKV_MAX_CUDAGRAPHS must be a positive integer, "
-                f"got {env_value!r}."
-            )
-        return max_cached_graphs
-
     def select_decode_cuda_graph_batch_size(self, real_batch_size: int, capture_sizes: list[int]) -> int | None:
         # Use the shared batch buckets (1, 2, 4, 8, ...) instead of capturing one
         # graph per exact DeltaKV batch size. The runner still checks coverage.
         del real_batch_size, capture_sizes
-        return None
-
-    def decode_graph_context_capacity(
-        self,
-        seqs: list[Sequence],
-        *,
-        requested_context_capacity: int,
-        current_context_capacity: int,
-    ) -> tuple[int, bool] | None:
-        # Use the shared DecodeCudaGraphRunner policy.  Returning None keeps
-        # DeltaKV aligned with vanilla/OmniKV/Quest/SnapKV/PyramidKV/StreamingLLM:
-        # batch bucket × context bucket, exact bucket match by default.
-        del seqs, requested_context_capacity, current_context_capacity
         return None
 
     def decode_graph_force_eager(self) -> bool:

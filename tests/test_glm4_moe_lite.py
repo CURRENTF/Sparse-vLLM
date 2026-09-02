@@ -196,7 +196,6 @@ def test_glm_runtime_kwargs_bind_shared_operators(
     context = _tp_context(tp_size=2)
     runtime = SimpleNamespace(
         decode_graph=True,
-        decode_graph_shape_policy="batch_only",
         max_model_len=32768,
         max_num_seqs_in_batch=4,
         max_decoding_seqs=8,
@@ -252,7 +251,6 @@ def test_glm_runtime_kwargs_bind_shared_operators(
 
 def test_glm_batch_only_mla_spec_owns_context_capacity() -> None:
     config = _config()
-    config.decode_graph_shape_policy = "batch_only"
     bound = object()
     with (
         patch(
