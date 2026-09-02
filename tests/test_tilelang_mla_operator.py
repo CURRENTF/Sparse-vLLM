@@ -29,8 +29,13 @@ from sparsevllm.operators.mla_attention import (
     MlaTileLangOutputProvider,
     MlaTileLangScoreProvider,
     MlaTritonProvider,
+    resolve_mla_attention_provider,
 )
-from sparsevllm.operators.registry import OpResolver
+from sparsevllm.operators.registry import (
+    NoProviderError,
+    OpResolver,
+    operator_binding_report,
+)
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
 
 
@@ -331,6 +336,74 @@ def test_tilelang_output_atomic_eligibility_ignores_benchmark_coordinates(
 
     assert type(resolved.provider) is MlaTileLangOutputProvider
     assert resolved.report.selection_basis == "benchmark_override"
+
+
+def test_internal_benchmark_override_forces_provider_and_static_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = replace(_spec(), score_output=AttentionScoreKind.NONE)
+    monkeypatch.setenv("SPARSEVLLM_INTERNAL_BENCHMARK_MLA_PROVIDER", "triton_mla")
+    monkeypatch.setenv(
+        "SPARSEVLLM_INTERNAL_BENCHMARK_MLA_TRITON_CONFIG",
+        '{"program_count": 64, "blocks_per_program": 2}',
+    )
+    with (
+        patch(
+            "sparsevllm.operators.mla_attention.platforms.current_platform.get_device_caps",
+            return_value=_h100_caps(),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+            return_value=_cpu_workspace(),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
+            return_value=(True, "sgl test"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.tilelang_mla_support",
+            return_value=(True, "tilelang test"),
+        ),
+    ):
+        provider = resolve_mla_attention_provider(
+            spec,
+            device="cpu",
+            max_batch_size=2,
+        )
+
+    assert type(provider) is MlaTritonProvider
+    assert provider.launch_config.program_count == 64
+    assert provider.launch_config.blocks_per_program == 2
+    assert operator_binding_report(provider).selection_basis == "benchmark_override"
+
+
+def test_internal_benchmark_override_does_not_bypass_atomic_support(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "SPARSEVLLM_INTERNAL_BENCHMARK_MLA_PROVIDER",
+        "tilelang_output",
+    )
+    with (
+        patch(
+            "sparsevllm.operators.mla_attention.platforms.current_platform.get_device_caps",
+            return_value=_h100_caps(),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
+            return_value=(True, "sgl test"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.tilelang_mla_support",
+            return_value=(True, "tilelang test"),
+        ),
+    ):
+        with pytest.raises(NoProviderError, match="does not satisfy"):
+            resolve_mla_attention_provider(
+                _spec(),
+                device="cpu",
+                max_batch_size=2,
+            )
 
 
 @pytest.mark.parametrize(
