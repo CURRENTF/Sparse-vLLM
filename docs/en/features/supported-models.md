@@ -26,42 +26,21 @@ TP is limited to sizes 1 through 8 and requires the checkpoint dimensions,
 including the attention heads and vocabulary size, to be divisible by the
 selected TP size.
 
-Qwen3MoE and MiniMax M2.7 use a hybrid layout when the outer TP size `T` is
-greater than 1. GLM-4.7-Flash uses the same layout when both `T > 1` and
-`E > 1`: attention TP is `T`, MoE EP is `E`, MoE TP is `T / E`, and the
-distributed world size is `T`. This layout requires `DP=1` and `T % E == 0`.
-The expert count must be divisible by `E`, and the MoE intermediate dimension
-must be divisible by `T / E`. Qwen3MoE outer TP requires a BF16 model dtype;
-FP16 Qwen3MoE checkpoints are limited to `TP=1`. When `TP=1`, the existing EP
-layout uses world size `E`.
-
-On H100 80GB, unquantized BF16 Qwen3-30B-A3B with EP1 uses the
-`qwen3_bf16_dispatch_plan` for TP1 and TP2. During model preparation, the plan
-binds the atomic `sgl_derived_triton_bf16` and `triton` providers over fixed
-token ranges. The SGL-derived provider handles 64 tokens or more; the generic
-Triton provider handles smaller inputs. Other shapes and topologies keep their
-existing providers. Binding reports record the ranges and runtime operator
-statistics report the atomic kernel path used by each dispatch.
+MoE models may combine tensor and expert parallelism internally; invalid TP/EP
+combinations are rejected during configuration.
 
 Block FP8 support requires E4M3 weights, dynamic activation quantization, and
 a `128 x 128` weight block size. Llama, Qwen2, and Qwen3 dense FP8 checkpoints
 also require every TP-local dense projection dimension to be 128-aligned and
-keep non-quantized parameters in BF16. Qwen3.5, Qwen3.6, and Qwen3.8 dense
-checkpoints share the `qwen3_5` runtime architecture and therefore the same
-precision, parallelism, sparse-method, and multimodal support. Qwen3.6 MoE
-uses `model_type=qwen3_5_moe`.
+keep non-quantized parameters in BF16.
 
-GLM-4.7-Flash uses BF16 latent MLA on NVIDIA H100 80GB HBM3 and requires
-`DP=1`. The validated `(TP, EP)` layouts are
+GLM-4.7-Flash requires BF16, H100, and `DP=1`. The supported `(TP, EP)`
+combinations are
 `(1,1)`, `(2,1)`, `(4,1)`, `(1,2)`, `(1,4)`, `(2,2)`, `(4,2)`, and `(4,4)`.
 Across all eight layouts, vanilla, StreamingLLM, SnapKV, H2O, OmniKV, and R-KV
-support decode CUDA Graph and prefix caching together. QuEST has a latent-aware
-decode path and decode CUDA Graph registration, but does not support prefix
-caching or prefix offload. Prefix caching uses
-radix mode for vanilla and OmniKV, and chain mode for StreamingLLM, SnapKV,
-H2O, and R-KV. Prefix offload, quantization, and the other sparse methods
-remain unsupported. The loader intentionally skips the checkpoint's MTP
-layer.
+support decode CUDA Graph and prefix caching together. QuEST supports decode
+CUDA Graph but not prefix caching or prefix offload. Quantization and the other
+sparse methods remain unsupported.
 
 ## Sparse Method Support
 
@@ -86,26 +65,19 @@ layer.
 ³ Qwen3.5, Qwen3.6, and Qwen3.8 require a matching DeltaKV checkpoint accepted
 by the mixed-attention runtime.
 
-⁴ H2O supports tensor parallelism with TP-local sparse selection: each rank
-scores and retains tokens using its local heads or KV heads, without cross-rank
-sparse-index aggregation. This is not guaranteed to be equivalent to TP=1 or
-global-head selection. Model-specific TP, EP, and DP restrictions still apply.
+⁴ H2O tensor-parallel execution may produce different sparse selections from
+TP=1. Model-specific TP, EP, and DP restrictions still apply.
 
-⁵ GLM support is limited to the eight `(TP, EP)` layouts listed above with
-`DP=1`. At `TP>1`, head-scored sparse methods use TP-local selection without
-cross-rank sparse-index aggregation, so their selection semantics are not
-guaranteed to match `TP=1`. The QuEST entry records code integration only;
-GPU numerical correctness, CUDA Graph replay, and performance validation are pending.
+⁵ GLM support requires `DP=1` and one of the `(TP, EP)` combinations listed
+above. QuEST support is experimental.
 
 ⁶ Gemma 4 checkpoints with shared KV layers reject per-layer StreamingLLM
 eviction. Vanilla and OmniKV remain supported.
 
 ## Native Multimodal Support
 
-Set `enable_multimodal=True` to use a checkpoint's native media towers.
-Sparse-vLLM accepts OpenAI-compatible Chat and Responses content parts and
-uses the checkpoint processor and chat template. Unsupported media fail
-explicitly during admission.
+Set `enable_multimodal=True` to accept supported image and video inputs through
+the OpenAI-compatible Chat and Responses APIs. Unsupported media return an error.
 
 | Model family | Image | Video | Audio |
 | --- | :---: | :---: | :---: |
