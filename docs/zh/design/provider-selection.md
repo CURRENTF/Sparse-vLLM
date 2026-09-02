@@ -25,17 +25,6 @@ OpSpec
 本地 benchmark 覆盖不是 atomic support 状态。尤其不能因为 Sparse-vLLM 没有
 在本地测过某个 shape，就拒绝上游实现声明支持的 shape。
 
-## 硬件身份
-
-`DeviceCaps.device_name` 是用于诊断和复现的原始发现信息，不是稳定的 provider
-选择 key。Platform 层将产品名称归一化为 `accelerator_family`（例如 `h100` 或
-`h20`）以及可选的物理 variant。Provider 和 profile 使用这些规范化事实，不能
-比较完整 CUDA 设备名或各自实现 substring 规则。
-
-Atomic support 仍应优先使用 kernel 实际依赖的 compute capability 和硬件特性。
-只有实现或性能 profile 确实属于特定产品族时才使用产品族。H100 SXM 与 PCIe
-默认共享产品族策略；只有兼容性差异或 matched benchmark 证据要求时才进一步分流。
-
 ## Repo-Owned DSL Kernel 的可移植性
 
 `repo_nonstandard` 描述的是 operation contract 的语义归属，不表示实现必须是

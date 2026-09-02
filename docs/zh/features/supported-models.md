@@ -42,10 +42,8 @@ Qwen3.8 Dense checkpoint 共享 `qwen3_5` 运行时架构，
 因此具有相同的精度、并行方式、稀疏方法和多模态支持。Qwen3.6 MoE 使用
 `model_type=qwen3_5_moe`。
 
-GLM-4.7-Flash 使用 BF16 latent MLA，要求 `DP=1`。MLA provider profile
-匹配归一化后的 H100 产品族，不精确匹配 CUDA 返回的完整设备名；当前端到端验证硬件为
-NVIDIA H100 80GB HBM3。无 score 的 decode 选择 FA3，需要逐头 raw QK score 的
-稀疏方法选择 TileLang score provider。已验证的 `(TP, EP)` 布局为 `(1,1)`、
+GLM-4.7-Flash 在 NVIDIA H100 80GB HBM3 上使用 BF16 latent MLA，要求
+`DP=1`。已验证的 `(TP, EP)` 布局为 `(1,1)`、
 `(2,1)`、`(4,1)`、`(1,2)`、`(1,4)`、`(2,2)`、`(4,2)` 和 `(4,4)`。
 在全部八种布局中，vanilla、StreamingLLM、SnapKV、H2O、OmniKV 和 R-KV
 均支持 decode CUDA Graph 与 Prefix Cache 的联合组合。QuEST 提供

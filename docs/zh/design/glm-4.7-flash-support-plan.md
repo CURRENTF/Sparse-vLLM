@@ -86,11 +86,9 @@ MoE TP 为 `T/E`，world size 为 `T`。该布局要求 `DP=1`、`T % E == 0`，
 
 ## Operator 与平台边界
 
-当前 MLA provider 支持 H100 产品族、BF16、SM90，以及 TP 1、2、4。平台层将
-CUDA 设备名归一化为产品族和可选 variant，provider 不精确匹配完整设备名。
-无 score 的 decode 绑定 FA3；稀疏方法要求逐头 raw QK score 时绑定 TileLang score
-provider。Provider 在模型初始化时解析并绑定；kernel 执行失败必须直接暴露，不能在
-forward 中静默切换到 Torch 或其他 backend，也不按 context length 切换实现。
+当前 MLA provider 支持 NVIDIA H100 80GB HBM3、BF16、SM90，以及 TP 1、2、4。
+Provider 在模型初始化时解析并绑定；kernel 执行失败必须直接暴露，不能在
+forward 中静默切换到 Torch 或其他 backend。
 
 Vendor kernel 固定来源为 LightLLM commit
 `65c174ee95ac6a6fd36b18b63d0b33d97e76b770`。本地 vendor 目录保留
