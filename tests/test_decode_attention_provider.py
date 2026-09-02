@@ -22,6 +22,7 @@ from sparsevllm.operators.decode_attention import (
     DecodeAttentionOpSpec,
     FlashInferPagedDecodeAttentionProvider,
     FixedGridTritonPagedDecodeAttentionProvider,
+    H100GqaDecodeLaunchProvider,
     PreparedDecodeAttentionOp,
     SglFa3PagedDecodeAttentionProvider,
     TritonPagedDecodeAttentionProvider,
@@ -52,6 +53,23 @@ def test_sparse_decode_score_contract_is_method_specific(
     requires_scores,
 ):
     assert sparse_decode_attention_requires_scores(method) is requires_scores
+
+
+def test_h100_gqa_launch_config_is_independent_of_context_length() -> None:
+    provider = H100GqaDecodeLaunchProvider()
+
+    short = provider.launch_config(
+        block_seq=256,
+        max_context_len=1024,
+        requires_attention_scores=False,
+    )
+    long = provider.launch_config(
+        block_seq=256,
+        max_context_len=65536,
+        requires_attention_scores=False,
+    )
+
+    assert short == long == (1024, 128, 4)
 
 
 def test_h2o_runtime_decode_spec_is_score_free_while_eviction_is_disabled():

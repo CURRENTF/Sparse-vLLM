@@ -1657,7 +1657,7 @@ DECODE_ATTENTION_LAUNCH_REGISTRY: OpRegistry[
 ] = OpRegistry(
     "decode attention launch",
     portfolio=PortfolioPolicy(repo_portable=("default_gqa",)),
-    profile_order=("h100_long_gqa_12q_2kv_hd128_profile",),
+    profile_order=("h100_gqa_12q_2kv_hd128_profile",),
 )
 
 
@@ -1665,8 +1665,8 @@ DECODE_ATTENTION_LAUNCH_REGISTRY: OpRegistry[
     ProviderRole.REPO_PORTABLE,
     profile_only=True,
 )
-class H100LongGqaDecodeLaunchProvider(DecodeAttentionLaunchProvider):
-    name = "h100_long_gqa_12q_2kv_hd128"
+class H100GqaDecodeLaunchProvider(DecodeAttentionLaunchProvider):
+    name = "h100_gqa_12q_2kv_hd128"
 
     @classmethod
     def supports(
@@ -1697,18 +1697,15 @@ class H100LongGqaDecodeLaunchProvider(DecodeAttentionLaunchProvider):
         max_context_len: int,
         requires_attention_scores: bool,
     ) -> tuple[int, int, int]:
-        if (
-            int(block_seq) == 256
-            and int(max_context_len) > 32768
-            and not requires_attention_scores
-        ):
+        del max_context_len
+        if not requires_attention_scores:
             return 1024, 128, 4
         return int(block_seq), 16, 2
 
 
 @DECODE_ATTENTION_LAUNCH_REGISTRY.register_profile
-class H100LongGqaDecodeLaunchProfile:
-    name = "h100_long_gqa_12q_2kv_hd128_profile"
+class H100GqaDecodeLaunchProfile:
+    name = "h100_gqa_12q_2kv_hd128_profile"
 
     @classmethod
     def atomic_provider_names(
@@ -1716,7 +1713,7 @@ class H100LongGqaDecodeLaunchProfile:
         spec: DecodeAttentionLaunchSpec,
     ) -> tuple[str, ...]:
         del spec
-        return ("h100_long_gqa_12q_2kv_hd128",)
+        return ("h100_gqa_12q_2kv_hd128",)
 
     @classmethod
     def matches(
@@ -1740,7 +1737,7 @@ class H100LongGqaDecodeLaunchProfile:
                 f"requires profiled local Q/KV/head shape {expected_shape}, "
                 f"got {actual_shape}"
             )
-        return ProfileMatch.yes("matched H100 long-GQA launch profile")
+        return ProfileMatch.yes("matched H100 GQA launch profile")
 
     @classmethod
     def bind(cls, spec: DecodeAttentionLaunchSpec, caps: DeviceCaps, **kwargs):
@@ -1749,7 +1746,7 @@ class H100LongGqaDecodeLaunchProfile:
             raise TypeError(
                 f"{cls.name} does not accept provider arguments: {sorted(kwargs)}"
             )
-        return H100LongGqaDecodeLaunchProvider()
+        return H100GqaDecodeLaunchProvider()
 
 
 @DECODE_ATTENTION_LAUNCH_REGISTRY.register_atomic(ProviderRole.REPO_PORTABLE)
