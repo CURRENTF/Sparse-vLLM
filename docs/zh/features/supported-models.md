@@ -18,40 +18,21 @@
 | Llama 3 / 3.1 | `llama` | BF16 / FP16 / 块级 FP8 | ✅ | 仅支持 1 | 仅支持 1 |
 | MiniMax M2.7 | `minimax_m2` | 块级 FP8，非量化权重使用 BF16 | ✅ | 仅支持 1 | ✅ |
 
-TP 规模限制为 1 到 8，并且 checkpoint 维度（包括 attention head 数和 vocabulary 大小）必须能被所选 TP 规模整除。Qwen3MoE 的 EP 规模必须整除 `num_experts`；MiniMax M2.7 的 EP 规模必须整除 `num_local_experts`。
+TP 规模限制为 1 到 8，并且 checkpoint 维度（包括 attention head 数和 vocabulary
+大小）必须能被所选 TP 规模整除。
 
-当外层 TP 规模 `T` 大于 1 时，Qwen3MoE 和 MiniMax M2.7 使用混合并行布局；
-GLM-4.7-Flash 在 `T > 1` 且 `E > 1` 时使用相同布局：attention TP 为 `T`、
-MoE EP 为 `E`、MoE TP 为 `T / E`，distributed world size 为 `T`。该布局
-要求 `DP=1` 且 `T % E == 0`；专家数量必须能被 `E` 整除，MoE intermediate
-dimension 必须能被 `T / E` 整除。Qwen3MoE 的外层 TP 要求模型 dtype 为
-BF16；FP16 Qwen3MoE checkpoint 仅支持 `TP=1`。当 `TP=1` 时，原有 EP
-布局的 world size 为 `E`。
-
-在 H100 80GB 上，未量化 BF16 Qwen3-30B-A3B 的 EP1 TP1/TP2 默认选择
-`qwen3_bf16_dispatch_plan`。该计划在模型准备阶段将 atomic
-`sgl_derived_triton_bf16` 与 `triton` provider 绑定到固定 token 区间：
-前者处理 64 token 及以上，后者处理更小输入。其他 shape 和 topology
-保持原有 provider。binding report 会记录区间，operator runtime statistics
-会记录每次 dispatch 实际执行的 atomic kernel path。
+MoE 模型可能在内部组合 tensor parallelism 和 expert parallelism；不合法的 TP/EP
+组合会在配置阶段被拒绝。
 
 块级 FP8 要求使用 E4M3 权重、动态激活量化以及 `128 x 128` 的权重块大小。
 Llama、Qwen2 和 Qwen3 Dense FP8 checkpoint 还要求每个 TP-local dense
-projection 维度按 128 对齐，且非量化参数保持 BF16。Qwen3.5、Qwen3.6 和
-Qwen3.8 Dense checkpoint 共享 `qwen3_5` 运行时架构，
-因此具有相同的精度、并行方式、稀疏方法和多模态支持。Qwen3.6 MoE 使用
-`model_type=qwen3_5_moe`。
+projection 维度按 128 对齐，且非量化参数保持 BF16。
 
-GLM-4.7-Flash 在 NVIDIA H100 80GB HBM3 上使用 BF16 latent MLA，要求
-`DP=1`。已验证的 `(TP, EP)` 布局为 `(1,1)`、
+GLM-4.7-Flash 要求使用 BF16、H100 和 `DP=1`。支持的 `(TP, EP)` 组合为 `(1,1)`、
 `(2,1)`、`(4,1)`、`(1,2)`、`(1,4)`、`(2,2)`、`(4,2)` 和 `(4,4)`。
 在全部八种布局中，vanilla、StreamingLLM、SnapKV、H2O、OmniKV 和 R-KV
-均支持 decode CUDA Graph 与 Prefix Cache 的联合组合。QuEST 提供
-latent-aware decode 路径并注册 decode CUDA Graph，但不支持 Prefix Cache
-或 Prefix offload。Prefix Cache 对
-vanilla 和 OmniKV 使用 radix 模式，对 StreamingLLM、SnapKV、H2O 和 R-KV
-使用 chain 模式。Prefix offload、量化和其他稀疏方法仍不支持。loader
-会有意跳过 checkpoint 中的 MTP 层。
+均支持 decode CUDA Graph 与 Prefix Cache 的联合组合。QuEST 支持 decode CUDA
+Graph，但不支持 Prefix Cache 或 Prefix offload。量化和其他稀疏方法仍不支持。
 
 ## 稀疏方法支持
 
@@ -75,25 +56,18 @@ vanilla 和 OmniKV 使用 radix 模式，对 StreamingLLM、SnapKV、H2O 和 R-K
 
 ³ Qwen3.5、Qwen3.6 和 Qwen3.8 需要 mixed-attention runtime 可接受的匹配 DeltaKV checkpoint。
 
-⁴ H2O 通过 TP-local 稀疏选择支持 tensor parallel：每个 rank 使用本地
-attention head 或 KV head 独立计算分数并保留 token，不跨 rank 聚合 sparse
-index。因此其算法行为不保证与 TP=1 或全局 head 选择等价；各模型原有的
+⁴ H2O 的 tensor-parallel 执行可能产生与 TP=1 不同的稀疏选择。各模型原有的
 TP、EP、DP 限制仍然适用。
 
-⁵ GLM 支持限定为上文列出的八种 `(TP, EP)` 布局，且要求 `DP=1`。在
-`TP>1` 时，基于 head 评分的稀疏方法使用 TP-local selection，不跨 rank
-聚合 sparse index，因此其选择语义不保证与 `TP=1` 相同。QuEST 表项仅表示
-代码已接入；GPU 数值正确性、CUDA Graph replay 与性能验证仍待完成。
+⁵ GLM 要求 `DP=1`，并使用上文列出的 `(TP, EP)` 组合。QuEST 支持仍为实验性。
 
 ⁶ 带共享 KV 层的 Gemma 4 checkpoint 不支持逐层 StreamingLLM eviction；
 Vanilla 和 OmniKV 仍受支持。
 
 ## 原生多模态支持
 
-设置 `enable_multimodal=True` 后，可使用 checkpoint 自带的媒体塔。
-Sparse-vLLM 接受 OpenAI 兼容的 Chat 与 Responses content part，并使用
-checkpoint 自身的 processor 和 chat template；不受支持的媒体会在接纳阶段
-明确报错。
+设置 `enable_multimodal=True` 后，可通过 OpenAI 兼容的 Chat 和 Responses API
+传入受支持的图片和视频。不受支持的媒体会返回错误。
 
 | 模型家族 | 图片 | 视频 | 音频 |
 | --- | :---: | :---: | :---: |
