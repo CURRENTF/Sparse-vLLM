@@ -32,7 +32,7 @@ from sparsevllm.method_registry import decode_sparse_long_text_threshold
 from sparsevllm.operators import registry as operator_registry
 from sparsevllm.operators.decode_attention import (
     collect_decode_graph_participants,
-    validate_batch_only_decode_graph_model,
+    validate_decode_graph_model,
 )
 from sparsevllm.operators.workspace import (
     close_workspace_manager,
@@ -382,7 +382,7 @@ class ModelRunner:
             close_workspace_manager()
             raise
         if self.config.decode_graph:
-            validate_batch_only_decode_graph_model(self.model)
+            validate_decode_graph_model(self.model)
         if config.tiny_random:
             from sparsevllm.debug.tiny_random import initialize_sparse_model
 
@@ -1453,17 +1453,16 @@ class ModelRunner:
             "cached_graph_count": len(
                 getattr(graph_runner, "_graphs", {})
             ),
-            "bucket_plan": (
-                graph_runner.bucket_plan()
-                if callable(getattr(graph_runner, "bucket_plan", None))
+            "graph_plan": (
+                graph_runner.graph_plan()
+                if callable(getattr(graph_runner, "graph_plan", None))
                 else None
             ),
             "last_state_key": (
                 {
                     "method": str(graph_key.method or ""),
                     "batch_size": int(graph_key.batch_size),
-                    "context_capacity": int(graph_key.context_capacity),
-                    "is_long_text": bool(graph_key.is_long_text),
+                    "graph_path_id": str(graph_key.graph_path_id),
                     "capture_sampling": bool(graph_key.capture_sampling),
                 }
                 if graph_key is not None

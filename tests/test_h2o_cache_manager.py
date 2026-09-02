@@ -1378,7 +1378,7 @@ def test_h2o_decode_fallback_matches_cross_layer_batch_fast_path_with_ties():
     assert retained[0] == retained[1]
 
 
-def test_h2o_decode_mixed_batch_only_compacts_triggered_sequence():
+def test_h2o_decode_mixed_graph_batch_compacts_triggered_sequence():
     manager = _manager_with_layer_rows(
         [[7, 6], [7, 6]],
         decode_budget=4,

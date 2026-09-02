@@ -162,7 +162,6 @@ def test_minimax_m2_production_provider_replays_across_32k_boundary():
         activation_dtype=torch.bfloat16,
         softmax_scale=head_dim**-0.5,
         max_batch_size=1,
-        batch_only_cuda_graph=True,
         context_capacity=capacity,
     )
     prepared = prepare_decode_attention_op(spec, device_index=device.index or 0)

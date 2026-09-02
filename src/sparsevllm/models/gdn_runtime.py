@@ -46,7 +46,6 @@ def build_gated_delta_rule_op(
             activation_dtype=model_activation_dtype(config),
             recurrent_state_dtype=recurrent_state_dtype,
             cuda_graph_decode=bool(cuda_graph),
-            batch_only_cuda_graph=bool(cuda_graph),
         ),
         device_index=int(device.index or 0),
     )

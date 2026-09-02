@@ -173,7 +173,7 @@ class Gemma4AttentionBackend(TritonAttentionBackend):
     """Gemma 4 attention semantics isolated from the tuned generic kernels."""
 
     name = "triton_gemma4"
-    supports_batch_only_cuda_graph = True
+    supports_decode_graph = True
 
     def __init__(
         self,

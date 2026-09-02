@@ -69,7 +69,6 @@ class MlaAttentionOpSpec:
     tp_size: int
     cuda_graph: bool
     score_output: AttentionScoreKind = AttentionScoreKind.NONE
-    batch_only_cuda_graph: bool = False
     context_capacity: int | None = None
     batch_capacity: int | None = None
 
@@ -164,7 +163,7 @@ class MlaTritonProvider(MlaAttentionProvider):
     """Portable Triton provider with caller-independent decode workspace."""
 
     name = "triton_mla"
-    supports_batch_only_cuda_graph = True
+    supports_decode_graph = True
     capabilities = AttentionKernelCapabilities(
         platforms=frozenset({PlatformEnum.CUDA}),
         activation_dtypes=frozenset({torch.bfloat16}),
@@ -252,11 +251,11 @@ class MlaTritonProvider(MlaAttentionProvider):
                 else "portable_default"
             ),
         }
-        if not self.spec.batch_only_cuda_graph:
+        if not self.spec.cuda_graph:
             return metadata
         return {
             **metadata,
-            "cuda_graph_shape_policy": "batch_only",
+            "cuda_graph_mode": "batch_indexed",
             "context_capacity": self.spec.context_capacity,
             "launch_plan_source": "batch_tp_heads_context_capacity",
         }
@@ -346,7 +345,7 @@ class MlaTritonProvider(MlaAttentionProvider):
         spec: MlaAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
-        if spec.batch_only_cuda_graph and spec.context_capacity is None:
+        if spec.cuda_graph and spec.context_capacity is None:
             return SupportResult.unsupported("requires a static context capacity")
         return cls._common_contract_support(spec, caps)
 
@@ -487,10 +486,10 @@ class MlaTritonProvider(MlaAttentionProvider):
             return self._fixed_launch_config
         if not self._use_h100_tp2_launch_profile:
             return DEFAULT_GLM_MLA_DECODE_CONFIG
-        if self.spec.batch_only_cuda_graph:
+        if self.spec.cuda_graph:
             if self.spec.context_capacity is None:
                 raise RuntimeError(
-                    "Batch-only MLA requires a static context capacity."
+                    "Decode Graph MLA requires a static context capacity."
                 )
             context_capacity = self.spec.context_capacity
         else:
@@ -560,7 +559,7 @@ class MlaSglFa3Provider(MlaTritonProvider):
 
     name = "sgl_fa3_sm90"
     supports_explicit_prefill = True
-    supports_batch_only_cuda_graph = True
+    supports_decode_graph = True
 
     def __init__(
         self,
@@ -915,17 +914,17 @@ class MlaTileLangOutputQuestBs4Profile:
             caps.accelerator_family,
             spec.tp_size,
             spec.score_output,
-            spec.batch_only_cuda_graph,
+            spec.cuda_graph,
             spec.context_capacity,
             spec.batch_capacity,
         )
         if actual != expected:
             return ProfileMatch.no(
-                "requires exact H100 TP2 score-free batch-only graph profile "
+                "requires exact H100 TP2 score-free graph profile "
                 "with context_capacity=2048 and batch_capacity=4, got "
                 f"device={caps.device_name} tp={spec.tp_size} "
                 f"score={spec.score_output.name} "
-                f"batch_only={spec.batch_only_cuda_graph} "
+                f"cuda_graph={spec.cuda_graph} "
                 f"context={spec.context_capacity} batch={spec.batch_capacity}"
             )
         return ProfileMatch.yes(
@@ -946,7 +945,7 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
     """Score-aware Composite over FA3 and statically planned TileLang."""
 
     name = "tilelang_score_sgl_fa3_h100"
-    supports_batch_only_cuda_graph = True
+    supports_decode_graph = True
 
     def __init__(
         self,

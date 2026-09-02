@@ -249,7 +249,7 @@ def test_glm_runtime_kwargs_bind_shared_operators(
     )
 
 
-def test_glm_batch_only_mla_spec_owns_context_capacity() -> None:
+def test_glm_decode_graph_mla_spec_owns_context_capacity() -> None:
     config = _config()
     bound = object()
     with (
@@ -274,7 +274,7 @@ def test_glm_batch_only_mla_spec_owns_context_capacity() -> None:
 
     assert actual is bound
     spec = bind.call_args.kwargs["spec"]
-    assert spec.batch_only_cuda_graph
+    assert spec.cuda_graph
     assert spec.context_capacity == 32768
 
 

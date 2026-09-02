@@ -29,7 +29,6 @@ class Gemma4OpSpec:
     cuda_graph: bool
     attention_contracts: tuple[tuple[int, int, int, int], ...] = ()
     max_batch_size: int = 1
-    batch_only_cuda_graph: bool = False
     context_capacity: int | None = None
 
     def __post_init__(self) -> None:
@@ -39,8 +38,8 @@ class Gemma4OpSpec:
             raise ValueError("Gemma 4 max_batch_size must be positive.")
         if self.context_capacity is not None and self.context_capacity <= 0:
             raise ValueError("Gemma 4 context_capacity must be positive.")
-        if self.batch_only_cuda_graph and self.context_capacity is None:
-            raise ValueError("Gemma 4 batch-only decode requires context_capacity.")
+        if self.cuda_graph and self.context_capacity is None:
+            raise ValueError("Gemma 4 Decode Graph requires context_capacity.")
 
 
 class Gemma4OperatorProvider:

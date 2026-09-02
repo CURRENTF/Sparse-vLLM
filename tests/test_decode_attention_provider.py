@@ -87,7 +87,7 @@ def test_eager_decode_does_not_register_provider_graph_lifecycle():
     assert graph.decode_graph_lifecycle
 
 
-def test_batch_only_decode_spec_carries_static_context_capacity():
+def test_decode_graph_spec_carries_static_context_capacity():
     config = SimpleNamespace(
         num_attention_heads=32,
         num_key_value_heads=8,
@@ -107,7 +107,7 @@ def test_batch_only_decode_spec_carries_static_context_capacity():
         runtime_config=runtime_config,
     )
 
-    assert spec.batch_only_cuda_graph
+    assert spec.cuda_graph
     assert spec.context_capacity == runtime_config.max_model_len
 
 
@@ -170,11 +170,10 @@ def test_deltakv_kivi_decode_spec_carries_mixed_storage_contract():
     assert spec.layer_varying_page_table
 
 
-def test_deltakv_kivi_batch_only_resolves_nonstandard_fixed_grid_provider():
+def test_deltakv_kivi_graph_resolves_nonstandard_fixed_grid_provider():
     spec = _spec(
         may_require_attention_scores=True,
         layer_varying_page_table=True,
-        batch_only_cuda_graph=True,
         context_capacity=131072,
         may_use_full_layer_kivi_int4=True,
         full_layer_kivi_decode_block_seq=512,
@@ -199,11 +198,11 @@ def test_deltakv_kivi_batch_only_resolves_nonstandard_fixed_grid_provider():
     assert not FlashInferPagedDecodeAttentionProvider.supports(spec, caps).supported
 
 
-def test_deltakv_kivi_bucketed_keeps_legacy_triton_baseline():
+def test_deltakv_kivi_eager_keeps_dynamic_triton_baseline():
     spec = _spec(
         may_require_attention_scores=True,
         layer_varying_page_table=True,
-        batch_only_cuda_graph=False,
+        cuda_graph=False,
         context_capacity=131072,
         may_use_full_layer_kivi_int4=True,
     )
@@ -220,7 +219,6 @@ def test_deltakv_kivi_fixed_grid_rejects_unsupported_head_dim():
         head_dim=256,
         may_require_attention_scores=True,
         layer_varying_page_table=True,
-        batch_only_cuda_graph=True,
         context_capacity=131072,
         may_use_full_layer_kivi_int4=True,
         full_layer_kivi_decode_block_seq=512,
@@ -280,7 +278,6 @@ def test_deltakv_fixed_grid_graph_state_owns_per_graph_workspace():
         max_batch_size=8,
         may_require_attention_scores=True,
         layer_varying_page_table=True,
-        batch_only_cuda_graph=True,
         context_capacity=131072,
         may_use_full_layer_kivi_int4=True,
         full_layer_kivi_decode_block_seq=512,
@@ -902,7 +899,6 @@ def test_flashinfer_graph_decode_replans_and_replays_new_metadata():
         softmax_scale=head_dim**-0.5,
         max_batch_size=batch,
         cuda_graph=True,
-        batch_only_cuda_graph=True,
         context_capacity=capacity,
     )
     contract = DecodeGraphContract(
@@ -1022,7 +1018,6 @@ def test_flashinfer_graph_page_size_16_replans_and_replays():
         max_batch_size=batch,
         page_size=page_size,
         cuda_graph=True,
-        batch_only_cuda_graph=True,
         context_capacity=context_capacity,
         sparse_context_budget=48,
     )

@@ -94,7 +94,6 @@ def build_glm4_moe_lite_mla_attention(
         tp_size=int(parallel_context.attention_tp_size),
         cuda_graph=bool(decode_graph),
         score_output=score_output,
-        batch_only_cuda_graph=bool(decode_graph),
         context_capacity=int(context_capacity),
         batch_capacity=int(max_batch_size),
     )

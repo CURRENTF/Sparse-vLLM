@@ -97,10 +97,14 @@ def test_model_runner_gathers_one_debug_summary_per_world_rank():
         last_state_key=SimpleNamespace(
             method="snapkv",
             batch_size=2,
-            context_capacity=1024,
-            is_long_text=True,
+            graph_path_id="long",
             capture_sampling=False,
         ),
+        graph_plan=lambda: {
+            "batch_sizes": [2],
+            "startup_plan_sealed": True,
+            "cached_graph_keys": [],
+        },
     )
 
     def gather(output, local, group):
@@ -124,12 +128,15 @@ def test_model_runner_gathers_one_debug_summary_per_world_rank():
         "eviction_count": 0,
         "recapture_count": 0,
         "cached_graph_count": 1,
-        "bucket_plan": None,
+        "graph_plan": {
+            "batch_sizes": [2],
+            "startup_plan_sealed": True,
+            "cached_graph_keys": [],
+        },
         "last_state_key": {
             "method": "snapkv",
             "batch_size": 2,
-            "context_capacity": 1024,
-            "is_long_text": True,
+            "graph_path_id": "long",
             "capture_sampling": False,
         },
     }

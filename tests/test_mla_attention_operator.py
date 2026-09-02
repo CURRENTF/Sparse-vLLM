@@ -150,10 +150,9 @@ def test_mla_resolver_selects_triton_on_sm120() -> None:
     assert resolved.report.selection_basis == "semantic_fallback"
 
 
-def test_batch_only_mla_requires_static_capacity() -> None:
+def test_decode_graph_mla_requires_static_capacity() -> None:
     spec = _spec(
         cuda_graph=True,
-        batch_only_cuda_graph=True,
         context_capacity=None,
     )
 
@@ -163,11 +162,10 @@ def test_batch_only_mla_requires_static_capacity() -> None:
     assert "static context capacity" in result.reason
 
 
-def test_batch_only_mla_launch_config_ignores_runtime_context() -> None:
+def test_decode_graph_mla_launch_config_ignores_runtime_context() -> None:
     spec = _spec(
         tp_size=2,
         cuda_graph=True,
-        batch_only_cuda_graph=True,
         context_capacity=32768,
     )
     workspace = _cpu_workspace(batch_size=32, head_count=10)
@@ -281,10 +279,9 @@ def test_h100_family_tp2_uses_profiled_mla_launch_config(
     )
 
 
-def test_sgl_mla_accepts_batch_only_score_free_contract() -> None:
+def test_sgl_mla_accepts_graph_stable_score_free_contract() -> None:
     spec = _spec(
         cuda_graph=True,
-        batch_only_cuda_graph=True,
         context_capacity=32768,
     )
     with patch(
@@ -294,13 +291,12 @@ def test_sgl_mla_accepts_batch_only_score_free_contract() -> None:
         result = MlaSglFa3Provider.supports(spec, _h100_caps())
 
     assert result.supported
-    assert MlaSglFa3Provider.supports_batch_only_cuda_graph
+    assert MlaSglFa3Provider.supports_decode_graph
 
 
-def test_batch_only_mla_resolver_prefers_sgl_fa3() -> None:
+def test_decode_graph_mla_resolver_prefers_sgl_fa3() -> None:
     spec = _spec(
         cuda_graph=True,
-        batch_only_cuda_graph=True,
         context_capacity=32768,
     )
     workspace = _cpu_workspace(batch_size=8, head_count=5)
@@ -705,7 +701,6 @@ def test_glm_production_provider_replays_across_1k_boundary() -> None:
     spec = _spec(
         tp_size=1,
         cuda_graph=True,
-        batch_only_cuda_graph=True,
         context_capacity=capacity,
     )
     provider = MlaSglFa3Provider(

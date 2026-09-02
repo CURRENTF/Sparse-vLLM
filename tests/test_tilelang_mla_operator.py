@@ -327,10 +327,9 @@ def test_tilelang_mla_h100_family_profile_overrides_default_portfolio(
     assert resolved.report.selection_basis == "profile_override"
 
 
-def test_batch_only_score_contract_binds_static_tilelang_plan() -> None:
+def test_decode_graph_score_contract_binds_static_tilelang_plan() -> None:
     spec = replace(
         _spec(),
-        batch_only_cuda_graph=True,
     )
     workspace = _cpu_workspace()
     with (
@@ -358,15 +357,14 @@ def test_batch_only_score_contract_binds_static_tilelang_plan() -> None:
         )
 
     assert type(resolved.provider) is MlaTileLangScoreProvider
-    assert resolved.provider.supports_batch_only_cuda_graph
+    assert resolved.provider.supports_decode_graph
     assert resolved.provider.tilelang_launch_plan.context_capacity == 65536
 
 
-def test_batch_only_reduced_score_contract_binds_static_triton_provider() -> None:
+def test_decode_graph_reduced_score_contract_binds_static_triton_provider() -> None:
     spec = replace(
         _spec(),
         score_output=AttentionScoreKind.RAW_QK_REDUCED,
-        batch_only_cuda_graph=True,
     )
     with (
         patch(
@@ -436,7 +434,6 @@ def _output_provider_with_mocks() -> tuple[MlaTileLangOutputProvider, Mock, Mock
     spec = replace(
         _spec(),
         score_output=AttentionScoreKind.NONE,
-        batch_only_cuda_graph=True,
         context_capacity=2048,
         batch_capacity=4,
     )

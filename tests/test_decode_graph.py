@@ -232,7 +232,7 @@ def test_typed_decode_graph_participant_delegates_to_cache_owner() -> None:
     assert calls[-1] == ("operator_close", 2)
 
 
-def test_mha_resolver_prefers_sgl_fa3_for_batch_only_on_supported_sm90() -> None:
+def test_mha_resolver_prefers_sgl_fa3_for_decode_graph_on_supported_sm90() -> None:
     spec = DecodeAttentionOpSpec(
         num_query_heads=8,
         num_kv_heads=2,
@@ -240,7 +240,6 @@ def test_mha_resolver_prefers_sgl_fa3_for_batch_only_on_supported_sm90() -> None
         activation_dtype=torch.bfloat16,
         softmax_scale=128**-0.5,
         max_batch_size=8,
-        batch_only_cuda_graph=True,
         context_capacity=32768,
     )
     caps = _cuda_caps()
@@ -256,7 +255,6 @@ def test_mha_resolver_prefers_sgl_fa3_for_batch_only_on_supported_sm90() -> None
         max_batch_size=8,
         may_require_attention_scores=True,
         h2o_layerwise_probability_scores=True,
-        batch_only_cuda_graph=True,
         context_capacity=32768,
     )
     assert FixedGridTritonPagedDecodeAttentionProvider.supports(
@@ -298,7 +296,6 @@ def test_mha_resolver_falls_back_to_fixed_grid_when_upstream_is_ineligible() -> 
         activation_dtype=torch.bfloat16,
         softmax_scale=128**-0.5,
         max_batch_size=8,
-        batch_only_cuda_graph=True,
         context_capacity=32768,
     )
     caps = DeviceCaps(
@@ -333,7 +330,6 @@ def test_mla_resolver_contract_selects_fixed_launch_provider() -> None:
         cache_dtype=torch.bfloat16,
         tp_size=2,
         cuda_graph=True,
-        batch_only_cuda_graph=True,
         context_capacity=32768,
     )
     caps = _cuda_caps()
@@ -347,7 +343,6 @@ def test_gemma4_resolver_contract_selects_fixed_grid_provider() -> None:
         cuda_graph=True,
         attention_contracts=((8, 2, 256, 1023), (8, 1, 512, -1)),
         max_batch_size=8,
-        batch_only_cuda_graph=True,
         context_capacity=32768,
     )
     caps = _cuda_caps()
@@ -369,7 +364,6 @@ def test_gemma4_provider_rejects_missing_multi_processor_count(
         cuda_graph=True,
         attention_contracts=((8, 2, 256, -1),),
         max_batch_size=8,
-        batch_only_cuda_graph=True,
         context_capacity=32768,
     )
     caps = DeviceCaps(
@@ -421,7 +415,7 @@ def _decode_reference(
         (torch.float16, 4, 4, 256),
     ],
 )
-def test_batch_only_mha_matches_reference_and_replays_new_lengths(
+def test_decode_graph_mha_matches_reference_and_replays_new_lengths(
     dtype,
     heads,
     kv_heads,
@@ -478,7 +472,7 @@ def test_batch_only_mha_matches_reference_and_replays_new_lengths(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires idle CUDA GPU")
-def test_batch_only_gqa_replays_exact_context_capacity() -> None:
+def test_decode_graph_gqa_replays_exact_context_capacity() -> None:
     torch.manual_seed(29)
     batch, heads, kv_heads, head_dim, capacity = 1, 8, 2, 128, 8352
     device = torch.device("cuda")
@@ -545,7 +539,7 @@ def test_batch_only_gqa_replays_exact_context_capacity() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires idle CUDA GPU")
-def test_batch_only_gqa_produces_raw_per_head_scores() -> None:
+def test_decode_graph_gqa_produces_raw_per_head_scores() -> None:
     torch.manual_seed(23)
     batch, heads, kv_heads, head_dim, capacity = 2, 4, 2, 64, 33
     device = torch.device("cuda")
