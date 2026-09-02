@@ -15,6 +15,7 @@ from sparsevllm.operators.registry import (
     SupportResult,
 )
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
+from sparsevllm.utils.device_name import device_name_contains
 
 
 @dataclass(frozen=True)
@@ -184,10 +185,9 @@ class H20GateUpSwiGLUDispatchPlan(GateUpSwiGLUProvider):
         spec: GateUpSwiGLUOpSpec,
         caps: DeviceCaps,
     ) -> ProfileMatch:
-        if caps.accelerator_family != "h20":
+        if not device_name_contains(caps.device_name, "H20"):
             return ProfileMatch.no(
-                "requires profiled H20-family hardware, "
-                f"got {caps.device_name} ({caps.accelerator_family})"
+                f"requires profiled H20 hardware, got {caps.device_name}"
             )
         if (spec.hidden_size, spec.intermediate_size, spec.tp_size) not in {
             (2048, 512, 1),

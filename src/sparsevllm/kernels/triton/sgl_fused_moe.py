@@ -30,7 +30,7 @@ from sparsevllm.kernels.triton.moe import (
     moe_sum,
 )
 from sparsevllm.kernels.triton.silu_and_mul import silu_and_mul_fwd
-from sparsevllm.platforms.interface import normalize_accelerator_identity
+from sparsevllm.utils.device_name import device_name_contains
 
 
 @triton.jit(do_not_specialize=["EM", "num_valid_tokens"])
@@ -258,7 +258,7 @@ def _load_sgl_h100_qwen3_profile() -> tuple[
     _validate_profile_contract(
         payload,
         {
-            "accelerator_family": "h100",
+            "device_name_keyword": "H100",
             "compute_capability": [9, 0],
             "activation_dtype": "bfloat16",
             "weight_dtype": "bfloat16",
@@ -283,7 +283,7 @@ def _load_sgl_h100_glm47_profile() -> tuple[
     _validate_profile_contract(
         payload,
         {
-            "accelerator_family": "h100",
+            "device_name_keyword": "H100",
             "compute_capability": [9, 0],
             "activation_dtype": "bfloat16",
             "weight_dtype": "bfloat16",
@@ -385,10 +385,9 @@ def resolve_sgl_moe_config(
     glm_payload, glm_tables = _load_sgl_h100_glm47_profile()
     glm_contract = glm_payload["contract"]
     glm_profile_supported, _ = sgl_glm47_moe_profile_support()
-    accelerator_family = normalize_accelerator_identity(device_name)[0]
     if (
         glm_profile_supported
-        and accelerator_family == glm_contract["accelerator_family"]
+        and device_name_contains(device_name, glm_contract["device_name_keyword"])
         and tuple(device_capability) == tuple(glm_contract["compute_capability"])
         and activation_dtype == torch.bfloat16
         and weight_dtype == torch.bfloat16
@@ -408,7 +407,7 @@ def resolve_sgl_moe_config(
     table = None
     if (
         profile_supported
-        and accelerator_family == contract["accelerator_family"]
+        and device_name_contains(device_name, contract["device_name_keyword"])
         and tuple(device_capability) == tuple(contract["compute_capability"])
         and activation_dtype == torch.bfloat16
         and weight_dtype == torch.bfloat16

@@ -17,6 +17,7 @@ from sparsevllm.operators.registry import (
     runtime_version_at_least,
 )
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
+from sparsevllm.utils.device_name import device_name_contains
 
 
 @dataclass(frozen=True)
@@ -633,8 +634,8 @@ class GlmH100Bf16DecodeMoeDispatchPlan(MoeDispatchPlan):
             spec.ep_size,
             spec.routing_method,
         )
-        if caps.accelerator_family != "h100":
-            return ProfileMatch.no("requires profiled H100-family hardware")
+        if not device_name_contains(caps.device_name, "H100"):
+            return ProfileMatch.no("requires profiled H100 hardware")
         if actual not in cls.PROFILED_SHAPES:
             return ProfileMatch.no(
                 f"requires a profiled GLM H100 BF16 shape, got {actual}"
@@ -1157,8 +1158,8 @@ class Qwen3Bf16MoeDispatchPlan(MoeDispatchPlan):
             spec.tp_size,
             spec.ep_size,
         )
-        if caps.accelerator_family != "h100":
-            return ProfileMatch.no("requires profiled H100-family hardware")
+        if not device_name_contains(caps.device_name, "H100"):
+            return ProfileMatch.no("requires profiled H100 hardware")
         if actual not in SglDerivedTritonMoeProvider.PROFILED_SHAPES:
             return ProfileMatch.no(
                 "requires a profiled Qwen3 BF16 shape in "
@@ -1248,7 +1249,10 @@ class SglAlignedTritonGlmMoeProfile(_SingleAtomicMoeProfile):
             spec.ep_size,
             spec.routing_method,
         )
-        if caps.accelerator_family not in {"h100", "h20"}:
+        if not any(
+            device_name_contains(caps.device_name, name)
+            for name in ("H100", "H20")
+        ):
             return ProfileMatch.no("requires profiled H100 or H20 hardware")
         if actual not in expected:
             return ProfileMatch.no(
@@ -1275,7 +1279,7 @@ class SglTritonGlmTp1MoeProfile(_SingleAtomicMoeProfile):
             spec.ep_size,
             spec.routing_method,
         )
-        if caps.accelerator_family != "h100":
+        if not device_name_contains(caps.device_name, "H100"):
             return ProfileMatch.no("requires profiled H100 hardware")
         if actual != expected:
             return ProfileMatch.no(
@@ -1297,8 +1301,8 @@ class TritonMinimaxM2MoeProfile(_SingleAtomicMoeProfile):
 
     @classmethod
     def matches(cls, spec: MoeOpSpec, caps: DeviceCaps) -> ProfileMatch:
-        if caps.accelerator_family != "h100":
-            return ProfileMatch.no("requires profiled H100-family hardware")
+        if not device_name_contains(caps.device_name, "H100"):
+            return ProfileMatch.no("requires profiled H100 hardware")
         actual = (
             spec.num_experts,
             spec.num_local_experts,
@@ -1320,7 +1324,7 @@ class TritonMinimaxM2MoeProfile(_SingleAtomicMoeProfile):
 class HopperFusedBf16MoeProfile(_SingleAtomicMoeProfile):
     name = "hopper_fused_bf16_profile"
     atomic_provider_name = "triton_hopper_fused"
-    profiled_accelerator_family = "h100"
+    profiled_device_name = "H100"
     profiled_shapes = TritonHopperFusedMoeProvider.PROFILED_SHAPES
 
     @classmethod
@@ -1334,11 +1338,10 @@ class HopperFusedBf16MoeProfile(_SingleAtomicMoeProfile):
             spec.tp_size,
             spec.ep_size,
         )
-        if caps.accelerator_family != cls.profiled_accelerator_family:
+        if not device_name_contains(caps.device_name, cls.profiled_device_name):
             return ProfileMatch.no(
-                "requires profiled accelerator family "
-                f"{cls.profiled_accelerator_family}, got "
-                f"{caps.device_name} ({caps.accelerator_family})"
+                f"requires profiled {cls.profiled_device_name} hardware, "
+                f"got {caps.device_name}"
             )
         if actual not in cls.profiled_shapes:
             return ProfileMatch.no(
@@ -1351,7 +1354,7 @@ class HopperFusedBf16MoeProfile(_SingleAtomicMoeProfile):
 class H20Qwen36FusedBf16MoeProfile(HopperFusedBf16MoeProfile):
     name = "h20_qwen36_fused_bf16_profile"
     atomic_provider_name = "h20_qwen36_fused_bf16"
-    profiled_accelerator_family = "h20"
+    profiled_device_name = "H20"
     profiled_shapes = H20Qwen36FusedMoeProvider.PROFILED_SHAPES
 
 
@@ -1474,10 +1477,8 @@ class Qwen3Fp8MoeDispatchPlan(MoeDispatchPlan):
 
     @classmethod
     def matches(cls, spec: MoeOpSpec, caps: DeviceCaps) -> ProfileMatch:
-        if caps.accelerator_family != "h100":
-            return ProfileMatch.no(
-                "requires profiled H100-family hardware"
-            )
+        if not device_name_contains(caps.device_name, "H100"):
+            return ProfileMatch.no("requires profiled H100 hardware")
         if spec.weight_dtype != torch.float8_e4m3fn:
             return ProfileMatch.no("requires FP8 E4M3 weights")
         if spec.block_shape != (128, 128):
@@ -1531,7 +1532,7 @@ class HopperQwen36Fp8MoeDispatchPlan(MoeDispatchPlan):
 
     name = "hopper_qwen36_fp8_dispatch_plan"
     gate_up_order = "up_gate"
-    PROFILED_ACCELERATOR_FAMILY = "h100"
+    PROFILED_DEVICE_NAME = "H100"
     PROFILED_SHAPES = frozenset(
         {
             (256, 256, 2048, 512, 8, 1, 1),
@@ -1549,11 +1550,10 @@ class HopperQwen36Fp8MoeDispatchPlan(MoeDispatchPlan):
     def matches(cls, spec: MoeOpSpec, caps: DeviceCaps) -> ProfileMatch:
         if spec.cuda_graph and not caps.supports_graph_capture:
             return ProfileMatch.no("device does not support CUDA Graph capture")
-        if caps.accelerator_family != cls.PROFILED_ACCELERATOR_FAMILY:
+        if not device_name_contains(caps.device_name, cls.PROFILED_DEVICE_NAME):
             return ProfileMatch.no(
-                "requires profiled accelerator family "
-                f"{cls.PROFILED_ACCELERATOR_FAMILY}, got "
-                f"{caps.device_name} ({caps.accelerator_family})"
+                f"requires profiled {cls.PROFILED_DEVICE_NAME} hardware, "
+                f"got {caps.device_name}"
             )
         actual_shape = (
             spec.num_experts,
@@ -1596,7 +1596,7 @@ class HopperQwen36Fp8MoeDispatchPlan(MoeDispatchPlan):
 @MOE_REGISTRY.register_profile
 class H20Qwen36Fp8MoeDispatchPlan(HopperQwen36Fp8MoeDispatchPlan):
     name = "h20_qwen36_fp8_dispatch_plan"
-    PROFILED_ACCELERATOR_FAMILY = "h20"
+    PROFILED_DEVICE_NAME = "H20"
     TRITON_MAX_TOKENS_BY_EP_SIZE = {1: 8, 2: 1}
 
 

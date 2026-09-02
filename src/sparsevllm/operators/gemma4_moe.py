@@ -17,6 +17,7 @@ from sparsevllm.operators.registry import (
     runtime_version_at_least,
 )
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
+from sparsevllm.utils.device_name import device_name_contains
 
 
 class Gemma4MoeProvider(MoeProvider):
@@ -150,10 +151,9 @@ class H20Gemma4MoeProfile:
     @classmethod
     def matches(cls, spec: MoeOpSpec, caps: DeviceCaps) -> ProfileMatch:
         del spec
-        if caps.accelerator_family != "h20":
+        if not device_name_contains(caps.device_name, "H20"):
             return ProfileMatch.no(
-                "requires profiled H20-family hardware, "
-                f"got {caps.device_name} ({caps.accelerator_family})"
+                f"requires profiled H20 hardware, got {caps.device_name}"
             )
         return ProfileMatch.yes("matched H20 Gemma 4 MoE profile")
 

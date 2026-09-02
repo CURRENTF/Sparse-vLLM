@@ -12,7 +12,6 @@ from sparsevllm.platforms.interface import (
     DeviceCaps,
     Platform,
     PlatformEnum,
-    normalize_accelerator_identity,
 )
 from sparsevllm.platforms.rocm import RocmPlatform
 
@@ -120,7 +119,6 @@ __all__ = [
     "DeviceCaps",
     "Platform",
     "PlatformEnum",
-    "normalize_accelerator_identity",
     "RocmPlatform",
     "current_platform",
     "get_current_platform",

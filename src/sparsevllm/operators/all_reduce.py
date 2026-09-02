@@ -22,6 +22,7 @@ from sparsevllm.operators.registry import (
     runtime_version_at_least,
 )
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
+from sparsevllm.utils.device_name import device_name_contains
 
 if TYPE_CHECKING:
     from sparsevllm.distributed.parallel_context import ParallelGroup
@@ -148,6 +149,17 @@ _FLASHINFER_TRTLLM_PROFILES = {
 }
 
 
+def _flashinfer_trtllm_profile(
+    spec: AllReduceOpSpec,
+    caps: DeviceCaps,
+) -> _FlashInferTrtllmProfile | None:
+    if not device_name_contains(caps.device_name, "H100"):
+        return None
+    return _FLASHINFER_TRTLLM_PROFILES.get(
+        ("h100", spec.world_size, spec.hidden_size)
+    )
+
+
 def _flashinfer_dependency_support() -> SupportResult:
     if find_spec("flashinfer") is None:
         return SupportResult.dependency_absent("flashinfer is not installed")
@@ -233,9 +245,12 @@ class FlashInferTrtllmAllReduceProvider(AllReduceProvider):
                 f"selected={device_index} current={current_device}."
             )
         caps = platforms.current_platform.get_device_caps(current_device)
-        profile = _FLASHINFER_TRTLLM_PROFILES[
-            (caps.accelerator_family, spec.world_size, spec.hidden_size)
-        ]
+        profile = _flashinfer_trtllm_profile(spec, caps)
+        if profile is None:
+            raise RuntimeError(
+                "Prepared FlashInfer TRT-LLM profile no longer matches the active "
+                f"device {caps.device_name}."
+            )
         workspace = create_allreduce_fusion_workspace(
             backend="trtllm",
             world_size=spec.world_size,
@@ -588,9 +603,7 @@ class FlashInferTrtllmAllReduceProfile(_FlashInferAllReduceProfile):
 
     @classmethod
     def matches(cls, spec: AllReduceOpSpec, caps: DeviceCaps) -> ProfileMatch:
-        profile = _FLASHINFER_TRTLLM_PROFILES.get(
-            (caps.accelerator_family, spec.world_size, spec.hidden_size)
-        )
+        profile = _flashinfer_trtllm_profile(spec, caps)
         if profile is None or spec.dtype != torch.bfloat16:
             return ProfileMatch.no(
                 "requires an exact H100 BF16 topology/shape profile, got "
@@ -612,10 +625,9 @@ class FlashInferVllmAllReduceProfile(_FlashInferAllReduceProfile):
 
     @classmethod
     def matches(cls, spec: AllReduceOpSpec, caps: DeviceCaps) -> ProfileMatch:
-        if caps.accelerator_family != "h100":
+        if not device_name_contains(caps.device_name, "H100"):
             return ProfileMatch.no(
-                "requires profiled H100-family hardware, "
-                f"got {caps.device_name} ({caps.accelerator_family})"
+                f"requires profiled H100 hardware, got {caps.device_name}"
             )
         if (
             spec.world_size != 2

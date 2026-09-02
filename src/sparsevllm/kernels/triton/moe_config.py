@@ -5,7 +5,7 @@ from functools import lru_cache
 
 import torch
 
-from sparsevllm.platforms.interface import normalize_accelerator_identity
+from sparsevllm.utils.device_name import device_name_contains
 
 
 @dataclass(frozen=True)
@@ -56,8 +56,11 @@ def device_info(
     )
 
 
-def _hardware_family(device_name: str) -> str:
-    return normalize_accelerator_identity(device_name)[0]
+def _profiled_hardware(device_name: str) -> str:
+    for keyword in ("H100", "H20"):
+        if device_name_contains(device_name, keyword):
+            return keyword.lower()
+    return "unprofiled"
 
 
 def token_bucket(num_tokens: int) -> int:
@@ -456,7 +459,7 @@ def _resolve_moe_gemm_config(
     capability: tuple[int, int],
 ) -> MoeGemmConfig:
     shape = MoeGemmShape(
-        hardware=_hardware_family(device_name),
+        hardware=_profiled_hardware(device_name),
         capability=capability,
         dtype=dtype,
         top_k=top_k,

@@ -20,6 +20,7 @@ from sparsevllm.operators.registry import (
     runtime_version_at_least,
 )
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
+from sparsevllm.utils.device_name import device_name_contains
 
 
 @dataclass(frozen=True)
@@ -231,7 +232,7 @@ def _load_sm120_fp8_linear_profile() -> tuple[
     if not isinstance(payload, dict) or payload.get("schema_version") != 1:
         raise RuntimeError("Unsupported SM120 FP8 Linear profile schema.")
     expected_device = {
-        "accelerator_family": "rtx_pro_6000",
+        "device_name_keyword": "RTX PRO 6000",
         "compute_capability": [12, 0],
     }
     expected_contract = {
@@ -296,13 +297,12 @@ def _sm120_fp8_linear_profile_support(
     payload, routes = _load_sm120_fp8_linear_profile()
     device = payload["device"]
     if (
-        caps.accelerator_family != device["accelerator_family"]
+        not device_name_contains(caps.device_name, device["device_name_keyword"])
         or list(caps.compute_capability or ()) != device["compute_capability"]
     ):
         return ProfileMatch.no(
             "requires profiled NVIDIA RTX PRO 6000 SM120 hardware, got "
-            f"{caps.device_name} ({caps.accelerator_family}) "
-            f"{caps.compute_capability}"
+            f"{caps.device_name} {caps.compute_capability}"
         )
     contract = payload["contract"]
     actual_contract = {

@@ -45,13 +45,14 @@ from sparsevllm.operators.attention_capabilities import (
     match_attention_capabilities,
 )
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
+from sparsevllm.utils.device_name import device_name_contains
 
 _GLM_MLA_NUM_Q_HEADS = 20
 _GLM_MLA_KV_LORA_RANK = 512
 _GLM_MLA_ROPE_DIM = 64
 _GLM_MLA_QK_HEAD_DIM = 256
 _GLM_MLA_VALUE_HEAD_DIM = 256
-_PROFILED_H100_FAMILY = "h100"
+_PROFILED_H100_NAME = "H100"
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,7 +233,7 @@ class MlaTritonProvider(MlaAttentionProvider):
         return cls(
             use_h100_launch_profile=(
                 caps.compute_capability == (9, 0)
-                and caps.accelerator_family == _PROFILED_H100_FAMILY
+                and device_name_contains(caps.device_name, _PROFILED_H100_NAME)
             ),
             **kwargs,
         )
@@ -974,10 +975,9 @@ class MlaTileLangScoreProfile:
         caps: DeviceCaps,
     ) -> ProfileMatch:
         del spec
-        if caps.accelerator_family != _PROFILED_H100_FAMILY:
+        if not device_name_contains(caps.device_name, _PROFILED_H100_NAME):
             return ProfileMatch.no(
-                "requires profiled H100-family hardware, "
-                f"got {caps.device_name} ({caps.accelerator_family})"
+                f"requires profiled H100 hardware, got {caps.device_name}"
             )
         return ProfileMatch.yes("matched H100 TileLang MLA score profile")
 

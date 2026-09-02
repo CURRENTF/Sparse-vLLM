@@ -34,6 +34,7 @@ from sparsevllm.operators.registry import (
 )
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
 from sparsevllm.utils.context import get_context
+from sparsevllm.utils.device_name import device_name_contains
 from sparsevllm.utils.log import logger
 
 
@@ -1727,10 +1728,9 @@ class H100GqaDecodeLaunchProfile:
             spec.num_kv_heads,
             spec.head_dim,
         )
-        if caps.accelerator_family != "h100":
+        if not device_name_contains(caps.device_name, "H100"):
             return ProfileMatch.no(
-                "requires profiled H100-family hardware, "
-                f"got {caps.device_name} ({caps.accelerator_family})"
+                f"requires profiled H100 hardware, got {caps.device_name}"
             )
         if actual_shape != expected_shape:
             return ProfileMatch.no(
