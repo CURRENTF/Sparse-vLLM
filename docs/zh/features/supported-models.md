@@ -10,10 +10,10 @@
 | --- | --- | --- | :---: | :---: | :---: |
 | Qwen2.5 | `qwen2` | BF16 / FP16 / 块级 FP8 | ✅ | 仅支持 1 | 仅支持 1 |
 | Qwen3 Dense | `qwen3` | BF16 / FP16 / 块级 FP8 | ✅（FP8：1/2/4/8） | 仅支持 1 | 仅支持 1 |
-| Qwen3MoE | `qwen3_moe` | BF16 / FP16 / 块级 FP8 | ✅（TP > 1 时模型 dtype 仅支持 BF16） | 仅支持 1 | ✅ |
+| Qwen3MoE | `qwen3_moe` | BF16 / FP16 / 块级 FP8 | ✅ | 仅支持 1 | ✅ |
 | Qwen3.5 / 3.6 / 3.8 | `qwen3_5` | BF16 / 块级 FP8 | ✅ | 仅支持 1 | 仅支持 1 |
 | Qwen3.6 MoE | `qwen3_5_moe` | BF16 / 块级 FP8 | ✅ | 仅支持 1 | ✅ |
-| GLM-4.7-Flash | `glm4_moe_lite` | BF16 | 1 / 2 / 4（仅 H100）⁵ | 仅支持 1 | 1 / 2 / 4⁵ |
+| GLM-4.7-Flash | `glm4_moe_lite` | BF16 | ✅ | 仅支持 1 | 1 / 2 / 4 |
 | Gemma 4 Dense / MoE | `gemma4` | BF16 / FP16 | ✅ | 仅支持 1 | ✅（仅 MoE） |
 | Llama 3 / 3.1 | `llama` | BF16 / FP16 / 块级 FP8 | ✅ | 仅支持 1 | 仅支持 1 |
 | MiniMax M2.7 | `minimax_m2` | 块级 FP8，非量化权重使用 BF16 | ✅ | 仅支持 1 | ✅ |
@@ -27,12 +27,6 @@ MoE 模型可能在内部组合 tensor parallelism 和 expert parallelism；不�
 块级 FP8 要求使用 E4M3 权重、动态激活量化以及 `128 x 128` 的权重块大小。
 Llama、Qwen2 和 Qwen3 Dense FP8 checkpoint 还要求每个 TP-local dense
 projection 维度按 128 对齐，且非量化参数保持 BF16。
-
-GLM-4.7-Flash 要求使用 BF16、H100 和 `DP=1`。支持的 `(TP, EP)` 组合为 `(1,1)`、
-`(2,1)`、`(4,1)`、`(1,2)`、`(1,4)`、`(2,2)`、`(4,2)` 和 `(4,4)`。
-在全部八种布局中，vanilla、StreamingLLM、SnapKV、H2O、OmniKV 和 R-KV
-均支持 decode CUDA Graph 与 Prefix Cache 的联合组合。QuEST 支持 decode CUDA
-Graph，但不支持 Prefix Cache 或 Prefix offload。量化和其他稀疏方法仍不支持。
 
 ## 稀疏方法支持
 
@@ -59,7 +53,7 @@ Graph，但不支持 Prefix Cache 或 Prefix offload。量化和其他稀疏方�
 ⁴ H2O 的 tensor-parallel 执行可能产生与 TP=1 不同的稀疏选择。各模型原有的
 TP、EP、DP 限制仍然适用。
 
-⁵ GLM 要求 `DP=1`，并使用上文列出的 `(TP, EP)` 组合。QuEST 支持仍为实验性。
+⁵ GLM 要求 `DP=1`。QuEST 支持仍为实验性。
 
 ⁶ 带共享 KV 层的 Gemma 4 checkpoint 不支持逐层 StreamingLLM eviction；
 Vanilla 和 OmniKV 仍受支持。

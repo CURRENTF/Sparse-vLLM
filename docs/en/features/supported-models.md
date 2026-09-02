@@ -14,10 +14,10 @@ parallel size must use that value.
 | --- | --- | --- | :---: | :---: | :---: |
 | Qwen2.5 | `qwen2` | BF16 / FP16 / block FP8 | ✅ | 1 only | 1 only |
 | Qwen3 Dense | `qwen3` | BF16 / FP16 / block FP8 | ✅ (FP8: 1/2/4/8) | 1 only | 1 only |
-| Qwen3MoE | `qwen3_moe` | BF16 / FP16 / block FP8 | ✅ (TP > 1: BF16 model dtype only) | 1 only | ✅ |
+| Qwen3MoE | `qwen3_moe` | BF16 / FP16 / block FP8 | ✅ | 1 only | ✅ |
 | Qwen3.5 / 3.6 / 3.8 | `qwen3_5` | BF16 / block FP8 | ✅ | 1 only | 1 only |
 | Qwen3.6 MoE | `qwen3_5_moe` | BF16 / block FP8 | ✅ | 1 only | ✅ |
-| GLM-4.7-Flash | `glm4_moe_lite` | BF16 | 1 / 2 / 4 (H100 only)⁵ | 1 only | 1 / 2 / 4⁵ |
+| GLM-4.7-Flash | `glm4_moe_lite` | BF16 | ✅ | 1 only | 1 / 2 / 4 |
 | Gemma 4 Dense / MoE | `gemma4` | BF16 / FP16 | ✅ | 1 only | ✅ (MoE only) |
 | Llama 3 / 3.1 | `llama` | BF16 / FP16 / block FP8 | ✅ | 1 only | 1 only |
 | MiniMax M2.7 | `minimax_m2` | block FP8 with BF16 non-quantized weights | ✅ | 1 only | ✅ |
@@ -33,14 +33,6 @@ Block FP8 support requires E4M3 weights, dynamic activation quantization, and
 a `128 x 128` weight block size. Llama, Qwen2, and Qwen3 dense FP8 checkpoints
 also require every TP-local dense projection dimension to be 128-aligned and
 keep non-quantized parameters in BF16.
-
-GLM-4.7-Flash requires BF16, H100, and `DP=1`. The supported `(TP, EP)`
-combinations are
-`(1,1)`, `(2,1)`, `(4,1)`, `(1,2)`, `(1,4)`, `(2,2)`, `(4,2)`, and `(4,4)`.
-Across all eight layouts, vanilla, StreamingLLM, SnapKV, H2O, OmniKV, and R-KV
-support decode CUDA Graph and prefix caching together. QuEST supports decode
-CUDA Graph but not prefix caching or prefix offload. Quantization and the other
-sparse methods remain unsupported.
 
 ## Sparse Method Support
 
@@ -68,8 +60,7 @@ by the mixed-attention runtime.
 ⁴ H2O tensor-parallel execution may produce different sparse selections from
 TP=1. Model-specific TP, EP, and DP restrictions still apply.
 
-⁵ GLM support requires `DP=1` and one of the `(TP, EP)` combinations listed
-above. QuEST support is experimental.
+⁵ GLM requires `DP=1`. QuEST support is experimental.
 
 ⁶ Gemma 4 checkpoints with shared KV layers reject per-layer StreamingLLM
 eviction. Vanilla and OmniKV remain supported.
