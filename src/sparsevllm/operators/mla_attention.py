@@ -152,8 +152,7 @@ MLA_ATTENTION_REGISTRY: OpRegistry[
         repo_nonstandard=("triton_mla",),
     ),
     profile_order=(
-        "tilelang_output_h100_quest_bs4_profile",
-        "tilelang_score_sgl_fa3_h100_profile",
+        "tilelang_score_h100_profile",
     ),
 )
 
@@ -787,7 +786,7 @@ class MlaSglFa3Provider(MlaTritonProvider):
 class MlaTileLangOutputProvider(MlaSglFa3Provider):
     """TileLang decode output with FA3 retained for explicit prefill."""
 
-    name = "tilelang_output_h100_quest_bs4"
+    name = "tilelang_output"
 
     def __init__(
         self,
@@ -819,10 +818,6 @@ class MlaTileLangOutputProvider(MlaSglFa3Provider):
         base = MlaSglFa3Provider.supports(spec, caps)
         if not base.supported:
             return base
-        if spec.context_capacity is None or spec.batch_capacity is None:
-            return SupportResult.unsupported(
-                "requires static decode context and batch capacities"
-            )
         supported, reason = tilelang_mla_support()
         return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
 
@@ -833,8 +828,7 @@ class MlaTileLangOutputProvider(MlaSglFa3Provider):
             "decode_kernel_path": "tilelang_mla_decode",
             "prefill_kernel_path": "sgl_kernel.fa3.fwd",
             "tilelang_num_split": 32,
-            "profile_context_capacity": self.spec.context_capacity,
-            "profile_batch_capacity": self.spec.batch_capacity,
+            "launch_config_source": "static_provider_config",
         }
 
     def runtime_kernel_stats(self) -> dict[str, object]:
@@ -887,56 +881,6 @@ class MlaTileLangOutputProvider(MlaSglFa3Provider):
         )
 
 
-@MLA_ATTENTION_REGISTRY.register_profile
-class MlaTileLangOutputQuestBs4Profile:
-    name = "tilelang_output_h100_quest_bs4_profile"
-
-    @classmethod
-    def atomic_provider_names(cls, spec: MlaAttentionOpSpec) -> tuple[str, ...]:
-        del spec
-        return ("tilelang_output_h100_quest_bs4",)
-
-    @classmethod
-    def matches(
-        cls,
-        spec: MlaAttentionOpSpec,
-        caps: DeviceCaps,
-    ) -> ProfileMatch:
-        expected = (
-            _PROFILED_H100_FAMILY,
-            2,
-            AttentionScoreKind.NONE,
-            True,
-            2048,
-            4,
-        )
-        actual = (
-            caps.accelerator_family,
-            spec.tp_size,
-            spec.score_output,
-            spec.cuda_graph,
-            spec.context_capacity,
-            spec.batch_capacity,
-        )
-        if actual != expected:
-            return ProfileMatch.no(
-                "requires exact H100 TP2 score-free graph profile "
-                "with context_capacity=2048 and batch_capacity=4, got "
-                f"device={caps.device_name} tp={spec.tp_size} "
-                f"score={spec.score_output.name} "
-                f"cuda_graph={spec.cuda_graph} "
-                f"context={spec.context_capacity} batch={spec.batch_capacity}"
-            )
-        return ProfileMatch.yes(
-            "matched H100 TP2 QuEST BS4 2048-token TileLang profile"
-        )
-
-    @classmethod
-    def bind(cls, spec: MlaAttentionOpSpec, caps: DeviceCaps, **kwargs):
-        del spec, caps
-        return MlaTileLangOutputProvider(**kwargs)
-
-
 @MLA_ATTENTION_REGISTRY.register_atomic(
     ProviderRole.REPO_NONSTANDARD,
     profile_only=True,
@@ -944,7 +888,7 @@ class MlaTileLangOutputQuestBs4Profile:
 class MlaTileLangScoreProvider(MlaSglFa3Provider):
     """Score-aware Composite over FA3 and statically planned TileLang."""
 
-    name = "tilelang_score_sgl_fa3_h100"
+    name = "tilelang_score"
     supports_decode_graph = True
 
     def __init__(
@@ -1132,12 +1076,12 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
 
 @MLA_ATTENTION_REGISTRY.register_profile
 class MlaTileLangScoreProfile:
-    name = "tilelang_score_sgl_fa3_h100_profile"
+    name = "tilelang_score_h100_profile"
 
     @classmethod
     def atomic_provider_names(cls, spec: MlaAttentionOpSpec) -> tuple[str, ...]:
         del spec
-        return ("tilelang_score_sgl_fa3_h100",)
+        return ("tilelang_score",)
 
     @classmethod
     def matches(

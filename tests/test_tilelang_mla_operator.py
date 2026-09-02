@@ -253,12 +253,12 @@ def test_missing_tilelang_binds_score_capable_triton_provider() -> None:
         "does not satisfy the prepared score-output contract",
     ) in resolved.rejected
     assert (
-        "tilelang_score_sgl_fa3_h100",
+        "tilelang_score",
         "tilelang missing",
     ) in resolved.rejected
 
 
-def test_tilelang_mla_profile_is_exact_but_atomic_support_is_portable() -> None:
+def test_tilelang_mla_profile_uses_hardware_family_not_tp_or_capacity() -> None:
     spec = _spec(tp_size=4)
     workspace = _cpu_workspace()
     with (
@@ -287,6 +287,50 @@ def test_tilelang_mla_profile_is_exact_but_atomic_support_is_portable() -> None:
     assert resolved.report.selected_profile is None
     assert resolved.report.profiles[0].matched is False
     assert resolved.report.candidates[2].supported is True
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "context_capacity", "batch_capacity"),
+    [(1, 8192, 1), (2, 65536, 4), (4, 32768, 32)],
+)
+def test_tilelang_output_atomic_eligibility_ignores_benchmark_coordinates(
+    tp_size: int,
+    context_capacity: int,
+    batch_capacity: int,
+) -> None:
+    spec = replace(
+        _spec(tp_size=tp_size),
+        score_output=AttentionScoreKind.NONE,
+        context_capacity=context_capacity,
+        batch_capacity=batch_capacity,
+    )
+    with (
+        patch(
+            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
+            return_value=(True, "sgl test"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.tilelang_mla_support",
+            return_value=(True, "tilelang test"),
+        ),
+        patch(
+            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
+            return_value=_cpu_workspace(),
+        ),
+        patch("sparsevllm.operators.mla_attention.SglFa3DecodeKernel"),
+        patch("sparsevllm.operators.mla_attention.TileMlaDecodeKernel"),
+    ):
+        resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
+            spec,
+            _h100_caps(),
+            force_atomic_provider="tilelang_output",
+            op_spec=spec,
+            device="cpu",
+            max_batch_size=batch_capacity,
+        )
+
+    assert type(resolved.provider) is MlaTileLangOutputProvider
+    assert resolved.report.selection_basis == "benchmark_override"
 
 
 @pytest.mark.parametrize(
@@ -323,7 +367,7 @@ def test_tilelang_mla_h100_family_profile_overrides_default_portfolio(
         )
 
     assert type(resolved.provider) is MlaTileLangScoreProvider
-    assert resolved.report.selected_profile == "tilelang_score_sgl_fa3_h100_profile"
+    assert resolved.report.selected_profile == "tilelang_score_h100_profile"
     assert resolved.report.selection_basis == "profile_override"
 
 
@@ -390,7 +434,7 @@ def test_decode_graph_reduced_score_contract_binds_static_triton_provider() -> N
 
     assert type(resolved.provider) is MlaTritonProvider
     assert (
-        "tilelang_score_sgl_fa3_h100",
+        "tilelang_score",
         "requires the RAW_QK_PER_HEAD decode score contract",
     ) in resolved.rejected
 
