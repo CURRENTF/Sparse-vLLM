@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -15,6 +16,27 @@ class PlatformEnum(Enum):
     NPU = auto()
     CPU = auto()
     UNSPECIFIED = auto()
+
+
+_ACCELERATOR_FAMILY_PATTERN = re.compile(
+    r"(?<![A-Z0-9])(GB\d{3}|B\d{3}|H\d{2,3}|A\d{2,3}|L\d{2,3}S?)(?![A-Z0-9])",
+    re.IGNORECASE,
+)
+
+
+def normalize_accelerator_identity(device_name: str) -> tuple[str, str | None]:
+    """Return a stable product family and an optional physical variant."""
+
+    normalized_name = " ".join(str(device_name).strip().upper().split())
+    match = _ACCELERATOR_FAMILY_PATTERN.search(normalized_name)
+    family = match.group(1).lower() if match is not None else "unknown"
+    if family != "h100":
+        return family, None
+    if "PCIE" in normalized_name:
+        return family, "pcie"
+    if "SXM" in normalized_name or "80GB HBM3" in normalized_name:
+        return family, "sxm"
+    return family, None
 
 
 @dataclass(frozen=True)
@@ -38,6 +60,15 @@ class DeviceCaps:
     supports_bfloat16: bool = False
     supports_native_fp8: bool = False
     multi_processor_count: int | None = None
+    accelerator_family: str | None = None
+    accelerator_variant: str | None = None
+
+    def __post_init__(self) -> None:
+        family, variant = normalize_accelerator_identity(self.device_name)
+        if self.accelerator_family is None:
+            object.__setattr__(self, "accelerator_family", family)
+        if self.accelerator_variant is None and self.accelerator_family == family:
+            object.__setattr__(self, "accelerator_variant", variant)
 
 
 class Platform:

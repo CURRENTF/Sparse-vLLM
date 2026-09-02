@@ -4,6 +4,29 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sparsevllm.platforms.interface import normalize_accelerator_identity
+
+
+@pytest.mark.parametrize(
+    ("device_name", "family", "variant"),
+    [
+        ("NVIDIA H100 80GB HBM3", "h100", "sxm"),
+        ("NVIDIA H100-SXM5-80GB", "h100", "sxm"),
+        ("NVIDIA H100 PCIe", "h100", "pcie"),
+        ("nvidia h100 pcie", "h100", "pcie"),
+        ("NVIDIA H200", "h200", None),
+        ("NVIDIA H20", "h20", None),
+        ("NVIDIA H1000", "unknown", None),
+        ("unprofiled SM90 GPU", "unknown", None),
+    ],
+)
+def test_accelerator_identity_is_normalized(
+    device_name: str,
+    family: str,
+    variant: str | None,
+) -> None:
+    assert normalize_accelerator_identity(device_name) == (family, variant)
+
 
 def test_explicit_cpu_platform_is_lazy_and_available(monkeypatch):
     monkeypatch.setenv("SPARSEVLLM_PLATFORM", "cpu")
@@ -45,6 +68,8 @@ def test_cuda_device_caps_are_the_capability_source(monkeypatch):
 
     assert caps.device_index == 7
     assert caps.device_name == "Test H100"
+    assert caps.accelerator_family == "h100"
+    assert caps.accelerator_variant is None
     assert caps.compute_capability == (9, 0)
     assert caps.multi_processor_count == 120
     assert caps.supports_native_fp8
