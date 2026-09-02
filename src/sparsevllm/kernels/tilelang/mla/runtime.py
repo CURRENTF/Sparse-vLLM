@@ -22,42 +22,13 @@ _HEAD_TILE_SIZE = 16
 _LATENT_DIM = 512
 _ROPE_DIM = 64
 _BLOCK_N = 64
-_CALIBRATED_CONTEXT_BUCKETS = (1024, 4096, 8192, 16384, 32768, 65536)
-_CALIBRATED_BATCH_BUCKETS = (1, 8, 32)
+_CALIBRATED_BATCH_BUCKETS = (1, 4, 16, 32)
 _FUSED_SCORE_SPLITS = {
-    5: {
-        1: (16, 32, 32, 32, 32, 32),
-        8: (16, 16, 16, 16, 16, 32),
-        32: (4, 4, 4, 8, 8, 16),
-    },
-    10: {
-        1: (16, 32, 32, 32, 32, 32),
-        8: (16, 16, 16, 16, 16, 32),
-        32: (4, 4, 4, 8, 4, 4),
-    },
-    20: {
-        1: (16, 32, 32, 32, 32, 32),
-        8: (16, 16, 16, 16, 16, 16),
-        32: (4, 4, 4, 4, 8, 8),
-    },
+    5: {1: 32, 4: 32, 16: 8, 32: 4},
+    10: {1: 32, 4: 32, 16: 8, 32: 4},
+    20: {1: 32, 4: 16, 16: 4, 32: 4},
 }
-_OUTPUT_ONLY_SPLITS = {
-    5: {
-        1: (16, 32, 32, 32, 32, 32),
-        8: (16, 16, 16, 16, 16, 32),
-        32: (4, 4, 4, 8, 4, 4),
-    },
-    10: {
-        1: (16, 32, 32, 32, 32, 32),
-        8: (16, 16, 16, 16, 16, 32),
-        32: (4, 4, 4, 8, 8, 4),
-    },
-    20: {
-        1: (16, 32, 32, 32, 32, 32),
-        8: (16, 16, 16, 16, 16, 16),
-        32: (4, 4, 4, 4, 4, 8),
-    },
-}
+_OUTPUT_ONLY_SPLITS = _FUSED_SCORE_SPLITS
 
 
 def _padded_head_count(valid_heads: int) -> int:
@@ -129,7 +100,6 @@ class TileMlaLaunchPlan:
         for batch_size in range(1, int(max_batch_size) + 1):
             config = select_tile_mla_config(
                 batch_size=batch_size,
-                context_capacity=int(context_capacity),
                 need_score=bool(need_score),
                 local_q_heads=int(local_q_heads),
             )
@@ -184,41 +154,24 @@ class TileMlaLaunchPlan:
 def select_tile_mla_config(
     *,
     batch_size: int,
-    context_capacity: int,
     need_score: bool,
     local_q_heads: int = 10,
 ) -> TileMlaLaunchConfig:
-    """Select an offline-calibrated split; never benchmark in the hot path.
+    """Select an offline-calibrated batch/head split independent of context."""
 
-    The table is the GPU4 H100 sweep over BS 1/8/32 and context
-    1K/4K/8K/16K/32K/64K. Shapes between calibration points use the next
-    larger bucket; larger shapes reuse the largest calibrated bucket.
-    """
-
-    if batch_size <= 0 or context_capacity <= 0:
-        raise ValueError(
-            "TileLang MLA batch/context must be positive, got "
-            f"batch={batch_size} context={context_capacity}."
-        )
+    if batch_size <= 0:
+        raise ValueError(f"TileLang MLA batch must be positive, got {batch_size}.")
     batch_bucket = next(
         (bucket for bucket in _CALIBRATED_BATCH_BUCKETS if batch_size <= bucket),
         _CALIBRATED_BATCH_BUCKETS[-1],
     )
-    context_index = next(
-        (
-            index
-            for index, bucket in enumerate(_CALIBRATED_CONTEXT_BUCKETS)
-            if context_capacity <= bucket
-        ),
-        len(_CALIBRATED_CONTEXT_BUCKETS) - 1,
-    )
     _padded_head_count(local_q_heads)
     table = _FUSED_SCORE_SPLITS if need_score else _OUTPUT_ONLY_SPLITS
-    split = table[local_q_heads][batch_bucket][context_index]
+    split = table[local_q_heads][batch_bucket]
     block_h = 32 if local_q_heads == 20 and batch_bucket > 1 else 16
     score_mode = "direct"
     if need_score and local_q_heads == 20 and block_h == 16:
-        score_mode = "atomic" if context_capacity <= 4096 else "partial"
+        score_mode = "partial"
     return TileMlaLaunchConfig(
         num_split=split,
         block_h=block_h,
@@ -347,7 +300,6 @@ class TileMlaDecodeKernel:
             return self.fixed_config
         return select_tile_mla_config(
             batch_size=batch_size,
-            context_capacity=context_capacity,
             need_score=need_score,
             local_q_heads=self.valid_heads,
         )

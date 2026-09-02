@@ -478,6 +478,25 @@ def test_decode_graph_score_contract_binds_static_tilelang_plan() -> None:
     assert resolved.provider.tilelang_launch_plan.context_capacity == 65536
 
 
+def test_tilelang_launch_configs_are_independent_of_context_capacity() -> None:
+    short = TileMlaLaunchPlan.build(
+        context_capacity=1024,
+        local_q_heads=10,
+        max_batch_size=32,
+        need_score=True,
+        score_mode="per_head",
+    )
+    long = TileMlaLaunchPlan.build(
+        context_capacity=65536,
+        local_q_heads=10,
+        max_batch_size=32,
+        need_score=True,
+        score_mode="per_head",
+    )
+
+    assert short.configs == long.configs
+
+
 def test_decode_graph_reduced_score_contract_binds_static_triton_provider() -> None:
     spec = replace(
         _spec(),
