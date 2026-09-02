@@ -579,6 +579,7 @@ def test_gemma4_shared_kv_rejects_per_layer_streaming_eviction():
             num_kv_shared_layers=18,
         ),
         sparse_method="streamingllm",
+        prefill_sparse_method="",
     )
     with pytest.raises(NotImplementedError, match="KV-sharing"):
         normalize_sparse_methods(config)

@@ -17,7 +17,6 @@ from sparsevllm.engine.cache_manager.skipkv import (
     SkipKVSequenceState,
 )
 from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
-from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphRunner
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.sparse_controller import SparseController
 
@@ -33,35 +32,22 @@ def _sequences(lengths: list[int]) -> list[Sequence]:
     return seqs
 
 
-def test_snapkv_graph_runner_uses_physical_budget_not_logical_context():
+def test_snapkv_graph_uses_static_semantic_path_capacities():
     manager = object.__new__(SnapKVCacheManager)
-    manager.config = SparseMethodConfig(
-        sparse_method="snapkv",
-        sink_keep_tokens=64,
-        decode_keep_tokens=8064,
-        recent_keep_tokens=64,
+    manager.config = SimpleNamespace(
+        **vars(
+            SparseMethodConfig(
+                sparse_method="snapkv",
+                sink_keep_tokens=64,
+                decode_keep_tokens=8064,
+                recent_keep_tokens=64,
+            )
+        ),
+        max_model_len=131072,
     )
-    seqs = [
-        SimpleNamespace(
-            num_prompt_tokens=65536,
-            num_tokens=65536,
-            max_tokens=4096,
-        ),
-        SimpleNamespace(
-            num_prompt_tokens=32768,
-            num_tokens=32768,
-            max_tokens=1024,
-        ),
-    ]
-    runner = object.__new__(DecodeCudaGraphRunner)
-    runner.cache_manager = manager
-    runner.context_sizes = [32768, 65536, 131072]
-    runner.max_context_len_override = None
 
-    capacity, allow_larger = runner._graph_context_capacity_policy(seqs)
-
-    assert capacity == 12288
-    assert allow_larger is True
+    assert manager.decode_graph_path_capacity(False) == 8192
+    assert manager.decode_graph_path_capacity(True) == 131072
 
 
 def _page_table_manager(

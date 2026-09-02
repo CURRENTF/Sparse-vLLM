@@ -57,5 +57,11 @@ def test_gemma4_provider_requires_supported_cuda_profile():
     )
     with pytest.raises(RuntimeError, match="requires attention head dimensions"):
         OpResolver(GEMMA4_REGISTRY).resolve(
-            Gemma4OpSpec(torch.bfloat16, (128,), cuda_graph=True), caps
+            Gemma4OpSpec(
+                torch.bfloat16,
+                (128,),
+                cuda_graph=True,
+                context_capacity=4096,
+            ),
+            caps,
         )
