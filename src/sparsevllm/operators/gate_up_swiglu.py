@@ -184,9 +184,10 @@ class H20GateUpSwiGLUDispatchPlan(GateUpSwiGLUProvider):
         spec: GateUpSwiGLUOpSpec,
         caps: DeviceCaps,
     ) -> ProfileMatch:
-        if caps.device_name != "NVIDIA H20":
+        if caps.accelerator_family != "h20":
             return ProfileMatch.no(
-                f"requires profiled NVIDIA H20 hardware, got {caps.device_name}"
+                "requires profiled H20-family hardware, "
+                f"got {caps.device_name} ({caps.accelerator_family})"
             )
         if (spec.hidden_size, spec.intermediate_size, spec.tp_size) not in {
             (2048, 512, 1),

@@ -411,9 +411,10 @@ class H20Gemma4Profile:
     @classmethod
     def matches(cls, spec: Gemma4OpSpec, caps: DeviceCaps) -> ProfileMatch:
         del spec
-        if caps.device_name != "NVIDIA H20":
+        if caps.accelerator_family != "h20":
             return ProfileMatch.no(
-                f"requires profiled NVIDIA H20 hardware, got {caps.device_name}"
+                "requires profiled H20-family hardware, "
+                f"got {caps.device_name} ({caps.accelerator_family})"
             )
         return ProfileMatch.yes("matched H20 Gemma 4 composite profile")
 

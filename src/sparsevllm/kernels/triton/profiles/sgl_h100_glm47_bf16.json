@@ -5,7 +5,7 @@
   "provider": "sgl_triton_glm_bf16",
   "kernel": "sgl_fused_moe_triton_v1",
   "contract": {
-    "device_name": "H100",
+    "accelerator_family": "h100",
     "compute_capability": [9, 0],
     "activation_dtype": "bfloat16",
     "weight_dtype": "bfloat16",

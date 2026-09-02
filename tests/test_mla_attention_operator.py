@@ -240,7 +240,13 @@ def test_sm120_tp2_uses_portable_mla_launch_config() -> None:
     select.assert_not_called()
 
 
-def test_exact_h100_tp2_uses_profiled_mla_launch_config() -> None:
+@pytest.mark.parametrize(
+    "device_name",
+    ["NVIDIA H100 80GB HBM3", "NVIDIA H100 PCIe"],
+)
+def test_h100_family_tp2_uses_profiled_mla_launch_config(
+    device_name: str,
+) -> None:
     spec = _spec(tp_size=2)
     workspace = _cpu_workspace(batch_size=8, head_count=10)
     with patch(
@@ -249,7 +255,7 @@ def test_exact_h100_tp2_uses_profiled_mla_launch_config() -> None:
     ):
         provider = MlaTritonProvider.bind(
             spec,
-            _h100_caps(),
+            _h100_caps(device_name=device_name),
             op_spec=spec,
             device="cpu",
             max_batch_size=8,

@@ -231,7 +231,7 @@ def _load_sm120_fp8_linear_profile() -> tuple[
     if not isinstance(payload, dict) or payload.get("schema_version") != 1:
         raise RuntimeError("Unsupported SM120 FP8 Linear profile schema.")
     expected_device = {
-        "name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        "accelerator_family": "rtx_pro_6000",
         "compute_capability": [12, 0],
     }
     expected_contract = {
@@ -296,12 +296,13 @@ def _sm120_fp8_linear_profile_support(
     payload, routes = _load_sm120_fp8_linear_profile()
     device = payload["device"]
     if (
-        caps.device_name != device["name"]
+        caps.accelerator_family != device["accelerator_family"]
         or list(caps.compute_capability or ()) != device["compute_capability"]
     ):
         return ProfileMatch.no(
             "requires profiled NVIDIA RTX PRO 6000 SM120 hardware, got "
-            f"{caps.device_name} {caps.compute_capability}"
+            f"{caps.device_name} ({caps.accelerator_family}) "
+            f"{caps.compute_capability}"
         )
     contract = payload["contract"]
     actual_contract = {

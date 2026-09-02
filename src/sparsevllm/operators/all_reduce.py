@@ -138,13 +138,13 @@ class _FlashInferTrtllmProfile:
 
 
 _FLASHINFER_TRTLLM_PROFILES = {
-    ("NVIDIA H100 80GB HBM3", 2, 2048): _FlashInferTrtllmProfile(
+    ("h100", 2, 2048): _FlashInferTrtllmProfile(
         max_rows=256,
         launch_with_pdl=True,
         completion_row_threshold=16,
         provider_output_buffer=False,
     ),
-    ("NVIDIA H100 80GB HBM3", 4, 3072): _FlashInferTrtllmProfile(max_rows=32),
+    ("h100", 4, 3072): _FlashInferTrtllmProfile(max_rows=32),
 }
 
 
@@ -234,7 +234,7 @@ class FlashInferTrtllmAllReduceProvider(AllReduceProvider):
             )
         caps = platforms.current_platform.get_device_caps(current_device)
         profile = _FLASHINFER_TRTLLM_PROFILES[
-            (caps.device_name, spec.world_size, spec.hidden_size)
+            (caps.accelerator_family, spec.world_size, spec.hidden_size)
         ]
         workspace = create_allreduce_fusion_workspace(
             backend="trtllm",
@@ -589,7 +589,7 @@ class FlashInferTrtllmAllReduceProfile(_FlashInferAllReduceProfile):
     @classmethod
     def matches(cls, spec: AllReduceOpSpec, caps: DeviceCaps) -> ProfileMatch:
         profile = _FLASHINFER_TRTLLM_PROFILES.get(
-            (caps.device_name, spec.world_size, spec.hidden_size)
+            (caps.accelerator_family, spec.world_size, spec.hidden_size)
         )
         if profile is None or spec.dtype != torch.bfloat16:
             return ProfileMatch.no(
@@ -612,10 +612,10 @@ class FlashInferVllmAllReduceProfile(_FlashInferAllReduceProfile):
 
     @classmethod
     def matches(cls, spec: AllReduceOpSpec, caps: DeviceCaps) -> ProfileMatch:
-        if caps.device_name != "NVIDIA H100 80GB HBM3":
+        if caps.accelerator_family != "h100":
             return ProfileMatch.no(
-                "requires profiled NVIDIA H100 80GB HBM3 hardware, "
-                f"got {caps.device_name}"
+                "requires profiled H100-family hardware, "
+                f"got {caps.device_name} ({caps.accelerator_family})"
             )
         if (
             spec.world_size != 2

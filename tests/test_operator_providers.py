@@ -159,7 +159,13 @@ def _non_cuda_caps(platform: PlatformEnum) -> DeviceCaps:
     )
 
 
-def test_quest_fused_paged_view_is_the_default_h100_profile() -> None:
+@pytest.mark.parametrize(
+    "device_name",
+    ["NVIDIA H100 80GB HBM3", "NVIDIA H100 PCIe"],
+)
+def test_quest_fused_paged_view_is_the_default_h100_profile(
+    device_name: str,
+) -> None:
     spec = QuestPageSelectionOpSpec(
         score_dtype=torch.bfloat16,
         cuda_graph=True,
@@ -171,33 +177,12 @@ def test_quest_fused_paged_view_is_the_default_h100_profile() -> None:
     ):
         resolved = OpResolver(QUEST_PAGE_SELECTION_REGISTRY).resolve(
             spec,
-            _cuda_caps((9, 0), device_name="NVIDIA H100 80GB HBM3"),
+            _cuda_caps((9, 0), device_name=device_name),
             op_spec=spec,
         )
 
     assert isinstance(resolved.provider, H100ExactQuestPagedViewDispatch)
     assert resolved.report.selection_basis == "profile_override"
-
-
-def test_quest_fused_profile_miss_preserves_flashinfer_default() -> None:
-    spec = QuestPageSelectionOpSpec(
-        score_dtype=torch.bfloat16,
-        cuda_graph=True,
-    )
-    with patch(
-        "sparsevllm.operators.quest_selection."
-        "flashinfer_top_k_page_table_transform_support",
-        return_value=(True, "available"),
-    ):
-        resolved = OpResolver(QUEST_PAGE_SELECTION_REGISTRY).resolve(
-            spec,
-            _cuda_caps((9, 0), device_name="NVIDIA H100 PCIe"),
-            op_spec=spec,
-        )
-
-    assert isinstance(resolved.provider, FlashInferQuestPageSelectionProvider)
-    assert resolved.report.selection_basis == "upstream_default"
-
 
 def test_quest_triton_exact_atomic_capability_is_portable_cuda() -> None:
     spec = QuestPageSelectionOpSpec(

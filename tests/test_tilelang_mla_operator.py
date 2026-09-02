@@ -289,7 +289,13 @@ def test_tilelang_mla_profile_is_exact_but_atomic_support_is_portable() -> None:
     assert resolved.report.candidates[2].supported is True
 
 
-def test_tilelang_mla_exact_h100_profile_overrides_default_portfolio() -> None:
+@pytest.mark.parametrize(
+    "device_name",
+    ["NVIDIA H100 80GB HBM3", "NVIDIA H100 PCIe"],
+)
+def test_tilelang_mla_h100_family_profile_overrides_default_portfolio(
+    device_name: str,
+) -> None:
     spec = _spec()
     workspace = _cpu_workspace()
     with (
@@ -310,7 +316,7 @@ def test_tilelang_mla_exact_h100_profile_overrides_default_portfolio() -> None:
     ):
         resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
             spec,
-            _h100_caps(),
+            _h100_caps(device_name=device_name),
             op_spec=spec,
             device="cpu",
             max_batch_size=2,

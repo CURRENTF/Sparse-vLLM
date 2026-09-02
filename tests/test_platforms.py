@@ -16,6 +16,11 @@ from sparsevllm.platforms.interface import normalize_accelerator_identity
         ("nvidia h100 pcie", "h100", "pcie"),
         ("NVIDIA H200", "h200", None),
         ("NVIDIA H20", "h20", None),
+        (
+            "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+            "rtx_pro_6000",
+            None,
+        ),
         ("NVIDIA H1000", "unknown", None),
         ("unprofiled SM90 GPU", "unknown", None),
     ],

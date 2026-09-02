@@ -5,6 +5,8 @@ from functools import lru_cache
 
 import torch
 
+from sparsevllm.platforms.interface import normalize_accelerator_identity
+
 
 @dataclass(frozen=True)
 class MoeGemmConfig:
@@ -55,10 +57,7 @@ def device_info(
 
 
 def _hardware_family(device_name: str) -> str:
-    name = device_name.upper()
-    if "H20" in name:
-        return "H20"
-    return name
+    return normalize_accelerator_identity(device_name)[0]
 
 
 def token_bucket(num_tokens: int) -> int:
@@ -114,7 +113,7 @@ def _glm_h100_tp2_config(
 
     profiled_shapes = {
         MoeGemmShape(
-            "NVIDIA H100 80GB HBM3",
+            "h100",
             (9, 0),
             torch.bfloat16,
             4,
@@ -123,7 +122,7 @@ def _glm_h100_tp2_config(
             768,
         ),
         MoeGemmShape(
-            "NVIDIA H100 80GB HBM3",
+            "h100",
             (9, 0),
             torch.bfloat16,
             5,
@@ -155,7 +154,7 @@ def _glm_h100_tp2_ep2_config(
     """Return measured BF16 configs for the GLM outer-TP2/EP2 shape."""
 
     profiled_shape = MoeGemmShape(
-        "NVIDIA H100 80GB HBM3",
+        "h100",
         (9, 0),
         torch.bfloat16,
         4,
@@ -187,51 +186,51 @@ def _stage_table(
 # BF16 profiles are keyed by kernel-relevant hardware and GEMM shape rather
 # than by model name.
 _TUNED_CONFIGS = {
-    MoeGemmShape("H20", (9, 0), torch.bfloat16, 8, 256, 2048, 512): {
+    MoeGemmShape("h20", (9, 0), torch.bfloat16, 8, 256, 2048, 512): {
         "w13": {1: _G, 2: _G, 4: _A, 8: _C},
         "w2": {1: _G, 2: _A, 4: _K, 8: _I},
     },
-    MoeGemmShape("H20", (9, 0), torch.bfloat16, 8, 256, 2048, 256): {
+    MoeGemmShape("h20", (9, 0), torch.bfloat16, 8, 256, 2048, 256): {
         "w13": {1: _G, 2: _G, 4: _G, 8: _A},
         "w2": {1: _H, 2: _J, 4: _K, 8: _K},
     },
-    MoeGemmShape("H20", (9, 0), torch.bfloat16, 8, 128, 2048, 512): {
+    MoeGemmShape("h20", (9, 0), torch.bfloat16, 8, 128, 2048, 512): {
         "w13": {1: _G, 2: _I, 4: _I, 8: _C},
         "w2": {1: _I, 2: _H, 4: _A, 8: _I},
     },
-    MoeGemmShape("H20", (9, 0), torch.bfloat16, 8, 128, 2048, 768): _stage_table(
+    MoeGemmShape("h20", (9, 0), torch.bfloat16, 8, 128, 2048, 768): _stage_table(
         (_D, _D, _D, _A, _A, _A, _B, _B, _B, _F, _F, _F),
         (_D, _D, _D, _B, _B, _B, _B, _B, _B, _F, _F, _F),
     ),
-    MoeGemmShape("H20", (9, 0), torch.bfloat16, 8, 64, 2048, 768): _stage_table(
+    MoeGemmShape("h20", (9, 0), torch.bfloat16, 8, 64, 2048, 768): _stage_table(
         (_D, _D, _D, _C, _B, _A, _A, _B, _B, _F, _F, _F),
         (_D, _D, _D, _B, _A, _B, _A, _A, _B, _F, _F, _F),
     ),
-    MoeGemmShape("H20", (9, 0), torch.bfloat16, 8, 32, 2048, 768): _stage_table(
+    MoeGemmShape("h20", (9, 0), torch.bfloat16, 8, 32, 2048, 768): _stage_table(
         (_D, _D, _D, _A, _C, _A, _B, _B, _B, _F, _F, _F),
         (_D, _D, _D, _A, _A, _B, _C, _C, _B, _F, _F, _F),
     ),
-    MoeGemmShape("NVIDIA H100 80GB HBM3", (9, 0), torch.bfloat16, 8, 128, 2048, 768): _stage_table(
+    MoeGemmShape("h100", (9, 0), torch.bfloat16, 8, 128, 2048, 768): _stage_table(
         (_D, _A, _A, _A, _A, _A, _A, _A, _F, _F, _F, _F),
         (_D, _A, _A, _A, _A, _A, _A, _A, _A, _A, _C, _C),
     ),
-    MoeGemmShape("NVIDIA H100 80GB HBM3", (9, 0), torch.bfloat16, 8, 64, 2048, 768): _stage_table(
+    MoeGemmShape("h100", (9, 0), torch.bfloat16, 8, 64, 2048, 768): _stage_table(
         (_A, _A, _A, _A, _A, _F, _F, _F, _F, _F, _F, _F),
         (_A, _A, _A, _A, _A, _A, _A, _A, _A, _A, _B, _B),
     ),
-    MoeGemmShape("NVIDIA H100 80GB HBM3", (9, 0), torch.bfloat16, 8, 32, 2048, 768): _stage_table(
+    MoeGemmShape("h100", (9, 0), torch.bfloat16, 8, 32, 2048, 768): _stage_table(
         (_A, _D, _D, _A, _A, _A, _A, _A, _A, _A, _F, _F),
         (_A, _D, _D, _A, _A, _A, _A, _A, _A, _A, _A, _B),
     ),
-    MoeGemmShape("NVIDIA H100 80GB HBM3", (9, 0), torch.bfloat16, 8, 256, 2048, 512): {
+    MoeGemmShape("h100", (9, 0), torch.bfloat16, 8, 256, 2048, 512): {
         "w13": {1: _G, 2: _I, 4: _A, 8: _A},
         "w2": {1: _G, 2: _G, 4: _A, 8: _H},
     },
-    MoeGemmShape("NVIDIA H100 80GB HBM3", (9, 0), torch.bfloat16, 8, 256, 2048, 256): {
+    MoeGemmShape("h100", (9, 0), torch.bfloat16, 8, 256, 2048, 256): {
         "w13": {1: _G, 2: _G, 4: _G, 8: _H},
         "w2": {1: _G, 2: _I, 4: _J, 8: _H},
     },
-    MoeGemmShape("NVIDIA H100 80GB HBM3", (9, 0), torch.bfloat16, 8, 128, 2048, 512): {
+    MoeGemmShape("h100", (9, 0), torch.bfloat16, 8, 128, 2048, 512): {
         "w13": {1: _G, 2: _G, 4: _G, 8: _A},
         "w2": {1: _G, 2: _G, 4: _H, 8: _H},
     },
@@ -242,7 +241,7 @@ _TUNED_CONFIGS = {
 # tile can create register pressure.
 _TUNED_GATE_UP_SWIGLU_CONFIGS = {
     MoeGemmShape(
-        "H20",
+        "h20",
         (9, 0),
         torch.bfloat16,
         8,
@@ -251,7 +250,7 @@ _TUNED_GATE_UP_SWIGLU_CONFIGS = {
         512,
     ): {1: _G, 2: _G, 4: _H, 8: _G},
     MoeGemmShape(
-        "H20",
+        "h20",
         (9, 0),
         torch.bfloat16,
         8,
@@ -260,7 +259,7 @@ _TUNED_GATE_UP_SWIGLU_CONFIGS = {
         256,
     ): {1: _G, 2: _G, 4: _G, 8: _H},
     MoeGemmShape(
-        "H20",
+        "h20",
         (9, 0),
         torch.bfloat16,
         8,
@@ -269,7 +268,7 @@ _TUNED_GATE_UP_SWIGLU_CONFIGS = {
         512,
     ): {1: _G, 2: _G, 4: _G, 8: _H},
     MoeGemmShape(
-        "NVIDIA H100 80GB HBM3",
+        "h100",
         (9, 0),
         torch.bfloat16,
         8,
@@ -278,7 +277,7 @@ _TUNED_GATE_UP_SWIGLU_CONFIGS = {
         512,
     ): {1: _G, 2: _G, 4: _H, 8: _H},
     MoeGemmShape(
-        "NVIDIA H100 80GB HBM3",
+        "h100",
         (9, 0),
         torch.bfloat16,
         8,
@@ -287,7 +286,7 @@ _TUNED_GATE_UP_SWIGLU_CONFIGS = {
         256,
     ): {1: _G, 2: _G, 4: _G, 8: _H},
     MoeGemmShape(
-        "NVIDIA H100 80GB HBM3",
+        "h100",
         (9, 0),
         torch.bfloat16,
         8,
@@ -296,7 +295,7 @@ _TUNED_GATE_UP_SWIGLU_CONFIGS = {
         512,
     ): {1: _G, 2: _G, 4: _G, 8: _H},
     MoeGemmShape(
-        "NVIDIA H100 80GB HBM3",
+        "h100",
         (9, 0),
         torch.bfloat16,
         8,
@@ -325,7 +324,7 @@ _FP8_N128_SWAP_S4 = MoeGemmConfig(16, 128, 128, 1, 4, 4, True)
 # the explicit generic configuration.
 _TUNED_FP8_ROUTED_CONFIGS = {
     MoeGemmShape(
-        "H20",
+        "h20",
         (9, 0),
         torch.float8_e4m3fn,
         8,
@@ -347,7 +346,7 @@ _TUNED_FP8_ROUTED_CONFIGS = {
         },
     },
     MoeGemmShape(
-        "H20",
+        "h20",
         (9, 0),
         torch.float8_e4m3fn,
         8,
@@ -364,7 +363,7 @@ _TUNED_FP8_ROUTED_CONFIGS = {
         },
     },
     MoeGemmShape(
-        "H20",
+        "h20",
         (9, 0),
         torch.float8_e4m3fn,
         8,
@@ -381,7 +380,7 @@ _TUNED_FP8_ROUTED_CONFIGS = {
         },
     },
     MoeGemmShape(
-        "NVIDIA H100 80GB HBM3",
+        "h100",
         (9, 0),
         torch.float8_e4m3fn,
         8,
@@ -403,7 +402,7 @@ _TUNED_FP8_ROUTED_CONFIGS = {
         },
     },
     MoeGemmShape(
-        "NVIDIA H100 80GB HBM3",
+        "h100",
         (9, 0),
         torch.float8_e4m3fn,
         8,
@@ -425,7 +424,7 @@ _TUNED_FP8_ROUTED_CONFIGS = {
         },
     },
     MoeGemmShape(
-        "NVIDIA H100 80GB HBM3",
+        "h100",
         (9, 0),
         torch.float8_e4m3fn,
         8,

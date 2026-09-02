@@ -5,7 +5,7 @@
   "operator": "block-scaled FP8 Linear",
   "scope": "semantic_contract_and_shape",
   "device": {
-    "name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "accelerator_family": "rtx_pro_6000",
     "compute_capability": [12, 0]
   },
   "contract": {

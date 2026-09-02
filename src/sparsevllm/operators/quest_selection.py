@@ -316,10 +316,8 @@ class H100ExactQuestPagedViewDispatch(QuestPageSelectionProvider):
         spec: QuestPageSelectionOpSpec,
         caps: DeviceCaps,
     ) -> ProfileMatch:
-        if caps.device_name != "NVIDIA H100 80GB HBM3":
-            return ProfileMatch.no(
-                "requires profiled NVIDIA H100 80GB HBM3 hardware"
-            )
+        if caps.accelerator_family != "h100":
+            return ProfileMatch.no("requires profiled H100-family hardware")
         if spec.score_dtype != torch.bfloat16:
             return ProfileMatch.no(f"requires BF16 scores, got {spec.score_dtype}")
         return ProfileMatch.yes("matched H100 exact QuEST paged-view profile")

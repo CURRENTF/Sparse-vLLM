@@ -22,12 +22,19 @@ _ACCELERATOR_FAMILY_PATTERN = re.compile(
     r"(?<![A-Z0-9])(GB\d{3}|B\d{3}|H\d{2,3}|A\d{2,3}|L\d{2,3}S?)(?![A-Z0-9])",
     re.IGNORECASE,
 )
+_RTX_PRO_FAMILY_PATTERN = re.compile(
+    r"(?<![A-Z0-9])RTX\s+PRO\s+(\d{4})(?![A-Z0-9])",
+    re.IGNORECASE,
+)
 
 
 def normalize_accelerator_identity(device_name: str) -> tuple[str, str | None]:
     """Return a stable product family and an optional physical variant."""
 
     normalized_name = " ".join(str(device_name).strip().upper().split())
+    rtx_pro_match = _RTX_PRO_FAMILY_PATTERN.search(normalized_name)
+    if rtx_pro_match is not None:
+        return f"rtx_pro_{rtx_pro_match.group(1)}", None
     match = _ACCELERATOR_FAMILY_PATTERN.search(normalized_name)
     family = match.group(1).lower() if match is not None else "unknown"
     if family != "h100":

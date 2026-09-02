@@ -52,7 +52,7 @@ _GLM_MLA_KV_LORA_RANK = 512
 _GLM_MLA_ROPE_DIM = 64
 _GLM_MLA_QK_HEAD_DIM = 256
 _GLM_MLA_VALUE_HEAD_DIM = 256
-_PROFILED_H100_NAME = "NVIDIA H100 80GB HBM3"
+_PROFILED_H100_FAMILY = "h100"
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,7 +235,7 @@ class MlaTritonProvider(MlaAttentionProvider):
         return cls(
             use_h100_tp2_launch_profile=(
                 caps.compute_capability == (9, 0)
-                and caps.device_name == _PROFILED_H100_NAME
+                and caps.accelerator_family == _PROFILED_H100_FAMILY
                 and spec.tp_size == 2
             ),
             **kwargs,
@@ -904,7 +904,7 @@ class MlaTileLangOutputQuestBs4Profile:
         caps: DeviceCaps,
     ) -> ProfileMatch:
         expected = (
-            _PROFILED_H100_NAME,
+            _PROFILED_H100_FAMILY,
             2,
             AttentionScoreKind.NONE,
             True,
@@ -912,7 +912,7 @@ class MlaTileLangOutputQuestBs4Profile:
             4,
         )
         actual = (
-            caps.device_name,
+            caps.accelerator_family,
             spec.tp_size,
             spec.score_output,
             spec.batch_only_cuda_graph,
@@ -1147,10 +1147,10 @@ class MlaTileLangScoreProfile:
         caps: DeviceCaps,
     ) -> ProfileMatch:
         del spec
-        if caps.device_name != _PROFILED_H100_NAME:
+        if caps.accelerator_family != _PROFILED_H100_FAMILY:
             return ProfileMatch.no(
-                "requires profiled NVIDIA H100 80GB HBM3 hardware, "
-                f"got {caps.device_name}"
+                "requires profiled H100-family hardware, "
+                f"got {caps.device_name} ({caps.accelerator_family})"
             )
         return ProfileMatch.yes("matched H100 TileLang MLA score profile")
 

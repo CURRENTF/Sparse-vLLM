@@ -27,6 +27,21 @@ Local benchmark coverage is not an atomic support status. In particular, an
 upstream implementation must not reject a shape merely because Sparse-vLLM did
 not benchmark that shape locally.
 
+## Hardware Identity
+
+`DeviceCaps.device_name` is raw discovery metadata for diagnostics and
+reproducibility, not a stable provider-selection key. The platform layer
+normalizes product names into `accelerator_family` (for example, `h100` or
+`h20`) and an optional physical variant. Providers and profiles consume those
+normalized facts instead of comparing full CUDA device-name strings or
+implementing their own substring rules.
+
+Atomic support should still prefer compute capability and hardware features
+actually required by the kernel. Use a product family only when the
+implementation or a performance profile is genuinely family-specific. Variants
+such as H100 SXM and PCIe share the family policy by default; split them only
+when a compatibility difference or matched benchmark evidence requires it.
+
 ## Portability Of Repository-Owned DSL Kernels
 
 `repo_nonstandard` describes ownership of a nonstandard operation contract; it
