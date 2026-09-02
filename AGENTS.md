@@ -142,3 +142,7 @@ run without a GPU.
    - Write the description in English, using the imperative mood (e.g., "add" not "added").
    - Start the description with a lowercase letter.
    - Keep the entire line under 200 characters.
+
+# Docs Rules
+
+Keep official documentation focused on stable user-visible behavior and operational constraints; place internal implementation details, provider/kernel selection rationale, benchmark methodology and results, and transient engineering plans in development documentation unless users need them to use or troubleshoot the feature.
