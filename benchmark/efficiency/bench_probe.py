@@ -1766,27 +1766,6 @@ def parse_args():
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--hyper-params", type=str, default="{}")
     parser.add_argument(
-        "--internal-benchmark-mla-provider",
-        choices=[
-            "sgl_fa3_sm90",
-            "triton_mla",
-            "tilelang_output",
-            "tilelang_score",
-        ],
-        default=None,
-        help="Temporary internal MLA provider override for matched benchmarks.",
-    )
-    parser.add_argument(
-        "--internal-benchmark-mla-triton-config",
-        default=None,
-        help="Temporary JSON MlaDecodeLaunchConfig override.",
-    )
-    parser.add_argument(
-        "--internal-benchmark-mla-tilelang-config",
-        default=None,
-        help="Temporary JSON TileMlaLaunchConfig override.",
-    )
-    parser.add_argument(
         "--allow-single-omnikv-full-layer",
         action="store_true",
         help="Allow an explicit single-full-layer OmniKV ablation.",
@@ -1819,27 +1798,6 @@ def parse_args():
 
 def main():
     args = parse_args()
-    benchmark_overrides = {
-        "SPARSEVLLM_INTERNAL_BENCHMARK_MLA_PROVIDER": (
-            args.internal_benchmark_mla_provider
-        ),
-        "SPARSEVLLM_INTERNAL_BENCHMARK_MLA_TRITON_CONFIG": (
-            args.internal_benchmark_mla_triton_config
-        ),
-        "SPARSEVLLM_INTERNAL_BENCHMARK_MLA_TILELANG_CONFIG": (
-            args.internal_benchmark_mla_tilelang_config
-        ),
-    }
-    if any(value is not None for value in benchmark_overrides.values()):
-        if args.engine != "sparsevllm":
-            raise ValueError("Internal MLA overrides require --engine sparsevllm.")
-        if args.internal_benchmark_mla_provider is None:
-            raise ValueError(
-                "Internal MLA config overrides require a provider override."
-            )
-        for name, value in benchmark_overrides.items():
-            if value is not None:
-                os.environ[name] = value
     for name in ("prompt_lens", "output_lens", "batch_sizes"):
         values = getattr(args, name)
         if not values or any(int(value) <= 0 for value in values):
@@ -1929,9 +1887,6 @@ def main():
                 "VLLM_USE_V1",
                 "PROFILER_SVLLM",
                 "SPARSEVLLM_SYNC_DEVICE",
-                "SPARSEVLLM_INTERNAL_BENCHMARK_MLA_PROVIDER",
-                "SPARSEVLLM_INTERNAL_BENCHMARK_MLA_TRITON_CONFIG",
-                "SPARSEVLLM_INTERNAL_BENCHMARK_MLA_TILELANG_CONFIG",
             )
             if key in os.environ
         },

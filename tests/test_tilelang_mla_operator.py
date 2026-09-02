@@ -26,15 +26,11 @@ from sparsevllm.operators.attention_capabilities import AttentionScoreKind
 from sparsevllm.operators.mla_attention import (
     MLA_ATTENTION_REGISTRY,
     MlaAttentionOpSpec,
-    MlaTileLangOutputProvider,
     MlaTileLangScoreProvider,
     MlaTritonProvider,
-    resolve_mla_attention_provider,
 )
 from sparsevllm.operators.registry import (
-    NoProviderError,
     OpResolver,
-    operator_binding_report,
 )
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
 
@@ -295,118 +291,6 @@ def test_tilelang_mla_profile_uses_hardware_family_not_tp_or_capacity() -> None:
 
 
 @pytest.mark.parametrize(
-    ("tp_size", "context_capacity", "batch_capacity"),
-    [(1, 8192, 1), (2, 65536, 4), (4, 32768, 32)],
-)
-def test_tilelang_output_atomic_eligibility_ignores_benchmark_coordinates(
-    tp_size: int,
-    context_capacity: int,
-    batch_capacity: int,
-) -> None:
-    spec = replace(
-        _spec(tp_size=tp_size),
-        score_output=AttentionScoreKind.NONE,
-        context_capacity=context_capacity,
-        batch_capacity=batch_capacity,
-    )
-    with (
-        patch(
-            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
-            return_value=(True, "sgl test"),
-        ),
-        patch(
-            "sparsevllm.operators.mla_attention.tilelang_mla_support",
-            return_value=(True, "tilelang test"),
-        ),
-        patch(
-            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
-            return_value=_cpu_workspace(),
-        ),
-        patch("sparsevllm.operators.mla_attention.SglFa3DecodeKernel"),
-        patch("sparsevllm.operators.mla_attention.TileMlaDecodeKernel"),
-    ):
-        resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
-            spec,
-            _h100_caps(),
-            force_atomic_provider="tilelang_output",
-            op_spec=spec,
-            device="cpu",
-            max_batch_size=batch_capacity,
-        )
-
-    assert type(resolved.provider) is MlaTileLangOutputProvider
-    assert resolved.report.selection_basis == "benchmark_override"
-
-
-def test_internal_benchmark_override_forces_provider_and_static_config(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    spec = replace(_spec(), score_output=AttentionScoreKind.NONE)
-    monkeypatch.setenv("SPARSEVLLM_INTERNAL_BENCHMARK_MLA_PROVIDER", "triton_mla")
-    monkeypatch.setenv(
-        "SPARSEVLLM_INTERNAL_BENCHMARK_MLA_TRITON_CONFIG",
-        '{"program_count": 64, "blocks_per_program": 2}',
-    )
-    with (
-        patch(
-            "sparsevllm.operators.mla_attention.platforms.current_platform.get_device_caps",
-            return_value=_h100_caps(),
-        ),
-        patch(
-            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
-            return_value=_cpu_workspace(),
-        ),
-        patch(
-            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
-            return_value=(True, "sgl test"),
-        ),
-        patch(
-            "sparsevllm.operators.mla_attention.tilelang_mla_support",
-            return_value=(True, "tilelang test"),
-        ),
-    ):
-        provider = resolve_mla_attention_provider(
-            spec,
-            device="cpu",
-            max_batch_size=2,
-        )
-
-    assert type(provider) is MlaTritonProvider
-    assert provider.launch_config.program_count == 64
-    assert provider.launch_config.blocks_per_program == 2
-    assert operator_binding_report(provider).selection_basis == "benchmark_override"
-
-
-def test_internal_benchmark_override_does_not_bypass_atomic_support(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(
-        "SPARSEVLLM_INTERNAL_BENCHMARK_MLA_PROVIDER",
-        "tilelang_output",
-    )
-    with (
-        patch(
-            "sparsevllm.operators.mla_attention.platforms.current_platform.get_device_caps",
-            return_value=_h100_caps(),
-        ),
-        patch(
-            "sparsevllm.operators.mla_attention.sgl_fa3_device_support",
-            return_value=(True, "sgl test"),
-        ),
-        patch(
-            "sparsevllm.operators.mla_attention.tilelang_mla_support",
-            return_value=(True, "tilelang test"),
-        ),
-    ):
-        with pytest.raises(NoProviderError, match="does not satisfy"):
-            resolve_mla_attention_provider(
-                _spec(),
-                device="cpu",
-                max_batch_size=2,
-            )
-
-
-@pytest.mark.parametrize(
     "device_name",
     ["NVIDIA H100 80GB HBM3", "NVIDIA H100 PCIe"],
 )
@@ -558,82 +442,6 @@ def _provider_with_mocks() -> tuple[MlaTileLangScoreProvider, Mock, Mock]:
             max_batch_size=2,
         )
     return provider, fa3, tilelang
-
-
-def _output_provider_with_mocks() -> tuple[MlaTileLangOutputProvider, Mock, Mock]:
-    fa3 = Mock(return_value=torch.empty(2, 10, 512, dtype=torch.bfloat16))
-    tilelang = Mock(return_value=torch.empty(2, 10, 512, dtype=torch.bfloat16))
-    tilelang.runtime_metadata.return_value = {
-        "compiled_variant_count": 1,
-        "compiled_variants": [],
-    }
-    spec = replace(
-        _spec(),
-        score_output=AttentionScoreKind.NONE,
-        context_capacity=2048,
-        batch_capacity=4,
-    )
-    with (
-        patch(
-            "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
-            return_value=_cpu_workspace(),
-        ),
-        patch(
-            "sparsevllm.operators.mla_attention.SglFa3DecodeKernel",
-            return_value=fa3,
-        ),
-        patch(
-            "sparsevllm.operators.mla_attention.TileMlaDecodeKernel",
-            return_value=tilelang,
-        ),
-    ):
-        provider = MlaTileLangOutputProvider(
-            op_spec=spec,
-            device="cpu",
-            max_batch_size=4,
-        )
-    return provider, fa3, tilelang
-
-
-def test_output_only_provider_routes_decode_to_tilelang() -> None:
-    provider, fa3, tilelang = _output_provider_with_mocks()
-    view = _view(score=None)
-    q_latent = torch.empty(2, 10, 512, dtype=torch.bfloat16)
-    q_rope = torch.empty(2, 10, 64, dtype=torch.bfloat16)
-    output = torch.empty_like(q_latent)
-
-    with patch(
-        "sparsevllm.operators.mla_attention.validate_mla_decode_metadata"
-    ):
-        provider.run(q_latent, q_rope, view, output)
-
-    fa3.assert_not_called()
-    tilelang.assert_called_once_with(
-        q_latent,
-        q_rope,
-        view.payload.latent_cache,
-        view.payload.rope_cache,
-        view.meta.active_slots,
-        view.meta.req_indices,
-        view.meta.context_lens,
-        output,
-        attn_score=None,
-        max_context_len=64,
-    )
-
-
-def test_output_only_provider_rejects_runtime_score_request() -> None:
-    provider, fa3, tilelang = _output_provider_with_mocks()
-    view = _view(score=torch.empty(2, 64, dtype=torch.float32))
-    q_latent = torch.empty(2, 10, 512, dtype=torch.bfloat16)
-    q_rope = torch.empty(2, 10, 64, dtype=torch.bfloat16)
-    output = torch.empty_like(q_latent)
-
-    with pytest.raises(RuntimeError, match="attention-score request"):
-        provider.run(q_latent, q_rope, view, output)
-
-    fa3.assert_not_called()
-    tilelang.assert_not_called()
 
 
 def test_per_head_score_path_routes_to_tilelang_with_caller_owned_score() -> None:

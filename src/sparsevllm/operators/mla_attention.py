@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import json
-import os
 from dataclasses import dataclass
-from typing import TypeVar
 
 import torch
 
@@ -21,7 +18,6 @@ from sparsevllm.kernels.external.sgl.fa3 import (
 )
 from sparsevllm.kernels.tilelang.mla.runtime import (
     TileMlaDecodeKernel,
-    TileMlaLaunchConfig,
     TileMlaLaunchPlan,
     tilelang_mla_support,
 )
@@ -56,35 +52,6 @@ _GLM_MLA_ROPE_DIM = 64
 _GLM_MLA_QK_HEAD_DIM = 256
 _GLM_MLA_VALUE_HEAD_DIM = 256
 _PROFILED_H100_FAMILY = "h100"
-_BENCHMARK_MLA_PROVIDER_ENV = "SPARSEVLLM_INTERNAL_BENCHMARK_MLA_PROVIDER"
-_BENCHMARK_MLA_TRITON_CONFIG_ENV = (
-    "SPARSEVLLM_INTERNAL_BENCHMARK_MLA_TRITON_CONFIG"
-)
-_BENCHMARK_MLA_TILELANG_CONFIG_ENV = (
-    "SPARSEVLLM_INTERNAL_BENCHMARK_MLA_TILELANG_CONFIG"
-)
-_ConfigT = TypeVar("_ConfigT")
-
-
-def _benchmark_config_override(
-    environment_name: str,
-    config_type: type[_ConfigT],
-) -> _ConfigT | None:
-    raw = os.environ.get(environment_name)
-    if raw is None:
-        return None
-    try:
-        values = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"{environment_name} must contain a JSON object: {exc.msg}."
-        ) from exc
-    if not isinstance(values, dict):
-        raise ValueError(f"{environment_name} must contain a JSON object.")
-    try:
-        return config_type(**values)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Invalid {environment_name}: {exc}") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -802,115 +769,6 @@ class MlaSglFa3Provider(MlaTritonProvider):
     ProviderRole.REPO_NONSTANDARD,
     profile_only=True,
 )
-class MlaTileLangOutputProvider(MlaSglFa3Provider):
-    """TileLang decode output with FA3 retained for explicit prefill."""
-
-    name = "tilelang_output"
-
-    def __init__(
-        self,
-        *,
-        op_spec: MlaAttentionOpSpec,
-        device: torch.device | str,
-        max_batch_size: int,
-        launch_config: MlaDecodeLaunchConfig | None = None,
-        tilelang_config: TileMlaLaunchConfig | None = None,
-    ) -> None:
-        super().__init__(
-            op_spec=op_spec,
-            device=device,
-            max_batch_size=max_batch_size,
-            launch_config=launch_config,
-        )
-        self.tilelang_config = tilelang_config or TileMlaLaunchConfig(num_split=32)
-        self.tilelang_output = TileMlaDecodeKernel(
-            device=self.device,
-            softmax_scale=self.spec.softmax_scale,
-            valid_heads=self.spec.local_q_heads,
-            fixed_config=self.tilelang_config,
-        )
-
-    @classmethod
-    def supports(
-        cls,
-        spec: MlaAttentionOpSpec,
-        caps: DeviceCaps,
-    ) -> SupportResult:
-        base = MlaSglFa3Provider.supports(spec, caps)
-        if not base.supported:
-            return base
-        supported, reason = tilelang_mla_support()
-        return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
-
-    def binding_metadata(self) -> dict[str, object]:
-        return {
-            "implementation_kind": "composite_provider",
-            "implementation_source": "tilelang+sglang-kernel",
-            "decode_kernel_path": "tilelang_mla_decode",
-            "prefill_kernel_path": "sgl_kernel.fa3.fwd",
-            "tilelang_config": {
-                "num_split": self.tilelang_config.num_split,
-                "block_n": self.tilelang_config.block_n,
-                "block_h": self.tilelang_config.block_h,
-                "score_mode": self.tilelang_config.score_mode,
-            },
-            "launch_config_source": "static_provider_config",
-        }
-
-    def runtime_kernel_stats(self) -> dict[str, object]:
-        return {
-            **super().runtime_kernel_stats(),
-            "tilelang": self.tilelang_output.runtime_metadata(),
-        }
-
-    @torch.no_grad()
-    def run(
-        self,
-        q_nope_absorbed: torch.Tensor,
-        q_rope: torch.Tensor,
-        view: DecodeComputeView,
-        output: torch.Tensor,
-        *,
-        validation_scope: object | None = None,
-        valid_batch_size: int | None = None,
-    ) -> torch.Tensor:
-        if view.meta.attn_score is not None:
-            raise RuntimeError(
-                "TileLang output-only MLA received an attention-score request."
-            )
-        payload = self._validate_run_inputs(
-            q_nope_absorbed,
-            q_rope,
-            view,
-            output,
-        )
-        self._validate_metadata(
-            view,
-            payload,
-            validation_scope=validation_scope,
-            valid_batch_size=valid_batch_size,
-        )
-        if view.meta.max_context_len is None:
-            raise ValueError("TileLang MLA requires max_context_len in the decode view.")
-        self._record_runtime_kernel_path("tilelang_output")
-        return self.tilelang_output(
-            q_nope_absorbed,
-            q_rope,
-            payload.latent_cache,
-            payload.rope_cache,
-            view.meta.active_slots,
-            view.meta.req_indices,
-            view.meta.context_lens,
-            output,
-            attn_score=None,
-            max_context_len=int(view.meta.max_context_len),
-        )
-
-
-@MLA_ATTENTION_REGISTRY.register_atomic(
-    ProviderRole.REPO_NONSTANDARD,
-    profile_only=True,
-)
 class MlaTileLangScoreProvider(MlaSglFa3Provider):
     """Score-aware Composite over FA3 and statically planned TileLang."""
 
@@ -924,7 +782,6 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
         device: torch.device | str,
         max_batch_size: int,
         launch_config: MlaDecodeLaunchConfig | None = None,
-        tilelang_config: TileMlaLaunchConfig | None = None,
     ) -> None:
         super().__init__(
             op_spec=op_spec,
@@ -936,29 +793,19 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
             raise ValueError(
                 "TileLang MLA requires a capture-time context capacity."
             )
-        if tilelang_config is not None and tilelang_config.score_mode != "per_head":
-            raise ValueError(
-                "TileLang per-head score provider requires score_mode='per_head'."
-            )
-        self.tilelang_launch_plan = (
-            None
-            if tilelang_config is not None
-            else TileMlaLaunchPlan.build(
-                context_capacity=self.spec.context_capacity,
-                local_q_heads=self.spec.local_q_heads,
-                max_batch_size=self.max_batch_size,
-                need_score=True,
-                score_mode="per_head",
-            )
+        self.tilelang_launch_plan = TileMlaLaunchPlan.build(
+            context_capacity=self.spec.context_capacity,
+            local_q_heads=self.spec.local_q_heads,
+            max_batch_size=self.max_batch_size,
+            need_score=True,
+            score_mode="per_head",
         )
         self.tilelang_score = TileMlaDecodeKernel(
             device=self.device,
             softmax_scale=self.spec.softmax_scale,
             valid_heads=self.spec.local_q_heads,
             launch_plan=self.tilelang_launch_plan,
-            fixed_config=tilelang_config,
         )
-        self.tilelang_config = tilelang_config
 
     @classmethod
     def supports(
@@ -991,17 +838,7 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
                 "score_free": "sgl_kernel.fa3.fwd",
                 "raw_qk_per_head": "tilelang_mla_decode",
             },
-            "tilelang_launch_plan": (
-                self.tilelang_launch_plan.metadata()
-                if self.tilelang_launch_plan is not None
-                else {
-                    "source": "benchmark_override",
-                    "num_split": self.tilelang_config.num_split,
-                    "block_n": self.tilelang_config.block_n,
-                    "block_h": self.tilelang_config.block_h,
-                    "score_mode": self.tilelang_config.score_mode,
-                }
-            ),
+            "tilelang_launch_plan": self.tilelang_launch_plan.metadata(),
         }
 
     def runtime_kernel_stats(self) -> dict[str, object]:
@@ -1162,48 +999,13 @@ def resolve_mla_attention_provider(
     device = torch.device(device)
     device_index = 0 if device.index is None else int(device.index)
     caps = platforms.current_platform.get_device_caps(device_index)
-    forced_provider = os.environ.get(_BENCHMARK_MLA_PROVIDER_ENV)
-    if forced_provider is not None:
-        forced_provider = forced_provider.strip()
-    triton_config = _benchmark_config_override(
-        _BENCHMARK_MLA_TRITON_CONFIG_ENV,
-        MlaDecodeLaunchConfig,
-    )
-    tilelang_config = _benchmark_config_override(
-        _BENCHMARK_MLA_TILELANG_CONFIG_ENV,
-        TileMlaLaunchConfig,
-    )
-    if launch_config is not None and triton_config is not None:
-        raise ValueError(
-            "MLA launch_config conflicts with the internal benchmark override."
-        )
-    if (triton_config is not None or tilelang_config is not None) and not forced_provider:
-        raise ValueError(
-            "Internal MLA config overrides require an explicitly forced provider."
-        )
-    if triton_config is not None and forced_provider != MlaTritonProvider.name:
-        raise ValueError(
-            "The internal Triton MLA config requires provider='triton_mla'."
-        )
-    if tilelang_config is not None and forced_provider not in {
-        MlaTileLangOutputProvider.name,
-        MlaTileLangScoreProvider.name,
-    }:
-        raise ValueError(
-            "The internal TileLang MLA config requires a TileLang provider."
-        )
-    provider_kwargs = {}
-    if tilelang_config is not None:
-        provider_kwargs["tilelang_config"] = tilelang_config
     return OpResolver(MLA_ATTENTION_REGISTRY).resolve(
         spec,
         caps,
-        force_atomic_provider=forced_provider,
         op_spec=spec,
         device=device,
         max_batch_size=max_batch_size,
-        launch_config=triton_config or launch_config,
-        **provider_kwargs,
+        launch_config=launch_config,
     ).provider
 
 
@@ -1212,7 +1014,6 @@ __all__ = [
     "MlaAttentionOpSpec",
     "MlaAttentionProvider",
     "MlaSglFa3Provider",
-    "MlaTileLangOutputProvider",
     "MlaTileLangScoreProvider",
     "MlaTritonProvider",
     "resolve_mla_attention_provider",
