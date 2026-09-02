@@ -60,10 +60,9 @@ class MlaDecodeLaunchConfig:
 
 DEFAULT_GLM_MLA_DECODE_CONFIG = MlaDecodeLaunchConfig()
 
-# Measured on NVIDIA H100 80GB HBM3 with GLM-4.7-Flash TP2.  Keep this
-# table deliberately narrow: other TP layouts retain the correctness-first
-# default until they have their own matched-shape measurements.
-_GLM_MLA_TP2_SMALL_BATCH_CONFIG = MlaDecodeLaunchConfig(
+# Measured on H100 with GLM-4.7-Flash TP1/TP2/TP4 across 1K-64K contexts.
+# Selection is batch/head indexed and deliberately independent of context.
+_GLM_MLA_SMALL_BATCH_CONFIG = MlaDecodeLaunchConfig(
     program_count=256,
     blocks_per_program=4,
     block_n=32,
@@ -73,7 +72,7 @@ _GLM_MLA_TP2_SMALL_BATCH_CONFIG = MlaDecodeLaunchConfig(
     stage2_num_warps=4,
     stage2_pipeline_stages=1,
 )
-_GLM_MLA_TP2_MEDIUM_BATCH_CONFIG = MlaDecodeLaunchConfig(
+_GLM_MLA_MEDIUM_BATCH_CONFIG = MlaDecodeLaunchConfig(
     program_count=264,
     blocks_per_program=2,
     block_n=32,
@@ -83,7 +82,7 @@ _GLM_MLA_TP2_MEDIUM_BATCH_CONFIG = MlaDecodeLaunchConfig(
     stage2_num_warps=4,
     stage2_pipeline_stages=1,
 )
-_GLM_MLA_TP2_SHORT_CONTEXT_CONFIG = MlaDecodeLaunchConfig(
+_GLM_MLA_WIDE_SPLIT_CONFIG = MlaDecodeLaunchConfig(
     program_count=128,
     blocks_per_program=8,
     block_n=32,
@@ -93,7 +92,7 @@ _GLM_MLA_TP2_SHORT_CONTEXT_CONFIG = MlaDecodeLaunchConfig(
     stage2_num_warps=4,
     stage2_pipeline_stages=1,
 )
-_GLM_MLA_TP2_LARGE_BATCH_CONFIG = MlaDecodeLaunchConfig(
+_GLM_MLA_LARGE_BATCH_CONFIG = MlaDecodeLaunchConfig(
     program_count=256,
     blocks_per_program=8,
     block_n=32,
@@ -114,26 +113,33 @@ GLM_MLA_MAX_WORKSPACE_CONFIG = MlaDecodeLaunchConfig(
 def select_glm_mla_decode_config(
     *,
     batch_size: int,
-    context_capacity: int,
     local_q_heads: int,
 ) -> MlaDecodeLaunchConfig:
-    """Select a launch config from a capture-time context capacity."""
+    """Select one H100 launch config for a static batch/head graph."""
 
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
-    if context_capacity <= 0:
-        raise ValueError("context_capacity must be positive")
     if local_q_heads <= 0:
         raise ValueError("local_q_heads must be positive")
-    if local_q_heads != 10:
-        return DEFAULT_GLM_MLA_DECODE_CONFIG
-    if batch_size <= 1:
-        return _GLM_MLA_TP2_SMALL_BATCH_CONFIG
-    if batch_size <= 8:
-        return _GLM_MLA_TP2_MEDIUM_BATCH_CONFIG
-    if context_capacity <= 1024:
-        return _GLM_MLA_TP2_SHORT_CONTEXT_CONFIG
-    return _GLM_MLA_TP2_LARGE_BATCH_CONFIG
+    if local_q_heads == 20:
+        if batch_size <= 1:
+            return _GLM_MLA_MEDIUM_BATCH_CONFIG
+        if batch_size <= 16:
+            return _GLM_MLA_SMALL_BATCH_CONFIG
+        return _GLM_MLA_WIDE_SPLIT_CONFIG
+    if local_q_heads == 10:
+        if batch_size <= 1:
+            return _GLM_MLA_MEDIUM_BATCH_CONFIG
+        if batch_size <= 4:
+            return _GLM_MLA_SMALL_BATCH_CONFIG
+        if batch_size <= 16:
+            return _GLM_MLA_WIDE_SPLIT_CONFIG
+        return _GLM_MLA_LARGE_BATCH_CONFIG
+    if local_q_heads == 5:
+        if batch_size <= 4:
+            return _GLM_MLA_MEDIUM_BATCH_CONFIG
+        return _GLM_MLA_LARGE_BATCH_CONFIG
+    return DEFAULT_GLM_MLA_DECODE_CONFIG
 
 
 @dataclass(frozen=True, slots=True)

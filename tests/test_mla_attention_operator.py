@@ -177,7 +177,7 @@ def test_decode_graph_mla_launch_config_ignores_runtime_context() -> None:
             op_spec=spec,
             device="cpu",
             max_batch_size=32,
-            use_h100_tp2_launch_profile=True,
+            use_h100_launch_profile=True,
         )
     launch_config = object()
     with patch(
@@ -200,7 +200,6 @@ def test_decode_graph_mla_launch_config_ignores_runtime_context() -> None:
     assert select.call_count == 2
     select.assert_called_with(
         batch_size=32,
-        context_capacity=32768,
         local_q_heads=10,
     )
 
@@ -238,15 +237,16 @@ def test_sm120_tp2_uses_portable_mla_launch_config() -> None:
     select.assert_not_called()
 
 
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
 @pytest.mark.parametrize(
-    "device_name",
-    ["NVIDIA H100 80GB HBM3", "NVIDIA H100 PCIe"],
+    "device_name", ["NVIDIA H100 80GB HBM3", "NVIDIA H100 PCIe"]
 )
-def test_h100_family_tp2_uses_profiled_mla_launch_config(
+def test_h100_family_uses_profiled_mla_launch_config_for_every_tp(
     device_name: str,
+    tp_size: int,
 ) -> None:
-    spec = _spec(tp_size=2)
-    workspace = _cpu_workspace(batch_size=8, head_count=10)
+    spec = _spec(tp_size=tp_size)
+    workspace = _cpu_workspace(batch_size=8, head_count=20 // tp_size)
     with patch(
         "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
         return_value=workspace,
@@ -271,11 +271,13 @@ def test_h100_family_tp2_uses_profiled_mla_launch_config(
         )
 
     assert launch_config is profiled_config
-    assert provider.binding_metadata()["launch_config_source"] == "h100_tp2_profile"
+    assert (
+        provider.binding_metadata()["launch_config_source"]
+        == "h100_batch_head_profile"
+    )
     select.assert_called_once_with(
         batch_size=8,
-        context_capacity=4096,
-        local_q_heads=10,
+        local_q_heads=20 // tp_size,
     )
 
 

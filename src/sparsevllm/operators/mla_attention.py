@@ -213,7 +213,7 @@ class MlaTritonProvider(MlaAttentionProvider):
         device: torch.device | str,
         max_batch_size: int,
         launch_config: MlaDecodeLaunchConfig | None = None,
-        use_h100_tp2_launch_profile: bool = False,
+        use_h100_launch_profile: bool = False,
     ) -> None:
         self.spec = op_spec
         requested_device = torch.device(device)
@@ -224,11 +224,11 @@ class MlaTritonProvider(MlaAttentionProvider):
                 f"{self.max_batch_size}."
             )
         self._fixed_launch_config = launch_config
-        self._use_h100_tp2_launch_profile = bool(use_h100_tp2_launch_profile)
+        self._use_h100_launch_profile = bool(use_h100_launch_profile)
         self.launch_config = launch_config or DEFAULT_GLM_MLA_DECODE_CONFIG
         workspace_config = launch_config or (
             GLM_MLA_MAX_WORKSPACE_CONFIG
-            if self._use_h100_tp2_launch_profile
+            if self._use_h100_launch_profile
             else DEFAULT_GLM_MLA_DECODE_CONFIG
         )
         self.workspace = allocate_mla_decode_workspace(
@@ -263,10 +263,9 @@ class MlaTritonProvider(MlaAttentionProvider):
         if cls is not MlaTritonProvider:
             return cls(**kwargs)
         return cls(
-            use_h100_tp2_launch_profile=(
+            use_h100_launch_profile=(
                 caps.compute_capability == (9, 0)
                 and caps.accelerator_family == _PROFILED_H100_FAMILY
-                and spec.tp_size == 2
             ),
             **kwargs,
         )
@@ -277,8 +276,8 @@ class MlaTritonProvider(MlaAttentionProvider):
             "implementation_source": "repo_triton",
             "decode_kernel_path": "triton_mla_stage1_stage2",
             "launch_config_source": (
-                "h100_tp2_profile"
-                if self._use_h100_tp2_launch_profile
+                "h100_batch_head_profile"
+                if self._use_h100_launch_profile
                 else "portable_default"
             ),
         }
@@ -288,7 +287,7 @@ class MlaTritonProvider(MlaAttentionProvider):
             **metadata,
             "cuda_graph_mode": "batch_indexed",
             "context_capacity": self.spec.context_capacity,
-            "launch_plan_source": "batch_tp_heads_context_capacity",
+            "launch_plan_source": "batch_local_heads",
         }
 
     def _record_runtime_kernel_path(self, path: str) -> None:
@@ -515,23 +514,11 @@ class MlaTritonProvider(MlaAttentionProvider):
     ) -> MlaDecodeLaunchConfig:
         if self._fixed_launch_config is not None:
             return self._fixed_launch_config
-        if not self._use_h100_tp2_launch_profile:
+        del max_context_len, active_slot_width
+        if not self._use_h100_launch_profile:
             return DEFAULT_GLM_MLA_DECODE_CONFIG
-        if self.spec.cuda_graph:
-            if self.spec.context_capacity is None:
-                raise RuntimeError(
-                    "Decode Graph MLA requires a static context capacity."
-                )
-            context_capacity = self.spec.context_capacity
-        else:
-            context_capacity = (
-                active_slot_width
-                if max_context_len is None
-                else int(max_context_len)
-            )
         return select_glm_mla_decode_config(
             batch_size=batch_size,
-            context_capacity=context_capacity,
             local_q_heads=self.spec.local_q_heads,
         )
 
