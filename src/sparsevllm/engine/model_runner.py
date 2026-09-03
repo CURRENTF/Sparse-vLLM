@@ -343,7 +343,6 @@ class ModelRunner:
             bool(getattr(config, "decode_graph", False)),
         )
         max_real_decode_batch_size = _decode_cuda_graph_max_real_batch_size(
-            max_num_seqs_in_batch=config.max_num_seqs_in_batch,
             max_decoding_seqs=config.max_decoding_seqs,
         )
         decode_static_capture_sizes = _resolve_decode_cuda_graph_capture_sizes(
@@ -366,7 +365,6 @@ class ModelRunner:
                 device=self.device,
                 max_decode_tokens=_resolve_decode_static_batch_capacity(
                     decode_static_capture_sizes,
-                    max_num_seqs_in_batch=config.max_num_seqs_in_batch,
                     max_decoding_seqs=config.max_decoding_seqs,
                 ),
             )
@@ -544,7 +542,6 @@ class ModelRunner:
         self.load_deltakv_compressors()
 
         max_real_decode_batch_size = _decode_cuda_graph_max_real_batch_size(
-            max_num_seqs_in_batch=runtime_config.max_num_seqs_in_batch,
             max_decoding_seqs=runtime_config.max_decoding_seqs,
         )
         decode_static_capture_sizes = _resolve_decode_cuda_graph_capture_sizes(

@@ -84,10 +84,18 @@ def _resolve_decode_cuda_graph_capture_sizes(
             max_real_batch_size
         ),
     )
-    if sizes[-1] < int(max_real_batch_size):
+    max_real_batch_size = int(max_real_batch_size)
+    if sizes[-1] < max_real_batch_size:
         raise ValueError(
-            "decode_graph_capture_sizes must cover the maximum reachable decode batch: "
-            f"max capture size {sizes[-1]} < reachable batch {int(max_real_batch_size)}."
+            "decode_graph_capture_sizes must cover max_decoding_seqs: "
+            f"max capture size {sizes[-1]} < max_decoding_seqs "
+            f"{max_real_batch_size}."
+        )
+    if max_real_batch_size not in sizes:
+        raise ValueError(
+            "decode_graph_capture_sizes must contain max_decoding_seqs as an "
+            f"exact batch bucket, got max_decoding_seqs={max_real_batch_size} "
+            f"and capture sizes {sizes}."
         )
     return sizes
 
@@ -118,24 +126,21 @@ def _select_decode_cuda_graph_batch_size(
 
 def _decode_cuda_graph_max_real_batch_size(
     *,
-    max_num_seqs_in_batch: int,
     max_decoding_seqs: int,
 ) -> int:
     """Return the largest decode batch that the scheduler can execute in one step."""
 
-    return min(int(max_num_seqs_in_batch), int(max_decoding_seqs))
+    return int(max_decoding_seqs)
 
 
 def _resolve_decode_static_batch_capacity(
     capture_sizes: list[int] | tuple[int, ...],
     *,
-    max_num_seqs_in_batch: int,
     max_decoding_seqs: int,
 ) -> int:
     """Return the largest padded decode batch reachable by the scheduler."""
 
     max_real_batch_size = _decode_cuda_graph_max_real_batch_size(
-        max_num_seqs_in_batch=max_num_seqs_in_batch,
         max_decoding_seqs=max_decoding_seqs,
     )
     return _select_decode_cuda_graph_batch_size(
@@ -299,7 +304,6 @@ def normalize_decode_cuda_graph(config) -> None:
         and capture_sizes_setting.strip().lower() in {"", "auto"}
     )
     max_real_batch_size = _decode_cuda_graph_max_real_batch_size(
-        max_num_seqs_in_batch=config.max_num_seqs_in_batch,
         max_decoding_seqs=config.max_decoding_seqs,
     )
     config.decode_graph_capture_sizes = _resolve_decode_cuda_graph_capture_sizes(

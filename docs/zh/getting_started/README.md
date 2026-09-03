@@ -131,7 +131,9 @@ Sparse-vLLM runtime 参数定义在 `src/sparsevllm/configs/groups.py` 和 `runt
 - `gpu_memory_utilization`：分配给 KV cache 的 GPU 总显存比例。
 - `max_model_len`：允许的最大 prompt 加生成 token 数。
 - `engine_prefill_chunk_size`：Sparse-vLLM prefill scheduling 与 memory admission 的 chunk size。
-- `max_num_batched_tokens`、`max_num_seqs_in_batch`、`max_decoding_seqs`：scheduler 吞吐量与延迟约束。
+- `max_num_batched_tokens`：单 step 的 token 预算。
+- `max_num_seqs_in_batch`：prefill batch 上限，同时作为默认 decode batch 上限。
+- `max_decoding_seqs`：可选的 decode batch 覆盖值；显式设置后，其精确值会纳入 decode CUDA Graph 预捕获 buckets。
 
 稀疏参数：
 

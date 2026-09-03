@@ -649,7 +649,11 @@ class Scheduler:
             target_is_long_decode = False
         decode_scan_budget = len(self.decoding)
         blocked_decode_victim: Sequence | None = None
-        while self.decoding and decode_scan_budget > 0 and num_batched_seqs < self.max_num_seqs_in_batch:
+        while (
+            self.decoding
+            and decode_scan_budget > 0
+            and num_batched_seqs < self.max_decoding_seqs
+        ):
             seq = self._pop_next_decoding_seq(target_is_long_decode)
             if seq is None:
                 break

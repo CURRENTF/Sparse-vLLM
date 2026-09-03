@@ -763,14 +763,33 @@ class PrefillPolicyConfigTest(unittest.TestCase):
                 decode_graph_capture_sampling=True,
             )
 
-    def test_decode_cuda_graph_auto_capture_sizes_end_at_reachable_batch_limit(self):
-        for max_num_seqs_in_batch, max_decoding_seqs, expected_sizes in (
-            (1, 64, [1]),
-            (6, 64, [1, 2, 3, 4, 5, 6]),
-            (8, 64, [1, 2, 3, 4, 5, 6, 7, 8]),
-            (24, 64, [1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24]),
-            (32, 64, [1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 28, 32]),
-            (64, 16, [1, 2, 3, 4, 5, 6, 7, 8, 12, 16]),
+    def test_decode_batch_defaults_to_prefill_batch_limit(self):
+        cfg = self.make_config(
+            sparse_method="omnikv",
+            decode_graph=True,
+            max_num_seqs_in_batch=8,
+        )
+
+        self.assertEqual(cfg.max_num_seqs_in_batch, 8)
+        self.assertEqual(cfg.max_decoding_seqs, 8)
+        self.assertIn(8, cfg.decode_graph_capture_sizes)
+
+    def test_explicit_decode_batch_override_updates_resident_capacity(self):
+        cfg = self.make_config(
+            sparse_method="vanilla",
+            max_num_seqs_in_batch=8,
+            max_decoding_seqs=64,
+        )
+
+        self.assertEqual(cfg.max_num_seqs_in_batch, 8)
+        self.assertEqual(cfg.max_decoding_seqs, 64)
+        self.assertGreaterEqual(cfg.max_num_seqs_in_gpu, 64)
+
+    def test_decode_cuda_graph_auto_capture_sizes_use_decode_limit(self):
+        for max_num_seqs_in_batch, max_decoding_seqs in (
+            (1, 64),
+            (8, 64),
+            (64, 16),
         ):
             with self.subTest(
                 max_num_seqs_in_batch=max_num_seqs_in_batch,
@@ -783,12 +802,12 @@ class PrefillPolicyConfigTest(unittest.TestCase):
                     max_decoding_seqs=max_decoding_seqs,
                 )
                 capture_sizes = cfg.decode_graph_capture_sizes
-                reachable_batch = min(max_num_seqs_in_batch, max_decoding_seqs)
                 self.assertEqual(capture_sizes, sorted(set(capture_sizes)))
-                self.assertEqual(capture_sizes[-1], reachable_batch)
-                self.assertTrue(all(0 < size <= reachable_batch for size in capture_sizes))
+                self.assertEqual(capture_sizes[-1], max_decoding_seqs)
+                self.assertTrue(
+                    all(0 < size <= max_decoding_seqs for size in capture_sizes)
+                )
                 self.assertTrue(cfg.decode_graph)
-                self.assertEqual(cfg.decode_graph_capture_sizes, expected_sizes)
 
     def test_decode_cuda_graph_auto_capture_sizes_are_bounded_for_large_limits(self):
         for max_decoding_seqs in (64, 80, 128, 256, 1024):
@@ -801,20 +820,17 @@ class PrefillPolicyConfigTest(unittest.TestCase):
 
     def test_decode_static_batch_capacity_uses_reachable_padding_bucket(self):
         cases = (
-            ([1, 2, 4, 8, 16, 32, 64], 32, 64, 32),
-            ([1, 4, 8, 64], 32, 64, 64),
-            ([1, 2, 4, 8, 16, 32, 64], 80, 64, 64),
+            ([1, 2, 4, 8, 16, 32, 64], 64, 64),
+            ([1, 4, 8, 32, 64], 32, 32),
         )
-        for capture_sizes, max_batch, max_decode, expected in cases:
+        for capture_sizes, max_decode, expected in cases:
             with self.subTest(
                 capture_sizes=capture_sizes,
-                max_batch=max_batch,
                 max_decode=max_decode,
             ):
                 self.assertEqual(
                     _resolve_decode_static_batch_capacity(
                         capture_sizes,
-                        max_num_seqs_in_batch=max_batch,
                         max_decoding_seqs=max_decode,
                     ),
                     expected,
@@ -969,8 +985,8 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         self.assertAlmostEqual(token_logprobs[0], expected_logprob)
         self.assertEqual(list(top_logprobs[0]), [1])
 
-    def test_decode_cuda_graph_capture_sizes_must_cover_reachable_batch_limit(self):
-        with self.assertRaisesRegex(ValueError, "maximum reachable decode batch"):
+    def test_decode_cuda_graph_capture_sizes_must_include_decode_limit(self):
+        with self.assertRaisesRegex(ValueError, "cover max_decoding_seqs"):
             self.make_config(
                 sparse_method="omnikv",
                 decode_graph=True,
@@ -979,14 +995,24 @@ class PrefillPolicyConfigTest(unittest.TestCase):
                 decode_graph_capture_sizes=[1, 2, 4],
             )
 
+        with self.assertRaisesRegex(ValueError, "exact batch bucket"):
+            self.make_config(
+                sparse_method="omnikv",
+                decode_graph=True,
+                max_num_seqs_in_batch=4,
+                max_decoding_seqs=6,
+                decode_graph_capture_sizes=[1, 2, 4, 8],
+            )
+
         cfg = self.make_config(
             sparse_method="omnikv",
             decode_graph=True,
             max_num_seqs_in_batch=4,
             max_decoding_seqs=64,
-            decode_graph_capture_sizes=[1, 2, 4],
+            decode_graph_capture_sizes=[1, 2, 4, 64],
         )
-        self.assertEqual(cfg.decode_graph_capture_sizes, [1, 2, 4])
+        self.assertEqual(cfg.decode_graph_capture_sizes, [1, 2, 4, 64])
+
 
 class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
     def make_config(self, method="deltakv", decode_graph=True):
@@ -1508,6 +1534,36 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
 
         self.assertFalse(is_prefill)
         self.assertEqual(scheduled, [short_seq, long_seq])
+
+    def test_decode_batch_limit_is_independent_from_prefill_batch_limit(self):
+        scheduler = make_scheduler(
+            PREFILL_POLICY_ALL_CHUNKED,
+            method="",
+        )
+        seqs = [seq_with_len(4) for _ in range(6)]
+        for seq in seqs:
+            seq.num_prefilled_tokens = seq.num_prompt_tokens
+        scheduler.decoding.extend(seqs)
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+
+        self.assertFalse(is_prefill)
+        self.assertEqual(scheduled, seqs)
+
+    def test_prefill_batch_still_uses_prefill_sequence_limit(self):
+        scheduler = make_scheduler(
+            PREFILL_POLICY_ALL_CHUNKED,
+            method="",
+            max_tokens=100,
+        )
+        seqs = [seq_with_len(4) for _ in range(6)]
+        for seq in seqs:
+            scheduler.add(seq)
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, seqs[:4])
 
     def test_sparse_decode_schedules_short_and_long_topologies_separately(self):
         scheduler = make_scheduler(

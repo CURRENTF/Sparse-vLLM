@@ -61,7 +61,9 @@ class Config(
     max_num_seqs_in_batch: int = 32  # 不能设置太大
     max_model_len: int | None = None
     max_model_len_auto: bool = field(default=False, init=False)
-    max_decoding_seqs: int = 64
+    # None preserves the legacy shared batch limit. Set explicitly to allow
+    # decode and prefill to use different per-step sequence limits.
+    max_decoding_seqs: int | None = None
     max_num_seqs_in_gpu: int | None = None
 
     engine_prefill_chunk_size: int | None = None

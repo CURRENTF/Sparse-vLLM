@@ -2366,6 +2366,7 @@ def test_standard_capacity_skips_prefix_scan_with_physical_step_headroom():
     manager = _make_standard_manager_for_prefix(block_size=2)
     manager.config.max_num_batched_tokens = 16
     manager.config.max_num_seqs_in_batch = 4
+    manager.config.max_decoding_seqs = 4
 
     with patch.object(
         manager.prefix_cache,
@@ -2380,6 +2381,7 @@ def test_standard_capacity_skips_prefix_scan_with_physical_step_headroom():
 def test_standard_decode_uses_evictable_leaf_headroom_without_tree_scan():
     manager = _make_standard_manager_for_prefix(block_size=2)
     manager.config.max_num_seqs_in_batch = 4
+    manager.config.max_decoding_seqs = 4
     manager._num_free_slots = 0
     for token_ids in ([1, 2], [3, 4]):
         stable_block_id = manager.prefix_cache.stable_block_id(

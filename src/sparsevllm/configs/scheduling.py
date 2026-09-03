@@ -10,6 +10,8 @@ from sparsevllm.method_registry import (
     normalize_sparse_method,
     resolve_prefill_schedule_policy,
 )
+
+
 def normalize_scheduling(config) -> None:
     config.max_num_seqs_in_batch = int(config.max_num_seqs_in_batch)
     if config.max_num_seqs_in_batch <= 0:
@@ -17,7 +19,11 @@ def normalize_scheduling(config) -> None:
             "max_num_seqs_in_batch must be > 0, "
             f"got {config.max_num_seqs_in_batch}."
         )
-    config.max_decoding_seqs = int(config.max_decoding_seqs)
+    config.max_decoding_seqs = (
+        config.max_num_seqs_in_batch
+        if config.max_decoding_seqs is None
+        else int(config.max_decoding_seqs)
+    )
     if config.max_decoding_seqs <= 0:
         raise ValueError(
             f"max_decoding_seqs must be > 0, got {config.max_decoding_seqs}."

@@ -564,7 +564,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
     def decode_step_free_slots(self) -> int:
         physical_free = int(self.num_free_slots)
         max_step_seqs = int(
-            getattr(self.config, "max_num_seqs_in_batch", 0) or 0
+            getattr(self.config, "max_decoding_seqs", 0) or 0
         )
         if max_step_seqs > 0 and physical_free >= max_step_seqs:
             return physical_free

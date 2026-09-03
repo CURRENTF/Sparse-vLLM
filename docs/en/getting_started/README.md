@@ -149,7 +149,9 @@ Common knobs:
 - `gpu_memory_utilization`: fraction of total GPU memory to allocate for the KV cache.
 - `max_model_len`: max prompt plus generated tokens allowed.
 - `engine_prefill_chunk_size`: Sparse-vLLM prefill scheduling and memory-admission chunk size.
-- `max_num_batched_tokens`, `max_num_seqs_in_batch`, `max_decoding_seqs`: scheduler throughput and latency constraints.
+- `max_num_batched_tokens`: per-step token budget.
+- `max_num_seqs_in_batch`: prefill batch limit and the default decode batch limit.
+- `max_decoding_seqs`: optional decode batch override; when set, its exact value is included in the decode CUDA Graph capture buckets.
 
 Sparse knobs:
 
