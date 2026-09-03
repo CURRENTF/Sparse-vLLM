@@ -152,7 +152,7 @@ def _create_model(hf_config, model_spec: ModelSpec, **runtime_kwargs):
         configure_multimodal = getattr(model, "configure_multimodal", None)
         if (
             callable(configure_multimodal)
-            and bool(getattr(engine_config, "enable_multimodal", True))
+            and bool(getattr(engine_config, "enable_multimodal", False))
             and getattr(engine_config, "outer_hf_config", hf_config) is not hf_config
         ):
             configure_multimodal(engine_config.outer_hf_config)
