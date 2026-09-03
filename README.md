@@ -141,6 +141,9 @@ Use `cu129` instead of `cu130` for CUDA 12.9.
 are all part of the main installation; no workflow-specific extras are required.
 The SGL kernel package is pinned because its compiled operators must match the
 validated PyTorch/CUDA ABI; other versions are rejected during provider setup.
+The CUDA extras also require FlashInfer. GPU engine startup fails with the
+matching `pip install -e ".[cu129]"` or `pip install -e ".[cu130]"` repair hint
+when either required kernel family is absent or broken.
 
 Sparse-vLLM supports Qwen3.5/Qwen3.6/Qwen3.8 checkpoints in unquantized BF16
 and block-scaled FP8 formats. These releases share the `qwen3_5` runtime

@@ -35,6 +35,11 @@ CUDA 12.9 环境将 `cu130` 换成 `cu129`。
 不再需要工作流专用 extra。SGL kernel package 固定到已经验证的 PyTorch/CUDA ABI；
 其他版本会在 Provider 准备阶段明确失败，不会静默 fallback。
 
+CUDA extra 同时要求 `flashinfer-python>=0.6.15,<0.7`。FlashInfer 或 SGL kernel
+缺失、package metadata 不兼容或无法加载时，GPU engine 会在启动阶段直接失败；
+请按 CUDA 版本执行 `pip install -e ".[cu129]"` 或
+`pip install -e ".[cu130]"` 修复环境。
+
 Sparse-vLLM 当前支持未量化 BF16 和 block-scaled FP8 格式的
 Qwen3.5/Qwen3.6/Qwen3.8 checkpoint。三者共享 `qwen3_5` 运行时架构和支持矩阵。
 

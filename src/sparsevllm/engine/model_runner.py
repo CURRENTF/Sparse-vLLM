@@ -28,6 +28,9 @@ from sparsevllm.engine.sequence import Sequence
 from sparsevllm.models.qwen2 import Qwen2ForCausalLM
 from sparsevllm.models.llama import LlamaForCausalLM
 from sparsevllm.layers.sampler import Sampler
+from sparsevllm.kernels.external.required import (
+    validate_required_cuda_kernel_families,
+)
 from sparsevllm.method_registry import decode_sparse_long_text_threshold
 from sparsevllm.operators import registry as operator_registry
 from sparsevllm.operators.decode_attention import (
@@ -295,6 +298,8 @@ class ModelRunner:
 
         # 初始化分布式环境并绑定对应的设备
         self.platform.set_device(self.device)
+        if self.platform.enum is platforms.PlatformEnum.CUDA:
+            validate_required_cuda_kernel_families()
         if not dist.is_initialized():
             master_port = select_master_port() if master_port is None else master_port
             _init_process_group(

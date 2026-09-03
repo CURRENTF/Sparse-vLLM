@@ -90,9 +90,13 @@ portable repo-owned nonstandard 路径。
 
 ## 依赖与证据
 
-适用的上游依赖缺失时，resolver 可以绑定 repo baseline，并记录
-`selection_basis=dependency_degraded`；已安装依赖损坏则直接终止绑定。运行期
-异常不会触发 provider 重选。
+FlashInfer 与 SGL kernel 是标准 CUDA 安装的必需依赖。GPU engine 在启动 worker
+前只检查 package discovery 和版本 metadata，不导入 device-bound binary；每个 rank
+完成 CUDA device 绑定后，才 import 并验证这些 binary。Provider resolution 遇到任一
+必需 family 缺失或损坏也会直接失败，并提示按 CUDA 版本执行
+`pip install -e ".[cu129]"` 或 `pip install -e ".[cu130]"`。只有真正可选的上游依赖
+缺失时，resolver 才可以绑定 repo baseline 并记录
+`selection_basis=dependency_degraded`。运行期异常不会触发 provider 重选。
 
 每份 binding report 都记录最终 provider、可选 profile、`selection_basis`、全部
 atomic/profile 判断和 provider metadata。它只解释实现为何被选中，不证明数值

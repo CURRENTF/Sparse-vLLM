@@ -13,9 +13,15 @@ from sparsevllm.operators.all_reduce import (
     FlashInferVllmAllReduceProvider,
     TorchDistributedAllReduceProvider,
     _expandable_segments_enabled,
+    _flashinfer_dependency_support,
 )
 from sparsevllm.operators.registry import OpResolver, SupportResult
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
+from sparsevllm.kernels.external.support import (
+    KernelFamilyHealth,
+    KernelFamilyState,
+    RequiredExternalKernelFamilyError,
+)
 
 
 def _spec(
@@ -66,6 +72,29 @@ def _fake_flashinfer_modules() -> dict[str, ModuleType]:
     flashinfer = ModuleType("flashinfer")
     flashinfer.comm = comm
     return {"flashinfer": flashinfer, "flashinfer.comm": comm}
+
+
+def test_all_reduce_rejects_missing_required_flashinfer() -> None:
+    error = RequiredExternalKernelFamilyError(
+        KernelFamilyHealth(
+            family="flashinfer-python",
+            state=KernelFamilyState.ABSENT,
+            version=None,
+            reason="flashinfer-python is not installed",
+        ),
+        feature="communication",
+    )
+    with (
+        patch(
+            "sparsevllm.operators.all_reduce.flashinfer_kernel_support",
+            side_effect=error,
+        ),
+        pytest.raises(
+            RequiredExternalKernelFamilyError,
+            match=r'pip install -e "\.\[cu130\]"',
+        ),
+    ):
+        _flashinfer_dependency_support()
 
 
 def test_vllm_all_reduce_uses_explicit_cuda_ordinals_not_global_ranks():

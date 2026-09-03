@@ -12,6 +12,7 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer, GenerationConfig, Qwen2Tokenizer
 import torch
 import torch.multiprocessing as mp
+import sparsevllm.platforms as platforms
 from sparsevllm.utils.code_revision import code_revision_info
 from sparsevllm.utils.log import logger
 import sys
@@ -20,7 +21,11 @@ import time
 from sparsevllm.configs.cuda_graph import build_decode_cuda_graph_startup_plan
 
 from sparsevllm.config import Config
+from sparsevllm.kernels.external.required import (
+    validate_required_cuda_kernel_metadata,
+)
 from sparsevllm.method_registry import decode_graph_path_id
+from sparsevllm.platforms.interface import PlatformEnum
 from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.scheduler import Scheduler
@@ -207,6 +212,8 @@ class LLMEngine:
             )
         config = Config(model, **config_kwargs)
         self.config = config
+        if platforms.get_current_platform().enum is PlatformEnum.CUDA:
+            validate_required_cuda_kernel_metadata()
         
         # 初始化 Profiler
         profiler.set_enabled(config.enable_profiler)

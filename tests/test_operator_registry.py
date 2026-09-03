@@ -10,6 +10,7 @@ from sparsevllm.kernels.external.support import (
     ExternalKernelFamilyError,
     KernelFamilyHealth,
     KernelFamilyState,
+    RequiredExternalKernelFamilyError,
 )
 from sparsevllm.operators.registry import (
     NoProviderError,
@@ -325,6 +326,44 @@ def test_absent_external_family_is_typed_and_does_not_abort_iteration() -> None:
         candidate.provider: candidate.status
         for candidate in resolved.report.candidates
     }["upstream"] == "dependency_absent"
+
+
+def test_absent_required_external_family_fails_with_install_hint() -> None:
+    registry = OpRegistry(
+        "_test",
+        portfolio=PortfolioPolicy(
+            upstream_standard=("upstream",),
+            repo_portable=("portable",),
+        ),
+    )
+    health = KernelFamilyHealth(
+        family="upstream",
+        state=KernelFamilyState.ABSENT,
+        version=None,
+        reason="not installed",
+    )
+
+    @registry.register_atomic(ProviderRole.UPSTREAM_STANDARD)
+    class Upstream:
+        name = "upstream"
+
+        @classmethod
+        def supports(cls, spec, caps):
+            raise RequiredExternalKernelFamilyError(health, feature="test op")
+
+    @registry.register_atomic(ProviderRole.REPO_PORTABLE)
+    class Portable:
+        name = "portable"
+
+        @classmethod
+        def supports(cls, spec, caps):
+            return SupportResult.yes()
+
+    with pytest.raises(
+        RequiredExternalKernelFamilyError,
+        match=r'pip install -e "\.\[cu129\]"',
+    ):
+        OpResolver(registry).resolve(_Spec(), _caps())
 
 
 def test_dependency_broken_fails_binding() -> None:

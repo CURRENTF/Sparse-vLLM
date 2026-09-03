@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import ctypes
 import os
-import re
 from dataclasses import dataclass
-from importlib.metadata import PackageNotFoundError, version
-from importlib.util import find_spec
 from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 
 import sparsevllm.platforms as platforms
+from sparsevllm.kernels.external.flashinfer.support import flashinfer_kernel_support
+from sparsevllm.kernels.external.support import (
+    KernelFamilyHealth,
+    KernelFamilyState,
+    RequiredExternalKernelFamilyError,
+)
 from sparsevllm.operators.registry import (
     OpRegistry,
     OpResolver,
@@ -161,22 +164,8 @@ def _flashinfer_trtllm_profile(
 
 
 def _flashinfer_dependency_support() -> SupportResult:
-    if find_spec("flashinfer") is None:
-        return SupportResult.dependency_absent("flashinfer is not installed")
-    try:
-        installed = version("flashinfer-python")
-    except PackageNotFoundError:
-        return SupportResult.dependency_broken(
-            "flashinfer-python package metadata is unavailable"
-        )
-    numeric = tuple(int(part) for part in re.findall(r"\d+", installed)[:3])
-    if numeric < (0, 6, 15):
-        return SupportResult.dependency_broken(
-            f"requires flashinfer-python >= 0.6.15, got {installed}"
-        )
-    return SupportResult.yes(
-        f"flashinfer-python {installed} communication family is available"
-    )
+    _, reason = flashinfer_kernel_support("communication")
+    return SupportResult.yes(reason)
 
 
 def _expandable_segments_enabled() -> bool:
@@ -354,8 +343,14 @@ class FlashInferVllmAllReduceProvider(AllReduceProvider):
         try:
             from flashinfer import comm
         except (ImportError, OSError, RuntimeError) as exc:
-            return SupportResult.dependency_broken(
-                f"FlashInfer communication APIs are unavailable: {exc}"
+            raise RequiredExternalKernelFamilyError(
+                KernelFamilyHealth(
+                    family="flashinfer-python",
+                    state=KernelFamilyState.BROKEN,
+                    version=None,
+                    reason=f"communication APIs are unavailable: {exc}",
+                ),
+                feature="communication",
             )
         required = (
             "CudaRTLibrary",
@@ -369,13 +364,17 @@ class FlashInferVllmAllReduceProvider(AllReduceProvider):
             "vllm_register_graph_buffers",
         )
         missing = [name for name in required if not hasattr(comm, name)]
-        return (
-            SupportResult.dependency_broken(
-                "FlashInfer communication APIs are missing: " + ", ".join(missing)
+        if missing:
+            raise RequiredExternalKernelFamilyError(
+                KernelFamilyHealth(
+                    family="flashinfer-python",
+                    state=KernelFamilyState.BROKEN,
+                    version=None,
+                    reason="communication APIs are missing: " + ", ".join(missing),
+                ),
+                feature="communication",
             )
-            if missing
-            else dependency
-        )
+        return dependency
 
     def __init__(self) -> None:
         self._group: dist.ProcessGroup | None = None

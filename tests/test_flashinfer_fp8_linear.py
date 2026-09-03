@@ -21,11 +21,13 @@ from sparsevllm.kernels.external.flashinfer.moe import (
 )
 from sparsevllm.kernels.external.flashinfer.support import (
     flashinfer_kernel_health,
+    flashinfer_kernel_metadata_health,
 )
 from sparsevllm.kernels.external.support import (
     ExternalKernelContractError,
     ExternalKernelFamilyError,
     KernelFamilyState,
+    RequiredExternalKernelFamilyError,
 )
 
 
@@ -35,6 +37,17 @@ def test_flashinfer_health_distinguishes_missing_package() -> None:
 
     assert health.state is KernelFamilyState.ABSENT
     assert "flashinfer-python is not installed" in health.reason
+
+
+def test_flashinfer_metadata_health_does_not_import_package() -> None:
+    with (
+        patch("importlib.util.find_spec", return_value=object()),
+        patch("importlib.metadata.version", return_value="0.6.15"),
+        patch("importlib.import_module", side_effect=AssertionError("unexpected import")),
+    ):
+        health = flashinfer_kernel_metadata_health()
+
+    assert health.state is KernelFamilyState.READY
 
 
 @pytest.mark.parametrize("version", ["0.6.14", "0.7.0"])
@@ -59,6 +72,8 @@ def test_flashinfer_feature_does_not_hide_broken_family() -> None:
         _sm120_groupwise_fp8_linear_op.cache_clear()
 
     assert exc_info.value.health.state is KernelFamilyState.ABSENT
+    assert isinstance(exc_info.value, RequiredExternalKernelFamilyError)
+    assert 'pip install -e ".[cu130]"' in str(exc_info.value)
 
 
 def test_flashinfer_groupwise_feature_accepts_public_contract() -> None:

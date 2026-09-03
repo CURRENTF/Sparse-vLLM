@@ -10,6 +10,7 @@ from sparsevllm.kernels.external.support import (
     ExternalKernelContractError,
     ExternalKernelFamilyError,
     KernelFamilyState,
+    RequiredExternalKernelFamilyError,
 )
 from sparsevllm.kernels.external.sgl.fa3 import (
     _FWD_ARGUMENTS,
@@ -17,6 +18,7 @@ from sparsevllm.kernels.external.sgl.fa3 import (
     sgl_fa3_device_support,
     sgl_fa3_support,
 )
+from sparsevllm.kernels.external.sgl.support import sgl_kernel_metadata_health
 
 
 def test_sgl_fa3_support_rejects_missing_package() -> None:
@@ -25,7 +27,20 @@ def test_sgl_fa3_support_rejects_missing_package() -> None:
             sgl_fa3_support()
 
     assert exc_info.value.health.state is KernelFamilyState.ABSENT
+    assert isinstance(exc_info.value, RequiredExternalKernelFamilyError)
     assert "sglang-kernel is not installed" in str(exc_info.value)
+    assert 'pip install -e ".[cu129]"' in str(exc_info.value)
+
+
+def test_sgl_metadata_health_does_not_import_device_bound_ops() -> None:
+    with (
+        patch("importlib.util.find_spec", return_value=object()),
+        patch("importlib.metadata.version", return_value="0.4.5"),
+        patch("importlib.import_module", side_effect=AssertionError("unexpected import")),
+    ):
+        health = sgl_kernel_metadata_health()
+
+    assert health.state is KernelFamilyState.READY
 
 
 @pytest.mark.parametrize("version", ["0.4.4", "0.4.5.post1", "0.4.6.post1"])

@@ -844,8 +844,11 @@ class OpResolver(Generic[SpecT, ProviderT]):
             ExternalKernelContractError,
             ExternalKernelFamilyError,
             KernelFamilyState,
+            RequiredExternalKernelFamilyError,
         )
 
+        if isinstance(error, RequiredExternalKernelFamilyError):
+            raise error
         if isinstance(error, ExternalKernelFamilyError):
             if error.health.state is KernelFamilyState.ABSENT:
                 return SupportResult.dependency_absent(str(error))

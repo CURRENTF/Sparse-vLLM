@@ -39,6 +39,11 @@ are runtime dependencies, so workflow-specific extras are not required. The SGL
 kernel package is pinned to the validated PyTorch/CUDA ABI; other versions fail
 provider setup instead of falling back silently.
 
+The CUDA extras also require `flashinfer-python>=0.6.15,<0.7`. GPU engine
+startup fails if FlashInfer or SGL kernel is absent, has incompatible package
+metadata, or cannot load. Reinstall the matching dependency set with
+`pip install -e ".[cu129]"` or `pip install -e ".[cu130]"`.
+
 Sparse-vLLM supports Qwen3.5/Qwen3.6/Qwen3.8 checkpoints in unquantized BF16
 and block-scaled FP8 formats. All three share the `qwen3_5` runtime architecture
 and support matrix.

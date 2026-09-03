@@ -8,6 +8,7 @@ from sparsevllm.kernels.external.support import (
     ExternalKernelFamilyError,
     KernelFamilyHealth,
     KernelFamilyState,
+    RequiredExternalKernelFamilyError,
 )
 from sparsevllm.operators.activation import (
     SILU_AND_MUL_REGISTRY,
@@ -102,6 +103,18 @@ def _broken_sgl_family(feature: str) -> ExternalKernelFamilyError:
     )
 
 
+def _missing_sgl_family(feature: str) -> RequiredExternalKernelFamilyError:
+    return RequiredExternalKernelFamilyError(
+        KernelFamilyHealth(
+            family="sglang-kernel",
+            state=KernelFamilyState.ABSENT,
+            version=None,
+            reason="sglang-kernel is not installed",
+        ),
+        feature=feature,
+    )
+
+
 def _broken_flashinfer_family(feature: str) -> ExternalKernelFamilyError:
     return ExternalKernelFamilyError(
         KernelFamilyHealth(
@@ -114,8 +127,8 @@ def _broken_flashinfer_family(feature: str) -> ExternalKernelFamilyError:
     )
 
 
-def _missing_flashinfer_family(feature: str) -> ExternalKernelFamilyError:
-    return ExternalKernelFamilyError(
+def _missing_flashinfer_family(feature: str) -> RequiredExternalKernelFamilyError:
+    return RequiredExternalKernelFamilyError(
         KernelFamilyHealth(
             family="flashinfer-python",
             state=KernelFamilyState.ABSENT,
@@ -555,6 +568,40 @@ def test_sgl_triton_moe_does_not_hide_broken_alignment() -> None:
             )
 
 
+def test_sgl_triton_moe_fails_when_required_alignment_is_missing() -> None:
+    spec = _moe_spec(
+        activation_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        block_shape=None,
+        hidden_size=2048,
+        intermediate_size=384,
+        num_local_experts=128,
+        num_experts=128,
+        top_k=8,
+        ep_size=1,
+        tp_size=2,
+    )
+
+    with (
+        patch(
+            "sparsevllm.kernels.external.sgl.moe.sgl_moe_alignment_support",
+            side_effect=_missing_sgl_family("MoE alignment"),
+        ),
+        pytest.raises(
+            RequiredExternalKernelFamilyError,
+            match=r'pip install -e "\.\[cu129\]"',
+        ),
+    ):
+        OpResolver(MOE_REGISTRY).resolve(
+            spec,
+            _cuda_caps(
+                (9, 0),
+                native_fp8=False,
+                device_name="NVIDIA H100 80GB HBM3",
+            ),
+        )
+
+
 @pytest.mark.parametrize(
     ("overrides", "reason"),
     [
@@ -770,7 +817,7 @@ def test_minimax_m2_mixed_tp_ep_uses_flashinfer_upstream_default(
     ("tp_size", "ep_size", "num_local_experts", "intermediate_size"),
     [(2, 2, 128, 768), (1, 4, 64, 1536), (1, 8, 32, 1536)],
 )
-def test_minimax_mixed_ep_uses_triton_when_flashinfer_missing(
+def test_minimax_mixed_ep_fails_when_flashinfer_missing(
     tp_size: int,
     ep_size: int,
     num_local_experts: int,
@@ -788,19 +835,21 @@ def test_minimax_mixed_ep_uses_triton_when_flashinfer_missing(
         scale_dtype=torch.float32,
     )
 
-    with patch(
-        "sparsevllm.kernels.external.flashinfer.moe."
-        "flashinfer_cutlass_fp8_moe_support",
-        side_effect=_missing_flashinfer_family("SM90 CUTLASS FP8 MoE"),
+    with (
+        patch(
+            "sparsevllm.kernels.external.flashinfer.moe."
+            "flashinfer_cutlass_fp8_moe_support",
+            side_effect=_missing_flashinfer_family("SM90 CUTLASS FP8 MoE"),
+        ),
+        pytest.raises(
+            RequiredExternalKernelFamilyError,
+            match=r'pip install -e "\.\[cu130\]"',
+        ),
     ):
-        resolved = OpResolver(MOE_REGISTRY).resolve(
+        OpResolver(MOE_REGISTRY).resolve(
             spec,
             _cuda_caps((9, 0), device_name="NVIDIA H100 80GB HBM3"),
         )
-
-    assert resolved.provider.name == "triton_minimax_m2_fused"
-    assert resolved.report.selected_profile is None
-    assert resolved.report.selection_basis == "dependency_degraded"
 
 
 def test_minimax_ep4_uses_triton_when_flashinfer_unsupported() -> None:
@@ -900,18 +949,19 @@ def test_triton_fp8_moe_does_not_hide_broken_sgl_quantization() -> None:
             OpResolver(MOE_REGISTRY).resolve(_moe_spec(), _cuda_caps((12, 0)))
 
 
-def test_fp8_moe_marks_missing_flashinfer_as_degraded():
-    with patch(
-        "sparsevllm.kernels.external.flashinfer.moe."
-        "flashinfer_cutlass_fp8_moe_support",
-        side_effect=_missing_flashinfer_family("SM90 CUTLASS FP8 MoE"),
+def test_fp8_moe_fails_when_flashinfer_is_missing():
+    with (
+        patch(
+            "sparsevllm.kernels.external.flashinfer.moe."
+            "flashinfer_cutlass_fp8_moe_support",
+            side_effect=_missing_flashinfer_family("SM90 CUTLASS FP8 MoE"),
+        ),
+        pytest.raises(RequiredExternalKernelFamilyError, match="flashinfer-python"),
     ):
-        resolved = OpResolver(MOE_REGISTRY).resolve(
+        OpResolver(MOE_REGISTRY).resolve(
             _moe_spec(),
             _cuda_caps((9, 0)),
         )
-
-    assert resolved.report.selection_basis == "dependency_degraded"
 
 
 @pytest.mark.parametrize(

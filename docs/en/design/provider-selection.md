@@ -125,10 +125,16 @@ prefill/decode pairs are valid when their shared cache contract matches.
 
 ## Dependency And Evidence Rules
 
-If an applicable upstream dependency is absent, the resolver may bind a
-repository baseline and records `selection_basis=dependency_degraded`. A broken
-installed dependency fails binding. Runtime exceptions never trigger provider
-reselection.
+FlashInfer and SGL kernel are required by the canonical CUDA installation. The
+GPU engine validates package discovery and version metadata before starting
+workers, without importing device-bound binaries. Each rank imports and
+validates those binaries only after selecting its CUDA device. Provider
+resolution also fails if either required family is absent or broken. The error
+includes the matching `pip install -e ".[cu129]"` or
+`pip install -e ".[cu130]"` repair command. An absent genuinely optional
+upstream dependency may still bind a repository baseline and records
+`selection_basis=dependency_degraded`. Runtime exceptions never trigger
+provider reselection.
 
 Every binding report records the selected provider and optional profile,
 `selection_basis`, all atomic and profile decisions, and provider metadata. It

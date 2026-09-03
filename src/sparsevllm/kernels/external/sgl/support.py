@@ -5,17 +5,17 @@ import importlib.metadata
 import importlib.util
 
 from sparsevllm.kernels.external.support import (
-    ExternalKernelFamilyError,
     KernelFamilyHealth,
     KernelFamilyState,
+    RequiredExternalKernelFamilyError,
 )
 
 _DISTRIBUTION = "sglang-kernel"
 _REQUIRED_VERSION = "0.4.5"
 
 
-def sgl_kernel_health() -> KernelFamilyHealth:
-    """Inspect the required SGL binary family independently of any feature."""
+def sgl_kernel_metadata_health() -> KernelFamilyHealth:
+    """Inspect SGL discovery and metadata without importing device-bound ops."""
     try:
         package_spec = importlib.util.find_spec("sgl_kernel")
     except (ImportError, ValueError) as error:
@@ -48,6 +48,21 @@ def sgl_kernel_health() -> KernelFamilyHealth:
             version,
             f"requires {_DISTRIBUTION}=={_REQUIRED_VERSION}, got {version}",
         )
+    return KernelFamilyHealth(
+        _DISTRIBUTION,
+        KernelFamilyState.READY,
+        version,
+        f"{_DISTRIBUTION} {version} package metadata is ready",
+    )
+
+
+def sgl_kernel_health() -> KernelFamilyHealth:
+    """Inspect SGL metadata and import ops for the already-selected device."""
+
+    metadata_health = sgl_kernel_metadata_health()
+    if not metadata_health.ready:
+        return metadata_health
+    version = metadata_health.version
     try:
         importlib.import_module("sgl_kernel")
     except Exception as error:
@@ -70,8 +85,12 @@ def sgl_kernel_support(feature: str) -> tuple[bool, str]:
 
     health = sgl_kernel_health()
     if not health.ready:
-        raise ExternalKernelFamilyError(health, feature=feature)
+        raise RequiredExternalKernelFamilyError(health, feature=feature)
     return True, f"{_DISTRIBUTION} {health.version} {feature} is available"
 
 
-__all__ = ["sgl_kernel_health", "sgl_kernel_support"]
+__all__ = [
+    "sgl_kernel_health",
+    "sgl_kernel_metadata_health",
+    "sgl_kernel_support",
+]

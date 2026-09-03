@@ -36,6 +36,21 @@ class ExternalKernelFamilyError(ExternalKernelError):
         )
 
 
+CUDA_DEPENDENCY_INSTALL_HINT = (
+    'Run `pip install -e ".[cu129]"` or `pip install -e ".[cu130]"`, '
+    "matching the CUDA runtime."
+)
+
+
+class RequiredExternalKernelFamilyError(ExternalKernelFamilyError):
+    """A required CUDA dependency is absent or unusable."""
+
+    def __init__(self, health: KernelFamilyHealth, *, feature: str) -> None:
+        super().__init__(health, feature=feature)
+        self.install_hint = CUDA_DEPENDENCY_INSTALL_HINT
+        self.args = (f"{self.args[0]} {self.install_hint}",)
+
+
 class ExternalKernelContractError(ExternalKernelError):
     def __init__(self, family: str, feature: str, reason: str) -> None:
         self.family = str(family)
@@ -45,9 +60,11 @@ class ExternalKernelContractError(ExternalKernelError):
 
 
 __all__ = [
+    "CUDA_DEPENDENCY_INSTALL_HINT",
     "ExternalKernelContractError",
     "ExternalKernelError",
     "ExternalKernelFamilyError",
     "KernelFamilyHealth",
     "KernelFamilyState",
+    "RequiredExternalKernelFamilyError",
 ]
