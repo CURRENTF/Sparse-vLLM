@@ -44,6 +44,7 @@ from sparsevllm.operators.workspace import (
 )
 from sparsevllm.utils.context import set_context, get_context, reset_context
 from sparsevllm.utils.loader import load_model, sync_deltakv_config_from_checkpoint
+from sparsevllm.utils.process_title import set_engine_process_title
 
 from sparsevllm.engine.cache_manager import CacheManager
 from sparsevllm.engine.cache_manager.base import _debug_tensor_summary
@@ -312,6 +313,7 @@ class ModelRunner:
         self.parallel_context = init_parallel_context(
             topology=config.parallel_topology,
         )
+        set_engine_process_title(self.parallel_context)
         # CUDA allocator peaks are process-global and survive LLMEngine.exit().
         # Start a new lifecycle before model construction so KV sizing observes
         # only this engine's model load and persistent allocations.

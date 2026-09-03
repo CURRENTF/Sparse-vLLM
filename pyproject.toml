@@ -42,6 +42,7 @@ dependencies = [
     "jieba",
     "pytest",
     "rouge",
+    "setproctitle>=1.3,<2",
     "tomli; python_version < '3.11'",
 ]
 
