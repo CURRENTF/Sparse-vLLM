@@ -33,6 +33,7 @@ def _parallel_context(
     ("parallel_context", "expected"),
     [
         (_parallel_context(world_size=1), "SVLLM_Engine"),
+        (_parallel_context(world_size=2, tp_rank=1), "SVLLM_TP1"),
         (
             _parallel_context(world_size=4, tp_rank=1, ep_rank=1),
             "SVLLM_TP1_EP1",
