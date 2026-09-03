@@ -140,6 +140,8 @@ def _make_glm_graph_lane(
         cache_dtype=torch.bfloat16,
         tp_size=1,
         cuda_graph=True,
+        context_capacity=128,
+        batch_capacity=1,
     )
     mla_attention = MLAAttention.bind(
         spec=spec,
@@ -319,7 +321,6 @@ def _make_glm_graph_lane(
         is_long_text_batch=lambda seqs, is_prefill: False,
         method="",
         capture_sizes=[1],
-        context_sizes=[128],
     )
     return SimpleNamespace(
         attention=attention,
@@ -476,6 +477,8 @@ def _make_glm_full_graph_lane(
         cache_dtype=torch.bfloat16,
         tp_size=1,
         cuda_graph=True,
+        context_capacity=128,
+        batch_capacity=1,
     )
     mla_attention = MLAAttention.bind(
         spec=mla_spec,
@@ -626,7 +629,6 @@ def _make_glm_full_graph_lane(
         is_long_text_batch=lambda seqs, is_prefill: False,
         method="",
         capture_sizes=[1],
-        context_sizes=[128],
     )
     return SimpleNamespace(
         model=model,
@@ -1045,6 +1047,8 @@ def _make_glm_method_graph_lane(
         tp_size=1,
         cuda_graph=True,
         score_output=sparse_decode_attention_score_kind(method),
+        context_capacity=16,
+        batch_capacity=1,
     )
     mla_attention = MLAAttention.bind(
         spec=spec,
@@ -1182,7 +1186,6 @@ def _make_glm_method_graph_lane(
         is_long_text_batch=lambda seqs, is_prefill: True,
         method=method,
         capture_sizes=[1],
-        context_sizes=[16],
     )
     return SimpleNamespace(
         attentions=attentions,
