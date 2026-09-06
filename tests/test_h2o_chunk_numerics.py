@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from sparsevllm.engine.cache_manager.base import (
-    AttentionViewMeta, ExplicitKVPayload, LayerBatchStates, PrefillComputeView,
+    AttentionViewMeta, DecodeComputeView, ExplicitKVPayload, LayerBatchStates, PrefillComputeView,
 )
 from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
 from sparsevllm.engine.cache_manager.storage import ExplicitKVStorage
@@ -16,6 +16,7 @@ from sparsevllm.engine.sparse_methods.base import PrefillScoreEvent, SparseStepC
 from sparsevllm.engine.sparse_methods.h2o import H2ORuntime
 from sparsevllm.kernels.triton.context_flashattention_nopad import context_attention_fwd
 from sparsevllm.kernels.triton.prefill_score import PrefillScoreWorkspace
+from sparsevllm.operators.decode_attention import DecodeAttentionOpSpec, prepare_decode_attention_op
 from sparsevllm.utils.context import reset_context, set_context
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
@@ -118,13 +119,20 @@ def _run_chunks(q, k, v, chunks, budget, reduction):
             assert manager._num_free_slots[0] + len(histories[0]) == length + 1
             output_chunks.append(output)
             start += chunk
-        # A one-query score-free read is the causal attention contract used at
-        # decode handoff; model tests separately exercise the native provider.
+        # Exercise the registered native decode provider on the compressed KV.
         resident = len(histories[0])
         context = torch.tensor([resident], device=q.device, dtype=torch.int32)
-        output = torch.empty_like(q[:1])
-        context_attention_fwd(q[:1], storage.cache[0, 0], storage.cache[1, 0], output,
-                              zero, zero, context, context - 1, 1, view.meta.active_slots)
+        set_context(False, cache_manager=manager, seqs=[seq])
+        decode = prepare_decode_attention_op(DecodeAttentionOpSpec(
+            num_query_heads=heads, num_kv_heads=kv_heads, head_dim=dim,
+            activation_dtype=q.dtype, softmax_scale=dim ** -.5,
+            max_batch_size=1, cuda_graph=False, layer_varying_page_table=True,
+        ), device_index=0)
+        output = decode.run(q[:1], DecodeComputeView(
+            meta=AttentionViewMeta(active_slots=view.meta.active_slots, req_indices=zero,
+                                   context_lens=context, max_context_len=resident),
+            payload=view.payload,
+        ))
         for head in range(heads):
             group = head // group_size
             keys, values = k[histories[group], group].float(), v[histories[group], group].float()
