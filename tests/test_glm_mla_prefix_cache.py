@@ -13,6 +13,8 @@ from sparsevllm.engine.cache_manager import (
     PrefillComputeView,
 )
 from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
+from sparsevllm.engine.sparse_methods.h2o import H2ORuntime
+from sparsevllm.engine.sparse_methods.base import SparseStepContext
 from sparsevllm.engine.cache_manager.rkv import RKVCacheManager
 from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
 from sparsevllm.engine.cache_manager.storage import MlaLatentStorage
@@ -54,6 +56,7 @@ def _latent_chain_manager(manager_type, method: str):
         h2o_prefill_budget=8,
         h2o_recent_ratio=0.5,
         h2o_prefill_score_window=2,
+        h2o_head_reduction="max",
         rkv_compression_interval=2,
         rkv_observation_tokens=2,
         rkv_alpha=0.5,
@@ -105,6 +108,7 @@ def _latent_chain_manager(manager_type, method: str):
     manager._prefill_attn_score_accumulators = {}
     manager._uniform_decode_metadata = False
     manager._h2o_scores = {}
+    manager._h2o_positions = {}
     manager._h2o_active_decode_seq_ids = set()
     manager._h2o_counters = {
         "intermediate_prefill_evictions": 0,
@@ -113,7 +117,6 @@ def _latent_chain_manager(manager_type, method: str):
         "decode_evictions": 0,
         "dropped_tokens": 0,
     }
-    manager._h2o_final_prefill_workspace = None
     manager._rkv_query_cache_enabled = True
     manager._rkv_observation_tokens = 2
     manager._rkv_vectorized_prefill_query_cache = True
@@ -259,6 +262,9 @@ def test_snapkv_chain_resume_preserves_latent_payload_and_resets_prefill_scores(
 def test_h2o_chain_resume_preserves_aligned_scores_and_cleans_side_state():
     manager, storage, config = _latent_chain_manager(H2OCacheManager, "h2o")
     coordinator = ChainCacheCoordinator(config, manager)
+    runtime = object.__new__(H2ORuntime)
+    runtime.config = config
+    runtime.cache_manager = manager
     owner_tokens = list(range(6))
     owner = Sequence(owner_tokens)
     owner.seq_id = 0
@@ -277,9 +283,9 @@ def test_h2o_chain_resume_preserves_aligned_scores_and_cleans_side_state():
     owner_slots = manager.layer_batch_states[0].slot_mapping.clone().long()
     _fill_latent_slots(storage, owner_slots, owner_tokens)
     manager._h2o_scores[(0, owner.seq_id)] = torch.tensor(
-        [1.0, 9.0, 2.0, 8.0, 0.0, 0.0]
+        [[1.0, 9.0, 2.0, 8.0, 0.0, 0.0], [0.0, 1.0, 0.0, 2.0, 0.0, 0.0]]
     )
-    manager.evict_after_prefill([owner])
+    runtime.finish_step(SparseStepContext([owner], True, None))
     assert manager.row_seq_lens[0].tolist() == [4]
     resident_slots = manager.buffer_req_to_token_slots[0][0, :4].clone().long()
     payload = storage.layer_payload(0)
@@ -291,8 +297,7 @@ def test_h2o_chain_resume_preserves_aligned_scores_and_cleans_side_state():
         payload.rope_cache[resident_slots, 0, 0],
         torch.tensor([101, 103, 104, 105], dtype=torch.bfloat16),
     )
-    assert manager._h2o_scores[(0, owner.seq_id)].tolist() == [9.0, 8.0, 0.0, 0.0]
-    assert manager._h2o_final_prefill_workspace is None
+    assert manager._h2o_scores[(0, owner.seq_id)].tolist() == [[9.0, 8.0, 0.0, 0.0], [1.0, 2.0, 0.0, 0.0]]
     coordinator.index.finish(
         owner.chain_id,
         token_ids=owner_tokens,
@@ -320,7 +325,7 @@ def test_h2o_chain_resume_preserves_aligned_scores_and_cleans_side_state():
     input_ids, positions, _ = manager._prepare_prefill([resumed])
     assert input_ids.tolist() == [6, 7]
     assert positions.tolist() == [6, 7]
-    assert manager._h2o_scores[(0, resumed.seq_id)].tolist() == [9.0, 8.0, 0.0, 0.0]
+    assert manager._h2o_scores[(0, resumed.seq_id)].tolist() == [[9.0, 8.0, 0.0, 0.0], [1.0, 2.0, 0.0, 0.0]]
     resumed_row = manager.seq_id_to_row[0][resumed.seq_id]
     resumed_slots = manager.buffer_req_to_token_slots[0][
         resumed_row, :6
@@ -329,11 +334,11 @@ def test_h2o_chain_resume_preserves_aligned_scores_and_cleans_side_state():
     _fill_latent_slots(storage, resumed_slots[4:], [6, 7])
     manager._h2o_scores[(0, resumed.seq_id)] = manager._accumulate_score(
         manager._h2o_scores[(0, resumed.seq_id)],
-        torch.tensor([0.0, 0.0, 0.0, 0.0, 7.0, 6.0]),
+        torch.tensor([[0.0, 0.0, 0.0, 0.0, 7.0, 6.0], [3.0, 2.0, 0.0, 0.0, 1.0, 1.0]]),
         new_len=6,
         weight=1.0,
     )
-    manager.evict_after_prefill([resumed])
+    runtime.finish_step(SparseStepContext([resumed], True, None))
     final_slots = manager.buffer_req_to_token_slots[0][
         resumed_row, :4
     ].clone().long()
@@ -345,9 +350,8 @@ def test_h2o_chain_resume_preserves_aligned_scores_and_cleans_side_state():
         payload.rope_cache[final_slots, 0, 0],
         torch.tensor([101, 103, 106, 107], dtype=torch.bfloat16),
     )
-    assert manager._h2o_scores[(0, resumed.seq_id)].tolist() == [9.0, 8.0, 7.0, 6.0]
+    assert manager._h2o_scores[(0, resumed.seq_id)].tolist() == [[9.0, 8.0, 7.0, 6.0], [4.0, 4.0, 1.0, 1.0]]
     assert manager._h2o_counters["final_prefill_evictions"] == 2
-    assert manager._h2o_final_prefill_workspace is None
 
     coordinator.index.finish(
         owner.chain_id,
@@ -358,6 +362,7 @@ def test_h2o_chain_resume_preserves_aligned_scores_and_cleans_side_state():
     coordinator.invalidate(owner.chain_id)
     manager.free_seq(resumed.seq_id)
     assert manager._h2o_scores == {}
+    assert manager._h2o_positions == {}
     assert manager._prefill_attn_score_accumulators == {}
     assert manager.seq_id_to_row == [{}]
     assert manager._num_free_slots == [32]

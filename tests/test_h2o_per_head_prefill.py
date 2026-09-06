@@ -193,3 +193,94 @@ def test_chunk_prefill_append_retention_and_final_handoff_follow_logical_positio
             for head in range(2):
                 assert (manager.attention_cache_storage.cache[:, 0, slot, head] == histories[head][packed] + 100 * head).all()
         assert manager._num_free_slots[0] + resident == 12
+
+
+def _multi_request_manager():
+    manager = manager_with_storage()
+    manager.num_layers = manager.num_kv_layers = 2
+    manager.runtime_layout.kv_idx_to_layer_idx = (0, 1)
+    manager.attention_cache_storage.allocate(num_layers=2, num_slots=24, device=manager.device)
+    cache = manager.attention_cache_storage.cache
+    cache.copy_(torch.arange(cache.numel()).reshape_as(cache))
+    manager.config = SimpleNamespace(h2o_prefill_budget=4, h2o_decode_budget=3,
+                                     h2o_recent_ratio=.5, h2o_head_reduction='max')
+    manager.seq_id_to_row = [{7: 0, 8: 1}, {7: 0, 8: 1}]
+    manager.row_seq_lens = [np.array([6, 5], dtype=np.int32) for _ in range(2)]
+    manager.buffer_req_to_token_slots = [torch.zeros(2, 8, dtype=torch.int32) for _ in range(2)]
+    manager.free_slots_stack = [torch.zeros(24, dtype=torch.int32) for _ in range(2)]
+    manager._num_free_slots = [13, 13]
+    manager._h2o_scores.clear()
+    manager._h2o_positions.clear()
+    for layer in range(2):
+        for row, (seq_id, length) in enumerate([(7, 6), (8, 5)]):
+            manager.buffer_req_to_token_slots[layer][row, :length] = torch.arange(length).flip(0) + row * 12
+            manager._h2o_scores[(layer, seq_id)] = torch.stack([
+                torch.arange(length).float().roll(layer + head) for head in range(4)
+            ])
+            manager._h2o_positions[(layer, seq_id)] = torch.arange(length)[None].expand(2, -1).clone()
+    return manager
+
+
+def _mixed_prefill_seqs():
+    from sparsevllm.engine.sequence import Sequence
+    seqs = [Sequence(list(range(6))), Sequence(list(range(20)))]
+    for seq, seq_id, chunk in zip(seqs, [7, 8], [6, 5]):
+        seq.seq_id = seq_id
+        seq.current_chunk_size = chunk
+    return seqs
+
+
+def test_multilayer_mixed_prefill_budgets_preserve_independent_head_payloads():
+    from sparsevllm.engine.sparse_methods.base import SparseStepContext
+    from sparsevllm.engine.sparse_methods.h2o import H2ORuntime
+
+    manager = _multi_request_manager()
+    expected = {}
+    old_cache = manager.attention_cache_storage.cache.clone()
+    for layer in range(2):
+        for row, (seq_id, length, budget) in enumerate([(7, 6, 3), (8, 5, 4)]):
+            scores = manager._h2o_scores[(layer, seq_id)]
+            recent = max(1, int(budget * .5))
+            for group in range(2):
+                rank = lambda index: max(float(scores[2 * group + head, index]) for head in range(2))
+                heavy = sorted(range(length - recent), key=lambda index: (-rank(index), index))[:budget - recent]
+                selected = sorted(heavy + list(range(length - recent, length)))
+                slots = manager.buffer_req_to_token_slots[layer][row, selected].long()
+                expected[layer, seq_id, group] = (selected, old_cache[:, layer, slots, group].clone())
+    runtime = object.__new__(H2ORuntime)
+    runtime.config, runtime.cache_manager = manager.config, manager
+    runtime.finish_step(SparseStepContext(_mixed_prefill_seqs(), True, None))
+    for layer in range(2):
+        assert manager.row_seq_lens[layer].tolist() == [3, 4]
+        for row, (seq_id, budget) in enumerate([(7, 3), (8, 4)]):
+            slots = manager.buffer_req_to_token_slots[layer][row, :budget].long()
+            for group in range(2):
+                positions, payload = expected[layer, seq_id, group]
+                assert manager._h2o_positions[layer, seq_id][group].tolist() == positions
+                torch.testing.assert_close(manager.attention_cache_storage.cache[:, layer, slots, group], payload)
+    assert manager._num_free_slots == [17, 17]
+    assert manager._h2o_counters['final_prefill_evictions'] == 2
+    assert manager._h2o_counters['intermediate_prefill_evictions'] == 2
+    assert manager._h2o_counters['dropped_tokens'] == 8
+
+
+def test_later_layer_capacity_failure_does_not_commit_earlier_layers():
+    from sparsevllm.engine.sparse_methods.base import SparseStepContext
+    from sparsevllm.engine.sparse_methods.h2o import H2ORuntime
+
+    manager = _multi_request_manager()
+    manager._num_free_slots[1] = 23
+    old_cache = manager.attention_cache_storage.cache.clone()
+    old_tables = [table.clone() for table in manager.buffer_req_to_token_slots]
+    old_scores = {key: score.clone() for key, score in manager._h2o_scores.items()}
+    runtime = object.__new__(H2ORuntime)
+    runtime.config, runtime.cache_manager = manager.config, manager
+    with pytest.raises(RuntimeError, match='overflow.*layer=1'):
+        runtime.finish_step(SparseStepContext(_mixed_prefill_seqs(), True, None))
+    torch.testing.assert_close(manager.attention_cache_storage.cache, old_cache)
+    for actual, before in zip(manager.buffer_req_to_token_slots, old_tables):
+        torch.testing.assert_close(actual, before)
+    for key, before in old_scores.items():
+        torch.testing.assert_close(manager._h2o_scores[key], before)
+    assert manager._num_free_slots == [13, 23]
+    assert [lengths.tolist() for lengths in manager.row_seq_lens] == [[6, 5], [6, 5]]

@@ -22,6 +22,13 @@ class H2ORetention:
 class H2OPrefillRetentionMixin:
     """Cache-owned per-head state and overlap-safe physical retention."""
 
+    @staticmethod
+    def _assert_retention_tensor(condition: torch.Tensor, message: str) -> None:
+        if condition.is_cuda:
+            torch._assert_async(condition)
+        elif not bool(condition.item()):
+            raise RuntimeError(message)
+
     @property
     def h2o_selection_groups(self) -> int:
         from .storage import MlaLatentStorage
@@ -60,7 +67,7 @@ class H2OPrefillRetentionMixin:
             ):
                 raise ValueError("H2O retention requires [selection_groups, budget] int64 indices.")
             budget = int(keep.shape[-1])
-            self._assert_final_prefill_tensor(
+            self._assert_retention_tensor(
                 ((keep >= 0) & (keep < length)).all()
                 & (keep[:, 1:] > keep[:, :-1]).all(),
                 "H2O retention indices must be in bounds and strictly increasing.",
@@ -74,15 +81,16 @@ class H2OPrefillRetentionMixin:
                 raise ValueError("H2O retention score/position metadata is not aligned.")
             slots = self.buffer_req_to_token_slots[layer][row, :length].long().clone()
             ordered_slots = slots.sort().values
-            self._assert_final_prefill_tensor(
+            self._assert_retention_tensor(
                 ((slots >= 0) & (slots < storage.slot_capacity())).all()
                 & (ordered_slots[1:] > ordered_slots[:-1]).all(),
                 "H2O retention physical slots must be valid and unique.",
             )
             release_counts[layer] = release_counts.get(layer, 0) + length - budget
-            end = int(self._num_free_slots[layer]) + release_counts[layer]
-            if end > self.free_slots_stack[layer].numel():
-                raise RuntimeError("H2O retention would overflow the free-slot stack.")
+            pointer = int(self._num_free_slots[layer])
+            end = pointer + release_counts[layer]
+            if pointer < 0 or end > self.free_slots_stack[layer].numel():
+                raise RuntimeError(f"H2O retention would overflow the free-slot stack: layer={layer}.")
             # Every query head keeps its own history, including heads that did
             # not supply the group's maximum on this step.
             score_keep = keep.repeat_interleave(score.shape[0] // groups, dim=0)

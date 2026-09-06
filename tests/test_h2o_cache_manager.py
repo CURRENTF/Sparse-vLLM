@@ -18,7 +18,6 @@ from sparsevllm.engine.cache_manager.base import (
 )
 from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
 from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
-from sparsevllm.engine.cache_manager.storage import MlaLatentStorage
 from sparsevllm.engine.decode_graph_contract import (
     DecodeGraphContract,
     DecodeGraphInputs,
@@ -104,7 +103,6 @@ def _manager_with_layer_rows(
         "decode_evictions": 0,
         "dropped_tokens": 0,
     }
-    manager._h2o_final_prefill_workspace = None
     manager._uniform_decode_metadata = False
     manager.seq_id_to_row = [
         {idx: idx for idx in range(batch_size)}
@@ -186,32 +184,6 @@ def _set_layer_row_slots(
             slots,
             dtype=torch.int32,
         )
-
-
-def _fill_kv_by_physical_slot(manager: H2OCacheManager):
-    for layer_idx in manager.kv_transformer_layer_indices():
-        k_cache, v_cache = manager.get_layer_kv_cache(layer_idx)
-        slot_values = torch.arange(k_cache.shape[0], dtype=k_cache.dtype).view(-1, 1, 1)
-        offsets = torch.arange(
-            manager.num_kv_heads * manager.head_dim,
-            dtype=k_cache.dtype,
-        ).view(1, manager.num_kv_heads, manager.head_dim)
-        k_cache.copy_(slot_values * 10 + offsets)
-        v_cache.copy_(-slot_values * 10 - offsets - 1)
-
-
-def _use_kv_layout(manager: H2OCacheManager, layout: str):
-    if layout == "tensor":
-        return
-    if layout != "list":
-        raise ValueError(f"unknown KV layout: {layout}")
-    manager.kv_cache = [
-        (
-            manager.kv_cache[0, layer_idx].clone(),
-            manager.kv_cache[1, layer_idx].clone(),
-        )
-        for layer_idx in manager.kv_transformer_layer_indices()
-    ]
 
 
 def _assert_scores_match_slot_rows(manager: H2OCacheManager):
@@ -454,54 +426,14 @@ def test_h2o_prefill_score_ranges_use_compressed_physical_coordinates():
     assert ranges[0][2:] == (8, 8, 11)
 
 
-def test_h2o_logit_prefill_score_window_zero_covers_full_current_chunk():
+def test_h2o_prefill_score_window_zero_covers_full_current_chunk():
     manager = _manager_with_rows([11])
-    manager.config.sparse_prefill_score_mode = "logits"
     manager.config.h2o_prefill_score_window = 0
     seq = _seq(0, 100, prefilled=64, chunk=6)
 
     ranges = manager.prefill_score_ranges(0, [seq])
 
     assert ranges[0][2:] == (5, 5, 11)
-
-
-def test_h2o_logit_prefill_score_is_normalized_before_weighted_accumulation():
-    logits = torch.tensor([0.0, 1.0, 2.0])
-    normalized = H2OCacheManager._normalize_logit_prefill_score(logits, new_len=3)
-    cumulative = H2OCacheManager._accumulate_score(
-        torch.tensor([1.0, 2.0]),
-        normalized,
-        new_len=3,
-        weight=4.0,
-    )
-
-    assert normalized.sum().item() == pytest.approx(1.0)
-    assert torch.equal(normalized, torch.softmax(logits, dim=0))
-    assert torch.equal(
-        cumulative,
-        torch.tensor([1.0, 2.0, 0.0]) + 4.0 * torch.softmax(logits, dim=0),
-    )
-
-
-def test_h2o_logit_prefill_score_converts_unscored_minus_inf_to_zero_prob():
-    logits = torch.tensor([0.0, -torch.inf, 2.0])
-    normalized = H2OCacheManager._normalize_logit_prefill_score(logits, new_len=3)
-    assert normalized[1].item() == 0.0
-    assert torch.isfinite(normalized).all()
-    assert normalized.sum().item() == pytest.approx(1.0)
-
-
-def test_h2o_logit_prefill_score_rejects_nan_or_all_inf():
-    with pytest.raises(RuntimeError, match="invalid non-finite values"):
-        H2OCacheManager._normalize_logit_prefill_score(
-            torch.tensor([float("nan"), 1.0]),
-            new_len=2,
-        )
-    with pytest.raises(RuntimeError, match="invalid non-finite values"):
-        H2OCacheManager._normalize_logit_prefill_score(
-            torch.tensor([-torch.inf, -torch.inf]),
-            new_len=2,
-        )
 
 
 def _score_runtime(manager):
@@ -576,29 +508,6 @@ def test_h2o_missing_score_for_existing_physical_prefix_fails_fast():
     seq = _seq(0, 100, prefilled=64, chunk=3)
     with pytest.raises(RuntimeError, match="not aligned"):
         manager._require_score_length(0, seq, 8)
-
-
-def test_h2o_intermediate_and_final_prefill_use_distinct_budgets_and_counters():
-    manager = _manager_with_rows([10], decode_budget=4, prefill_budget=8)
-    seq = _seq(0, 20, prefilled=0, chunk=10)
-    manager._h2o_scores[(0, 0)] = torch.arange(10, dtype=torch.float32)
-
-    manager.evict_after_prefill([seq])
-    assert manager.row_seq_lens[0][0] == 8
-    assert manager._h2o_counters["intermediate_prefill_evictions"] == 1
-
-    manager.buffer_req_to_token_slots[0][0, 8:10] = torch.tensor([20, 21])
-    manager.row_seq_lens[0][0] = 10
-    manager._h2o_scores[(0, 0)] = manager._expand_score(
-        manager._h2o_scores[(0, 0)], 10, device=manager.device
-    )
-    seq.num_prefilled_tokens = 10
-    seq.current_chunk_size = 10
-    manager.evict_after_prefill([seq])
-
-    assert manager.row_seq_lens[0][0] == 4
-    assert manager._h2o_counters["final_prefill_evictions"] == 1
-    assert manager._h2o_counters["dropped_tokens"] == 8
 
 
 def test_h2o_decode_score_update_supports_batch_with_different_kv_lengths():
@@ -866,221 +775,6 @@ def test_h2o_decode_burst_compacts_all_layers_and_batch_once():
     }
 
 
-def test_h2o_intermediate_prefill_reuses_uniform_batch_fast_path():
-    manager = _manager_with_layer_rows(
-        [[6, 6], [7, 7]], decode_budget=3, prefill_budget=4
-    )
-    seqs = [
-        _seq(0, 20, prefilled=0, chunk=6),
-        _seq(1, 20, prefilled=0, chunk=6),
-    ]
-    _set_scores_from_slot_rows(manager)
-    calls = []
-    original = SnapKVCacheManager.free_part_slots_batch_layers
-
-    def tracked_batch_free(self, layer_indices, batch_seqs, keep_indices, **kwargs):
-        calls.append((list(layer_indices), keep_indices.clone()))
-        return original(self, layer_indices, batch_seqs, keep_indices, **kwargs)
-
-    with patch.object(
-        SnapKVCacheManager,
-        "free_part_slots_batch_layers",
-        new=tracked_batch_free,
-    ):
-        assert manager._try_batched_evict(seqs, is_prefill=True)
-
-    assert len(calls) == 1
-    assert calls[0][0] == [0, 1]
-    assert calls[0][1].shape == (2, 2, 4)
-    assert [lengths.tolist() for lengths in manager.row_seq_lens] == [[4, 4], [4, 4]]
-    _assert_scores_match_slot_rows(manager)
-    assert manager._h2o_counters == {
-        "intermediate_prefill_evictions": 4,
-        "final_prefill_evictions": 0,
-        "decode_eviction_bursts": 0,
-        "decode_evictions": 0,
-        "dropped_tokens": 10,
-    }
-
-
-def test_h2o_mixed_prefill_budgets_fall_back_with_exact_counters():
-    manager = _manager_with_rows([6, 6], decode_budget=3, prefill_budget=4)
-    seqs = [
-        _seq(0, 6, prefilled=0, chunk=6),
-        _seq(1, 20, prefilled=0, chunk=6),
-    ]
-    _set_scores_from_slot_rows(manager)
-    _fill_kv_by_physical_slot(manager)
-    k_cache, v_cache = manager.get_layer_kv_cache(0)
-    selected_slots = torch.tensor([3, 4, 5], dtype=torch.long)
-    expected_k = k_cache.index_select(0, selected_slots).clone()
-    expected_v = v_cache.index_select(0, selected_slots).clone()
-
-    assert not manager._try_batched_evict(seqs, is_prefill=True)
-    manager.evict_after_prefill(seqs)
-
-    assert manager.row_seq_lens[0].tolist() == [3, 4]
-    assert manager._h2o_scores[(0, 0)].tolist() == [3.0, 4.0, 5.0]
-    assert manager._h2o_scores[(0, 1)].tolist() == [102.0, 103.0, 104.0, 105.0]
-    final_slots = manager.buffer_req_to_token_slots[0][0, :3].long()
-    assert final_slots.tolist() == [0, 1, 2]
-    assert torch.equal(k_cache.index_select(0, final_slots), expected_k)
-    assert torch.equal(v_cache.index_select(0, final_slots), expected_v)
-    assert manager._h2o_counters == {
-        "intermediate_prefill_evictions": 1,
-        "final_prefill_evictions": 1,
-        "decode_eviction_bursts": 0,
-        "decode_evictions": 0,
-        "dropped_tokens": 5,
-    }
-
-
-@pytest.mark.parametrize("kv_layout", ["tensor", "list"])
-def test_h2o_final_prefill_page_table_compaction_preserves_logical_kv_alignment(
-    kv_layout: str,
-):
-    manager = _manager_with_layer_rows(
-        [[6, 6], [6, 6]], decode_budget=4, prefill_budget=8
-    )
-    rows_by_layer = [
-        [[9, 2, 7, 1, 6, 4], [29, 22, 27, 21, 26, 24]],
-        [[109, 102, 107, 101, 106, 104], [129, 122, 127, 121, 126, 124]],
-    ]
-    for layer_idx, rows in enumerate(rows_by_layer):
-        _set_layer_row_slots(manager, layer_idx, rows)
-        for seq_id in range(2):
-            manager._h2o_scores[(layer_idx, seq_id)] = torch.tensor(
-                [1.0, 9.0, 2.0, 8.0, 0.0, 0.0]
-            )
-    _use_kv_layout(manager, kv_layout)
-    _fill_kv_by_physical_slot(manager)
-    seqs = [
-        _seq(0, 6, prefilled=0, chunk=6),
-        _seq(1, 6, prefilled=0, chunk=6),
-    ]
-    keep = torch.tensor([1, 3, 4, 5], dtype=torch.long)
-    keep_set = set(keep.tolist())
-    expected = {}
-    for layer_idx in range(2):
-        k_cache, v_cache = manager.get_layer_kv_cache(layer_idx)
-        for seq_id, row_slots in enumerate(rows_by_layer[layer_idx]):
-            selected_slots = torch.tensor(row_slots, dtype=torch.long)[keep]
-            expected[(layer_idx, seq_id)] = (
-                k_cache.index_select(0, selected_slots).clone(),
-                v_cache.index_select(0, selected_slots).clone(),
-            )
-
-    manager.evict_after_prefill(seqs)
-
-    for layer_idx, rows in enumerate(rows_by_layer):
-        k_cache, v_cache = manager.get_layer_kv_cache(layer_idx)
-        released = []
-        active = []
-        for seq_id, row_slots in enumerate(rows):
-            destination = torch.tensor(row_slots, dtype=torch.long)[keep].tolist()
-            released.extend(
-                slot for idx, slot in enumerate(row_slots) if idx not in keep_set
-            )
-            active.extend(destination)
-            actual_slots = manager.buffer_req_to_token_slots[layer_idx][
-                seq_id, :4
-            ].long()
-            assert actual_slots.tolist() == destination
-            expected_k, expected_v = expected[(layer_idx, seq_id)]
-            assert torch.equal(k_cache.index_select(0, actual_slots), expected_k)
-            assert torch.equal(v_cache.index_select(0, actual_slots), expected_v)
-            assert manager._h2o_scores[(layer_idx, seq_id)].tolist() == [
-                9.0,
-                8.0,
-                0.0,
-                0.0,
-            ]
-        assert len(active) == len(set(active))
-        assert manager.free_slots_stack[layer_idx][32:36].tolist() == released
-        assert manager._num_free_slots[layer_idx] == 36
-
-    assert manager._h2o_final_prefill_workspace is None
-
-
-def test_h2o_final_prefill_compacts_mla_latent_and_rope_slots():
-    manager = _manager_with_rows([6], decode_budget=4, prefill_budget=8)
-    _set_layer_row_slots(manager, 0, [[9, 2, 7, 1, 6, 4]])
-    manager._h2o_scores[(0, 0)] = torch.tensor(
-        [1.0, 9.0, 2.0, 8.0, 0.0, 0.0]
-    )
-    storage = MlaLatentStorage(
-        kv_lora_rank=512,
-        rope_dim=64,
-        dtype=torch.bfloat16,
-    )
-    storage.allocate(num_layers=1, num_slots=64, device=torch.device("cpu"))
-    manager.attention_cache_storage = storage
-    manager.kv_cache = None
-    assert storage.latent_cache is not None
-    assert storage.rope_cache is not None
-    for slot in [9, 2, 7, 1, 6, 4]:
-        storage.latent_cache[0, slot].fill_(slot)
-        storage.rope_cache[0, slot].fill_(slot + 100)
-    seq = _seq(0, 6, prefilled=0, chunk=6)
-
-    manager.evict_after_prefill([seq])
-
-    destination_slots = manager.buffer_req_to_token_slots[0][0, :4].long()
-    assert destination_slots.tolist() == [2, 1, 6, 4]
-    payload = storage.layer_payload(0)
-    expected_sources = torch.tensor([2, 1, 6, 4], dtype=torch.bfloat16)
-    torch.testing.assert_close(
-        payload.latent_cache[destination_slots, 0, 0],
-        expected_sources,
-    )
-    torch.testing.assert_close(
-        payload.rope_cache[destination_slots, 0, 0],
-        expected_sources + 100,
-    )
-    assert manager._h2o_scores[(0, 0)].tolist() == [9.0, 8.0, 0.0, 0.0]
-    assert manager._h2o_final_prefill_workspace is None
-
-
-def test_h2o_intermediate_prefill_does_not_move_kv_payloads():
-    manager = _manager_with_rows([6], decode_budget=3, prefill_budget=4)
-    _set_layer_row_slots(manager, 0, [[9, 2, 7, 1, 6, 4]])
-    manager._h2o_scores[(0, 0)] = torch.tensor([1.0, 9.0, 2.0, 8.0, 0.0, 0.0])
-    _fill_kv_by_physical_slot(manager)
-    k_cache, v_cache = manager.get_layer_kv_cache(0)
-    old_k = k_cache.clone()
-    old_v = v_cache.clone()
-    seq = _seq(0, 20, prefilled=0, chunk=6)
-
-    manager.evict_after_prefill([seq])
-
-    assert manager.buffer_req_to_token_slots[0][0, :4].tolist() == [2, 1, 6, 4]
-    assert torch.equal(k_cache, old_k)
-    assert torch.equal(v_cache, old_v)
-    assert manager._h2o_final_prefill_workspace is None
-
-
-def test_h2o_final_prefill_capacity_preflight_prevents_partial_layer_updates():
-    manager = _manager_with_layer_rows([[6], [6]], decode_budget=4, prefill_budget=8)
-    _set_scores_from_slot_rows(manager)
-    _fill_kv_by_physical_slot(manager)
-    manager._num_free_slots[1] = 511
-    layer0_slots = manager.buffer_req_to_token_slots[0].clone()
-    layer0_k, layer0_v = manager.get_layer_kv_cache(0)
-    expected_k = layer0_k.clone()
-    expected_v = layer0_v.clone()
-    seq = _seq(0, 6, prefilled=0, chunk=6)
-
-    with pytest.raises(RuntimeError, match=r"overflow.*layer=1"):
-        manager.evict_after_prefill([seq])
-
-    assert torch.equal(manager.buffer_req_to_token_slots[0], layer0_slots)
-    assert torch.equal(layer0_k, expected_k)
-    assert torch.equal(layer0_v, expected_v)
-    assert manager.row_seq_lens[0].tolist() == [6]
-    assert manager._num_free_slots[0] == 32
-    assert manager._h2o_final_prefill_workspace is None
-
-
 def test_h2o_decode_waits_for_interval_then_drops_full_burst():
     manager = _manager_with_rows(
         [5], decode_budget=4, decode_eviction_interval=3, prefill_budget=8
@@ -1152,42 +846,6 @@ def test_h2o_decode_pressure_reclaims_over_budget_row_before_interval():
     assert scheduled == [seq]
     assert not is_prefill
     assert preempted == []
-
-
-@pytest.mark.parametrize("use_tensor_table", [True, False])
-def test_h2o_final_prefill_pressure_reclaims_unscheduled_active_decode_row(
-    use_tensor_table: bool,
-):
-    manager = _manager_with_layer_rows(
-        [[5, 2], [5, 2]],
-        decode_budget=4,
-        decode_eviction_interval=3,
-        prefill_budget=8,
-    )
-    active_decode = _seq(0, 5, prefilled=5, chunk=1)
-    final_prefill = _seq(1, 2, prefilled=0, chunk=2)
-    _set_scores_from_slot_rows(manager)
-    manager.evict_after_decode([active_decode])
-    # Post-forward state: this final prefill consumed the last physical slot.
-    manager._num_free_slots = [0, 0]
-    if not use_tensor_table:
-        manager.buffer_req_to_token_slots_tensor = None
-
-    manager.evict_after_prefill([final_prefill])
-
-    assert [lengths.tolist() for lengths in manager.row_seq_lens] == [
-        [4, 2],
-        [4, 2],
-    ]
-    _assert_scores_match_slot_rows(manager)
-    assert manager._num_free_slots == [1, 1]
-    assert manager._h2o_counters == {
-        "intermediate_prefill_evictions": 0,
-        "final_prefill_evictions": 0,
-        "decode_eviction_bursts": 1,
-        "decode_evictions": 2,
-        "dropped_tokens": 2,
-    }
 
 
 def test_h2o_decode_pressure_reclaims_unscheduled_active_row():
