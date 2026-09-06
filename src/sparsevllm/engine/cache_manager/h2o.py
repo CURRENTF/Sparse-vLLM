@@ -705,6 +705,16 @@ class H2OCacheManager(H2OPrefillRetentionMixin, SnapKVCacheManager):
                 logical_start = int(seq.num_prefilled_tokens)
                 logical_end = logical_start + chunk_size
                 if logical_start == 0:
+                    # Reject a stale restart before discarding the resident
+                    # score/position history needed to resume or release it.
+                    for layer_idx in layer_ids:
+                        row = self.seq_id_to_row[layer_idx].get(int(seq.seq_id))
+                        if row is not None and int(self.row_seq_lens[layer_idx][row]) != 0:
+                            raise RuntimeError(
+                                "H2O first prefill chunk found a non-empty physical row: "
+                                f"layer={layer_idx} seq_id={seq.seq_id} "
+                                f"physical_len={int(self.row_seq_lens[layer_idx][row])}."
+                            )
                     for layer_idx in score_layer_ids:
                         self._h2o_scores.pop(self._score_key(layer_idx, seq.seq_id), None)
                         self._h2o_positions.pop(self._score_key(layer_idx, seq.seq_id), None)
@@ -712,11 +722,6 @@ class H2OCacheManager(H2OPrefillRetentionMixin, SnapKVCacheManager):
                 for layer_idx in layer_ids:
                     row_idx = self._get_free_row(layer_idx, int(seq.seq_id))
                     physical_start = int(self.row_seq_lens[layer_idx][row_idx])
-                    if logical_start == 0 and physical_start != 0:
-                        raise RuntimeError(
-                            "H2O first prefill chunk found a non-empty physical row: "
-                            f"layer={layer_idx} seq_id={seq.seq_id} physical_len={physical_start}."
-                        )
                     if logical_start > 0 and layer_idx in score_layer_ids:
                         self._require_score_length(layer_idx, seq, physical_start)
                     key = self._score_key(layer_idx, seq.seq_id)

@@ -324,3 +324,20 @@ def test_mla_rejects_tp_without_cross_rank_head_reduction(monkeypatch):
     monkeypatch.setattr(SnapKVCacheManager, '_get_available_slots_info', lambda self: (2**30, 1152))
     with pytest.raises(ValueError, match='requires TP1'):
         manager._get_available_slots_info()
+
+
+def test_rejected_first_chunk_preserves_resident_head_history():
+    from sparsevllm.engine.sequence import Sequence
+
+    manager = manager_with_storage()
+    manager.num_layers = manager.num_kv_layers = 1
+    manager.runtime_layout.kv_idx_to_layer_idx = (0,)
+    seq = Sequence(list(range(6)))
+    seq.seq_id, seq.current_chunk_size = 7, 3
+    scores, positions = manager._h2o_scores[0, 7], manager._h2o_positions[0, 7]
+    with pytest.raises(RuntimeError, match='non-empty physical row'):
+        manager._prepare_prefill([seq])
+    assert manager._h2o_scores[0, 7] is scores
+    assert manager._h2o_positions[0, 7] is positions
+    assert manager.row_seq_lens[0][0] == 6
+    assert manager._num_free_slots == [6]
