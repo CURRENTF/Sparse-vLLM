@@ -10,6 +10,7 @@ import torch
 from sparsevllm.config import Config
 from sparsevllm.engine.cache_manager import CacheManager, SparseSelection
 from sparsevllm.engine.cache_manager.base import (
+    PrefillComputeView,
     _debug_tensor_summary,
     _debug_value_summary,
 )
@@ -62,6 +63,17 @@ class PrefillSelectionRequest:
 
 
 @dataclass(frozen=True)
+class PrefillScoreEvent:
+    layer_idx: int
+    query: torch.Tensor
+    view: PrefillComputeView
+    b_start_loc: torch.Tensor
+    chunk_lens: torch.Tensor
+    softmax_scale: float
+    attention_lse: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
 class DecodeSelectionRequest:
     layer_idx: int
     query: torch.Tensor
@@ -83,6 +95,13 @@ class LayerEndEvent:
 
 class SparseMethodRuntime(ABC):
     """Method-owned logical sparse runtime behind the controller facade."""
+
+    def collect_prefill_attention_score(self, event: PrefillScoreEvent) -> None:
+        self.cache_manager.collect_prefill_attention_score(
+            event.layer_idx, event.query, event.view,
+            b_start_loc=event.b_start_loc, chunk_lens=event.chunk_lens,
+            attention_lse=event.attention_lse,
+        )
 
     def __init__(self, config: Config, cache_manager: CacheManager):
         self.config = config

@@ -38,15 +38,18 @@ prefill attention 计算。它们是同一条轴上的备选项，可以分别�
 
 SnapKV 的 `sparse_prefill_score_mode` 默认值改为 `logits`；`probability`
 仍可显式启用以复现实验，但它需要额外执行归一化 QK sweep，在已测长上下文
-prefill 中开销明显更高。PyramidKV 和 H2O 继续默认使用 `probability`。对两个阶段
-共享的 H2O prompt scoring state 而言，这是 canonical 路径：每个 KV layer 都独立地对
-完整当前 query chunk 的归一化 softmax attention probability 求和，并在
-prefill chunk 之间累计 attention mass。当前明确关闭 decode score 收集与
-淘汰。Sparse-vLLM 复用 FA3 的
-softmax LSE；由于 FlashAttention 不物化 probability matrix，还需额外执行
-一遍 QK。`h2o_prefill_score_window=0` 表示完整当前 chunk，是 canonical
-默认设置；`[1, 128]` 的非零 window 或显式 `logits` 模式均属于非 canonical
-近似，但都不会改变每个 H2O KV layer 必须独立计算并保存 prefill score 的要求。
+prefill 中开销明显更高。PyramidKV 和 H2O 使用 `probability`。H2O 逐 query head 跨 prefill chunks
+累计 FP32 概率和；驱逐时通过 `h2o_head_reduction=max`（默认）或 `mean`，
+在 GQA 的每个 KV 组内或 MLA 的整个 layer 内归约累计分数。MHA 各 head 独立选择。
+每套选择在预算内保留 heavy hitters 和 recent tokens，保持 GQA 的原生 KV 共享
+以及 MLA 的原生 latent 存储。MLA H2O prefill 当前要求 TP1。
+
+`h2o_prefill_score_window=0` 观察完整当前 chunk；`[1, 128]` 的窗口属于显式近似。
+H2O 拒绝 `logits` 模式，因为归约后的 logits 无法表示逐 head 累计概率。
+Attention 提供 softmax LSE 时复用该结果，否则使用同一可见 KV 集合重新计算归一化。
+中间 chunk 的实际驱逐会改变后续 attention，结果因此可能随 chunk size 和预算变化。
+Decode 评分和驱逐仍保持关闭；`h2o_decode_budget` 用于最后一个 prefill chunk 的保留预算，
+之后缓存随生成增长。
 
 ## Prefill Scheduling Policy
 

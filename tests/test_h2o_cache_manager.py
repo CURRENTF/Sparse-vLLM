@@ -28,6 +28,8 @@ from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.sparse_controller import SparseController
 from sparsevllm.engine.sparse_methods import SparseStepContext
 from sparsevllm.engine.sparse_methods.h2o import H2ORuntime
+from sparsevllm.engine.sparse_methods.base import PrefillScoreEvent
+from sparsevllm.kernels.triton.prefill_score import PrefillScoreWorkspace
 from sparsevllm.method_registry import (
     PREFILL_POLICY_ALL_CHUNKED,
 )
@@ -93,6 +95,7 @@ def _manager_with_layer_rows(
     manager.head_dim = 2
     manager.hf_config = SimpleNamespace(dtype=torch.float32)
     manager._h2o_scores = {}
+    manager._h2o_positions = {}
     manager._h2o_active_decode_seq_ids = set()
     manager._h2o_counters = {
         "intermediate_prefill_evictions": 0,
@@ -283,7 +286,7 @@ def test_h2o_decode_does_not_request_scores_or_run_eviction():
     )
 
     assert runtime.needs_attention_score(0, decode) is False
-    assert runtime.needs_attention_score(0, prefill) is True
+    assert runtime.needs_attention_score(0, prefill) is False
     runtime.finish_step(decode)
 
     runtime.cache_manager.evict_after_decode.assert_not_called()
@@ -501,10 +504,20 @@ def test_h2o_logit_prefill_score_rejects_nan_or_all_inf():
         )
 
 
+def _score_runtime(manager):
+    runtime = object.__new__(H2ORuntime)
+    runtime.cache_manager = manager
+    runtime.config = manager.config
+    runtime._prefill_score_workspace = PrefillScoreWorkspace()
+    runtime._prefill_head_score_buffer = None
+    return runtime
+
+
 def test_h2o_prefill_score_collection_accumulates_in_physical_coordinates():
     manager = _manager_with_rows([6])
     seq = _seq(0, 20, prefilled=8, chunk=2)
-    manager._h2o_scores[(0, 0)] = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    previous = torch.tensor([[1., 2., 3., 4.], [4., 3., 2., 1.]])
+    manager._h2o_scores[(0, 0)] = previous.clone()
     view = PrefillComputeView(
         meta=AttentionViewMeta(
             active_slots=manager.buffer_req_to_token_slots[0],
@@ -512,131 +525,24 @@ def test_h2o_prefill_score_collection_accumulates_in_physical_coordinates():
             context_lens=torch.tensor([6], dtype=torch.int32),
             max_context_len=6,
         ),
-        payload=ExplicitKVPayload(
-            k_cache=torch.empty((16, 1, 1)),
-            v_cache=torch.empty((16, 1, 1)),
-        ),
+        payload=ExplicitKVPayload(k_cache=torch.empty(16, 2, 16), v_cache=torch.empty(16, 2, 16)),
     )
     set_context(is_prefill=True, cache_manager=manager, seqs=[seq])
+    increment = torch.tensor([[.1, .2, .3, .4, .5, .5], [.5, .5, .4, .3, .2, .1]])
 
-    def fake_run_prefill_score(
-        q,
-        k_cache,
-        attn_score,
-        meta,
-        b_start_loc,
-        prompt_cache_lens,
-        max_query_len,
-        score_starts,
-        score_ends,
-        **kwargs,
-    ):
-        del q, k_cache, meta, b_start_loc, max_query_len
-        assert prompt_cache_lens.tolist() == [4]
-        assert score_starts.tolist() == [4]
-        assert score_ends.tolist() == [6]
-        assert kwargs == {"candidate_start": 0, "recent_keep_tokens": 0}
-        attn_score[0, :6] = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+    def produce_scores(q, k, output, reqs, starts, contexts, prefixes, max_queries, slots, score_start, score_end, **kwargs):
+        assert prefixes.tolist() == [4]
+        assert score_start.tolist() == [4]
+        assert score_end.tolist() == [6]
+        assert kwargs['per_head'] is True
+        assert kwargs['softmax_scale'] == .25
+        output[0].copy_(increment)
 
-    with patch.object(
-        manager,
-        "_run_prefill_score",
-        side_effect=fake_run_prefill_score,
-    ):
-        manager.collect_prefill_attention_score(
-            0,
-            torch.empty((2, 1, 1)),
-            view,
-            b_start_loc=torch.tensor([0], dtype=torch.int32),
-            chunk_lens=torch.tensor([2], dtype=torch.int32),
-        )
-
-    assert manager._h2o_scores[(0, 0)].tolist() == pytest.approx(
-        [1.2, 2.4, 3.6, 4.8, 1.0, 1.2]
-    )
-
-
-def test_h2o_logit_prefill_score_collection_normalizes_logits():
-    manager = _manager_with_rows([6])
-    manager.config.sparse_prefill_score_mode = "logits"
-    manager.config.h2o_prefill_score_window = 0
-    seq = _seq(0, 20, prefilled=8, chunk=2)
-    manager._h2o_scores[(0, 0)] = torch.tensor([1.0, 2.0, 3.0, 4.0])
-    view = PrefillComputeView(
-        meta=AttentionViewMeta(
-            active_slots=manager.buffer_req_to_token_slots[0],
-            req_indices=torch.tensor([0], dtype=torch.int32),
-            context_lens=torch.tensor([6], dtype=torch.int32),
-            max_context_len=6,
-        ),
-        payload=ExplicitKVPayload(
-            k_cache=torch.empty((16, 1, 1)),
-            v_cache=torch.empty((16, 1, 1)),
-        ),
-    )
-    set_context(is_prefill=True, cache_manager=manager, seqs=[seq])
-    logits = torch.arange(6, dtype=torch.float32)
-
-    def fake_run_prefill_score(*args, **kwargs):
-        del kwargs
-        args[2][0, :6].copy_(logits)
-
-    with patch.object(
-        manager,
-        "_run_prefill_score",
-        side_effect=fake_run_prefill_score,
-    ):
-        manager.collect_prefill_attention_score(
-            0,
-            torch.empty((2, 1, 1)),
-            view,
-            b_start_loc=torch.tensor([0], dtype=torch.int32),
-            chunk_lens=torch.tensor([2], dtype=torch.int32),
-        )
-
-    expected = torch.tensor([1.0, 2.0, 3.0, 4.0, 0.0, 0.0])
-    expected.add_(torch.softmax(logits, dim=0), alpha=2.0)
-    assert torch.equal(manager._h2o_scores[(0, 0)], expected)
-
-
-def test_h2o_logit_prefill_score_collection_consumes_fused_main_score():
-    manager = _manager_with_rows([6])
-    manager.config.sparse_prefill_score_mode = "logits"
-    manager.config.h2o_prefill_score_window = 0
-    seq = _seq(0, 20, prefilled=8, chunk=2)
-    manager._h2o_scores[(0, 0)] = torch.tensor([1.0, 2.0, 3.0, 4.0])
-    logits = torch.arange(6, dtype=torch.float32).unsqueeze(0)
-    view = PrefillComputeView(
-        meta=AttentionViewMeta(
-            active_slots=manager.buffer_req_to_token_slots[0],
-            req_indices=torch.tensor([0], dtype=torch.int32),
-            context_lens=torch.tensor([6], dtype=torch.int32),
-            max_context_len=6,
-            attn_score=logits,
-        ),
-        payload=ExplicitKVPayload(
-            k_cache=torch.empty((16, 1, 1)),
-            v_cache=torch.empty((16, 1, 1)),
-        ),
-    )
-    set_context(is_prefill=True, cache_manager=manager, seqs=[seq])
-
-    with patch.object(
-        manager,
-        "_run_prefill_score",
-        side_effect=AssertionError("launched posthoc scorer"),
-    ):
-        manager.collect_prefill_attention_score(
-            0,
-            torch.empty((2, 1, 1)),
-            view,
-            b_start_loc=torch.tensor([0], dtype=torch.int32),
-            chunk_lens=torch.tensor([2], dtype=torch.int32),
-        )
-
-    expected = torch.tensor([1.0, 2.0, 3.0, 4.0, 0.0, 0.0])
-    expected.add_(torch.softmax(logits[0], dim=0), alpha=2.0)
-    assert torch.equal(manager._h2o_scores[(0, 0)], expected)
+    event = PrefillScoreEvent(0, torch.empty(2, 2, 16), view, torch.tensor([0], dtype=torch.int32), torch.tensor([2], dtype=torch.int32), .25)
+    with patch('sparsevllm.kernels.triton.prefill_score.prefill_score_fwd', side_effect=produce_scores):
+        _score_runtime(manager).collect_prefill_attention_score(event)
+    expected = torch.nn.functional.pad(previous, (0, 2)) + increment
+    torch.testing.assert_close(manager._h2o_scores[(0, 0)], expected)
 
 
 def test_h2o_prefill_score_collection_rejects_misaligned_physical_view():
@@ -658,19 +564,17 @@ def test_h2o_prefill_score_collection_rejects_misaligned_physical_view():
     set_context(is_prefill=True, cache_manager=manager, seqs=[seq])
 
     with pytest.raises(RuntimeError, match="compressed physical coordinates"):
-        manager.collect_prefill_attention_score(
-            0,
-            torch.empty((2, 1, 1)),
-            view,
-            b_start_loc=torch.tensor([0], dtype=torch.int32),
-            chunk_lens=torch.tensor([2], dtype=torch.int32),
-        )
+        _score_runtime(manager).collect_prefill_attention_score(PrefillScoreEvent(
+            0, torch.empty((2, 1, 1)), view,
+            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([2], dtype=torch.int32), 1.,
+        ))
 
 
 def test_h2o_missing_score_for_existing_physical_prefix_fails_fast():
     manager = _manager_with_rows([8])
     seq = _seq(0, 100, prefilled=64, chunk=3)
-    with pytest.raises(RuntimeError, match="score vector is missing"):
+    with pytest.raises(RuntimeError, match="not aligned"):
         manager._require_score_length(0, seq, 8)
 
 
@@ -2290,3 +2194,51 @@ def test_h2o_debug_summary_exposes_auditable_eviction_counters():
     assert summary["h2o"]["counters"]["dropped_tokens"] == 0
     assert summary["h2o"]["counters"]["decode_eviction_bursts"] == 0
     assert summary["h2o"]["score_lengths"] == {"0:0": 2}
+
+
+def test_h2o_runtime_tiles_full_chunk_without_reducing_or_reweighting_heads():
+    manager = _manager_with_rows([0])
+    manager.config.h2o_prefill_score_window = 0
+    # No physical payload is read by this producer mock; the oracle describes
+    # normalized probability mass, and tests runtime tiling/accumulation only.
+    manager.row_seq_lens[0][0] = 264
+    manager._h2o_scores[(0, 0)] = torch.ones(2, 5)
+    seq = _seq(0, 300, prefilled=5, chunk=259)
+    view = PrefillComputeView(
+        meta=AttentionViewMeta(
+            active_slots=torch.zeros(1, 264, dtype=torch.int32),
+            req_indices=torch.tensor([0], dtype=torch.int32),
+            context_lens=torch.tensor([264], dtype=torch.int32), max_context_len=264,
+        ),
+        payload=ExplicitKVPayload(k_cache=torch.empty(264, 2, 16), v_cache=torch.empty(264, 2, 16)),
+    )
+    set_context(is_prefill=True, cache_manager=manager, seqs=[seq])
+    queries = torch.arange(5, 264)[:, None]
+    keys = torch.arange(264)[None, :]
+    logits = torch.stack([keys.expand(259, -1).float() * .01, -keys.expand(259, -1).float() * .01])
+    probabilities = logits.masked_fill((keys > queries)[None], -torch.inf).softmax(-1)
+    ranges = []
+
+    def produce(q, k, output, reqs, starts, contexts, prefixes, max_queries, slots, begin, end, **kwargs):
+        first, last = int(begin[0]), int(end[0])
+        ranges.append((first, last))
+        output.zero_()
+        output[0].copy_(probabilities[:, first - 5:last - 5].sum(1))
+
+    event = PrefillScoreEvent(0, torch.empty(259, 2, 16), view, torch.tensor([0], dtype=torch.int32), torch.tensor([259], dtype=torch.int32), .25)
+    with patch('sparsevllm.kernels.triton.prefill_score.prefill_score_fwd', side_effect=produce):
+        _score_runtime(manager).collect_prefill_attention_score(event)
+    expected = probabilities.sum(1)
+    expected[:, :5] += 1
+    torch.testing.assert_close(manager._h2o_scores[(0, 0)], expected)
+    assert ranges[0][0] == 5 and ranges[-1][1] == 264
+    assert all(left[1] == right[0] for left, right in zip(ranges, ranges[1:]))
+
+
+def test_h2o_failed_prefill_free_releases_positions_before_scores_exist():
+    manager = _manager_with_rows([2])
+    manager._h2o_positions[(0, 0)] = torch.arange(2)[None].expand(2, -1)
+    with patch.object(SnapKVCacheManager, 'free_seq', autospec=True):
+        manager.free_seq(0)
+    assert manager._h2o_positions == {}
+    assert manager._h2o_scores == {}

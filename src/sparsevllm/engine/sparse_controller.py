@@ -16,10 +16,19 @@ from sparsevllm.engine.sparse_methods import (
     create_sparse_method_runtime,
 )
 from sparsevllm.utils.context import get_context
+from sparsevllm.engine.sparse_methods.base import PrefillScoreEvent
 
 
 class SparseController:
     """Method-agnostic sparse lifecycle facade used by the inference engine."""
+
+    def collect_prefill_attention_score(
+        self, layer_idx, q, view, *, b_start_loc, chunk_lens,
+        softmax_scale: float, attention_lse=None,
+    ) -> None:
+        self.runtime.collect_prefill_attention_score(PrefillScoreEvent(
+            layer_idx, q, view, b_start_loc, chunk_lens, softmax_scale, attention_lse,
+        ))
 
     def __init__(self, config: Config, cache_manager: CacheManager):
         self.config = config

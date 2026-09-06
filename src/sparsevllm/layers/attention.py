@@ -121,13 +121,14 @@ class Attention(nn.Module):
                         attention_lse = prefill_result.softmax_lse
                     else:
                         o = prefill_result
-                cache_manager.collect_prefill_attention_score(
+                sparse_controller.collect_prefill_attention_score(
                     layer_idx,
                     q,
                     prefill_view,
                     b_start_loc=b_start_loc,
                     chunk_lens=chunk_lens,
                     attention_lse=attention_lse,
+                    softmax_scale=self.scale,
                 )
                 cache_manager.record_prefill_query(
                     layer_idx,

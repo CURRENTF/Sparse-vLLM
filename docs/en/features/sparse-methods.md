@@ -49,16 +49,21 @@ compatibility rule.
 SnapKV defaults `sparse_prefill_score_mode` to `logits`; `probability` remains
 an explicit reproducibility option because its additional normalized QK sweep
 is substantially more expensive in measured long-context prefill. PyramidKV
-and H2O continue to default to `probability`. For the shared H2O prompt-scoring
-state this is the canonical path: every KV layer independently sums its
-normalized softmax attention probabilities over the full current query chunk,
-then accumulates that attention mass across prefill chunks. Decode score
-collection and eviction are intentionally disabled. Sparse-vLLM
-reuses FA3's softmax LSE and performs one additional QK sweep because FlashAttention
-does not materialize its probability matrix. `h2o_prefill_score_window=0` selects
-the full current chunk and is the canonical default. A nonzero window in `[1, 128]`
-or explicit `logits` mode is a non-canonical approximation; neither changes the
-requirement that every H2O KV layer computes and retains its own prefill score.
+and H2O use `probability`. H2O accumulates FP32 probability sums per query
+head across prefill chunks. At eviction, `h2o_head_reduction=max` (default) or
+`mean` combines the cumulative scores within each GQA KV group, or across the
+whole layer for MLA. MHA heads select independently. Each selection retains
+heavy hitters plus recent tokens within its token budget; native GQA KV sharing
+and MLA latent storage are preserved. MLA H2O prefill currently requires TP1.
+
+`h2o_prefill_score_window=0` scores all queries in each chunk. Windows in
+`[1, 128]` are explicit approximations. H2O rejects `logits` mode because a
+reduced logit vector cannot represent per-head cumulative probabilities.
+When attention provides its softmax LSE, scoring reuses it; otherwise it
+recomputes normalization from the same visible keys. Intermediate chunk eviction
+changes subsequent attention, so results can depend on chunk size and budgets.
+Decode scoring and eviction remain disabled; `h2o_decode_budget` determines the
+final prefill retention budget, and the cache grows during generation.
 
 ## Prefill Scheduling Policies
 

@@ -4,19 +4,26 @@ import torch
 
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.method_registry import (
-    h2o_uses_fused_prefill_score,
     normalize_sparse_method,
     resolve_prefill_sparse_method,
 )
+from sparsevllm.engine.cache_manager.h2o_retention import H2ORetention, H2O_PREFILL_QUERY_TILE
 from sparsevllm.utils.profiler import profiler
+from sparsevllm.utils.context import get_context
+from sparsevllm.engine.cache_manager.base import ExplicitKVPayload
+from sparsevllm.kernels.triton.prefill_score import PrefillScoreWorkspace
 
-from .base import SparseStepContext
+from .base import SparseStepContext, PrefillScoreEvent
 from .passthrough import PassThroughRuntime
+from .h2o_selection import select_h2o_heads
 
 
 class H2ORuntime(PassThroughRuntime):
     def __init__(self, config, cache_manager):
         super().__init__(config, cache_manager)
+        self._prefill_score_workspace = PrefillScoreWorkspace()
+        self._prefill_head_score_buffer: torch.Tensor | None = None
+        self._prefill_head_score_total: torch.Tensor | None = None
         self._h2o_decode_attn_score_buffers: dict[
             tuple[int, ...],
             torch.Tensor,
@@ -38,12 +45,8 @@ class H2ORuntime(PassThroughRuntime):
         layer_idx: int,
         step: SparseStepContext,
     ) -> bool:
-        del layer_idx
-        return (
-            h2o_uses_fused_prefill_score(self.config)
-            if step.is_prefill
-            else False
-        )
+        del layer_idx, step
+        return False
 
     def prefill_score_shape(
         self,
@@ -51,25 +54,143 @@ class H2ORuntime(PassThroughRuntime):
         num_heads: int,
         max_len: int,
     ) -> tuple[int, ...]:
-        del num_heads
-        return batch_size, max_len
+        return batch_size, num_heads, max_len
 
     def prefill_score_fill_value(self) -> float:
-        return -torch.inf
+        return 0.0
+
+    @torch.no_grad()
+    def collect_prefill_attention_score(self, event: PrefillScoreEvent) -> None:
+        manager = self.cache_manager
+        layer_idx, q, view = event.layer_idx, event.query, event.view
+        b_start_loc, chunk_lens = event.b_start_loc, event.chunk_lens
+        attention_lse = event.attention_lse
+        ctx = get_context()
+        if not ctx.is_prefill:
+            raise RuntimeError("H2O prefill score collection was called outside prefill.")
+        seqs = getattr(ctx, "seqs", None)
+        if seqs is None:
+            raise RuntimeError("H2O prefill score collection requires current seqs in context.")
+        if int(chunk_lens.ndim) != 1 or int(chunk_lens.shape[0]) != len(seqs):
+            raise RuntimeError(
+                "H2O prefill scoring chunk-length batch mismatch: "
+                f"shape={tuple(chunk_lens.shape)} seqs={len(seqs)}."
+            )
+        ranges = manager.prefill_score_ranges(layer_idx, seqs)
+        if not ranges:
+            return None
+        if not isinstance(view.payload, ExplicitKVPayload):
+            raise TypeError(
+                "H2O prefill scoring requires ExplicitKVPayload, got "
+                f"{type(view.payload).__name__}."
+            )
+        meta = view.meta
+        payload = view.payload
+
+        context_lens = tuple(int(item[4]) for item in ranges)
+        prepared_context_lens = getattr(
+            manager,
+            "_prefill_context_lens_cpu_by_layer",
+            {},
+        ).get(int(layer_idx))
+        if prepared_context_lens is None and meta.context_lens.device.type == "cpu":
+            prepared_context_lens = tuple(
+                int(value) for value in meta.context_lens.tolist()
+            )
+        if prepared_context_lens is None:
+            raise RuntimeError(
+                "H2O prefill scoring requires CPU context lengths prepared "
+                f"for layer={layer_idx}."
+            )
+        if tuple(prepared_context_lens) != context_lens:
+            raise RuntimeError(
+                "H2O prefill score view is not in compressed physical coordinates: "
+                f"layer={layer_idx} view={tuple(prepared_context_lens)} "
+                f"physical={context_lens}."
+            )
+        prompt_cache_lens_cpu = tuple(int(item[2]) for item in ranges)
+        score_starts_cpu = tuple(int(item[3]) for item in ranges)
+        score_ends_cpu = tuple(int(item[4]) for item in ranges)
+        (
+            prompt_cache_lens,
+            _batch_indices,
+            score_starts,
+            score_ends,
+        ) = manager._cached_prefill_score_metadata_tensors(
+            device=q.device,
+            context_lens=context_lens,
+            prompt_cache_lens=prompt_cache_lens_cpu,
+            batch_indices=tuple(range(len(ranges))),
+            score_starts=score_starts_cpu,
+            score_ends=score_ends_cpu,
+        )
+        max_context_len = max(context_lens)
+        if meta.attn_score is not None:
+            raise ValueError("H2O requires per-head probability scores after attention.")
+        from sparsevllm.kernels.triton.prefill_score import (
+            prefill_score_fwd, prefill_score_from_lse_fwd,
+        )
+
+        shape = (len(seqs), int(q.shape[1]), max_context_len)
+        buffer = self._prefill_head_score_buffer
+        if buffer is None or any(old < new for old, new in zip(buffer.shape, shape)):
+            buffer = torch.empty(shape, dtype=torch.float32, device=q.device)
+            self._prefill_head_score_buffer = buffer
+            self._prefill_head_score_total = torch.empty_like(buffer)
+        step_score = buffer[:shape[0], :shape[1], :shape[2]]
+        total = self._prefill_head_score_total[:shape[0], :shape[1], :shape[2]]
+        total.zero_()
+        score_kwargs = dict(
+            workspace=self._prefill_score_workspace, per_head=True,
+            softmax_scale=event.softmax_scale,
+        )
+        max_queries = max(item[4] - item[3] for item in ranges)
+        # Bound QK statistics workspace independently of prompt chunk size.
+        # Tiles contribute probability sums; no head reduction occurs here.
+        for offset in range(0, max_queries, H2O_PREFILL_QUERY_TILE):
+            tile_start = torch.minimum(score_starts + offset, score_ends)
+            tile_end = torch.minimum(tile_start + H2O_PREFILL_QUERY_TILE, score_ends)
+            score_args = (
+                step_score, meta.req_indices, b_start_loc, meta.context_lens,
+                prompt_cache_lens, min(H2O_PREFILL_QUERY_TILE, max_queries - offset),
+                meta.active_slots, tile_start, tile_end,
+            )
+            if attention_lse is None:
+                prefill_score_fwd(q, payload.k_cache, *score_args, **score_kwargs)
+            else:
+                prefill_score_from_lse_fwd(
+                    q, payload.k_cache, attention_lse, *score_args, **score_kwargs,
+                )
+            total.add_(step_score)
+        manager.accumulate_prefill_scores(layer_idx, seqs, total)
 
     def finish_step(self, step: SparseStepContext) -> None:
         if not step.is_prefill:
             return
-        prefill_method = resolve_prefill_sparse_method(
-            getattr(self.config, "prefill_sparse_method", None),
-            sparse_method=getattr(self.config, "sparse_method", None),
-        )
-        if prefill_method == "h2o_prefill":
-            self.cache_manager.evict_after_intermediate_prefill(step.seqs)
-        if normalize_sparse_method(
-            getattr(self.config, "sparse_method", None)
-        ) == "h2o":
-            self.cache_manager.compact_final_prefill_for_decode(step.seqs)
+        manager = self.cache_manager
+        requests = []
+        for layer_idx in manager.kv_transformer_layer_indices():
+            for seq in step.seqs:
+                final = bool(seq.is_last_chunk_prefill)
+                if final:
+                    if not manager.h2o_decode_enabled:
+                        continue
+                elif not manager.h2o_prefill_enabled:
+                    continue
+                budget = manager.h2o_decode_budget if final else manager.h2o_prefill_budget
+                length = manager._physical_row_len(layer_idx, seq)
+                scores = manager._require_score_length(layer_idx, seq, length)
+                if length <= budget:
+                    continue
+                keep = select_h2o_heads(
+                    scores,
+                    selection_groups=manager.h2o_selection_groups,
+                    budget=budget,
+                    recent_ratio=float(self.config.h2o_recent_ratio),
+                    reduction=self.config.h2o_head_reduction,
+                )
+                requests.append(H2ORetention(layer_idx, int(seq.seq_id), length, keep, final))
+        manager.commit_h2o_retention(requests)
 
     def _h2o_kv_layer_indices(self) -> list[int]:
         return [

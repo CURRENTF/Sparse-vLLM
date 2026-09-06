@@ -225,6 +225,7 @@ def build_chain_cache_fingerprint(config: Any) -> bytes:
             "h2o_prefill_budget",
             "h2o_recent_ratio",
             "h2o_prefill_score_window",
+            "h2o_head_reduction",
             "sparse_prefill_score_mode",
             "sparse_attn_score_dtype",
         ),

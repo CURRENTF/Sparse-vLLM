@@ -33,6 +33,37 @@ class ExplicitKVStorage:
                 f"num_kv_heads={self.num_kv_heads} head_dim={self.head_dim}."
             )
         self.kv_cache: torch.Tensor | None = None
+        self._head_copy_workspace: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def copy_head_slots(
+        self, layer_idx: int, source_slots: torch.Tensor, destination_slots: torch.Tensor,
+    ) -> None:
+        """Pack [Hkv, B] source slices into B native-width slots, with overlap."""
+        payload = self.layer_payload(layer_idx)
+        if (
+            source_slots.ndim != 2 or source_slots.shape[0] != self.num_kv_heads
+            or destination_slots.ndim != 1
+            or source_slots.shape[1] != destination_slots.numel()
+        ):
+            raise ValueError("Per-head KV copy requires [Hkv, B] sources and [B] destinations.")
+        heads = torch.arange(self.num_kv_heads, device=source_slots.device)[:, None]
+        source = (source_slots * self.num_kv_heads + heads).reshape(-1)
+        destination = (destination_slots[None, :] * self.num_kv_heads + heads).reshape(-1)
+        count = source.numel()
+        workspace = self._head_copy_workspace
+        if workspace is None or workspace[0].shape[0] < count:
+            workspace = (
+                payload.k_cache.new_empty((count, self.head_dim)),
+                payload.v_cache.new_empty((count, self.head_dim)),
+            )
+            self._head_copy_workspace = workspace
+        k = payload.k_cache.view(-1, self.head_dim)
+        v = payload.v_cache.view(-1, self.head_dim)
+        scratch_k, scratch_v = workspace[0][:count], workspace[1][:count]
+        torch.index_select(k, 0, source, out=scratch_k)
+        torch.index_select(v, 0, source, out=scratch_v)
+        k.index_copy_(0, destination, scratch_k)
+        v.index_copy_(0, destination, scratch_v)
 
     def allocate(
         self,
@@ -57,6 +88,7 @@ class ExplicitKVStorage:
             dtype=self.dtype,
             device=device,
         )
+        self._head_copy_workspace = None
 
     def _require_cache(self) -> torch.Tensor:
         if self.kv_cache is None:
