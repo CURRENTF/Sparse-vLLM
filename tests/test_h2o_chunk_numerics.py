@@ -60,6 +60,7 @@ def _run_chunks(q, k, v, chunks, budget, reduction):
     score_reference = [dict() for _ in range(heads)]
     output_chunks = []
     start = 0
+    decode = None
     try:
         for chunk in chunks:
             seq.num_prefilled_tokens, seq.current_chunk_size = start, chunk
@@ -140,6 +141,8 @@ def _run_chunks(q, k, v, chunks, budget, reduction):
             torch.testing.assert_close(output[0, head].float(), expected, rtol=2e-2, atol=2e-2)
         return torch.cat(output_chunks), manager._h2o_scores[0, 7].clone()
     finally:
+        if decode is not None:
+            decode.close()
         reset_context()
 
 
