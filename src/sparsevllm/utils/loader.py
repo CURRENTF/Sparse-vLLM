@@ -13,6 +13,7 @@ from tqdm.auto import tqdm
 
 from sparsevllm.utils.log import logger
 from sparsevllm.utils.weight_target import WeightTarget
+from sparsevllm.quantization.fp8 import expand_fp8_tensor_scale
 
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -79,6 +80,10 @@ def _rank_local_slice_for_tensor(
     source_weight_name: str,
     source_shape: tuple[int, ...],
 ) -> tuple[slice, ...] | None:
+    is_tensor_scale = source_weight_name.endswith(".weight_scale")
+    if is_tensor_scale:
+        # A checkpoint scalar is replicated even when its weight is TP-sharded.
+        return None
     is_scale = source_weight_name.endswith(".weight_scale_inv")
     source_parameter_name = (
         source_weight_name[: -len(".weight_scale_inv")] + ".weight"
@@ -121,9 +126,12 @@ def _read_safetensors_shard(
                 tensors[key] = handle.get_tensor(key)
                 continue
 
-            is_scale = key.endswith(".weight_scale_inv")
+            scale_suffix = (
+                ".weight_scale" if key.endswith(".weight_scale") else ".weight_scale_inv"
+            )
+            is_scale = key.endswith(scale_suffix)
             source_parameter_name = (
-                key[: -len(".weight_scale_inv")] + ".weight"
+                key[: -len(scale_suffix)] + ".weight"
                 if is_scale
                 else key
             )
@@ -139,6 +147,21 @@ def _read_safetensors_shard(
                 if rank_slice is not None
                 else handle.get_tensor(key)
             )
+        for key in list(metadata):
+            if not key.endswith(".weight_scale"):
+                continue
+            weight_key = key[: -len(".weight_scale")] + ".weight"
+            block_key = _scale_key_for_weight_key(weight_key)
+            if block_key in metadata:
+                raise ValueError(f"Checkpoint contains both tensor and block scales for {weight_key}.")
+            metadata[block_key] = metadata.pop(key)
+            if key not in tensors:
+                continue
+            if weight_key not in tensors:
+                raise ValueError(f"FP8 tensor scale {key} has no weight in its shard.")
+            # Broadcast the scalar after rank-local slicing. This preserves every
+            # checkpoint weight value; no weight requantization is performed.
+            tensors[block_key] = expand_fp8_tensor_scale(tensors[weight_key], tensors.pop(key))
         return SafetensorsShard(metadata=metadata, tensors=tensors)
 
 

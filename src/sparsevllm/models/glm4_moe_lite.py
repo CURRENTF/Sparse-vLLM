@@ -22,6 +22,7 @@ from sparsevllm.layers.embed_head import (
 from sparsevllm.layers.activation import SiluAndMul
 from sparsevllm.layers.layernorm import RMSNorm
 from sparsevllm.layers.linear import (
+    AbsorbedColumnParallelLinear,
     ColumnParallelLinear,
     MergedReplicatedLinear,
     RowParallelLinear,
@@ -41,6 +42,7 @@ from sparsevllm.operators.moe import (
     MoeOpSpec,
     append_shared_expert_route,
     model_activation_dtype,
+    packed_shared_expert_token_limit,
     resolve_moe_provider,
     use_packed_shared_experts,
     use_packed_shared_experts_in_prefill,
@@ -147,8 +149,6 @@ class Glm4MoeLiteAttention(nn.Module):
                 f"model={config.hidden_size} mla={mla_attention.hidden_size}."
             )
         quantization = getattr(config, "quantization_config", None)
-        if bool(getattr(quantization, "enabled", False)):
-            raise NotImplementedError("GLM MLA projections do not support quantization.")
 
         self.fused_qkv_a_proj = MergedReplicatedLinear(
             int(config.hidden_size),
@@ -157,27 +157,31 @@ class Glm4MoeLiteAttention(nn.Module):
                 self.kv_lora_rank + self.qk_rope_head_dim,
             ],
             bias=bool(config.attention_bias),
+            quantization=quantization,
         )
         self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
         self.q_b_proj = ColumnParallelLinear(
             self.q_lora_rank,
             self.num_heads * self.qk_head_dim,
             bias=False,
+            quantization=quantization,
         )
         self.kv_a_layernorm = RMSNorm(
             self.kv_lora_rank,
             eps=config.rms_norm_eps,
         )
-        self.kv_b_proj = ColumnParallelLinear(
+        self.kv_b_proj = AbsorbedColumnParallelLinear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
+            quantization=quantization,
         )
         self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
             int(config.hidden_size),
             bias=bool(config.attention_bias),
             reduce_results=parallel_collectives is None,
+            quantization=quantization,
         )
 
     def _project_kv_history(self, latent: torch.Tensor) -> torch.Tensor:
@@ -205,7 +209,7 @@ class Glm4MoeLiteAttention(nn.Module):
         return out
 
     def _decode_absorbed_query(self, q_nope: torch.Tensor) -> torch.Tensor:
-        kv_b_weight = self.kv_b_proj.weight.view(
+        kv_b_weight = self.kv_b_proj.absorbed_weight.view(
             self.local_heads,
             self.qk_nope_head_dim + self.v_head_dim,
             self.kv_lora_rank,
@@ -217,7 +221,7 @@ class Glm4MoeLiteAttention(nn.Module):
         ).transpose(0, 1)
 
     def _reconstruct_decode_values(self, latent_output: torch.Tensor) -> torch.Tensor:
-        kv_b_weight = self.kv_b_proj.weight.view(
+        kv_b_weight = self.kv_b_proj.absorbed_weight.view(
             self.local_heads,
             self.qk_nope_head_dim + self.v_head_dim,
             self.kv_lora_rank,
@@ -246,7 +250,7 @@ class Glm4MoeLiteAttention(nn.Module):
             dim=-1,
         )
         latent = self.kv_a_layernorm(latent)
-        if get_context().is_prefill:
+        if get_context().is_prefill or self.q_b_proj.quantized:
             q = self.q_b_proj(normalized_q).view(
                 -1,
                 self.local_heads,
@@ -344,6 +348,10 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
         parallel_context = get_parallel_context()
         self.routed_num_experts = int(config.n_routed_experts)
         self.routed_top_k = int(config.num_experts_per_tok)
+        fp8_enabled = bool(getattr(getattr(config, "quantization_config", None), "enabled", False))
+        fp8_tensor_scales = fp8_enabled and config.quantization_config.checkpoint_scale_layout == "per_tensor"
+        self.shared_fusion_token_limit = packed_shared_expert_token_limit(
+            torch.float8_e4m3fn if fp8_enabled else model_activation_dtype(config))
         self.fuses_shared_decode = use_packed_shared_experts(
             num_routed_experts=self.routed_num_experts,
             num_shared_experts=int(config.n_shared_experts),
@@ -353,6 +361,8 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
             tp_size=int(parallel_context.moe_tp_size),
             ep_size=int(parallel_context.ep_size),
             cuda_graph=decode_graph,
+            weight_dtype=torch.float8_e4m3fn if fp8_enabled else model_activation_dtype(config),
+            fp8_tensor_scales=fp8_tensor_scales,
         )
         self.fuses_shared_prefill = use_packed_shared_experts_in_prefill(
             num_routed_experts=self.routed_num_experts,
@@ -363,6 +373,7 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
             tp_size=int(parallel_context.moe_tp_size),
             ep_size=int(parallel_context.ep_size),
             cuda_graph=decode_graph,
+            weight_dtype=torch.float8_e4m3fn if fp8_enabled else model_activation_dtype(config),
         )
         if self.fuses_shared_prefill and not self.fuses_shared_decode:
             raise RuntimeError("Prefill shared-expert fusion requires packed experts.")
@@ -376,7 +387,8 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
             intermediate_size=int(config.moe_intermediate_size),
             top_k=packed_top_k,
             activation_dtype=model_activation_dtype(config),
-            fp8_enabled=False,
+            fp8_enabled=fp8_enabled,
+            fp8_tensor_scales=fp8_tensor_scales,
             cuda_graph=bool(decode_graph),
             routing_method="biased_sigmoid",
             max_num_tokens=int(getattr(config, "moe_max_num_tokens", 1)),
@@ -435,8 +447,8 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
             topk_weights,
             self.w13_weight[: self.routed_num_experts],
             self.w2_weight[: self.routed_num_experts],
-            self.w13_scale_inv,
-            self.w2_scale_inv,
+            None if self.w13_scale_inv is None else self.w13_scale_inv[:self.routed_num_experts],
+            None if self.w2_scale_inv is None else self.w2_scale_inv[:self.routed_num_experts],
             local_expert_start=0,
             tp_rank=int(self.tp_rank),
             ep_rank=int(self.ep_rank),
@@ -445,6 +457,8 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
     def forward_shared(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.shared_expert_id is None:
             raise RuntimeError("Packed shared expert is not enabled.")
+        if self.fp8_enabled:
+            return self.provider.run_shared_expert(hidden_states)
         gate_up = F.linear(
             hidden_states,
             self.w13_weight[self.shared_expert_id],
@@ -453,6 +467,14 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
             self.shared_act(gate_up),
             self.w2_weight[self.shared_expert_id],
         )
+
+    def validate_loaded_weights(self):
+        super().validate_loaded_weights()
+        if self.shared_expert_id is not None and self.fp8_enabled:
+            idx = self.shared_expert_id
+            self.provider.prepare_shared_expert(
+                self.op_spec, self.w13_weight[idx], self.w2_weight[idx],
+                self.w13_scale_inv[idx], self.w2_scale_inv[idx])
 
     def forward_routed_and_shared(
         self,
@@ -503,7 +525,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 ),
                 hidden_act=str(config.hidden_act),
                 mlp_chunk_size=self.mlp_chunk_size,
-                quantization=None,
+                quantization=getattr(config, "quantization_config", None),
                 reduce_results=False,
                 activation_provider=resolve_silu_and_mul_provider(
                     activation_dtype=model_activation_dtype(config),
@@ -550,6 +572,8 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         if (
             not debug_enabled
             and fuse_shared_for_phase
+            and (experts.shared_fusion_token_limit is None
+                 or hidden_states.shape[0] <= experts.shared_fusion_token_limit)
         ):
             if int(hidden_states.shape[0]) <= self.mlp_chunk_size:
                 local_output = self._routed_and_shared_chunk(hidden_states)
@@ -706,7 +730,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
                 intermediate_size=int(config.intermediate_size),
                 hidden_act=str(config.hidden_act),
                 mlp_chunk_size=int(mlp_chunk_size),
-                quantization=None,
+                quantization=getattr(config, "quantization_config", None),
                 reduce_results=parallel_collectives is None,
                 activation_provider=resolve_silu_and_mul_provider(
                     activation_dtype=model_activation_dtype(config),

@@ -17,7 +17,7 @@ parallel size must use that value.
 | Qwen3MoE | `qwen3_moe` | BF16 / FP16 / block FP8 | ✅ | 1 only | ✅ |
 | Qwen3.5 / 3.6 / 3.8 | `qwen3_5` | BF16 / block FP8 | ✅ | 1 only | 1 only |
 | Qwen3.6 MoE | `qwen3_5_moe` | BF16 / block FP8 | ✅ | 1 only | ✅ |
-| GLM-4.7-Flash | `glm4_moe_lite` | BF16 | ✅ | 1 only | 1 / 2 / 4 |
+| GLM-4.7-Flash | `glm4_moe_lite` | BF16 / experimental per-tensor FP8 | ✅ | 1 only | 1 / 2 / 4 |
 | Gemma 4 Dense / MoE | `gemma4` | BF16 / FP16 | ✅ | 1 only | ✅ (MoE only) |
 | Llama 3 / 3.1 | `llama` | BF16 / FP16 / block FP8 | ✅ | 1 only | 1 only |
 | MiniMax M2.7 | `minimax_m2` | block FP8 with BF16 non-quantized weights | ✅ | 1 only | ✅ |
@@ -33,6 +33,13 @@ Block FP8 support requires E4M3 weights, dynamic activation quantization, and
 a `128 x 128` weight block size. Llama, Qwen2, and Qwen3 dense FP8 checkpoints
 also require every TP-local dense projection dimension to be 128-aligned and
 keep non-quantized parameters in BF16.
+
+GLM per-tensor FP8 loading accepts E4M3 weights with a BF16 scalar
+`weight_scale` for each quantized projection, as used by
+`marksverdhei/GLM-4.7-Flash-FP8`. It requires dynamic activation quantization
+and a device with a compatible native FP8 provider. Weight precision does not
+change the MLA KV-cache dtype. This experimental path does not imply a
+performance improvement over BF16; compare matched workloads before deployment.
 
 ## Sparse Method Support
 

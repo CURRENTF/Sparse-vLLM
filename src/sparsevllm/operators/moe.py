@@ -98,6 +98,28 @@ class MoeProvider:
     name = ""
     gate_up_order = "gate_up"
 
+    def prepare_shared_expert(self, spec, w13, w2, scale13, scale2):
+        """Bind standalone projections over a packed tensor-FP8 expert's views."""
+        if spec.weight_dtype != torch.float8_e4m3fn or spec.block_shape is not None:
+            raise ValueError("Standalone packed FP8 shared projection requires tensor scales")
+        from sparsevllm.operators.fp8_linear import resolve_fp8_linear_provider
+        providers = []
+        for weight, scale in ((w13, scale13), (w2, scale2)):
+            provider = resolve_fp8_linear_provider(
+                (128, 128), input_features=weight.shape[1], output_features=weight.shape[0],
+                activation_dtype=spec.activation_dtype, cuda_graph=spec.cuda_graph,
+                weight_layout_id="tensor_scales_in_block_grid")
+            provider.prepare_weights(weight, scale)
+            providers.append((provider, weight, scale))
+        self._shared_projections = tuple(providers)
+
+    def run_shared_expert(self, hidden_states):
+        from sparsevllm.kernels.triton.silu_and_mul import silu_and_mul_fwd
+        first, second = self._shared_projections
+        packed = first[0](hidden_states, first[1], first[2])
+        activated = silu_and_mul_fwd(packed, gate_up_order=self.gate_up_order)
+        return second[0](activated, second[1], second[2])
+
     @property
     def weight_layout_id(self) -> str:
         return f"packed_{self.gate_up_order}_v1"
@@ -429,6 +451,26 @@ _PACKED_SHARED_PREFILL_PROFILES = frozenset(
 )
 
 
+def _tensor_fp8_shared_decode_profile(profile, cuda_graph):
+    if not cuda_graph or profile != (64, 1, 4, 2048, 1536, 1, 1):
+        return False
+    platform = platforms.current_platform
+    if not platform.is_cuda_alike():
+        return False
+    caps = platform.get_device_caps(torch.cuda.current_device())
+    if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0) or not device_name_contains(caps.device_name, "H100"):
+        return False
+    import triton
+    return (str(torch.__version__).split("+")[0].startswith("2.11.")
+            and str(triton.__version__).startswith("3.6.")
+            and str(caps.runtime_version) == "13.0")
+
+
+def packed_shared_expert_token_limit(weight_dtype):
+    """The tensor-FP8 decode packing profile covers batches through four."""
+    return 4 if weight_dtype == torch.float8_e4m3fn else None
+
+
 def use_packed_shared_experts(
     *,
     num_routed_experts: int,
@@ -439,6 +481,8 @@ def use_packed_shared_experts(
     tp_size: int,
     ep_size: int,
     cuda_graph: bool,
+    weight_dtype: torch.dtype = torch.bfloat16,
+    fp8_tensor_scales: bool = False,
 ) -> bool:
     """Return whether a profiled decode path packs shared experts as routes."""
 
@@ -451,7 +495,9 @@ def use_packed_shared_experts(
         int(tp_size),
         int(ep_size),
     )
-    return bool(cuda_graph) and profile in _PACKED_SHARED_EXPERT_PROFILES
+    if weight_dtype == torch.float8_e4m3fn and fp8_tensor_scales:
+        return _tensor_fp8_shared_decode_profile(profile, cuda_graph)
+    return weight_dtype == torch.bfloat16 and bool(cuda_graph) and profile in _PACKED_SHARED_EXPERT_PROFILES
 
 
 def use_packed_shared_experts_in_prefill(
@@ -464,6 +510,7 @@ def use_packed_shared_experts_in_prefill(
     tp_size: int,
     ep_size: int,
     cuda_graph: bool,
+    weight_dtype: torch.dtype = torch.bfloat16,
 ) -> bool:
     profile = (
         int(num_routed_experts),
@@ -474,7 +521,7 @@ def use_packed_shared_experts_in_prefill(
         int(tp_size),
         int(ep_size),
     )
-    return bool(cuda_graph) and profile in _PACKED_SHARED_PREFILL_PROFILES
+    return weight_dtype == torch.bfloat16 and bool(cuda_graph) and profile in _PACKED_SHARED_PREFILL_PROFILES
 
 
 def append_shared_expert_route(
@@ -1377,14 +1424,18 @@ class TritonMoeProvider(MoeProvider):
                 f"requires BF16 or FP16 activations, got {spec.activation_dtype}"
             )
         if spec.weight_dtype == torch.float8_e4m3fn:
-            if spec.block_shape != (128, 128):
+            if spec.block_shape not in (None, (128, 128)):
                 return SupportResult.unsupported(
-                    f"FP8 requires block_shape=(128, 128), got {spec.block_shape}"
+                    f"FP8 requires tensor scales or block_shape=(128, 128), got {spec.block_shape}"
                 )
             if not caps.supports_native_fp8:
                 return SupportResult.unsupported("device does not provide native FP8 tensor cores")
             if spec.hidden_size % 128 or spec.intermediate_size % 128:
                 return SupportResult.unsupported("FP8 hidden/intermediate sizes must be 128-aligned")
+            if spec.block_shape is None:
+                from sparsevllm.kernels.external.sgl.fp8_linear import tensor_fp8_ops
+                tensor_fp8_ops()
+                return SupportResult.yes("per-token activations and per-logical-tensor expert scales")
             from sparsevllm.kernels.external.sgl.moe import (
                 sgl_fp8_group_quantization_support,
             )
@@ -1429,6 +1480,7 @@ class TritonMoeProvider(MoeProvider):
                 num_experts=spec.num_experts,
                 local_expert_start=local_expert_start,
                 gate_up_order=self.gate_up_order,
+                tensor_scales=spec.block_shape is None,
             )
         from sparsevllm.kernels.triton.moe import fused_moe
 

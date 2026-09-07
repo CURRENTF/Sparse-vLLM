@@ -193,6 +193,25 @@ class _ThroughputIntervalLogger:
                 last_batch=last_batch,
             )
 
+def _resolve_eos_token_ids(model_path, hf_config, tokenizer_eos_token_id):
+    if os.path.isdir(model_path) and not os.path.exists(os.path.join(model_path, "generation_config.json")):
+        # A generation config is optional in HF checkpoints. GLM FP8 publishes
+        # its complete EOS list in config.json instead; preserve every stop ID.
+        eos_values = getattr(hf_config, "eos_token_id", None)
+        logger.info("No generation_config.json in {}; use model config EOS metadata.", model_path)
+    else:
+        eos_values = GenerationConfig.from_pretrained(model_path).eos_token_id
+    if eos_values is None:
+        eos_values = []
+    elif isinstance(eos_values, int):
+        eos_values = [eos_values]
+    else:
+        eos_values = list(eos_values)
+    if tokenizer_eos_token_id is not None:
+        eos_values.append(int(tokenizer_eos_token_id))
+    return tuple(dict.fromkeys(int(token_id) for token_id in eos_values))
+
+
 class LLMEngine:
     """
     Sparse-vLLM 推理引擎的核心入口类。
@@ -248,17 +267,9 @@ class LLMEngine:
             and callable(getattr(self.model_runner.model, "encode_multimodal", None))
             else None
         )
-        generation_config = GenerationConfig.from_pretrained(config.model)
-        eos_values = generation_config.eos_token_id
-        if eos_values is None:
-            eos_values = []
-        elif isinstance(eos_values, int):
-            eos_values = [eos_values]
-        else:
-            eos_values = list(eos_values)
-        if self.tokenizer.eos_token_id is not None:
-            eos_values.append(int(self.tokenizer.eos_token_id))
-        config.eos_token_ids = tuple(dict.fromkeys(int(token_id) for token_id in eos_values))
+        config.eos_token_ids = _resolve_eos_token_ids(
+            config.model, config.hf_config, self.tokenizer.eos_token_id
+        )
         config.eos = config.eos_token_ids[0] if config.eos_token_ids else -1
         self.model_runner.call(
             "set_tokenizer_metadata",

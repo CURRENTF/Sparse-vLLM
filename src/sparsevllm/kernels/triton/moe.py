@@ -825,6 +825,7 @@ def _routed_fp8_gemm_kernel(
     MUL_ROUTING_WEIGHT: tl.constexpr,
     NAIVE_ASSIGNMENT: tl.constexpr,
     SWAP_AB: tl.constexpr,
+    TENSOR_SCALES: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -908,26 +909,34 @@ def _routed_fp8_gemm_kernel(
                 & (offsets_k[:, None] < remaining_k),
                 other=0.0,
             )
-        a_scale = tl.load(
-            a_scale_ptr
-            + input_rows * stride_asm
-            + k_block * stride_ask,
-            mask=assignment_mask,
-            other=0.0,
-        ).to(tl.float32)
-        b_scale = tl.load(
-            b_scale_ptr
-            + expert_id * stride_bse
-            + (offsets_n // 128) * stride_bsn
-            + k_block * stride_bsk
-        ).to(tl.float32)
-        if SWAP_AB:
-            accumulator += tl.dot(b, a) * b_scale[:, None] * a_scale[None, :]
+        if TENSOR_SCALES:
+            if SWAP_AB:
+                accumulator = tl.dot(b, a, accumulator)
+            else:
+                accumulator = tl.dot(a, b, accumulator)
         else:
-            accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+            a_scale = tl.load(
+                a_scale_ptr + input_rows * stride_asm + k_block * stride_ask,
+                mask=assignment_mask, other=0.0,
+            ).to(tl.float32)
+            b_scale = tl.load(
+                b_scale_ptr + expert_id * stride_bse
+                + (offsets_n // 128) * stride_bsn + k_block * stride_bsk,
+                mask=offsets_n < N, other=0.0,
+            ).to(tl.float32)
+            if SWAP_AB:
+                accumulator += tl.dot(b, a) * b_scale[:, None] * a_scale[None, :]
+            else:
+                accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
 
     if SWAP_AB:
         accumulator = tl.trans(accumulator, (1, 0))
+
+    if TENSOR_SCALES:
+        a_scale = tl.load(a_scale_ptr + input_rows * stride_asm, mask=assignment_mask, other=0.).to(tl.float32)
+        b_scale = tl.load(b_scale_ptr + expert_id * stride_bse + (offsets_n // 128) * stride_bsn,
+                          mask=offsets_n < N, other=0.).to(tl.float32)
+        accumulator *= a_scale[:, None] * b_scale[None, :]
 
     if MUL_ROUTING_WEIGHT:
         routing_weights = tl.load(
@@ -958,6 +967,7 @@ def _routed_fp8_gemm(
     input_top_k: int,
     multiply_routing_weight: bool,
     config: MoeGemmConfig | None = None,
+    tensor_scales: bool = False,
 ) -> None:
     config = config or MoeGemmConfig(alignment.block_size, 128, 128, 1, 4, 3)
     if config.block_m != alignment.block_size:
@@ -1005,6 +1015,7 @@ def _routed_fp8_gemm(
         MUL_ROUTING_WEIGHT=bool(multiply_routing_weight),
         NAIVE_ASSIGNMENT=alignment.naive,
         SWAP_AB=config.swap_ab,
+        TENSOR_SCALES=tensor_scales,
         BLOCK_SIZE_M=config.block_m,
         BLOCK_SIZE_N=config.block_n,
         BLOCK_SIZE_K=config.block_k,
@@ -1012,6 +1023,15 @@ def _routed_fp8_gemm(
         num_warps=config.num_warps,
         num_stages=config.num_stages,
     )
+
+
+def _quantize_fp8_token(inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    from sparsevllm.kernels.external.sgl.fp8_linear import tensor_fp8_ops
+    quantize, _ = tensor_fp8_ops()
+    output = torch.empty_like(inputs, dtype=torch.float8_e4m3fn)
+    scales = torch.empty((inputs.shape[0], 1), dtype=torch.float32, device=inputs.device)
+    quantize(inputs, output, scales)
+    return output, scales
 
 
 def _quantize_fp8_group128(inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1423,6 +1443,7 @@ def fused_moe_fp8(
     num_experts: int,
     local_expert_start: int,
     gate_up_order: str,
+    tensor_scales: bool = False,
 ) -> torch.Tensor:
     """Run block-scaled W8A8 routed experts with a generic Triton pipeline."""
 
@@ -1551,7 +1572,8 @@ def fused_moe_fp8(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-    hidden_states_q, hidden_states_scale = _quantize_fp8_group128(hidden_states)
+    quantize = _quantize_fp8_token if tensor_scales else _quantize_fp8_group128
+    hidden_states_q, hidden_states_scale = quantize(hidden_states)
     _routed_fp8_gemm(
         hidden_states_q,
         hidden_states_scale,
@@ -1563,6 +1585,7 @@ def fused_moe_fp8(
         input_top_k=top_k,
         multiply_routing_weight=False,
         config=w13_config,
+        tensor_scales=tensor_scales,
     )
     activated = torch.empty(
         (num_assignments, intermediate_size),
@@ -1574,7 +1597,7 @@ def fused_moe_fp8(
         gate_up_order=gate_up_order,
         output=activated,
     )
-    activated_q, activated_scale = _quantize_fp8_group128(activated)
+    activated_q, activated_scale = quantize(activated)
     w2_output = torch.empty(
         (num_assignments, hidden_size),
         dtype=hidden_states.dtype,
@@ -1591,6 +1614,7 @@ def fused_moe_fp8(
         input_top_k=1,
         multiply_routing_weight=True,
         config=w2_config,
+        tensor_scales=tensor_scales,
     )
     return moe_sum(
         w2_output.view(num_tokens, top_k, hidden_size),

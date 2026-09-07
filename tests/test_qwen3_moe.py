@@ -169,7 +169,7 @@ def _instantiate_model(config, context, full_attention_provider=None):
                 patch(
                     "sparsevllm.layers.linear.QuantizationRegistry."
                     "resolve_linear_provider",
-                    return_value=lambda *_args, **_kwargs: None,
+                    return_value=Mock(return_value=None),
                 )
             )
         return Qwen3MoeForCausalLM(

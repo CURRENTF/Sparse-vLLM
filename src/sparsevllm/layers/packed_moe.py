@@ -38,6 +38,7 @@ class PackedMoeExperts(PackedExpertWeightLoader, nn.Module):
         activation_dtype: torch.dtype,
         fp8_enabled: bool,
         cuda_graph: bool,
+        fp8_tensor_scales: bool = False,
         routing_method: str = "softmax",
         scale_dtype: torch.dtype | None = None,
         activation: str = "silu",
@@ -67,6 +68,9 @@ class PackedMoeExperts(PackedExpertWeightLoader, nn.Module):
             self.global_intermediate_size // self.tp_size
         )
         self.fp8_enabled = bool(fp8_enabled)
+        self.fp8_tensor_scales = bool(fp8_tensor_scales)
+        if self.fp8_tensor_scales and not self.fp8_enabled:
+            raise ValueError("Tensor FP8 scales require FP8 weights")
         scale_dtype = (scale_dtype or torch.float32) if self.fp8_enabled else None
         if self.fp8_enabled and (
             self.hidden_size % 128 or self.global_intermediate_size % 128
@@ -117,7 +121,7 @@ class PackedMoeExperts(PackedExpertWeightLoader, nn.Module):
             weight_dtype=(
                 torch.float8_e4m3fn if self.fp8_enabled else activation_dtype
             ),
-            block_shape=(128, 128) if self.fp8_enabled else None,
+            block_shape=(128, 128) if self.fp8_enabled and not self.fp8_tensor_scales else None,
             ep_size=int(self.ep_size),
             cuda_graph=bool(cuda_graph),
             tp_size=int(self.tp_size),
@@ -207,6 +211,8 @@ class PackedMoeExperts(PackedExpertWeightLoader, nn.Module):
                     f"Missing FP8 weight_scale_inv for {self.model_label} "
                     f"expert={global_expert_id}, projection={projection}."
                 )
+            if self.fp8_tensor_scales and not torch.equal(loaded_scale, loaded_scale.flatten()[0].expand_as(loaded_scale)):
+                raise ValueError("Per-tensor FP8 expert projection requires one constant scale")
             if loaded_weight.dtype != torch.float8_e4m3fn:
                 raise TypeError(
                     f"{self.model_label} expert weight must be FP8 E4M3, "

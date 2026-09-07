@@ -13,7 +13,7 @@
 | Qwen3MoE | `qwen3_moe` | BF16 / FP16 / 块级 FP8 | ✅ | 仅支持 1 | ✅ |
 | Qwen3.5 / 3.6 / 3.8 | `qwen3_5` | BF16 / 块级 FP8 | ✅ | 仅支持 1 | 仅支持 1 |
 | Qwen3.6 MoE | `qwen3_5_moe` | BF16 / 块级 FP8 | ✅ | 仅支持 1 | ✅ |
-| GLM-4.7-Flash | `glm4_moe_lite` | BF16 | ✅ | 仅支持 1 | 1 / 2 / 4 |
+| GLM-4.7-Flash | `glm4_moe_lite` | BF16 / 实验性逐张量 FP8 | ✅ | 仅支持 1 | 1 / 2 / 4 |
 | Gemma 4 Dense / MoE | `gemma4` | BF16 / FP16 | ✅ | 仅支持 1 | ✅（仅 MoE） |
 | Llama 3 / 3.1 | `llama` | BF16 / FP16 / 块级 FP8 | ✅ | 仅支持 1 | 仅支持 1 |
 | MiniMax M2.7 | `minimax_m2` | 块级 FP8，非量化权重使用 BF16 | ✅ | 仅支持 1 | ✅ |
@@ -27,6 +27,12 @@ MoE 模型可能在内部组合 tensor parallelism 和 expert parallelism；不�
 块级 FP8 要求使用 E4M3 权重、动态激活量化以及 `128 x 128` 的权重块大小。
 Llama、Qwen2 和 Qwen3 Dense FP8 checkpoint 还要求每个 TP-local dense
 projection 维度按 128 对齐，且非量化参数保持 BF16。
+
+GLM 逐张量 FP8 加载支持 E4M3 权重以及每个量化投影对应的 BF16 标量
+`weight_scale`，例如 `marksverdhei/GLM-4.7-Flash-FP8` 使用的格式。
+它要求动态激活量化，并需要设备提供兼容的原生 FP8 provider。
+权重精度不会改变 MLA KV cache 的 dtype。该路径仍为实验性支持，不代表比 BF16
+更快；部署前应使用匹配工作负载进行对比。
 
 ## 稀疏方法支持
 

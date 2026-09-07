@@ -20,7 +20,7 @@ import random
 import argparse
 import torch.multiprocessing as mp
 import torch
-from transformers import AutoTokenizer, GenerationConfig
+from transformers import AutoConfig, AutoTokenizer, GenerationConfig
 import torch.distributed as dist
 from benchmark.model_adapters.sparsevllm import get_sparsevllm_generate_api
 from benchmark.long_bench.prompt_budget import encode_prompt_with_generation_budget
@@ -604,7 +604,11 @@ def load_model_and_tokenizer(rank, args, infer_config):
     tokenizer_path = args.tokenizer_path if args.tokenizer_path else args.model_path
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
 
-    generation_config = GenerationConfig.from_pretrained(args.model_path, trust_remote_code=True)
+    if os.path.isdir(args.model_path) and not os.path.exists(os.path.join(args.model_path, "generation_config.json")):
+        # HF generation metadata is optional; malformed existing files still fail.
+        generation_config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
+    else:
+        generation_config = GenerationConfig.from_pretrained(args.model_path, trust_remote_code=True)
     eos_token_ids = generation_config.eos_token_id
     if eos_token_ids is None:
         eos_token_ids = []

@@ -196,7 +196,7 @@ def test_new_dense_fp8_models_load_shared_packed_weight_contract(
         ),
         patch(
             "sparsevllm.layers.linear.QuantizationRegistry.resolve_linear_provider",
-            return_value=fp8_blockwise_linear_reference,
+            return_value=Mock(side_effect=fp8_blockwise_linear_reference),
         ),
     ):
         model = model_type(config)

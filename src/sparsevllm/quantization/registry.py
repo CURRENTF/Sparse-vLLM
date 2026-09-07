@@ -42,4 +42,7 @@ class QuantizationRegistry:
             input_features=input_features,
             output_features=output_features,
             activation_dtype=activation_dtype,
+            weight_layout_id=("tensor_scales_in_block_grid"
+                              if quantization.checkpoint_scale_layout == "per_tensor"
+                              else "block_128x128_nt_k_major"),
         )

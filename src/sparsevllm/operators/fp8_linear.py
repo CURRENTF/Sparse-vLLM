@@ -70,6 +70,9 @@ class Fp8LinearProvider:
             ),
         }
 
+    def prepare_weights(self, weight: torch.Tensor, scales: torch.Tensor) -> None:
+        """Prepare provider-owned derived layouts after all logical shards load."""
+
     def _validate_call(
         self,
         x: torch.Tensor,
@@ -134,6 +137,7 @@ FP8_LINEAR_REGISTRY: OpRegistry[Fp8LinearSpec, Fp8LinearProvider] = OpRegistry(
     "block-scaled FP8 Linear",
     portfolio=PortfolioPolicy(
         upstream_standard=(
+            "sgl_tensor_fp8",
             "flashinfer_sm90",
             "flashinfer_groupwise_sm120",
         ),
@@ -141,6 +145,62 @@ FP8_LINEAR_REGISTRY: OpRegistry[Fp8LinearSpec, Fp8LinearProvider] = OpRegistry(
     ),
     profile_order=("sm120_fp8_linear_dispatch_plan",),
 )
+
+
+@FP8_LINEAR_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
+class SglTensorFp8LinearProvider(Fp8LinearProvider):
+    """Per-logical-tensor weights, per-token activations, channel-scale epilogue."""
+
+    name = "sgl_tensor_fp8"
+
+    @classmethod
+    def supports(cls, spec, caps):
+        if spec.weight_layout_id != "tensor_scales_in_block_grid":
+            return SupportResult.unsupported("requires tensor-scaled checkpoint weights")
+        if caps.platform != PlatformEnum.CUDA or not caps.supports_native_fp8:
+            return SupportResult.unsupported("requires CUDA native FP8")
+        capability = caps.compute_capability
+        if capability is None or capability < (8, 9):
+            return SupportResult.unsupported("requires SM89 or newer")
+        minimum = (12, 8) if capability >= (10, 0) else (12, 4) if capability == (8, 9) else (12, 0)
+        if not runtime_version_at_least(caps.runtime_version, minimum):
+            return SupportResult.unsupported(f"requires CUDA runtime >= {minimum}")
+        if spec.cuda_graph and not caps.supports_graph_capture:
+            return SupportResult.unsupported("requires graph capture support")
+        if spec.activation_dtype not in (torch.bfloat16, torch.float16):
+            return SupportResult.unsupported("requires BF16 or FP16 activations")
+        if spec.weight_dtype != torch.float8_e4m3fn or spec.scale_dtype != torch.float32:
+            return SupportResult.unsupported("requires E4M3 weights and FP32 scales")
+        if spec.block_shape != (128, 128) or spec.input_features % 16 or spec.output_features % 8:
+            return SupportResult.unsupported("requires scale grid 128, K aligned 16, N aligned 8")
+        from sparsevllm.kernels.external.sgl.fp8_linear import tensor_fp8_ops
+        tensor_fp8_ops()
+        return SupportResult.yes()
+
+    def prepare_weights(self, weight, scales):
+        if not torch.equal(scales, scales[:, :1].expand_as(scales)):
+            raise ValueError("Tensor-scaled Linear cannot consume scales varying along K")
+        # Preserve distinct fused projection scales without requantizing weights.
+        self.channel_scales = scales[:, 0].repeat_interleave(128)[:weight.shape[0]].contiguous()
+
+    def binding_metadata(self):
+        return {**super().binding_metadata(), "activation_quantization": "dynamic_per_token",
+                "weight_quantization": "per_logical_tensor", "gemm": "sgl_kernel.fp8_scaled_mm"}
+
+    def __call__(self, x, weight, weight_scale_inv, bias=None):
+        self._validate_call(x, weight, weight_scale_inv)
+        if not hasattr(self, "channel_scales"):
+            raise RuntimeError("Tensor-scaled FP8 Linear weights were not prepared")
+        from sparsevllm.kernels.external.sgl.fp8_linear import tensor_fp8_ops
+        quantize, gemm = tensor_fp8_ops()
+        flat = x.reshape(-1, x.shape[-1]).contiguous()
+        if not flat.shape[0]:
+            return x.new_empty((*x.shape[:-1], weight.shape[0]))
+        quantized = torch.empty_like(flat, dtype=torch.float8_e4m3fn)
+        scales = torch.empty((flat.shape[0], 1), device=x.device, dtype=torch.float32)
+        quantize(flat, quantized, scales)
+        output = gemm(quantized, weight.t(), scales, self.channel_scales, x.dtype, bias)
+        return output.reshape(*x.shape[:-1], weight.shape[0])
 
 
 @dataclass(frozen=True, slots=True)

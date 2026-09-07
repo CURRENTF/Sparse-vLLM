@@ -121,6 +121,8 @@ class LinearBase(nn.Module):
         weight_target.copy_(loaded_weight)
         scale_target.copy_(loaded_scale.to(dtype=scale_target.dtype))
         self._mark_quantized_weight_range_loaded(weight_target)
+        if self._quantized_weight_loaded:
+            self.quant_provider.prepare_weights(self.weight, self.weight_scale_inv)
 
     def _mark_quantized_weight_range_loaded(self, weight_target: torch.Tensor) -> None:
         if not self.quantized:
@@ -196,11 +198,27 @@ class MergedReplicatedLinear(ReplicatedLinear):
         input_size: int,
         output_sizes: list[int],
         bias: bool = False,
+        quantization=None,
     ):
         if not output_sizes or any(int(size) <= 0 for size in output_sizes):
             raise ValueError(f"output_sizes must be positive, got {output_sizes}.")
         self.output_sizes = [int(size) for size in output_sizes]
-        super().__init__(input_size, sum(self.output_sizes), bias)
+        super().__init__(input_size, sum(self.output_sizes), bias, quantization=quantization)
+
+    def load_quantized_weight(self, loaded_weight, loaded_scale, loaded_shard_id):
+        self._ensure_quantized_loader()
+        if not isinstance(loaded_shard_id, int) or not 0 <= loaded_shard_id < len(self.output_sizes):
+            raise ValueError(f"Invalid merged projection shard {loaded_shard_id!r}.")
+        offset = sum(self.output_sizes[:loaded_shard_id])
+        size = self.output_sizes[loaded_shard_id]
+        if offset % 128 or (size % 128 and loaded_shard_id != len(self.output_sizes) - 1):
+            raise ValueError("Merged FP8 projections must not share a scale block.")
+        self._copy_quantized_weight_and_scale(
+            loaded_weight,
+            loaded_scale,
+            weight_target=self.weight.data.narrow(0, offset, size),
+            scale_target=self.weight_scale_inv.narrow(0, offset // 128, (size + 127) // 128),
+        )
 
     def weight_loader(
         self,
@@ -280,6 +298,31 @@ class ColumnParallelLinear(LinearBase):
         if self.quantized:
             return self.quant_provider(x, self.weight, self.weight_scale_inv, self.bias)
         return F.linear(x, self.weight, self.bias)
+
+
+class AbsorbedColumnParallelLinear(ColumnParallelLinear):
+    """Keep a prepared activation-dtype matrix for MLA's absorbed BMMs."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.register_buffer("_absorbed_weight", None, persistent=False)
+
+    def load_quantized_weight(self, loaded_weight, loaded_scale, loaded_shard_id=None):
+        super().load_quantized_weight(loaded_weight, loaded_scale, loaded_shard_id)
+        # The absorbed query/value BMMs require BF16 matrices. Prepare once,
+        # while retaining FP8 storage for the ordinary prefill projection.
+        scales = self.weight_scale_inv.repeat_interleave(128, 0).repeat_interleave(128, 1)
+        self._absorbed_weight = (
+            self.weight.float() * scales[:self.weight.shape[0], :self.weight.shape[1]]
+        ).to(getattr(torch, self.quantization_config.activation_dtype))
+
+    @property
+    def absorbed_weight(self):
+        if not self.quantized:
+            return self.weight
+        if self._absorbed_weight is None:
+            raise RuntimeError("MLA absorbed FP8 weight has not been prepared.")
+        return self._absorbed_weight
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):

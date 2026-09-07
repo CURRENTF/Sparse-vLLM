@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 from safetensors.torch import save_file
@@ -90,7 +90,7 @@ def test_qwen3_dense_loads_official_block_fp8_projection_layout(tmp_path):
         patch("sparsevllm.layers.embed_head.get_parallel_context", return_value=context),
         patch(
             "sparsevllm.layers.linear.QuantizationRegistry.resolve_linear_provider",
-            return_value=fp8_blockwise_linear_reference,
+            return_value=Mock(side_effect=fp8_blockwise_linear_reference),
         ),
     ):
         model = Qwen3ForCausalLM(_config())
@@ -144,7 +144,7 @@ def test_qwen3_dense_fp8_forward_uses_loaded_scales(tmp_path):
         patch("sparsevllm.layers.embed_head.get_parallel_context", return_value=context),
         patch(
             "sparsevllm.layers.linear.QuantizationRegistry.resolve_linear_provider",
-            return_value=fp8_blockwise_linear_reference,
+            return_value=Mock(side_effect=fp8_blockwise_linear_reference),
         ),
     ):
         model = Qwen3ForCausalLM(_config())

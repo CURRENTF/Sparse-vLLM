@@ -15,6 +15,7 @@ class QuantizationConfig:
     weight_block_size: tuple[int, int] | None = None
     model_name: str = "qwen3_5"
     activation_dtype: str = "bfloat16"
+    checkpoint_scale_layout: str = "block_128x128"
 
     @classmethod
     def disabled(
@@ -57,7 +58,9 @@ class QuantizationConfig:
             "fmt": self.weight_dtype,
             "activation_scheme": self.activation_scheme,
         }
-        if self.weight_block_size is not None:
+        if self.checkpoint_scale_layout == "per_tensor":
+            payload["is_checkpoint_fp8_serialized"] = True
+        elif self.weight_block_size is not None:
             payload["weight_block_size"] = list(self.weight_block_size)
         return payload
 
@@ -154,6 +157,11 @@ class QuantizationConfig:
                 f"got {block_tuple}."
             )
 
+        per_tensor = bool(config_get(value, "is_checkpoint_fp8_serialized", False)) and all(
+            config_get(value, key, None) is None
+            for key in ("weight_block_size", "weight_block_shape", "block_size")
+        )
+
         return cls(
             enabled=True,
             quant_method="fp8",
@@ -162,4 +170,5 @@ class QuantizationConfig:
             weight_block_size=block_tuple,
             model_name=model_name,
             activation_dtype=normalized_activation_dtype,
+            checkpoint_scale_layout="per_tensor" if per_tensor else "block_128x128",
         )

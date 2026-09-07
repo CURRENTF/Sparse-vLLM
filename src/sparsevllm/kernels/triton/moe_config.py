@@ -559,7 +559,7 @@ def resolve_fp8_routed_gemm_config(
     if device_capability is None:
         device_capability = torch.cuda.get_device_capability()
     shape = MoeGemmShape(
-        _hardware_family(device_name),
+        _profiled_hardware(device_name),
         device_capability,
         torch.float8_e4m3fn,
         int(top_k),
