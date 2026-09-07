@@ -657,6 +657,7 @@ def test_model_runner_reset_after_warmup_resets_local_runtime_state():
 def test_model_runner_releases_the_complete_profiling_cache_runtime():
     calls = []
     controller = object()
+    cache_manager = object()
     runner = object.__new__(ModelRunner)
     runner.cache_runtime_phase = "profiling"
     runner.platform = SimpleNamespace(synchronize=lambda: calls.append("sync"))
@@ -668,12 +669,17 @@ def test_model_runner_releases_the_complete_profiling_cache_runtime():
     runner.collective_runtime = SimpleNamespace(
         reset_for_cuda_graph_recapture=lambda: calls.append("reset_collectives")
     )
-    runner.model = SimpleNamespace(model=SimpleNamespace(sparse_controller=controller))
+    runner.model = SimpleNamespace(
+        model=SimpleNamespace(sparse_controller=controller),
+        release_cache_runtime_bindings=lambda manager: calls.append(
+            ("release_bindings", manager)
+        ),
+    )
     runner.sparse_controller = controller
     runner.runtime_state = object()
     runner.prefix_cache_coordinator = object()
     runner.chain_cache_coordinator = object()
-    runner.cache_manager = object()
+    runner.cache_manager = cache_manager
     runner.world_size = 1
     runner.rank = 0
     runner.device = torch.device("cpu")
@@ -697,6 +703,7 @@ def test_model_runner_releases_the_complete_profiling_cache_runtime():
         "clear_graphs",
         "reset_collectives",
         "release_memory",
+        ("release_bindings", cache_manager),
         "release_memory",
     ]
     assert runner.cache_runtime_phase == "released"

@@ -622,6 +622,13 @@ class ModelRunner:
             self.platform,
             self.device,
         )
+        release_model_bindings = getattr(
+            self.model,
+            "release_cache_runtime_bindings",
+            None,
+        )
+        if callable(release_model_bindings):
+            release_model_bindings(self.cache_manager)
         model = getattr(self.model, "model", None)
         if model is not None and getattr(model, "sparse_controller", None) is self.sparse_controller:
             model.sparse_controller = None

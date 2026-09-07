@@ -137,6 +137,24 @@ def test_mla_binds_key_materializer_once_per_manager_and_layer() -> None:
     second_manager.register_attention_key_materializer.assert_called_once()
 
 
+def test_mla_releases_only_bindings_for_the_retiring_cache_runtime() -> None:
+    attention = _attention()
+    project_latent = Mock()
+    first_manager = SimpleNamespace(register_attention_key_materializer=Mock())
+    second_manager = SimpleNamespace(register_attention_key_materializer=Mock())
+
+    attention._ensure_key_materializer(first_manager, 0, project_latent)
+    attention._ensure_key_materializer(first_manager, 1, project_latent)
+    attention._ensure_key_materializer(second_manager, 0, project_latent)
+    attention.release_cache_runtime_bindings(first_manager)
+    attention.release_cache_runtime_bindings(first_manager)
+
+    attention._ensure_key_materializer(second_manager, 0, project_latent)
+    attention._ensure_key_materializer(first_manager, 1, project_latent)
+    second_manager.register_attention_key_materializer.assert_called_once()
+    assert first_manager.register_attention_key_materializer.call_count == 3
+
+
 def _expand_history(attention: MLAAttention, history):
     heads = attention.spec.local_q_heads
     latent = history.gathered_latent

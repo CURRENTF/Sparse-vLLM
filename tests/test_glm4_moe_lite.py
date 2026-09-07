@@ -115,6 +115,20 @@ def _fake_mla(tp_size: int = 1):
     )
 
 
+def test_glm_releases_shared_mla_cache_runtime_binding() -> None:
+    cache_manager = object()
+    mla_attention = SimpleNamespace(release_cache_runtime_bindings=Mock())
+    model = object.__new__(Glm4MoeLiteForCausalLM)
+    nn.Module.__init__(model)
+    model.model = SimpleNamespace(mla_attention=mla_attention)
+
+    model.release_cache_runtime_bindings(cache_manager)
+
+    mla_attention.release_cache_runtime_bindings.assert_called_once_with(
+        cache_manager
+    )
+
+
 @contextmanager
 def _construction_context(context: ParallelContext):
     with ExitStack() as stack:

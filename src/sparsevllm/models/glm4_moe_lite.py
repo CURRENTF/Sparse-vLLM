@@ -951,6 +951,9 @@ class Glm4MoeLiteForCausalLM(nn.Module):
             )
         )
 
+    def release_cache_runtime_bindings(self, cache_manager: object) -> None:
+        self.model.mla_attention.release_cache_runtime_bindings(cache_manager)
+
     def _sparse_block(self, layer_idx: int) -> Glm4MoeLiteSparseMoeBlock:
         if not 0 <= int(layer_idx) < len(self.model.layers):
             raise ValueError(
