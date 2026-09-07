@@ -285,8 +285,14 @@ class LLMEngine:
         self._atexit_callback = self.exit
         atexit.register(self._atexit_callback)
 
-        # 5. 预热模型
-        self._warmup()
+        # Startup requests only exercise kernels and capacity profiles. They
+        # must not consume persistent ChainCache identities across warmup
+        # batches or CUDA Graph families.
+        self._startup_warmup_active = True
+        try:
+            self._warmup()
+        finally:
+            self._startup_warmup_active = False
         if os.getenv("SPARSEVLLM_PROFILER_RESET_AFTER_WARMUP", "0") == "1":
             profiler.reset()
         self._throughput_logger.start()
@@ -743,8 +749,12 @@ class LLMEngine:
                 raise ChainModeError("Multimodal requests do not support chain mode.")
             multimodal = self.multimodal_processor.process(prompt)
             prompt = multimodal.token_ids
-        mode = str(
-            getattr(self.config, "resolved_prefix_cache_mode", "disabled")
+        mode = (
+            "disabled"
+            if bool(getattr(self, "_startup_warmup_active", False))
+            else str(
+                getattr(self.config, "resolved_prefix_cache_mode", "disabled")
+            )
         )
         normalized_chain_id = str(chain_id or "").strip()
         existing = None

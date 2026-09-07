@@ -1144,6 +1144,13 @@ def test_engine_chain_admission_reuses_resident_seq_and_logical_boundary():
     engine._active_chain_sequences = {}
     params = SamplingParams(max_tokens=2, temperature=0.0)
 
+    engine._startup_warmup_active = True
+    warmup = engine.admit_request([7], params)
+    assert warmup.chain_status == "disabled"
+    assert not coordinator.index.records
+    assert not engine._active_chain_sequences
+    engine._startup_warmup_active = False
+
     first = engine.admit_request([1, 2, 3], params)
     assert first.chain_status == "created"
     validation_args = next(
