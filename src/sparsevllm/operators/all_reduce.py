@@ -183,6 +183,44 @@ def _expandable_segments_enabled() -> bool:
     return False
 
 
+def _loaded_cuda_runtime_path() -> str:
+    """Return a loaded CUDA runtime library, excluding compiler stub libraries."""
+
+    candidates: list[str] = []
+    with open("/proc/self/maps", encoding="utf-8") as mappings:
+        for mapping in mappings:
+            path_start = mapping.find("/")
+            if path_start < 0:
+                continue
+            path = mapping[path_start:].strip()
+            filename = os.path.basename(path)
+            if (
+                filename.startswith("libcudart")
+                and ".so" in filename
+                and "stub" not in filename
+                and " (deleted)" not in path
+                and path not in candidates
+            ):
+                candidates.append(path)
+    if not candidates:
+        raise RuntimeError(
+            "FlashInfer all-reduce requires a loaded CUDA runtime library, but "
+            "only compiler stubs or no libcudart mapping was found."
+        )
+    return candidates[0]
+
+
+def _prepare_flashinfer_cuda_runtime():
+    from flashinfer.comm import CudaRTLibrary
+    from flashinfer.comm.cuda_ipc import cudart
+
+    runtime = CudaRTLibrary(_loaded_cuda_runtime_path())
+    # Keep the shared lazy proxy: TRT-LLM and IPC helpers retain references to it.
+    # FlashInfer 0.6.x has no public API for configuring this shared runtime.
+    cudart._library = runtime
+    return runtime
+
+
 @ALL_REDUCE_REGISTRY.register_atomic(
     ProviderRole.UPSTREAM_STANDARD,
     profile_only=True,
@@ -240,6 +278,7 @@ class FlashInferTrtllmAllReduceProvider(AllReduceProvider):
                 "Prepared FlashInfer TRT-LLM profile no longer matches the active "
                 f"device {caps.device_name}."
             )
+        _prepare_flashinfer_cuda_runtime()
         workspace = create_allreduce_fusion_workspace(
             backend="trtllm",
             world_size=spec.world_size,
@@ -400,7 +439,6 @@ class FlashInferVllmAllReduceProvider(AllReduceProvider):
                 "the process."
             )
         from flashinfer.comm import (
-            CudaRTLibrary,
             create_shared_buffer,
             vllm_init_custom_ar,
             vllm_meta_size,
@@ -437,6 +475,7 @@ class FlashInferVllmAllReduceProvider(AllReduceProvider):
             for peer in device_ordinals
         ):
             raise RuntimeError("FlashInfer vLLM all-reduce requires CUDA peer access.")
+        cudart = _prepare_flashinfer_cuda_runtime()
         max_size_bytes = spec.max_rows * spec.hidden_size * spec.dtype.itemsize
         meta_ptrs = create_shared_buffer(vllm_meta_size() + max_size_bytes, group)
         buffer_ptrs = create_shared_buffer(max_size_bytes, group)
@@ -450,7 +489,7 @@ class FlashInferVllmAllReduceProvider(AllReduceProvider):
         self._meta_ptrs = meta_ptrs
         self._buffer_ptrs = buffer_ptrs
         self._handle = handle
-        self._cudart = CudaRTLibrary()
+        self._cudart = cudart
 
     def run(self, spec, tensor, *, group) -> torch.Tensor:
         del group
