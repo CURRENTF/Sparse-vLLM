@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import sys
@@ -12,6 +13,12 @@ import pytest
 
 class FakeFormatError(Exception):
     pass
+
+
+class FakeAPIError(Exception):
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def _response(
@@ -73,7 +80,10 @@ def _load_model_module(monkeypatch, responses):
 
         def _query(self, messages, **kwargs):
             self.calls.append((messages, kwargs))
-            return responses.pop(0)
+            response = responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
 
         def _prepare_messages_for_api(self, messages):
             return messages
@@ -329,6 +339,69 @@ def test_chain_model_starts_new_chain_after_invalidation(monkeypatch):
     assert model.calls[1][1]["extra_body"]["chain_id"] is None
     assert "chain_append_start" not in model.calls[1][1]["extra_body"]
     assert model._chain_id == "chain-b"
+
+
+@pytest.mark.parametrize("error_source", ["worker", "router"])
+def test_chain_model_recreates_evicted_chain_from_full_history(
+    monkeypatch, error_source
+):
+    status_code = 410
+    detail = {"code": "chain_gone"}
+    if error_source == "router":
+        fastapi = pytest.importorskip("fastapi")
+        pytest.importorskip("uvicorn")
+        from sparsevllm.entrypoints.openai import smart_router
+
+        router = smart_router.SmartRouter(
+            worker_urls=["http://worker-a"],
+            request_timeout_s=1.0,
+            overload_load_factor=1.5,
+            load_abs_threshold=1,
+            profiles={},
+            route_log_dir=None,
+        )
+        monkeypatch.setattr(
+            smart_router,
+            "_post_json",
+            lambda *_args: {"present": False, "tombstone": True},
+        )
+        with pytest.raises(fastapi.HTTPException) as gone:
+            asyncio.run(router._select_chain_owner(router.workers, "chain-a"))
+        status_code = gone.value.status_code
+        detail = gone.value.detail
+
+    responses = [
+        _response("chain-a"),
+        FakeAPIError(
+            status_code,
+            f"Error code: {status_code} - {json.dumps({'detail': detail})}",
+        ),
+        _response("chain-b"),
+    ]
+    module = _load_model_module(monkeypatch, responses)
+    monkeypatch.setenv("SPARSEVLLM_CHAIN_CACHE", "1")
+    model = module.SparseVLLMLitellmModel()
+    first_messages = [{"role": "user", "content": "first"}]
+
+    model.query(first_messages)
+    recovered = model.query(
+        [
+            *first_messages,
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "continue"},
+        ]
+    )
+
+    evicted_extra = model.calls[1][1]["extra_body"]
+    recreated_extra = model.calls[2][1]["extra_body"]
+    assert evicted_extra["chain_id"] == "chain-a"
+    assert evicted_extra["chain_append_start"] == 2
+    assert recreated_extra["chain_id"] is None
+    assert "chain_append_start" not in recreated_extra
+    assert len(model.calls) == 3
+    assert model.calls[2][0] == model.calls[1][0]
+    assert model._chain_id == "chain-b"
+    assert recovered["extra"]["chain_reset_reason"] == "chain_gone"
 
 
 def test_chain_model_commits_state_only_after_successful_query(monkeypatch):

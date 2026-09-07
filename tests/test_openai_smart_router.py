@@ -162,6 +162,9 @@ class OpenAISmartRouterTest(unittest.TestCase):
             with self.assertRaises(HTTPException) as gone:
                 asyncio.run(router._select_chain_owner(router.workers, "chain-1"))
         self.assertEqual(gone.exception.status_code, 410)
+        self.assertEqual(gone.exception.detail["code"], "chain_gone")
+        self.assertEqual(gone.exception.detail["chain_id"], "chain-1")
+        self.assertIn("was evicted", gone.exception.detail["message"])
 
     def test_chain_affinity_fails_closed_on_probe_error_or_disabled_workers(self):
         from fastapi import HTTPException

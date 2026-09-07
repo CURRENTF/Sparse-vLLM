@@ -137,6 +137,11 @@ class SparseVLLMLitellmModel(LitellmModel):
         except ValueError as exc:
             raise ValueError(f"{name} must be an integer, got {value!r}.") from exc
 
+    @staticmethod
+    def _is_chain_gone_error(exc: Exception) -> bool:
+        status_code = getattr(exc, "status_code", None)
+        return status_code == 410 and "chain_gone" in str(exc)
+
     def _chat_selector(
         self,
         messages: list[dict[str, Any]],
@@ -414,11 +419,25 @@ class SparseVLLMLitellmModel(LitellmModel):
         }
         if chain_append_start is not None:
             extra_body["chain_append_start"] = chain_append_start
-        response = super()._query(
-            messages,
-            extra_body=extra_body,
-            **kwargs,
-        )
+        try:
+            response = super()._query(
+                messages,
+                extra_body=extra_body,
+                **kwargs,
+            )
+        except Exception as exc:
+            if request_chain_id is None or not self._is_chain_gone_error(exc):
+                raise
+            self._chain_id = None
+            self._recovery_chain_id = None
+            self._force_new_chain_reason = "chain_gone"
+            retry_extra_body = {**extra_body, "chain_id": None}
+            retry_extra_body.pop("chain_append_start", None)
+            response = super()._query(
+                messages,
+                extra_body=retry_extra_body,
+                **kwargs,
+            )
         chain_id = getattr(response, "chain_id", None)
         if chain_id is None:
             model_extra = getattr(response, "model_extra", None)

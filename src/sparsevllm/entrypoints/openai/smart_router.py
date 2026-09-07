@@ -23,7 +23,9 @@ from fastapi.responses import JSONResponse
 from fastapi.responses import Response
 from fastapi.responses import StreamingResponse
 
+from sparsevllm.engine.chain_cache import ChainGoneError
 from sparsevllm.entrypoints.openai.serving.base import DisconnectChecker
+from sparsevllm.entrypoints.openai.serving.base import _chain_http_exception
 from sparsevllm.entrypoints.openai.serving.base import _wait_for_any_or_disconnect
 from sparsevllm.utils.code_revision import code_revision_info
 from sparsevllm.utils.log import logger
@@ -487,13 +489,16 @@ class SmartRouter:
                 ),
             )
         if not owners:
+            if tombstoned:
+                raise _chain_http_exception(
+                    ChainGoneError(
+                        f"chain_id {chain_id!r} was evicted.",
+                        chain_id=chain_id,
+                    )
+                )
             raise HTTPException(
-                status_code=410 if tombstoned else 404,
-                detail=(
-                    f"chain_id {chain_id!r} was evicted."
-                    if tombstoned
-                    else f"Unknown chain_id {chain_id!r}."
-                ),
+                status_code=404,
+                detail=f"Unknown chain_id {chain_id!r}.",
             )
         worker, match = owners[0]
         if str(match.get("state") or "") == "active":
