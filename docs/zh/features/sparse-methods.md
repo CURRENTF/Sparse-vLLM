@@ -39,7 +39,7 @@ prefill attention 计算。它们是同一条轴上的备选项，可以分别�
 SnapKV 的 `sparse_prefill_score_mode` 默认值改为 `logits`；`probability`
 仍可显式启用以复现实验，但它需要额外执行归一化 QK sweep，在已测长上下文
 prefill 中开销明显更高。PyramidKV 和 H2O 使用 `probability`。H2O 逐 query head 跨 prefill chunks
-累计 FP32 概率和；驱逐时通过 `h2o_head_reduction=max`（默认）或 `mean`，
+累计 FP32 概率和；驱逐时通过 max，
 在 GQA 的每个 KV 组内或 MLA 的整个 layer 内归约累计分数。MHA 各 head 独立选择。
 每套选择在预算内保留 heavy hitters 和 recent tokens，保持 GQA 的原生 KV 共享
 以及 MLA 的原生 latent 存储。MLA H2O prefill 当前要求 TP1。

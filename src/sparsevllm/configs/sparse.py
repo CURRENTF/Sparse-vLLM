@@ -148,10 +148,6 @@ def _normalize_snapkv(config) -> None:
 
 
 def _normalize_h2o(config) -> None:
-    reduction = str(getattr(config, "h2o_head_reduction", "max")).strip().lower()
-    if reduction not in {"max", "mean"}:
-        raise ValueError("h2o_head_reduction must be 'max' or 'mean'.")
-    config.h2o_head_reduction = reduction
     if getattr(config, "sparse_prefill_score_mode", "probability") != "probability":
         raise ValueError("H2O per-head accumulation requires sparse_prefill_score_mode='probability'.")
     _normalize_positive_int(config, "h2o_decode_budget", fallback=0)

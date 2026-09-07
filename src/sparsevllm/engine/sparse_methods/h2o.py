@@ -22,12 +22,11 @@ def select_h2o_heads(
     selection_groups: int,
     budget: int,
     recent_ratio: float,
-    reduction: str,
 ) -> torch.Tensor:
     """Rank cumulative [Hq, L] probabilities, returning [groups, min(B,L)].
 
     A group is one native KV head for explicit KV, or the whole layer for
-    shared MLA latent storage. Reduction happens only after time accumulation.
+    shared MLA latent storage. Group-wise max follows time accumulation.
     Equal scores prefer older positions, independently of the device top-k.
     """
     if cumulative.ndim != 2 or cumulative.shape[0] == 0:
@@ -37,13 +36,11 @@ def select_h2o_heads(
         raise ValueError("H2O query heads must divide into complete selection groups.")
     if budget <= 0 or not 0 < recent_ratio < 1:
         raise ValueError("H2O requires a positive budget and recent_ratio in (0, 1).")
-    if reduction not in {"max", "mean"}:
-        raise ValueError("H2O head reduction must be 'max' or 'mean'.")
     if length <= budget:
         return torch.arange(length, device=cumulative.device).expand(selection_groups, -1)
 
     grouped = cumulative.reshape(selection_groups, heads // selection_groups, length)
-    ranks = grouped.amax(dim=1) if reduction == "max" else grouped.mean(dim=1)
+    ranks = grouped.amax(dim=1)
     recent_count = min(budget, max(1, int(budget * recent_ratio)))
     recent_start = length - recent_count
     heavy = torch.argsort(
@@ -224,7 +221,6 @@ class H2ORuntime(PassThroughRuntime):
                     selection_groups=manager.h2o_selection_groups,
                     budget=budget,
                     recent_ratio=float(self.config.h2o_recent_ratio),
-                    reduction=self.config.h2o_head_reduction,
                 )
                 requests.append(H2ORetention(layer_idx, int(seq.seq_id), length, keep, final))
         manager.commit_h2o_retention(requests)

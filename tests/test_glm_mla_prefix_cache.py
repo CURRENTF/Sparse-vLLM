@@ -56,7 +56,6 @@ def _latent_chain_manager(manager_type, method: str):
         h2o_prefill_budget=8,
         h2o_recent_ratio=0.5,
         h2o_prefill_score_window=2,
-        h2o_head_reduction="max",
         rkv_compression_interval=2,
         rkv_observation_tokens=2,
         rkv_alpha=0.5,

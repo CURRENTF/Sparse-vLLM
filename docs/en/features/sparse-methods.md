@@ -50,8 +50,7 @@ SnapKV defaults `sparse_prefill_score_mode` to `logits`; `probability` remains
 an explicit reproducibility option because its additional normalized QK sweep
 is substantially more expensive in measured long-context prefill. PyramidKV
 and H2O use `probability`. H2O accumulates FP32 probability sums per query
-head across prefill chunks. At eviction, `h2o_head_reduction=max` (default) or
-`mean` combines the cumulative scores within each GQA KV group, or across the
+head across prefill chunks. At eviction, max combines the cumulative scores within each GQA KV group, or across the
 whole layer for MLA. MHA heads select independently. Each selection retains
 heavy hitters plus recent tokens within its token budget; native GQA KV sharing
 and MLA latent storage are preserved. MLA H2O prefill currently requires TP1.

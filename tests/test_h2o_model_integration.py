@@ -22,7 +22,7 @@ def test_model_chunk_prefill_and_native_decode_handoff(tmp_path):
     model = os.environ['SPARSEVLLM_H2O_TEST_MODEL']
     output_dir = Path(os.environ.get('SPARSEVLLM_H2O_TEST_OUTPUT', str(tmp_path)))
     output_dir.mkdir(parents=True, exist_ok=True)
-    config = dict(sparse_method='h2o', h2o_head_reduction='max',
+    config = dict(sparse_method='h2o',
                   h2o_prefill_budget=64, h2o_decode_budget=32,
                   h2o_prefill_score_window=0, engine_prefill_chunk_size=64,
                   max_num_batched_tokens=128, max_num_seqs_in_batch=2,

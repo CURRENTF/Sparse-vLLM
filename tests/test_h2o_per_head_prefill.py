@@ -22,25 +22,24 @@ def test_late_max_preserves_head_history_across_chunks():
             cumulative, chunk, new_len=3, weight=1,
         )
     torch.testing.assert_close(cumulative, p.sum(0))
-    keep = select_h2o_heads(cumulative, selection_groups=1, budget=2, recent_ratio=.5, reduction='max')
+    keep = select_h2o_heads(cumulative, selection_groups=1, budget=2, recent_ratio=.5)
     assert keep.tolist() == [[1, 2]]
     assert p.amax(1).sum(0)[0] > p.amax(1).sum(0)[1]
 
 
-def test_groups_select_independently_and_mean_changes_only_ranking():
+def test_groups_select_independently_with_max_ranking():
     cumulative = torch.tensor([[9., 6., 0., 0.], [0., 6., 0., 0.], [0., 0., 8., 0.], [0., 0., 7., 0.]])
     args = dict(selection_groups=2, budget=2, recent_ratio=.5)
-    assert select_h2o_heads(cumulative, reduction='max', **args).tolist() == [[0, 3], [2, 3]]
-    assert select_h2o_heads(cumulative, reduction='mean', **args).tolist() == [[1, 3], [2, 3]]
-    mha = select_h2o_heads(cumulative, selection_groups=4, budget=2, recent_ratio=.5, reduction='max')
+    assert select_h2o_heads(cumulative, **args).tolist() == [[0, 3], [2, 3]]
+    mha = select_h2o_heads(cumulative, selection_groups=4, budget=2, recent_ratio=.5)
     assert mha.tolist() == [[0, 3], [1, 3], [2, 3], [2, 3]]
 
 
 def test_ties_and_recent_suffix_fill_budget_in_logical_order():
     scores = torch.zeros(3, 9)
-    keep = select_h2o_heads(scores, selection_groups=3, budget=4, recent_ratio=.5, reduction='max')
+    keep = select_h2o_heads(scores, selection_groups=3, budget=4, recent_ratio=.5)
     assert keep.tolist() == [[0, 1, 7, 8]] * 3
-    all_tokens = select_h2o_heads(scores, selection_groups=3, budget=12, recent_ratio=.5, reduction='mean')
+    all_tokens = select_h2o_heads(scores, selection_groups=3, budget=12, recent_ratio=.5)
     assert all_tokens.tolist() == [list(range(9))] * 3
 
 
@@ -139,8 +138,7 @@ def test_chunk_prefill_append_retention_and_final_handoff_follow_logical_positio
     manager._h2o_scores.clear()
     manager._h2o_positions.clear()
     manager.config = SimpleNamespace(h2o_prefill_budget=4, h2o_decode_budget=3,
-                                     h2o_prefill_score_window=0, h2o_recent_ratio=.5,
-                                     h2o_head_reduction='max')
+                                     h2o_prefill_score_window=0, h2o_recent_ratio=.5)
     runtime = object.__new__(H2ORuntime)
     runtime.config = manager.config
     runtime.cache_manager = manager
@@ -203,7 +201,7 @@ def _multi_request_manager():
     cache = manager.attention_cache_storage.cache
     cache.copy_(torch.arange(cache.numel()).reshape_as(cache))
     manager.config = SimpleNamespace(h2o_prefill_budget=4, h2o_decode_budget=3,
-                                     h2o_recent_ratio=.5, h2o_head_reduction='max')
+                                     h2o_recent_ratio=.5)
     manager.seq_id_to_row = [{7: 0, 8: 1}, {7: 0, 8: 1}]
     manager.row_seq_lens = [np.array([6, 5], dtype=np.int32) for _ in range(2)]
     manager.buffer_req_to_token_slots = [torch.zeros(2, 8, dtype=torch.int32) for _ in range(2)]

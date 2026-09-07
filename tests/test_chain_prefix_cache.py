@@ -1000,7 +1000,6 @@ def _h2o_fingerprint_config(**overrides):
         "h2o_prefill_budget": 8,
         "h2o_recent_ratio": 0.5,
         "h2o_prefill_score_window": 4,
-        "h2o_head_reduction": "max",
         "sparse_attn_score_dtype": "float32",
     }
     values.update(overrides)
@@ -1015,7 +1014,6 @@ def _h2o_fingerprint_config(**overrides):
         ("h2o_prefill_budget", 9),
         ("h2o_recent_ratio", 0.25),
         ("h2o_prefill_score_window", 8),
-        ("h2o_head_reduction", "mean"),
         ("sparse_attn_score_dtype", "float16"),
     ],
 )

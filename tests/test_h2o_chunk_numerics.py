@@ -22,7 +22,7 @@ from sparsevllm.utils.context import reset_context, set_context
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
 
 
-def _manager(heads, kv_heads, length, budget, reduction):
+def _manager(heads, kv_heads, length, budget):
     manager = object.__new__(H2OCacheManager)
     manager.device = torch.device('cuda:0')
     manager.num_kv_heads = kv_heads
@@ -40,8 +40,7 @@ def _manager(heads, kv_heads, length, budget, reduction):
     manager._h2o_scores, manager._h2o_positions = {}, {}
     manager._h2o_counters = dict(final_prefill_evictions=0, intermediate_prefill_evictions=0, dropped_tokens=0)
     manager.config = SimpleNamespace(h2o_prefill_budget=budget, h2o_decode_budget=budget,
-                                     h2o_prefill_score_window=0, h2o_recent_ratio=.25,
-                                     h2o_head_reduction=reduction)
+                                     h2o_prefill_score_window=0, h2o_recent_ratio=.25)
     runtime = object.__new__(H2ORuntime)
     runtime.config, runtime.cache_manager = manager.config, manager
     runtime._prefill_score_workspace = PrefillScoreWorkspace()
@@ -49,11 +48,11 @@ def _manager(heads, kv_heads, length, budget, reduction):
     return manager, runtime
 
 
-def _run_chunks(q, k, v, chunks, budget, reduction):
+def _run_chunks(q, k, v, chunks, budget):
     length, heads, dim = q.shape
     kv_heads = k.shape[1]
     group_size = heads // kv_heads
-    manager, runtime = _manager(heads, kv_heads, length, budget, reduction)
+    manager, runtime = _manager(heads, kv_heads, length, budget)
     seq = Sequence(list(range(length)))
     seq.seq_id = 7
     histories = [[] for _ in range(kv_heads)]
@@ -110,7 +109,7 @@ def _run_chunks(q, k, v, chunks, budget, reduction):
                 for group, history in enumerate(histories):
                     def importance(token):
                         scores = [score_reference[h][token] for h in range(group * group_size, (group + 1) * group_size)]
-                        return max(scores) if reduction == 'max' else sum(scores) / group_size
+                        return max(scores)
                     heavy = sorted(history[:-recent], key=lambda token: (-importance(token), token))[:budget - recent]
                     histories[group] = sorted(heavy + history[-recent:])
             assert manager._h2o_positions[0, 7].tolist() == histories
@@ -146,13 +145,13 @@ def _run_chunks(q, k, v, chunks, budget, reduction):
         reset_context()
 
 
-@pytest.mark.parametrize('kv_heads,reduction', [(4, 'max'), (2, 'max'), (2, 'mean')])
-def test_chunk_attention_and_retention_match_logical_token_oracle(kv_heads, reduction):
+@pytest.mark.parametrize('kv_heads', [4, 2])
+def test_chunk_attention_and_retention_match_logical_token_oracle(kv_heads):
     torch.manual_seed(57)
     q = torch.randn(35, 4, 32, device='cuda', dtype=torch.bfloat16)
     k = torch.randn(35, kv_heads, 32, device='cuda', dtype=torch.bfloat16)
     v = torch.randn_like(k)
-    _run_chunks(q, k, v, [11, 7, 17], budget=9, reduction=reduction)
+    _run_chunks(q, k, v, [11, 7, 17], budget=9)
 
 
 @pytest.mark.parametrize('kv_heads', [4, 2])
@@ -161,9 +160,9 @@ def test_no_eviction_full_and_chunked_prefill_are_equivalent(kv_heads):
     q = torch.randn(149, 4, 32, device='cuda', dtype=torch.bfloat16)
     k = torch.randn(149, kv_heads, 32, device='cuda', dtype=torch.bfloat16)
     v = torch.randn_like(k)
-    full_output, full_scores = _run_chunks(q, k, v, [149], budget=149, reduction='max')
+    full_output, full_scores = _run_chunks(q, k, v, [149], budget=149)
     for chunks in ([13, 129, 7], [71, 78]):
-        output, scores = _run_chunks(q, k, v, chunks, budget=149, reduction='max')
+        output, scores = _run_chunks(q, k, v, chunks, budget=149)
         torch.testing.assert_close(output, full_output, rtol=2e-2, atol=2e-2)
         torch.testing.assert_close(scores, full_scores, rtol=5e-3, atol=5e-3)
 
