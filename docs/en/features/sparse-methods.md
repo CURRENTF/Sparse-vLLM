@@ -50,8 +50,8 @@ SnapKV defaults `sparse_prefill_score_mode` to `logits`; `probability` remains
 an explicit reproducibility option because its additional normalized QK sweep
 is substantially more expensive in measured long-context prefill. PyramidKV
 and H2O use `probability`. H2O accumulates FP32 probability sums per query
-head across prefill chunks. At eviction, max combines the cumulative scores within each GQA KV group, or across the
-whole layer for MLA. MHA heads select independently. Each selection retains
+head across prefill chunks. At eviction, max combines the cumulative scores
+within each GQA KV group, or across the whole layer for MLA. MHA heads select independently. Each selection retains
 heavy hitters plus recent tokens within its token budget; native GQA KV sharing
 and MLA latent storage are preserved. MLA H2O prefill currently requires TP1.
 
@@ -61,8 +61,9 @@ reduced logit vector cannot represent per-head cumulative probabilities.
 When attention provides its softmax LSE, scoring reuses it; otherwise it
 recomputes normalization from the same visible keys. Intermediate chunk eviction
 changes subsequent attention, so results can depend on chunk size and budgets.
-Decode scoring and eviction remain disabled; `h2o_decode_budget` determines the
-final prefill retention budget, and the cache grows during generation.
+Decode scoring and eviction remain disabled. With `sparse_method=h2o`,
+`h2o_decode_budget` determines final-prefill retention; prefill-only H2O skips
+this final compaction. The cache then grows during generation.
 
 ## Prefill Scheduling Policies
 

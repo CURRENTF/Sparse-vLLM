@@ -251,7 +251,7 @@ def test_independent_h2o_axes_keep_prompt_score_and_page_table_contract(
     assert contract.main_score_kind is AttentionScoreKind.NONE
     assert (
         contract.score_collection
-        is PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED
+        is PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_PER_HEAD
     )
 
 

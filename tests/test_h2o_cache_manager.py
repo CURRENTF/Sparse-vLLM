@@ -264,64 +264,6 @@ def test_h2o_decode_does_not_request_scores_or_run_eviction():
     runtime.cache_manager.evict_after_decode.assert_not_called()
 
 
-def test_h2o_flashprefill_uses_posthoc_scoring_and_preserves_eviction():
-    runtime = object.__new__(H2ORuntime)
-    runtime.config = SimpleNamespace(
-        sparse_method="h2o",
-        prefill_sparse_method="flashprefill_v2",
-        sparse_prefill_score_mode="logits",
-        h2o_prefill_score_window=0,
-    )
-    runtime.cache_manager = Mock()
-    prefill = SparseStepContext(
-        seqs=[],
-        is_prefill=True,
-        forward_context=SimpleNamespace(is_prefill=True, is_long_text=True),
-    )
-
-    assert runtime.needs_attention_score(0, prefill) is False
-    runtime.finish_step(prefill)
-
-    runtime.cache_manager.evict_after_intermediate_prefill.assert_not_called()
-    runtime.cache_manager.compact_final_prefill_for_decode.assert_called_once_with([])
-
-
-@pytest.mark.parametrize(
-    ("sparse_method", "prefill_sparse_method", "intermediate", "final"),
-    [
-        ("", "h2o_prefill", True, False),
-        ("h2o", "", False, True),
-        ("h2o", "h2o_prefill", True, True),
-        ("", "", False, False),
-    ],
-)
-def test_h2o_runtime_triggers_prefill_and_decode_boundaries_independently(
-    sparse_method,
-    prefill_sparse_method,
-    intermediate,
-    final,
-):
-    runtime = object.__new__(H2ORuntime)
-    runtime.config = SimpleNamespace(
-        sparse_method=sparse_method,
-        prefill_sparse_method=prefill_sparse_method,
-    )
-    runtime.cache_manager = Mock()
-    step = SparseStepContext(
-        seqs=[],
-        is_prefill=True,
-        forward_context=SimpleNamespace(is_prefill=True, is_long_text=True),
-    )
-
-    runtime.finish_step(step)
-
-    assert (
-        runtime.cache_manager.evict_after_intermediate_prefill.called
-        is intermediate
-    )
-    assert runtime.cache_manager.compact_final_prefill_for_decode.called is final
-
-
 def test_h2o_cache_manager_factory_routes_first_class_method():
     expected = object()
     config = SimpleNamespace(

@@ -39,7 +39,7 @@ def _manager(heads, kv_heads, length, budget):
     manager._num_free_slots = [length + 1]
     manager._h2o_scores, manager._h2o_positions = {}, {}
     manager._h2o_counters = dict(final_prefill_evictions=0, intermediate_prefill_evictions=0, dropped_tokens=0)
-    manager.config = SimpleNamespace(h2o_prefill_budget=budget, h2o_decode_budget=budget,
+    manager.config = SimpleNamespace(sparse_method='h2o', prefill_sparse_method='h2o_prefill', h2o_prefill_budget=budget, h2o_decode_budget=budget,
                                      h2o_prefill_score_window=0, h2o_recent_ratio=.25)
     runtime = object.__new__(H2ORuntime)
     runtime.config, runtime.cache_manager = manager.config, manager
@@ -183,7 +183,7 @@ def test_mla_chunk_scores_and_outputs_follow_shared_latent_retention(budget):
     q = torch.randn(length, heads, 256, device='cuda', dtype=torch.bfloat16)
 
     def run(chunks):
-        manager, runtime = _manager(heads, 1, length, budget, 'max')
+        manager, runtime = _manager(heads, 1, length, budget)
         storage = MlaLatentStorage(kv_lora_rank=512, rope_dim=64, dtype=torch.bfloat16)
         storage.allocate(num_layers=1, num_slots=length + 1, device=manager.device)
         manager.attention_cache_storage = storage

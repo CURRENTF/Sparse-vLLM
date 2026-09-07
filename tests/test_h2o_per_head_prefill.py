@@ -137,7 +137,7 @@ def test_chunk_prefill_append_retention_and_final_handoff_follow_logical_positio
     manager.row_seq_lens[0][0] = 0
     manager._h2o_scores.clear()
     manager._h2o_positions.clear()
-    manager.config = SimpleNamespace(h2o_prefill_budget=4, h2o_decode_budget=3,
+    manager.config = SimpleNamespace(sparse_method='h2o', prefill_sparse_method='h2o_prefill', h2o_prefill_budget=4, h2o_decode_budget=3,
                                      h2o_prefill_score_window=0, h2o_recent_ratio=.5)
     runtime = object.__new__(H2ORuntime)
     runtime.config = manager.config
@@ -200,7 +200,7 @@ def _multi_request_manager():
     manager.attention_cache_storage.allocate(num_layers=2, num_slots=24, device=manager.device)
     cache = manager.attention_cache_storage.cache
     cache.copy_(torch.arange(cache.numel()).reshape_as(cache))
-    manager.config = SimpleNamespace(h2o_prefill_budget=4, h2o_decode_budget=3,
+    manager.config = SimpleNamespace(sparse_method='h2o', prefill_sparse_method='h2o_prefill', h2o_prefill_budget=4, h2o_decode_budget=3,
                                      h2o_recent_ratio=.5)
     manager.seq_id_to_row = [{7: 0, 8: 1}, {7: 0, 8: 1}]
     manager.row_seq_lens = [np.array([6, 5], dtype=np.int32) for _ in range(2)]
@@ -309,3 +309,33 @@ def test_rejected_first_chunk_preserves_resident_head_history():
     assert manager._h2o_positions[0, 7] is positions
     assert manager.row_seq_lens[0][0] == 6
     assert manager._num_free_slots == [6]
+
+
+@pytest.mark.parametrize(
+    'sparse_method,prefill_method,expected_lengths',
+    [
+        ('', 'h2o_prefill', [6, 4]),
+        ('h2o', '', [3, 5]),
+        ('h2o', 'h2o_prefill', [3, 4]),
+        ('h2o', 'flashprefill_v2', [3, 5]),
+        ('', '', [6, 5]),
+    ],
+)
+def test_independent_phase_switches_apply_per_head_retention(
+    sparse_method, prefill_method, expected_lengths,
+):
+    from sparsevllm.engine.sparse_methods.base import SparseStepContext
+    from sparsevllm.engine.sparse_methods.h2o import H2ORuntime
+
+    manager = _multi_request_manager()
+    manager.config.sparse_method = sparse_method
+    manager.config.prefill_sparse_method = prefill_method
+    runtime = object.__new__(H2ORuntime)
+    runtime.config, runtime.cache_manager = manager.config, manager
+    step = SparseStepContext(_mixed_prefill_seqs(), True, None)
+    assert not runtime.needs_attention_score(0, step)
+    runtime.finish_step(step)
+    for layer in range(manager.num_layers):
+        assert manager.row_seq_lens[layer].tolist() == expected_lengths
+        for row, seq in enumerate(step.seqs):
+            assert manager._h2o_scores[layer, seq.seq_id].shape[-1] == expected_lengths[row]

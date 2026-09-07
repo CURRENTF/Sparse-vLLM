@@ -239,7 +239,9 @@ def sparse_prefill_attention_contract(
         prefill_sparse_method,
         sparse_method=normalized,
     )
-    cache_method = resolve_cache_sparse_method(normalized, prefill_sparse_method=resolved_prefill_method)
+    cache_method = resolve_cache_sparse_method(
+        normalized, prefill_sparse_method=resolved_prefill_method,
+    )
     layer_varying_page_table = _PREFILL_LAYER_VARYING_PAGE_TABLE[cache_method]
     if cache_method == "h2o":
         if resolve_sparse_prefill_score_mode(normalized, sparse_prefill_score_mode) != "probability":

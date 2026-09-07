@@ -48,7 +48,8 @@ prefill 中开销明显更高。PyramidKV 和 H2O 使用 `probability`。H2O 逐
 H2O 拒绝 `logits` 模式，因为归约后的 logits 无法表示逐 head 累计概率。
 Attention 提供 softmax LSE 时复用该结果，否则使用同一可见 KV 集合重新计算归一化。
 中间 chunk 的实际驱逐会改变后续 attention，结果因此可能随 chunk size 和预算变化。
-Decode 评分和驱逐仍保持关闭；`h2o_decode_budget` 用于最后一个 prefill chunk 的保留预算，
+Decode 评分和驱逐仍保持关闭；仅当 `sparse_method=h2o` 时，
+`h2o_decode_budget` 用于最后一个 prefill chunk 的保留预算。仅启用 H2O prefill 时不做这次最终压缩；
 之后缓存随生成增长。
 
 ## Prefill Scheduling Policy
