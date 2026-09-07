@@ -5,6 +5,7 @@ from torch import nn
 
 from sparsevllm.method_registry import (
     normalize_sparse_method,
+    resolve_cache_sparse_method,
     resolve_prefill_sparse_method,
     resolve_sparse_prefill_score_mode,
     sparse_decode_attention_requires_scores,
@@ -86,8 +87,12 @@ def build_mha_prefill_attention_spec(
         getattr(score_config, "sparse_prefill_score_mode", None),
     )
     prefill_sparse_method = resolve_prefill_sparse_method(
-        getattr(score_config, "prefill_sparse_method", ""),
+        getattr(score_config, "prefill_sparse_method", None),
         sparse_method=normalized_method,
+    )
+    cache_method = resolve_cache_sparse_method(
+        normalized_method,
+        prefill_sparse_method=prefill_sparse_method,
     )
     contract = sparse_prefill_attention_contract(
         normalized_method,
@@ -128,11 +133,13 @@ def build_mha_prefill_attention_spec(
         score_output=contract.main_score_kind,
         layer_varying_page_table=contract.layer_varying_page_table,
         return_softmax_lse=(
-            prefill_sparse_method == "h2o_prefill"
+            cache_method == "h2o"
+            and prefill_sparse_method != "flashprefill_v2"
             and score_mode == "probability"
         ),
         allow_softmax_lse_fallback=(
-            prefill_sparse_method == "h2o_prefill"
+            cache_method == "h2o"
+            and prefill_sparse_method != "flashprefill_v2"
             and score_mode == "probability"
         ),
         prefill_sparse_method=prefill_sparse_method,
@@ -173,6 +180,14 @@ def build_mha_decode_attention_spec(
         attention_tp_size=attention_tp_size,
     )
     normalized_method = normalize_sparse_method(sparse_method)
+    cache_method = resolve_cache_sparse_method(
+        normalized_method,
+        prefill_sparse_method=getattr(
+            runtime_config,
+            "prefill_sparse_method",
+            None,
+        ),
+    )
     requires_decode_scores = sparse_decode_attention_requires_scores(
         normalized_method
     )
@@ -193,7 +208,7 @@ def build_mha_decode_attention_spec(
         # Bind the score-capable implementation up front instead of
         # switching providers in the runtime path.
         may_require_attention_scores=requires_decode_scores,
-        layer_varying_page_table=bool(normalized_method),
+        layer_varying_page_table=bool(cache_method),
         cuda_graph=bool(cuda_graph),
         h2o_layerwise_probability_scores=(
             normalized_method == "h2o" and requires_decode_scores

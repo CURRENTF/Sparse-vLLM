@@ -27,6 +27,7 @@ from sparsevllm.method_registry import (
     decode_graph_path_id,
     decode_sparse_long_text_threshold,
     normalize_sparse_method,
+    resolve_cache_sparse_method,
 )
 from sparsevllm.kernels.triton.store_kvcache import store_kvcache
 import sparsevllm.platforms as platforms
@@ -435,7 +436,10 @@ class CacheManager(ABC):
                 allocation_budget_bytes=allocation_budget_bytes,
             )
 
-        sparse_method = normalize_sparse_method(config.sparse_method)
+        sparse_method = resolve_cache_sparse_method(
+            config.sparse_method,
+            prefill_sparse_method=getattr(config, "prefill_sparse_method", None),
+        )
         if sparse_method not in SUPPORTED_SPARSE_METHODS:
             raise ValueError(f"Unsupported sparse_method={sparse_method!r}.")
         if sparse_method == "deltakv":

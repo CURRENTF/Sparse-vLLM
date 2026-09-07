@@ -71,6 +71,7 @@ def _manager_with_layer_rows(
     manager.runtime_layout = _layout(manager.num_layers)
     manager.config = SimpleNamespace(
         sparse_method="h2o",
+        prefill_sparse_method="h2o_prefill",
         h2o_decode_budget=decode_budget,
         h2o_decode_eviction_interval=decode_eviction_interval,
         h2o_prefill_budget=prefill_budget,
@@ -306,13 +307,66 @@ def test_h2o_flashprefill_uses_posthoc_scoring_and_preserves_eviction():
     assert runtime.needs_attention_score(0, prefill) is False
     runtime.finish_step(prefill)
 
-    runtime.cache_manager.evict_after_prefill.assert_called_once_with([])
+    runtime.cache_manager.evict_after_intermediate_prefill.assert_not_called()
+    runtime.cache_manager.compact_final_prefill_for_decode.assert_called_once_with([])
+
+
+@pytest.mark.parametrize(
+    ("sparse_method", "prefill_sparse_method", "intermediate", "final"),
+    [
+        ("", "h2o_prefill", True, False),
+        ("h2o", "", False, True),
+        ("h2o", "h2o_prefill", True, True),
+        ("", "", False, False),
+    ],
+)
+def test_h2o_runtime_triggers_prefill_and_decode_boundaries_independently(
+    sparse_method,
+    prefill_sparse_method,
+    intermediate,
+    final,
+):
+    runtime = object.__new__(H2ORuntime)
+    runtime.config = SimpleNamespace(
+        sparse_method=sparse_method,
+        prefill_sparse_method=prefill_sparse_method,
+    )
+    runtime.cache_manager = Mock()
+    step = SparseStepContext(
+        seqs=[],
+        is_prefill=True,
+        forward_context=SimpleNamespace(is_prefill=True, is_long_text=True),
+    )
+
+    runtime.finish_step(step)
+
+    assert (
+        runtime.cache_manager.evict_after_intermediate_prefill.called
+        is intermediate
+    )
+    assert runtime.cache_manager.compact_final_prefill_for_decode.called is final
 
 
 def test_h2o_cache_manager_factory_routes_first_class_method():
     expected = object()
     config = SimpleNamespace(
         sparse_method="h2o",
+        hf_config=SimpleNamespace(model_type="qwen2"),
+    )
+    with patch(
+        "sparsevllm.engine.cache_manager.h2o.H2OCacheManager",
+        return_value=expected,
+    ) as constructor:
+        actual = CacheManager.create(config, SimpleNamespace())
+    assert actual is expected
+    constructor.assert_called_once_with(config, ANY)
+
+
+def test_h2o_cache_manager_factory_routes_prefill_only_method():
+    expected = object()
+    config = SimpleNamespace(
+        sparse_method="",
+        prefill_sparse_method="h2o_prefill",
         hf_config=SimpleNamespace(model_type="qwen2"),
     )
     with patch(
@@ -2062,6 +2116,32 @@ def test_h2o_reset_after_warmup_clears_scores_and_counters():
         "decode_evictions": 0,
         "dropped_tokens": 0,
     }
+
+
+def test_h2o_capacity_follows_independent_prefill_and_decode_axes():
+    manager = _manager_with_rows([8], decode_budget=4, prefill_budget=8)
+    manager.free_rows = [deque([0])]
+
+    manager.config.prefill_sparse_method = ""
+    assert manager._prefill_append_peak(8, 20, 4) == 28
+    required, _, _, _ = manager.chain_capacity_deficits(
+        suffix_tokens=20,
+        generation_tokens=5,
+        existing_slots_by_layer=(8,),
+        needs_resident_row=False,
+    )
+    assert required == (20,)
+
+    manager.config.sparse_method = ""
+    manager.config.prefill_sparse_method = "h2o_prefill"
+    assert manager._prefill_append_peak(8, 20, 4) == 12
+    required, _, _, _ = manager.chain_capacity_deficits(
+        suffix_tokens=20,
+        generation_tokens=5,
+        existing_slots_by_layer=(8,),
+        needs_resident_row=False,
+    )
+    assert required == (8,)
 
 
 def test_h2o_capacity_hooks_reserve_prefill_peak_and_gate_chunk_with_real_free_slots():

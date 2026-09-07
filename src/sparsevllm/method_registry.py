@@ -70,7 +70,7 @@ CANONICAL_PREFILL_SPARSE_METHODS = {
 
 PREFILL_SPARSE_METHOD_COMPATIBILITY = {
     "": frozenset(CANONICAL_SPARSE_METHODS),
-    "h2o_prefill": frozenset({"h2o"}),
+    "h2o_prefill": frozenset({"", "h2o"}),
     "flashprefill_v2": frozenset({"", "omnikv", "quest", "snapkv", "h2o"}),
 }
 
@@ -88,9 +88,27 @@ def resolve_prefill_sparse_method(
 ) -> str:
     """Resolve the prefill algorithm, including cache-method defaults."""
 
-    normalized = normalize_prefill_sparse_method(method)
-    if not normalized and normalize_sparse_method(sparse_method) == "h2o":
+    # A missing value keeps old `sparse_method="h2o"` configurations combined.
+    # An explicit empty string is different: it requests decode-only H2O.
+    if method is None and normalize_sparse_method(sparse_method) == "h2o":
         return "h2o_prefill"
+    return normalize_prefill_sparse_method(method)
+
+
+def resolve_cache_sparse_method(
+    sparse_method: str | None,
+    *,
+    prefill_sparse_method: str | None,
+) -> str:
+    """Resolve the method that owns physical KV state and step lifecycle."""
+
+    normalized = normalize_sparse_method(sparse_method)
+    resolved_prefill = resolve_prefill_sparse_method(
+        prefill_sparse_method,
+        sparse_method=normalized,
+    )
+    if resolved_prefill == "h2o_prefill":
+        return "h2o"
     return normalized
 
 
@@ -220,12 +238,15 @@ def sparse_prefill_attention_contract(
         prefill_sparse_method,
         sparse_method=normalized,
     )
-    h2o_prefill = (
-        normalized == "h2o" and resolved_prefill_method == "h2o_prefill"
+    cache_method = resolve_cache_sparse_method(
+        normalized,
+        prefill_sparse_method=resolved_prefill_method,
     )
-    layer_varying_page_table = _PREFILL_LAYER_VARYING_PAGE_TABLE[normalized]
+    h2o_score_collection = cache_method == "h2o"
+    layer_varying_page_table = _PREFILL_LAYER_VARYING_PAGE_TABLE[cache_method]
     fused_h2o_score = (
-        h2o_prefill
+        h2o_score_collection
+        and resolved_prefill_method != "flashprefill_v2"
         and resolve_sparse_prefill_score_mode(
             normalized,
             sparse_prefill_score_mode,
@@ -241,7 +262,7 @@ def sparse_prefill_attention_contract(
         )
     collection = (
         PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED
-        if normalized in _PREFILL_POSTHOC_SCORE_METHODS
+        if cache_method in _PREFILL_POSTHOC_SCORE_METHODS
         else PrefillScoreCollectionKind.NONE
     )
     return SparsePrefillAttentionContract(
@@ -253,12 +274,16 @@ def sparse_prefill_attention_contract(
 
 def h2o_uses_fused_prefill_score(config) -> bool:
     return (
-        normalize_sparse_method(getattr(config, "sparse_method", None)) == "h2o"
-        and resolve_prefill_sparse_method(
-            getattr(config, "prefill_sparse_method", ""),
-            sparse_method="h2o",
+        resolve_cache_sparse_method(
+            getattr(config, "sparse_method", None),
+            prefill_sparse_method=getattr(config, "prefill_sparse_method", None),
         )
-        == "h2o_prefill"
+        == "h2o"
+        and resolve_prefill_sparse_method(
+            getattr(config, "prefill_sparse_method", None),
+            sparse_method=getattr(config, "sparse_method", None),
+        )
+        != "flashprefill_v2"
         and resolve_sparse_prefill_score_mode(
             "h2o",
             getattr(config, "sparse_prefill_score_mode", None),
@@ -486,9 +511,13 @@ def validate_model_runtime_compatibility(
     topology: ParallelTopology,
     decode_graph: bool,
     enable_prefix_caching: bool,
+    decode_sparse_method: str | None = None,
 ) -> ModelRuntimeCompatibility:
     model_type = str(model_type or "").strip().lower()
     method = normalize_sparse_method(sparse_method)
+    decode_method = normalize_sparse_method(
+        sparse_method if decode_sparse_method is None else decode_sparse_method
+    )
     compatibility = MODEL_RUNTIME_COMPATIBILITY.get((model_type, topology.mode))
     if compatibility is None:
         raise NotImplementedError(
@@ -496,14 +525,14 @@ def validate_model_runtime_compatibility(
             f"parallel mode={topology.mode.value!r}."
         )
 
-    if bool(decode_graph) and method not in compatibility.decode_graph_methods:
+    if bool(decode_graph) and decode_method not in compatibility.decode_graph_methods:
         supported = ", ".join(
             "'vanilla'" if item == "" else repr(item)
             for item in sorted(compatibility.decode_graph_methods)
         )
         raise ValueError(
             f"{model_type} v1 decode_graph is validated only for {supported}; "
-            f"got method={method!r}."
+            f"got method={decode_method!r}."
         )
     if method not in compatibility.sparse_methods:
         supported = ", ".join(

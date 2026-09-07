@@ -3,7 +3,11 @@ from __future__ import annotations
 import torch
 
 from sparsevllm.engine.sequence import Sequence
-from sparsevllm.method_registry import h2o_uses_fused_prefill_score
+from sparsevllm.method_registry import (
+    h2o_uses_fused_prefill_score,
+    normalize_sparse_method,
+    resolve_prefill_sparse_method,
+)
 from sparsevllm.utils.profiler import profiler
 
 from .base import SparseStepContext
@@ -54,8 +58,18 @@ class H2ORuntime(PassThroughRuntime):
         return -torch.inf
 
     def finish_step(self, step: SparseStepContext) -> None:
-        if step.is_prefill:
-            self.cache_manager.evict_after_prefill(step.seqs)
+        if not step.is_prefill:
+            return
+        prefill_method = resolve_prefill_sparse_method(
+            getattr(self.config, "prefill_sparse_method", None),
+            sparse_method=getattr(self.config, "sparse_method", None),
+        )
+        if prefill_method == "h2o_prefill":
+            self.cache_manager.evict_after_intermediate_prefill(step.seqs)
+        if normalize_sparse_method(
+            getattr(self.config, "sparse_method", None)
+        ) == "h2o":
+            self.cache_manager.compact_final_prefill_for_decode(step.seqs)
 
     def _h2o_kv_layer_indices(self) -> list[int]:
         return [

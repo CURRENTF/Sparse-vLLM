@@ -919,7 +919,14 @@ class LLMEngine:
         seq.num_prefilled_tokens = int(plan.reused_tokens)
         seq.prefix_cache_enabled = True
         seq.prefix_cache_hit_len = int(plan.reused_tokens)
-        seq.prefix_cache_method = str(self.config.sparse_method or "")
+        seq.prefix_cache_method = str(
+            getattr(
+                self.config,
+                "resolved_cache_sparse_method",
+                self.config.sparse_method,
+            )
+            or ""
+        )
         try:
             self.scheduler.add(seq)
         except Exception:

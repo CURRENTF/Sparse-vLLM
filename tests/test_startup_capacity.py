@@ -19,7 +19,7 @@ from sparsevllm.engine.startup import (
 from sparsevllm.models.layout import RuntimeLayout
 
 
-def _config(*, sparse_method: str = ""):
+def _config(*, sparse_method: str = "", prefill_sparse_method=None):
     layout = RuntimeLayout.dense(4)
     layout = RuntimeLayout(
         **{
@@ -30,6 +30,7 @@ def _config(*, sparse_method: str = ""):
     )
     return SimpleNamespace(
         sparse_method=sparse_method,
+        prefill_sparse_method=prefill_sparse_method,
         attention_cache_layout=CacheLayout.EXPLICIT_KV,
         runtime_layout=layout,
         parallel_topology=SimpleNamespace(attention_tp_size=2),
@@ -102,6 +103,15 @@ def test_quest_profiling_budget_includes_page_metadata():
     bytes_per_slot = 4 * 2 * 4 * 128 * 2
     fixed_metadata = 8 * 32 * 4 + 8 * 2 * 4 + 16 * (4 + 8)
     assert budget == 32 * bytes_per_slot + 2 * (bytes_per_slot + 4) + fixed_metadata
+
+
+def test_h2o_prefill_only_uses_h2o_physical_cache_budget():
+    config = _config(prefill_sparse_method="h2o_prefill")
+
+    budget = profiling_kv_budget_bytes(config, 10)
+
+    bytes_per_slot = 4 * 2 * 4 * 128 * 2
+    assert budget == 10 * bytes_per_slot * 2
 
 
 def test_prefill_profile_fills_token_chunk_and_batch_limits_together():

@@ -10,6 +10,7 @@ from sparsevllm.engine.cache_manager.storage import CacheLayout
 from sparsevllm.method_registry import (
     decode_sparse_long_text_threshold,
     normalize_sparse_method,
+    resolve_cache_sparse_method,
 )
 from sparsevllm.models.layout import resolve_attention_qk_head_dim
 
@@ -84,7 +85,10 @@ class KVCapacityPlan:
 
 
 def profiling_kv_slots(config) -> int:
-    method = normalize_sparse_method(config.sparse_method)
+    method = resolve_cache_sparse_method(
+        config.sparse_method,
+        prefill_sparse_method=getattr(config, "prefill_sparse_method", None),
+    )
     page_size = int(config.quest_chunk_size) if method == "quest" else 1
 
     def batch_slots(prompt_lengths: tuple[int, ...], output_tokens: int) -> int:
@@ -224,7 +228,10 @@ def profiling_kv_budget_bytes(config, num_slots: int) -> int:
     else:  # pragma: no cover - CacheLayout currently has no additional values.
         raise AssertionError(f"Unhandled attention cache layout {cache_layout!r}.")
 
-    method = normalize_sparse_method(config.sparse_method)
+    method = resolve_cache_sparse_method(
+        config.sparse_method,
+        prefill_sparse_method=getattr(config, "prefill_sparse_method", None),
+    )
     if method != "quest":
         if method in {"", "vanilla", "omnikv"}:
             int32_bytes = torch.empty((), dtype=torch.int32).element_size()

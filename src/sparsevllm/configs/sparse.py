@@ -12,6 +12,7 @@ from sparsevllm.method_registry import (
     SKIPKV_ASSET_MODEL_NAMES,
     SUPPORTED_SPARSE_METHODS,
     normalize_sparse_method,
+    resolve_cache_sparse_method,
     resolve_prefill_sparse_method,
     resolve_sparse_prefill_score_mode,
 )
@@ -37,7 +38,7 @@ def normalize_sparse_method_name(config) -> None:
 def normalize_prefill_sparse_method(config) -> None:
     sparse_method = normalize_sparse_method(getattr(config, "sparse_method", ""))
     method = resolve_prefill_sparse_method(
-        getattr(config, "prefill_sparse_method", ""),
+        getattr(config, "prefill_sparse_method", None),
         sparse_method=sparse_method,
     )
     if method not in CANONICAL_PREFILL_SPARSE_METHODS:
@@ -60,6 +61,10 @@ def normalize_prefill_sparse_method(config) -> None:
             f"{choices}."
         )
     config.prefill_sparse_method = method
+    config.resolved_cache_sparse_method = resolve_cache_sparse_method(
+        sparse_method,
+        prefill_sparse_method=method,
+    )
 
     for name in (
         "flashprefill_v2_k_block_m",
@@ -173,8 +178,12 @@ def _normalize_h2o(config) -> None:
 
 
 def _normalize_sparse_prefill_score(config) -> None:
-    mode = resolve_sparse_prefill_score_mode(
+    cache_method = resolve_cache_sparse_method(
         config.sparse_method,
+        prefill_sparse_method=config.prefill_sparse_method,
+    )
+    mode = resolve_sparse_prefill_score_mode(
+        cache_method,
         config.sparse_prefill_score_mode,
     )
     allowed = {"probability", "logits"}
@@ -183,14 +192,14 @@ def _normalize_sparse_prefill_score(config) -> None:
             "sparse_prefill_score_mode must be one of "
             f"{sorted(allowed)}, got {config.sparse_prefill_score_mode!r}."
         )
-    if mode != "probability" and config.sparse_method not in {
+    if mode != "probability" and cache_method not in {
         "snapkv",
         "pyramidkv",
         "h2o",
     }:
         raise ValueError(
             "sparse_prefill_score_mode='logits' only applies to "
-            f"SnapKV/PyramidKV/H2O, got method={config.sparse_method!r}."
+            f"SnapKV/PyramidKV/H2O, got method={cache_method!r}."
         )
     if mode == "logits" and config.sparse_attn_score_dtype != "float32":
         raise ValueError(

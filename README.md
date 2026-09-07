@@ -59,6 +59,11 @@ and hybrid KV compression. The main method families are `streamingllm`,
 | `quest` | Query-aware selection | Uses decode-time query-aware page selection while keeping prefill dense. |
 | `deltakv` / `deltakv-*` | Hybrid compression | Keeps a small full-precision pool and stores older context through DeltaKV compression or related ablations. |
 
+Prefill acceleration is an independent axis: `h2o_prefill` compacts KV between
+prompt chunks, while `flashprefill_v2` sparsifies prefill attention
+computation. Both are selected with `prefill_sparse_method` and combined with a
+compatible `sparse_method` for cache/decode behavior.
+
 Read the method overview and integration rules in
 [Core Sparse Methods](docs/en/features/sparse-methods.md).
 

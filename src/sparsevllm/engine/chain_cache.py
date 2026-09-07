@@ -197,7 +197,14 @@ def _jsonable(value: Any) -> Any:
 
 def build_chain_cache_fingerprint(config: Any) -> bytes:
     hf_config = getattr(config, "hf_config", None)
-    method = str(getattr(config, "sparse_method", "") or "")
+    method = str(
+        getattr(
+            config,
+            "resolved_cache_sparse_method",
+            getattr(config, "sparse_method", ""),
+        )
+        or ""
+    )
     method_fields = {
         "streamingllm": (
             "sink_keep_tokens",

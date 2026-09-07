@@ -10,6 +10,7 @@ from sparsevllm.engine.sparse_methods import (
     create_sparse_method_runtime,
 )
 from sparsevllm.engine.sparse_methods.dynamic import DeltaKVRuntime
+from sparsevllm.engine.sparse_methods.h2o import H2ORuntime
 from sparsevllm.engine.sparse_methods.passthrough import PassThroughRuntime
 from sparsevllm.engine.sparse_methods.snapkv import PyramidKVRuntime
 from sparsevllm.engine.sparse_methods.streamingllm import StreamingLLMRuntime
@@ -18,6 +19,7 @@ from sparsevllm.engine.sparse_methods.streamingllm import StreamingLLMRuntime
 def _config(method: str):
     return SimpleNamespace(
         sparse_method=method,
+        prefill_sparse_method=None,
         obs_layer_ids=[],
         full_attention_layers=[],
         runtime_layout=None,
@@ -66,6 +68,19 @@ def test_sparse_runtime_factory_rejects_unknown_method():
             _config("unknown-method"),
             SimpleNamespace(device=torch.device("cpu")),
         )
+
+
+def test_sparse_runtime_factory_binds_h2o_for_prefill_only():
+    config = _config("")
+    config.prefill_sparse_method = "h2o_prefill"
+
+    runtime = create_sparse_method_runtime(
+        config,
+        SimpleNamespace(device=torch.device("cpu")),
+    )
+
+    assert isinstance(runtime, H2ORuntime)
+    assert runtime.sparse_method == ""
 
 
 def test_passthrough_runtime_preserves_cache_manager_batch_tensor_identity():

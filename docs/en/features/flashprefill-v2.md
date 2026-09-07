@@ -67,7 +67,9 @@ GLM-4.7-Flash reject this configuration during initialization. H2O normally
 resolves an omitted `prefill_sparse_method` to `h2o_prefill`. Selecting
 `flashprefill_v2` instead replaces only the prefill attention computation.
 H2O still computes its method-owned posthoc importance scores and runs the same
-chunk/final-prefill KV compaction; SnapKV likewise preserves its existing
+final decode-cache preparation. It does not also run `h2o_prefill` intermediate
+compaction because both are alternatives on the same prefill axis. SnapKV likewise
+preserves its existing
 posthoc score-and-compact lifecycle. These extra scorers remain part of the
 cache method's cost and must be included in matched performance measurements.
 H2O decode scoring and periodic eviction are currently disabled independently

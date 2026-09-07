@@ -109,8 +109,10 @@ CacheManager 中的稳定张量，但不负责这些张量的分配和释放。
 
 ## Runtime 如何复用代码
 
-`engine/sparse_methods/factory.py` 在初始化时，根据规范化后的方法名选择 Runtime。
-逐层执行时不再查询注册表，也不再按方法名分支。
+`engine/sparse_methods/factory.py` 在初始化时，根据解析后的物理 cache method 选择
+Runtime。通常它就是 `sparse_method`；例外是
+`prefill_sparse_method="h2o_prefill"`，即使 decode 为 vanilla，也会解析为 H2O
+CacheManager/Runtime ownership。逐层执行时不再查询注册表，也不再按方法名分支。
 
 当前 Runtime 按实际处理方式进行少量继承：
 
@@ -119,7 +121,7 @@ CacheManager 中的稳定张量，但不负责这些张量的分配和释放。
 | `PassThroughRuntime` | vanilla、QuEST | Controller 侧返回完整逻辑选择，特殊物理视图由 CacheManager 或 Provider 构造。 |
 | `StreamingLLMRuntime` | StreamingLLM | Attention 使用普通视图，结束后按 sink 和 recent window 物理淘汰。 |
 | `ScoredCompactionRuntime` | SnapKV、PyramidKV | 共用打分和物理压缩流程；PyramidKV 使用逐层预算。 |
-| `H2ORuntime` | H2O | 准备 H2O 的 prefill 分数，并触发 CacheManager 中的累计重要度更新和淘汰。 |
+| `H2ORuntime` | H2O prefill 和/或 H2O decode | 准备 H2O prompt 分数；分别触发中间 chunk prefill 压缩和最终 prompt 的 decode cache 准备。 |
 | `JointDecodeRuntime` | R-KV、SkipKV | 共用 decode 压缩流程，但分数来源和选择算法不同。 |
 | `DynamicSelectionRuntime` | OmniKV、DeltaKV | 在观察层收集分数，并把动态选择结果传给后续层。 |
 

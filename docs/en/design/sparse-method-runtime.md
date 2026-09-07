@@ -119,9 +119,12 @@ lifetime.
 
 ## Runtime Construction And Reuse
 
-`engine/sparse_methods/factory.py` maps canonical methods to runtime classes at
-construction time. Runtime dispatch must not perform registry lookup or method
-string selection inside the per-layer hot path.
+`engine/sparse_methods/factory.py` maps the resolved physical cache method to a
+runtime class at construction time. Usually this is `sparse_method`; the
+exception is `prefill_sparse_method="h2o_prefill"`, which resolves H2O
+cache/runtime ownership even with vanilla decode. Runtime dispatch must not
+perform registry lookup or method string selection inside the per-layer hot
+path.
 
 The runtime hierarchy is deliberately shallow and organized by shared
 mechanics:
@@ -131,7 +134,7 @@ mechanics:
 | `PassThroughRuntime` | vanilla, QuEST | Controller selection is full; any native query-aware physical view remains cache-manager/provider owned. |
 | `StreamingLLMRuntime` | StreamingLLM | Pass-through attention view followed by physical sink/recent retention. |
 | `ScoredCompactionRuntime` | SnapKV, PyramidKV | Shared score lifecycle and physical compaction; PyramidKV specializes layer budgets and triggers. |
-| `H2ORuntime` | H2O | H2O-specific prefill score workspace and cache-owned cumulative importance/eviction lifecycle. |
+| `H2ORuntime` | H2O prefill and/or H2O decode | H2O prompt-score workspace; independently triggers intermediate-chunk prefill compaction and final-prompt decode-cache preparation. |
 | `JointDecodeRuntime` | R-KV, SkipKV | Shared decode compaction pipeline with different score sources and selectors. |
 | `DynamicSelectionRuntime` | OmniKV, DeltaKV | Observation-layer scoring and cross-layer dynamic selection; physical payload semantics remain method-specific. |
 

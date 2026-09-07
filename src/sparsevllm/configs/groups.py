@@ -36,6 +36,9 @@ class SparseMethodConfig:
     """Shared and method-specific sparse-attention settings."""
 
     sparse_method: str = ""
+    # Physical cache/runtime ownership can also come from a prefill method.
+    # This derived field is normalized before cache and prefix-cache setup.
+    resolved_cache_sparse_method: str = field(default="", init=False)
     sink_keep_tokens: int = 64
     recent_keep_tokens: int = 512
     decode_keep_tokens: int = 4096
@@ -94,9 +97,11 @@ class SparseMethodConfig:
 
 @dataclass(kw_only=True)
 class PrefillSparseMethodConfig:
-    """Prefill-attention algorithm settings, independent of KV/decode methods."""
+    """Prefill acceleration settings, independent of KV/decode methods."""
 
-    prefill_sparse_method: str = ""
+    # None preserves the legacy H2O combined default. Explicit "" disables
+    # prefill acceleration even when sparse_method="h2o" (decode-only H2O).
+    prefill_sparse_method: str | None = None
     flashprefill_v2_k_block_m: int = 128
     flashprefill_v2_k_block_n: int = 128
     flashprefill_v2_abs_threshold: float | None = None

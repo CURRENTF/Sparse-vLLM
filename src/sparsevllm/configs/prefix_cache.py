@@ -12,12 +12,16 @@ from sparsevllm.method_registry import PREFIX_CACHE_SUPPORTED_METHODS
 from sparsevllm.utils.log import log_once
 
 def normalize_prefix_cache(config) -> None:
+    cache_method = str(
+        getattr(config, "resolved_cache_sparse_method", config.sparse_method)
+        or ""
+    )
     config.enable_prefix_caching = _coerce_bool_config("enable_prefix_caching", config.enable_prefix_caching)
     config.prefix_cache_mode = str(config.prefix_cache_mode or "auto").strip().lower()
     config.resolved_prefix_cache_mode = normalize_prefix_cache_mode(
         config.prefix_cache_mode,
         enabled=config.enable_prefix_caching,
-        method=config.sparse_method,
+        method=cache_method,
     )
 
     config.prefix_cache_block_size = _coerce_optional_positive_int(
@@ -53,10 +57,10 @@ def normalize_prefix_cache(config) -> None:
             raise ValueError(
                 "enable_prefix_cache_offload requires enable_prefix_caching=True."
             )
-        if config.sparse_method not in ("", "omnikv", "quest"):
+        if cache_method not in ("", "omnikv", "quest"):
             raise ValueError(
                 "prefix cache offload currently supports only vanilla, OmniKV, and QuEST; "
-                f"got sparse_method={config.sparse_method!r}."
+                f"got cache method={cache_method!r}."
             )
         if int(config.tensor_parallel_size) not in (1, 2):
             raise ValueError(
@@ -94,7 +98,7 @@ def normalize_prefix_cache(config) -> None:
             )
         recurrent_state_max_bytes = config.prefix_cache_max_recurrent_bytes
     config.recurrent_state_max_bytes = recurrent_state_max_bytes
-    if config.enable_prefix_caching and config.sparse_method not in PREFIX_CACHE_SUPPORTED_METHODS:
+    if config.enable_prefix_caching and cache_method not in PREFIX_CACHE_SUPPORTED_METHODS:
         raise ValueError(
             "prefix caching only supports vanilla, streamingllm, omnikv, quest, "
             "snapkv, h2o, pyramidkv, rkv, and skipkv."

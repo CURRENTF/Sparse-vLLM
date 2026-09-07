@@ -242,6 +242,60 @@ def test_h2o_full_query_logits_request_fused_reduced_prefill_score():
     )
 
 
+@pytest.mark.parametrize(
+    ("sparse_method", "prefill_sparse_method"),
+    [("", "h2o_prefill"), ("h2o", "")],
+)
+def test_independent_h2o_axes_keep_prompt_score_and_page_table_contract(
+    sparse_method,
+    prefill_sparse_method,
+):
+    contract = sparse_prefill_attention_contract(
+        sparse_method,
+        prefill_sparse_method=prefill_sparse_method,
+        sparse_prefill_score_mode="probability",
+    )
+
+    assert contract.layer_varying_page_table
+    assert contract.main_score_kind is AttentionScoreKind.NONE
+    assert (
+        contract.score_collection
+        is PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED
+    )
+
+
+@pytest.mark.parametrize(
+    ("sparse_method", "prefill_sparse_method"),
+    [("", "h2o_prefill"), ("h2o", "")],
+)
+def test_independent_h2o_axes_request_lse_for_probability_scoring(
+    sparse_method,
+    prefill_sparse_method,
+):
+    config = SimpleNamespace(
+        dtype=torch.bfloat16,
+        hidden_size=4096,
+        num_attention_heads=32,
+        num_key_value_heads=4,
+        head_dim=128,
+    )
+    runtime_config = SimpleNamespace(
+        prefill_sparse_method=prefill_sparse_method,
+        sparse_prefill_score_mode="probability",
+        h2o_prefill_score_window=0,
+    )
+
+    spec = build_mha_prefill_attention_spec(
+        config,
+        sparse_method=sparse_method,
+        attention_tp_size=1,
+        runtime_config=runtime_config,
+    )
+
+    assert spec.return_softmax_lse
+    assert spec.allow_softmax_lse_fallback
+
+
 def test_h2o_flashprefill_uses_method_owned_posthoc_prefill_scoring():
     contract = sparse_prefill_attention_contract(
         "h2o",

@@ -8,6 +8,10 @@ import torch
 import torch.nn.functional as F
 
 from sparsevllm.engine.sequence import Sequence
+from sparsevllm.method_registry import (
+    normalize_sparse_method,
+    resolve_prefill_sparse_method,
+)
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.profiler import profiler
 
@@ -77,6 +81,22 @@ class H2OCacheManager(SnapKVCacheManager):
     def h2o_prefill_budget(self) -> int:
         return int(self.config.h2o_prefill_budget)
 
+    @property
+    def h2o_prefill_enabled(self) -> bool:
+        return (
+            resolve_prefill_sparse_method(
+                getattr(self.config, "prefill_sparse_method", None),
+                sparse_method=getattr(self.config, "sparse_method", None),
+            )
+            == "h2o_prefill"
+        )
+
+    @property
+    def h2o_decode_enabled(self) -> bool:
+        return normalize_sparse_method(
+            getattr(self.config, "sparse_method", None)
+        ) == "h2o"
+
     def _prefill_append_peak(
         self,
         resident_len: int,
@@ -86,6 +106,8 @@ class H2OCacheManager(SnapKVCacheManager):
         """Reserve the append-before-evict peak for a resident H2O row."""
         resident_len = int(resident_len)
         remaining_tokens = max(0, int(remaining_tokens))
+        if not self.h2o_prefill_enabled:
+            return resident_len + remaining_tokens
         chunk_size = max(1, int(engine_prefill_chunk_size))
         return min(
             resident_len + remaining_tokens,
@@ -185,12 +207,18 @@ class H2OCacheManager(SnapKVCacheManager):
                 suffix_tokens,
                 chunk_size,
             )
-            # Final-prefill compaction only runs when a suffix chunk executes.
-            resident_after_prefill = (
-                min(existing + suffix_tokens, self.h2o_decode_budget)
-                if suffix_tokens > 0
-                else existing
-            )
+            # The final prompt boundary belongs to the decode method. Without
+            # H2O decode, the last prefill chunk remains resident after any
+            # earlier h2o_prefill compactions.
+            if suffix_tokens <= 0:
+                resident_after_prefill = existing
+            elif self.h2o_decode_enabled:
+                resident_after_prefill = min(
+                    existing + suffix_tokens,
+                    self.h2o_decode_budget,
+                )
+            else:
+                resident_after_prefill = prefill_peak
             decode_peak = resident_after_prefill + generated_kv_tokens
             required_by_layer.append(
                 max(0, max(prefill_peak, decode_peak) - existing)
@@ -1598,7 +1626,35 @@ class H2OCacheManager(SnapKVCacheManager):
         self._h2o_counters["dropped_tokens"] += int(dropped_tokens)
         return True
 
-    def evict_after_prefill(self, seqs: list[Sequence]):
+    def evict_after_intermediate_prefill(self, seqs: list[Sequence]) -> None:
+        """Apply the prefill method only between prompt chunks."""
+
+        intermediate = [seq for seq in seqs if not seq.is_last_chunk_prefill]
+        if intermediate:
+            self._evict(intermediate, is_prefill=True)
+
+    def compact_final_prefill_for_decode(self, seqs: list[Sequence]) -> None:
+        """Apply the decode method at the final prompt boundary."""
+
+        final = [seq for seq in seqs if seq.is_last_chunk_prefill]
+        if not final:
+            return
+        self._evict(final, is_prefill=True)
+        for layer_idx in self.kv_transformer_layer_indices():
+            for seq in final:
+                kv_len = self._physical_row_len(layer_idx, seq)
+                if kv_len > self.h2o_decode_budget:
+                    raise RuntimeError(
+                        "H2O final prefill did not compact to the decode budget: "
+                        f"layer={layer_idx} seq_id={seq.seq_id} "
+                        f"kv_len={kv_len} budget={self.h2o_decode_budget}."
+                    )
+        if self.num_free_slots <= 0:
+            self._evict_decode_rows([])
+
+    def evict_after_prefill(self, seqs: list[Sequence]) -> None:
+        """Compatibility wrapper for the legacy combined H2O lifecycle."""
+
         self._evict(seqs, is_prefill=True)
         for layer_idx in self.kv_transformer_layer_indices():
             for seq in seqs:

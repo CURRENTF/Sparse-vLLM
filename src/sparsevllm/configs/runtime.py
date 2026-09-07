@@ -155,12 +155,15 @@ class Config(
         finalize_sparse_layout(self)
 
         logger.info(
-            "Runtime config: model={} sparse_method={} tp={} ep={} dp={} "
+            "Runtime config: model={} sparse_method={} prefill_sparse_method={} "
+            "cache_method={} tp={} ep={} dp={} "
             "max_model_len={} max_batched_tokens={} prefill_chunk={} "
             "max_prefill_batch={} max_decode_batch={} gpu_utilization={:.3f} "
             "decode_graph={}.",
             self.model,
             self.sparse_method or "vanilla",
+            self.prefill_sparse_method or "none",
+            self.resolved_cache_sparse_method or "standard",
             self.tensor_parallel_size,
             self.expert_parallel_size,
             self.data_parallel_size,

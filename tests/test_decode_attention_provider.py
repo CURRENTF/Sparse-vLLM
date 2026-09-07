@@ -93,6 +93,30 @@ def test_h2o_runtime_decode_spec_is_score_free_while_eviction_is_disabled():
     assert not spec.kernel_request.requires_softmax_lse
 
 
+def test_h2o_prefill_decode_spec_preserves_physical_cache_contract():
+    config = SimpleNamespace(
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        head_dim=128,
+        dtype=torch.bfloat16,
+    )
+    runtime_config = SimpleNamespace(prefill_sparse_method="h2o_prefill")
+
+    spec = build_mha_decode_attention_spec(
+        config,
+        sparse_method="",
+        attention_tp_size=1,
+        max_batch_size=8,
+        cuda_graph=True,
+        runtime_config=runtime_config,
+    )
+
+    assert spec.layer_varying_page_table
+    assert spec.page_size == 1
+    assert not spec.may_require_attention_scores
+    assert not spec.h2o_layerwise_probability_scores
+
+
 def test_eager_decode_does_not_register_provider_graph_lifecycle():
     provider = Mock()
     provider.name = "graph_aware_provider"

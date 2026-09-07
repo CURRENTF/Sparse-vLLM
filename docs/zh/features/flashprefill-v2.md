@@ -62,7 +62,8 @@ llm = LLM(
 `quest`、`snapkv` 和 `h2o`。GLM-4.7-Flash 等 MLA latent 模型会在初始化阶段拒绝
 该配置。H2O 未显式设置 `prefill_sparse_method` 时会默认解析为 `h2o_prefill`；改为
 `flashprefill_v2` 只替换 prefill attention 计算。H2O 仍通过 method-owned
-posthoc scorer 计算重要性分数，并执行原有的 chunk/最终 prefill KV 压缩；SnapKV
+posthoc scorer 计算重要性分数，并执行最终 decode cache 准备；它不会同时执行
+`h2o_prefill` 的中间 chunk 压缩，因为两者是同一 prefill 轴上的备选方法。SnapKV
 同样保留已有的 posthoc 评分和压缩生命周期。这些额外 scorer 仍属于 cache method
 的开销，匹配性能测量时必须计入。H2O decode 评分和周期淘汰当前关闭，与这里的
 prefill 选择无关。

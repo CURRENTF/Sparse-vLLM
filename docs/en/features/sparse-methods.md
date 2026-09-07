@@ -13,8 +13,8 @@ Set `sparse_method` to one of the following method names.
 | `vanilla` | Dense baseline | Full attention baseline. Use it to verify correctness and measure the non-sparse engine path. | Common engine knobs only. |
 | `streamingllm` | Physical eviction | StreamingLLM-style fixed sink plus recent-window cache. Tokens outside the retained prefix/tail policy are physically evicted from the active KV cache. | `sink_keep_tokens`, `recent_keep_tokens` |
 | `attention-sink` | Physical eviction | Alias-style attention-sink policy with the same sink-token and recent-window retention model. It is useful for comparing sink-window behavior against other physical eviction methods. | `sink_keep_tokens`, `recent_keep_tokens` |
-| `snapkv` | Physical eviction | SnapKV-style token selection keeps a compact set of important historical tokens after prefill. It reduces cache footprint by physically retaining only selected KV positions. | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
-| `h2o` | Physical eviction | H2O defaults to `prefill_sparse_method=h2o_prefill`, which maintains an independent cumulative attention-importance vector for every KV layer and physical row. Prefill scores and physically evicts after every chunk, and the final prefill chunk contracts to the decode budget. A different compatible prefill attention method changes the attention computation but preserves H2O's posthoc scoring and compaction. Decode scoring and periodic eviction are currently disabled: decode is score-free and its physical row grows with generated tokens. | `h2o_decode_budget`, `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window`, `sparse_prefill_score_mode` |
+| `snapkv` | Physical eviction | SnapKV-style token selection uses an end-of-prompt observation window to keep a compact set of important prompt KV positions before generation. The current paper-aligned decode path is score-free and appends generated tokens without another SnapKV selection pass. | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
+| `h2o` | Physical eviction | Sparse-vLLM's H2O prefill extension compacts intermediate prefill chunks to `h2o_prefill_budget`, reducing work in later prefill chunks. Separately, the H2O decode contract compacts the final prompt state to `h2o_decode_budget`; although this mutation runs at the final-prefill boundary, it prepares the shorter cache consumed by score-free decode. Decode scoring and periodic eviction are currently disabled, so physical rows grow with generated tokens. | `h2o_decode_budget`, `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window`, `sparse_prefill_score_mode` |
 | `pyramidkv` | Physical eviction | PyramidKV-style layer-dependent KV retention. It allocates sparse budgets across layers and physically stores the selected context tokens. | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
 | `omnikv` | Logical masking | OmniKV keeps the physical cache available but constructs sparse attention views for selected layers. This is useful when the method should avoid rewriting cache storage while still reducing attention work. | `full_attention_layers`, `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens` |
 | `quest` | Query-aware page selection | QuEST selects token pages from persistent min/max page summaries. Prefill stays dense. Explicit-KV models score in key coordinates; GLM-4.7-Flash scores the fused MLA latent/RoPE cache with the matching absorbed decode query while keeping the compute payload latent. | `quest_chunk_size`, `quest_skip_layers`, `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens` |
@@ -23,18 +23,34 @@ Set `sparse_method` to one of the following method names.
 Sparse-vLLM uses `sparse_method` unchanged in public commands, `LLM(...)`, the
 runtime config, and internal consumers.
 
+Prefill acceleration is selected separately with `prefill_sparse_method`.
+Sparse-vLLM currently supports `h2o_prefill` for intermediate-chunk KV
+compaction and `flashprefill_v2` for sparse prefill attention computation. They
+are alternatives on one axis and can each be combined with a compatible
+cache/decode method. See
+[runtime parameter semantics](../configuration/runtime-parameter-semantics.md#prefill-sparsity)
+for the H2O prefill/decode combination matrix and the omitted-versus-empty
+compatibility rule.
+
 > [!NOTE]
-> Decode scoring and eviction for `snapkv` and `h2o` are future work. In the
-> current runtime, both methods use score-free decode and their physical KV rows
-> grow with generated tokens. This behavior must remain explicit until the
-> score-producing eager/CUDA Graph paths and eviction lifecycle are implemented
-> and validated.
+> The two score-free decode contracts have different paper provenance. The
+> [SnapKV paper](https://arxiv.org/abs/2404.14469) selects prompt KV from an
+> observation window at the end of the prompt; adding decode-time rescoring and
+> eviction would be a Sparse-vLLM extension. The
+> [H2O paper](https://arxiv.org/abs/2306.14048) instead defines dynamic retention
+> over successive decode steps. Sparse-vLLM's intermediate-chunk H2O compaction
+> is its own prefill extension. Final-prompt compaction instead belongs to the
+> decode contract because it creates the shorter cache used during generation,
+> even though the mutation executes at the final-prefill boundary. Paper-style
+> online H2O updates would extend the current score-free decode runtime toward
+> the original H2O algorithm; periodic batched eviction would be an additional
+> systems variant.
 
 SnapKV defaults `sparse_prefill_score_mode` to `logits`; `probability` remains
 an explicit reproducibility option because its additional normalized QK sweep
 is substantially more expensive in measured long-context prefill. PyramidKV
-and H2O continue to default to `probability`. For H2O this is the canonical
-path: every KV layer independently sums its
+and H2O continue to default to `probability`. For the shared H2O prompt-scoring
+state this is the canonical path: every KV layer independently sums its
 normalized softmax attention probabilities over the full current query chunk,
 then accumulates that attention mass across prefill chunks. Decode score
 collection and eviction are intentionally disabled. Sparse-vLLM

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from sparsevllm.config import Config
 from sparsevllm.engine.cache_manager import CacheManager
-from sparsevllm.method_registry import normalize_sparse_method
+from sparsevllm.method_registry import resolve_cache_sparse_method
 
 from .base import SparseMethodRuntime
 from .dynamic import DeltaKVRuntime, OmniKVRuntime
@@ -31,7 +31,10 @@ def create_sparse_method_runtime(
     config: Config,
     cache_manager: CacheManager,
 ) -> SparseMethodRuntime:
-    method = normalize_sparse_method(config.sparse_method)
+    method = resolve_cache_sparse_method(
+        config.sparse_method,
+        prefill_sparse_method=getattr(config, "prefill_sparse_method", None),
+    )
     runtime_cls = RUNTIME_BINDINGS.get(method)
     if runtime_cls is None:
         raise ValueError(f"Unsupported sparse_method={method!r}.")

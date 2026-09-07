@@ -809,7 +809,7 @@ def test_resumed_h2o_capacity_uses_chunked_physical_peak():
     assert row_deficit == 0
 
 
-def test_h2o_flashprefill_capacity_preserves_h2o_prefill_compaction():
+def test_h2o_flashprefill_capacity_does_not_assume_h2o_prefill_compaction():
     manager = object.__new__(H2OCacheManager)
     manager.config = SimpleNamespace(
         sparse_method="h2o",
@@ -832,9 +832,11 @@ def test_h2o_flashprefill_capacity_preserves_h2o_prefill_compaction():
         )
     )
 
-    assert required == (9,)
+    # FlashPrefill owns the prefill axis in this combination. H2O still
+    # compacts the final prompt for decode, but the full suffix must fit first.
+    assert required == (100,)
     assert required_rows == 0
-    assert deficits == (6,)
+    assert deficits == (97,)
     assert row_deficit == 0
 
 

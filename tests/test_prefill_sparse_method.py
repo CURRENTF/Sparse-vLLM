@@ -27,7 +27,7 @@ from sparsevllm.platforms import DeviceCaps, PlatformEnum
 def _config(**overrides):
     values = {
         "sparse_method": "",
-        "prefill_sparse_method": "",
+        "prefill_sparse_method": None,
         "flashprefill_v2_k_block_m": 128,
         "flashprefill_v2_k_block_n": 128,
         "flashprefill_v2_abs_threshold": 0.1,
@@ -120,13 +120,40 @@ def test_flashprefill_mean_correction_rejects_ambiguous_string():
 def test_h2o_defaults_to_its_owned_prefill_method():
     config = _config(
         sparse_method="h2o",
-        prefill_sparse_method="",
+        prefill_sparse_method=None,
         flashprefill_v2_abs_threshold=None,
     )
 
     normalize_prefill_sparse_method(config)
 
     assert config.prefill_sparse_method == "h2o_prefill"
+    assert config.resolved_cache_sparse_method == "h2o"
+
+
+def test_explicit_empty_prefill_method_enables_decode_only_h2o():
+    config = _config(
+        sparse_method="h2o",
+        prefill_sparse_method="",
+        flashprefill_v2_abs_threshold=None,
+    )
+
+    normalize_prefill_sparse_method(config)
+
+    assert config.prefill_sparse_method == ""
+    assert config.resolved_cache_sparse_method == "h2o"
+
+
+def test_h2o_prefill_can_run_with_vanilla_decode():
+    config = _config(
+        sparse_method="",
+        prefill_sparse_method="h2o_prefill",
+        flashprefill_v2_abs_threshold=None,
+    )
+
+    normalize_prefill_sparse_method(config)
+
+    assert config.prefill_sparse_method == "h2o_prefill"
+    assert config.resolved_cache_sparse_method == "h2o"
 
 
 @pytest.mark.parametrize("sparse_method", ["", "omnikv", "quest", "snapkv", "h2o"])
@@ -146,7 +173,9 @@ def test_flashprefill_supports_declared_cache_decode_combinations(sparse_method)
     ("sparse_method", "prefill_sparse_method", "expected_prefill", "prefix_mode"),
     [
         ("", "flashprefill_v2", "flashprefill_v2", "radix"),
-        ("h2o", "", "h2o_prefill", "chain"),
+        ("", "h2o_prefill", "h2o_prefill", "chain"),
+        ("h2o", None, "h2o_prefill", "chain"),
+        ("h2o", "", "", "chain"),
         ("h2o", "flashprefill_v2", "flashprefill_v2", "chain"),
     ],
 )
@@ -194,10 +223,7 @@ def test_runtime_config_resolves_prefill_method_and_prefix_mode(
             "is incompatible with sparse_method",
         ),
         (
-            {
-                "sparse_method": "snapkv",
-                "prefill_sparse_method": "h2o_prefill",
-            },
+            {"sparse_method": "snapkv", "prefill_sparse_method": "h2o_prefill"},
             "is incompatible with sparse_method",
         ),
     ],

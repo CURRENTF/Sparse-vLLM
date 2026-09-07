@@ -12,7 +12,7 @@ Use semantic public names in commands, JSON configs, and benchmark manifests:
 | Canonical name | Meaning |
 | --- | --- |
 | `sparse_method` | Sparse method selector. |
-| `prefill_sparse_method` | Orthogonal prefill-attention algorithm selector. It does not replace the cache/decode `sparse_method`. |
+| `prefill_sparse_method` | Orthogonal prefill-acceleration selector. `h2o_prefill` compacts intermediate prompt chunks; `flashprefill_v2` sparsifies prefill attention computation. It does not replace the cache/decode `sparse_method`. |
 | `deltakv_checkpoint_path` | DeltaKV compressor checkpoint path. |
 | `engine_prefill_chunk_size` | Maximum scheduled prefill chunk. |
 | `sink_keep_tokens` | Fixed sink-token budget. |
@@ -64,15 +64,29 @@ size, and checkpoint path.
 
 ## Prefill sparsity
 
-`prefill_sparse_method` selects the prefill attention algorithm independently
-from `sparse_method`. `flashprefill_v2` supports `vanilla`, `omnikv`, `quest`,
+`prefill_sparse_method` selects prefill acceleration independently from
+`sparse_method`. Sparse-vLLM currently exposes two choices:
+`h2o_prefill`, which compacts physical KV after intermediate prompt chunks, and
+`flashprefill_v2`, which sparsifies the prefill attention computation.
+`flashprefill_v2` supports `vanilla`, `omnikv`, `quest`,
 `snapkv`, and `h2o` on explicit-KV MHA models, including their supported
 prefix-cache modes. MLA latent models reject this prefill method during
-configuration. H2O defaults to `prefill_sparse_method="h2o_prefill"`;
-explicitly selecting `flashprefill_v2` changes only the prefill attention
-computation. H2O still
-collects its method-owned posthoc scores and performs its normal prefill KV
-compaction. The cache manager owns that physical lifecycle, while the prepared
+configuration.
+
+| `prefill_sparse_method` | `sparse_method` | Intermediate prompt chunks | Final prompt boundary / decode |
+| --- | --- | --- | --- |
+| omitted | `h2o` | H2O compaction (legacy combined default) | Compact to `h2o_decode_budget`, then score-free decode |
+| `""` | `h2o` | No prefill compaction | Compact to `h2o_decode_budget`, then score-free decode |
+| `h2o_prefill` | `vanilla` | Compact to `h2o_prefill_budget` | No final decode-budget compaction; dense score-free decode over the remaining row |
+| `h2o_prefill` | `h2o` | Compact to `h2o_prefill_budget` | Compact to `h2o_decode_budget`, then score-free decode |
+| `flashprefill_v2` | `h2o` | FlashPrefill V2 computation; no H2O intermediate compaction | Collect H2O posthoc prompt scores, compact to `h2o_decode_budget`, then score-free decode |
+
+Omitting `prefill_sparse_method` with `sparse_method="h2o"` preserves the old
+combined behavior. An explicit empty string disables prefill acceleration and
+therefore selects decode-only H2O. Sparse-vLLM's intermediate-chunk H2O
+compaction is a prefill extension, while final-prompt compaction prepares the
+shorter cache consumed by decode. The cache manager owns that physical
+lifecycle, while the prepared
 prefill provider consumes its view without inspecting the cache method name. See
 [FlashPrefill V2](../features/flashprefill-v2.md) for the validated kernel
 contract and required calibration parameters.

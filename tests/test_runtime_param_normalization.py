@@ -68,7 +68,12 @@ class RuntimeParamNamingTest(unittest.TestCase):
     def test_internal_derived_fields_are_not_public_inputs(self):
         from sparsevllm import LLM
 
-        for key in ("quest_token_budget", "observation_layers", "obs_layer_ids"):
+        for key in (
+            "quest_token_budget",
+            "observation_layers",
+            "obs_layer_ids",
+            "resolved_cache_sparse_method",
+        ):
             with self.subTest(key=key):
                 with self.assertRaisesRegex(ValueError, "Unknown Sparse-vLLM config keys"):
                     LLM("/tmp/unused-model", **{key: 1})
