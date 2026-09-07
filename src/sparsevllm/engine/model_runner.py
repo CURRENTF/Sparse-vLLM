@@ -466,7 +466,9 @@ class ModelRunner:
         )
         self.cache_runtime_phase = "profiling"
 
-        torch.set_default_device("cpu")
+        # Uninstall the construction-only DeviceContext. Setting "cpu" keeps
+        # a Python interception mode on every Torch call in eager prefill.
+        torch.set_default_device(None)
         torch.set_default_dtype(default_dtype)
 
         # TP 场景下的多进程指令同步
