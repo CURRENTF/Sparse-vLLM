@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import numpy as np
@@ -16,7 +17,17 @@ from sparsevllm.utils.context import get_context
 from sparsevllm.utils.profiler import profiler
 
 from .snapkv import SnapKVCacheManager
-from .h2o_retention import H2OPrefillRetentionMixin, H2O_PREFILL_QUERY_TILE
+
+
+@dataclass(frozen=True)
+class H2ORetention:
+    """One layer/request selection in the current packed cache coordinates."""
+
+    layer_idx: int
+    seq_id: int
+    source_length: int
+    keep: torch.Tensor  # [native KV heads, budget], or [1, budget] for MLA
+    final_prefill: bool
 
 
 class _H2ORowRef(NamedTuple):
@@ -25,7 +36,7 @@ class _H2ORowRef(NamedTuple):
     seq_id: int
 
 
-class H2OCacheManager(H2OPrefillRetentionMixin, SnapKVCacheManager):
+class H2OCacheManager(SnapKVCacheManager):
     """Native KV storage with cumulative per-query-head prefill probabilities."""
 
     def __init__(
@@ -91,7 +102,6 @@ class H2OCacheManager(H2OPrefillRetentionMixin, SnapKVCacheManager):
     def _get_available_slots_info(self) -> tuple[int, int]:
         from .storage import MlaLatentStorage
 
-        available, payload_bytes = super()._get_available_slots_info()
         mla = isinstance(self.attention_cache_storage, MlaLatentStorage)
         if mla and self.tp_size != 1:
             raise ValueError("H2O MLA prefill currently requires TP1 for layer-wide head reduction.")
@@ -100,31 +110,112 @@ class H2OCacheManager(H2OPrefillRetentionMixin, SnapKVCacheManager):
         if heads <= 0 or groups <= 0 or heads % groups:
             raise ValueError("H2O requires complete local query-to-KV head groups.")
 
-        # Account for score/position retention copies and selection indices in
-        # addition to native payload. Decode may grow the cache but adds no scores.
-        metadata_per_slot = 20 * heads + 64 * groups + 64
-        batch = min(int(self.max_buffer_rows), int(self.config.max_num_seqs_in_batch))
-        chunk = min(int(self.config.engine_prefill_chunk_size), int(self.max_model_len))
-        width = min(int(self.max_model_len), self.h2o_prefill_budget + chunk)
-        if bool(getattr(self.config, "enable_prefix_caching", False)):
-            width = int(self.max_model_len)
-        window = int(self.config.h2o_prefill_score_window)
-        queries = min(H2O_PREFILL_QUERY_TILE, chunk, window or chunk)
-        # Probability QK stats use at most two padded head rows per real head
-        # and at most one bounded query tile at a time.
-        padded_queries = max(16, 1 << (queries - 1).bit_length())
-        stats = 8 * batch * (2 * heads) * padded_queries * ((width + 63) // 64 + 1)
-        scores = 8 * batch * heads * width
-        # Include replacement allocation while the previous workspace is live.
-        workspace_bytes = 2 * (stats + scores) + 2 * self.h2o_prefill_budget * payload_bytes
-        if workspace_bytes >= available:
-            raise RuntimeError(
-                "Not enough memory for H2O prefill score/retention workspaces: "
-                f"required={workspace_bytes} available={available}."
+        return super()._get_available_slots_info()
+
+    @staticmethod
+    def _assert_retention_tensor(condition: torch.Tensor, message: str) -> None:
+        if condition.is_cuda:
+            torch._assert_async(condition)
+        elif not bool(condition.item()):
+            raise RuntimeError(message)
+
+    @property
+    def h2o_selection_groups(self) -> int:
+        from .storage import MlaLatentStorage
+
+        return (
+            1 if isinstance(self.attention_cache_storage, MlaLatentStorage)
+            else self.num_kv_heads
+        )
+
+    def commit_h2o_retention(self, requests: list[H2ORetention]) -> None:
+        from .storage import ExplicitKVStorage
+
+        prepared = []
+        seen = set()
+        seen_rows = set()
+        release_counts = {}
+        storage = self.attention_cache_storage
+        for request in requests:
+            layer, seq_id, length = request.layer_idx, request.seq_id, request.source_length
+            key = (layer, seq_id)
+            if key in seen:
+                raise ValueError("Duplicate H2O retention request.")
+            seen.add(key)
+            row = self.seq_id_to_row[layer][seq_id]
+            if (layer, row) in seen_rows:
+                raise ValueError("H2O retention requests share a physical row.")
+            seen_rows.add((layer, row))
+            if int(self.row_seq_lens[layer][row]) != length:
+                raise ValueError("H2O retention refers to a stale physical row.")
+            keep = request.keep
+            groups = self.h2o_selection_groups
+            if (
+                keep.ndim != 2 or keep.shape[0] != groups
+                or keep.dtype != torch.long or keep.device != self.device
+                or not 0 < keep.shape[-1] < length
+            ):
+                raise ValueError("H2O retention requires [selection_groups, budget] int64 indices.")
+            budget = int(keep.shape[-1])
+            self._assert_retention_tensor(
+                ((keep >= 0) & (keep < length)).all()
+                & (keep[:, 1:] > keep[:, :-1]).all(),
+                "H2O retention indices must be in bounds and strictly increasing.",
             )
-        self._h2o_reserved_workspace_bytes = workspace_bytes
-        self._h2o_metadata_bytes_per_slot = metadata_per_slot
-        return available - workspace_bytes, payload_bytes + metadata_per_slot
+            score = self._h2o_scores[key]
+            positions = self._h2o_positions[key]
+            if (
+                score.ndim != 2 or score.shape[-1] != length
+                or score.shape[0] % groups or tuple(positions.shape) != (groups, length)
+            ):
+                raise ValueError("H2O retention score/position metadata is not aligned.")
+            slots = self.buffer_req_to_token_slots[layer][row, :length].long().clone()
+            ordered_slots = slots.sort().values
+            self._assert_retention_tensor(
+                ((slots >= 0) & (slots < storage.slot_capacity())).all()
+                & (ordered_slots[1:] > ordered_slots[:-1]).all(),
+                "H2O retention physical slots must be valid and unique.",
+            )
+            release_counts[layer] = release_counts.get(layer, 0) + length - budget
+            pointer = int(self._num_free_slots[layer])
+            end = pointer + release_counts[layer]
+            if pointer < 0 or end > self.free_slots_stack[layer].numel():
+                raise RuntimeError(f"H2O retention would overflow the free-slot stack: layer={layer}.")
+            # Every query head keeps its own history, including heads that did
+            # not supply the group's maximum on this step.
+            score_keep = keep.repeat_interleave(score.shape[0] // groups, dim=0)
+            kept_score = score.gather(1, score_keep).contiguous()
+            kept_positions = positions.gather(1, keep).contiguous()
+            prepared.append((request, row, slots, ordered_slots, kept_score, kept_positions))
+
+        # Validate the complete submission before publishing any row mutation.
+        for request, row, slots, ordered_slots, score, positions in prepared:
+            layer, seq_id, length = request.layer_idx, request.seq_id, request.source_length
+            keep = request.keep
+            budget = int(keep.shape[-1])
+            destination = ordered_slots[:budget]
+            released = ordered_slots[budget:]
+            kv_layer = self.kv_layer_index(layer)
+            selected = slots[keep]
+            if isinstance(storage, ExplicitKVStorage):
+                storage.copy_head_slots(kv_layer, selected, destination)
+            else:
+                storage.copy_slots(kv_layer, selected[0], destination)
+            ptr = int(self._num_free_slots[layer])
+            self.free_slots_stack[layer][ptr:ptr + released.numel()] = released
+            self._num_free_slots[layer] = ptr + released.numel()
+            self.buffer_req_to_token_slots[layer][row, :budget] = destination
+            self.buffer_req_to_token_slots[layer][row, budget:length] = 0
+            self.row_seq_lens[layer][row] = budget
+            self._h2o_scores[(layer, seq_id)] = score
+            self._h2o_positions[(layer, seq_id)] = positions
+            counter = "final_prefill_evictions" if request.final_prefill else "intermediate_prefill_evictions"
+            self._h2o_counters[counter] += 1
+            self._h2o_counters["dropped_tokens"] += length - budget
+        if prepared:
+            self._uniform_decode_metadata = False
+            self._decode_static_state_binding_key = None
+            self._invalidate_h2o_decode_score_workspace()
 
     def _iter_accounting_tensors(self):
         yield from super()._iter_accounting_tensors()
@@ -1290,7 +1381,5 @@ class H2OCacheManager(H2OPrefillRetentionMixin, SnapKVCacheManager):
                 f"{layer_idx}:{seq_id}": int(score.shape[-1])
                 for (layer_idx, seq_id), score in sorted(self._h2o_scores.items())
             },
-            "reserved_workspace_bytes": getattr(self, "_h2o_reserved_workspace_bytes", 0),
-            "metadata_bytes_per_slot": getattr(self, "_h2o_metadata_bytes_per_slot", 0),
         }
         return summary

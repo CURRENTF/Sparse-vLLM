@@ -5,9 +5,9 @@ import pytest
 import torch
 
 from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
-from sparsevllm.engine.cache_manager.h2o_retention import H2ORetention
+from sparsevllm.engine.cache_manager.h2o import H2ORetention
 from sparsevllm.engine.cache_manager.storage import ExplicitKVStorage, MlaLatentStorage
-from sparsevllm.engine.sparse_methods.h2o_selection import select_h2o_heads
+from sparsevllm.engine.sparse_methods.h2o import select_h2o_heads
 
 
 def test_late_max_preserves_head_history_across_chunks():
@@ -284,36 +284,6 @@ def test_later_layer_capacity_failure_does_not_commit_earlier_layers():
         torch.testing.assert_close(manager._h2o_scores[key], before)
     assert manager._num_free_slots == [13, 23]
     assert [lengths.tolist() for lengths in manager.row_seq_lens] == [[6, 5], [6, 5]]
-
-
-@pytest.mark.parametrize('mla,heads,groups,tp', [(False, 8, 8, 1), (False, 32, 2, 1), (False, 16, 2, 2), (True, 32, 1, 1)])
-def test_capacity_reserves_native_payload_and_live_head_metadata(monkeypatch, mla, heads, groups, tp):
-    from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
-
-    manager = object.__new__(H2OCacheManager)
-    manager.tp_size, manager.num_kv_heads = tp, groups
-    manager.hf_config = SimpleNamespace(num_attention_heads=heads * tp)
-    manager.max_buffer_rows, manager.max_model_len = 3, 2048
-    manager.config = SimpleNamespace(max_num_seqs_in_batch=2, engine_prefill_chunk_size=257,
-                                     h2o_prefill_budget=129, h2o_prefill_score_window=0,
-                                     enable_prefix_caching=False)
-    storage = (MlaLatentStorage(kv_lora_rank=512, rope_dim=64, dtype=torch.bfloat16) if mla
-               else ExplicitKVStorage(num_kv_heads=groups, head_dim=128, dtype=torch.bfloat16))
-    manager.attention_cache_storage = storage
-    native_bytes = storage.bytes_per_slot_per_layer()
-    available = 64 * 1024 * 1024
-    monkeypatch.setattr(SnapKVCacheManager, '_get_available_slots_info', lambda self: (available, native_bytes))
-    remaining, slot_cost = manager._get_available_slots_info()
-    # Scores and positions must survive while the newly gathered copies exist.
-    assert slot_cost >= native_bytes + 2 * (4 * heads + 8 * groups)
-    assert slot_cost - manager._h2o_metadata_bytes_per_slot == native_bytes
-    score_buffers = 2 * 4 * 2 * heads * (129 + 257)
-    copy_buffers = 129 * native_bytes
-    assert available - remaining >= score_buffers + copy_buffers
-    assert 0 < remaining < available
-    monkeypatch.setattr(SnapKVCacheManager, '_get_available_slots_info', lambda self: (1, native_bytes))
-    with pytest.raises(RuntimeError, match='Not enough memory'):
-        manager._get_available_slots_info()
 
 
 def test_mla_rejects_tp_without_cross_rank_head_reduction(monkeypatch):
