@@ -37,6 +37,22 @@ Verify that `SparseController`, Attention, ModelRunner, and Scheduler gained no
 method-name hot-path branches, and that persistent prefix-coupled metadata did
 not move from CacheManager into runtime state.
 
+### CUDA Graph Replay Checks
+
+For advertised graph support, compare eager execution with actual capture and
+repeated replay from equivalent initial state. Change metadata between replays:
+exercise growing lengths, relevant page/compaction boundaries, padded batches,
+and request completion followed by row/slot reuse. Check cache contents,
+selection, ownership, and attention outputs, not just successful capture.
+
+Verify buffer identity/keepalive and that capture warmup/reset does not consume
+live capacity or leave stale method state. Confirm that replay reads the new
+metadata and padded rows cannot write to another request. Use the declared
+numerical tolerance; changing algorithm semantics is not a tolerance adjustment.
+If graph support is deferred, test explicit rejection and record the missing
+replay cases. A config flag, CPU mock, or graph-configured eager fallback is not
+evidence of graph execution; performance artifacts must identify actual replay.
+
 ## 3. Model-Level And Quality Validation
 
 - Run a short deterministic generation that exercises prefill and multiple decode steps.
@@ -57,6 +73,25 @@ Follow `docs/en/benchmarking/efficiency.md` or `docs/zh/benchmarking/efficiency.
 - Separate selection, metadata/view construction, cache mutation, and attention/operator time when investigating overhead.
 - Report warmup, repetitions, variance, throughput, latency, and memory metrics required by the runbook.
 - Use the documented Nsight diagnostic for kernel-timeline attribution; sampled GPU activity is not theoretical MFU/MBU.
+
+Check the pre-implementation cost model against measured scaling. Use a bounded
+set of representative context lengths, batch sizes, and retained budgets that
+exercises the predicted bottleneck and overhead-dominated regime, not an
+exhaustive cross-product. Record selection frequency and page size where they
+affect the model. Include peak allocated/reserved device memory with the
+measurement scope and graph/workspace residency stated; distinguish fixed model
+and KV-pool reservations from method-specific live storage.
+
+Investigate unexpected time or memory growth, repeated launches, synchronization,
+and copying before calling the implementation efficient. Keep separately timed
+kernel/stage diagnostics separate from unsynchronized request-latency runs, and
+include all method work in end-to-end measurements. Validate optimized kernels
+and selections against an independent numerical/algorithm oracle; routing mocks
+and tests freezing a provider choice do not establish efficiency or correctness.
+
+If hardware or assets prevent measurement, report the implementation and static
+cost analysis separately from pending GPU correctness/performance evidence. Do
+not claim verified efficiency or complete validation from formulas or CPU tests.
 
 Do not claim a speedup from an unmatched schedule, a changed quality target, a different provider, or an invalid artifact.
 

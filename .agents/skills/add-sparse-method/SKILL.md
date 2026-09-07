@@ -37,9 +37,46 @@ Before editing code, complete the contract in [references/runtime-contract.md](r
 - scheduling and admission: prefill mode, batch compatibility, capacity budgets, reservation costs, and offload behavior;
 - lifecycle support: eager execution, CUDA Graph, radix prefix cache, chain prefix cache, and restore/fork/free behavior;
 - model and topology support: model types, TP/EP/DP assumptions, and provider requirements;
+- implementation cost: phase-specific time complexity, peak memory, kernel reuse candidates, and hot-path data movement;
 - validation evidence: correctness oracle, quality workload, performance workload, and unsupported combinations.
 
 Do not fill unknowns with permissive defaults. Unsupported combinations must be represented explicitly and fail during validation or initialization, not in a later kernel.
+
+### Design For Eager And CUDA Graph From The Start
+
+Consider decode CUDA Graph support in the initial design, before choosing
+metadata, cache-update kernels, and workspace layouts; do not treat it as an
+afterthought once an eager-only implementation is complete. Prefer a shared
+compute and state-transition path for eager execution and graph replay, with
+differences confined to preparation, capture/replay, and justified launch plans.
+Follow the [graph design contract](references/runtime-contract.md#eager-and-cuda-graph-design)
+and [replay validation](references/validation.md#cuda-graph-replay-checks).
+
+An initial eager-only scope must identify concrete blockers and the intended
+adaptation, distinguishing deferred work or missing GPU evidence from a genuine
+semantic/provider limitation. Do not advertise graph support until validated,
+or change the algorithm merely to make capture possible.
+
+### Required Cost And Reuse Review Before Implementation
+
+Complete the cost and reuse review in
+[references/runtime-contract.md](references/runtime-contract.md#cost-and-reuse-review)
+before implementation. Architecture compliance alone is insufficient: account
+for scoring, selection, metadata, mutation, and attention together, including
+temporary storage and repeated work. Identify existing repository kernels and
+upstream providers by symbol/path and explain each reuse, narrow extension, or
+new-kernel decision. Explicitly check vLLM and SGLang (including `sgl-kernel`)
+for reusable kernels; prefer direct reuse when the existing interface and
+execution contract fit, and use their implementations as references for narrow
+adaptations when direct reuse does not fit.
+
+Choose an implementation that avoids unnecessary full-domain intermediates,
+host synchronization, and repeated allocation or copying. Preserve the declared
+algorithm: changing selection granularity, scoring, update frequency, or cache
+lifecycle to make it faster requires explicit authorization for that semantic
+change. Distinguish an intentionally slow correctness oracle from the serving
+implementation. A required expensive algorithm is not grounds to silently
+replace it with an approximation.
 
 ## 3. Route Responsibilities By Owner
 
@@ -121,6 +158,8 @@ Use `build_decode_view` when the method only changes the logical explicit-KV vie
 Read and apply `$review-operator-organization` whenever a sparse-method change
 adds or changes provider selection, physical weight layout, or production
 kernel dispatch.
+Use `$optimize-sparsevllm-kernel` when implementing or tuning a GPU kernel;
+reusing an existing kernel does not by itself require a tuning project.
 
 ## 7. Integrate In Dependency Order
 
