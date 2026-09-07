@@ -18,6 +18,7 @@ from sparsevllm.configs.full_attention_profiles import (
 from sparsevllm.configs.groups import (
     DecodeCudaGraphConfig,
     DeltaKVConfig,
+    KVQuantConfig,
     ObservabilityConfig,
     PrefillSparseMethodConfig,
     PrefixCacheConfig,
@@ -54,6 +55,7 @@ class Config(
     SparseMethodConfig,
     PrefillSparseMethodConfig,
     DeltaKVConfig,
+    KVQuantConfig,
     ObservabilityConfig,
 ):
     model: str
@@ -147,6 +149,9 @@ class Config(
         normalize_deltakv_storage(self)
         normalize_platform(self)
         load_and_validate_model(self)
+        from sparsevllm.configs.kv_quant import validate_quantized_kv
+
+        validate_quantized_kv(self)
         normalize_decode_cuda_graph(self)
         normalize_sparse_methods(self)
         finalize_prefix_cache(self)

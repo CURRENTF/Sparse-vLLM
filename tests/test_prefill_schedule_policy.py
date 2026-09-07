@@ -48,6 +48,9 @@ from sparsevllm.method_registry import (
 
 
 class FakeMemoryOracle:
+    def prefill_private_slots_for(self, seq):
+        return 0
+
     def __init__(
         self,
         free_slots=1_000_000,
@@ -236,6 +239,40 @@ def make_sparse_controller_config():
         decode_keep_tokens=4,
         sparse_attn_score_dtype="float32",
     )
+
+
+def test_private_page_tail_progress_does_not_spend_another_requests_pages():
+    """Full shared pools can still fill owned tails; tails cannot fund new pages."""
+    from sparsevllm.engine.cache_manager.quantized import QuantizedCacheManager
+    from sparsevllm.engine.cache_manager.quantized_pages import QuantizedPagePool
+
+    first, second = Sequence(list(range(32))), Sequence(list(range(64)))
+    pool = QuantizedPagePool(2, 32, 128)
+    pool.append(first.seq_id, 31)
+    pool.append(second.seq_id, 1)
+    first.num_prefilled_tokens, second.num_prefilled_tokens = 31, 1
+    manager = object.__new__(QuantizedCacheManager)
+    manager.page_pool, manager.page_size = pool, 32
+
+    class PageOracle(FakeMemoryOracle):
+        def prefill_private_slots_for(self, seq):
+            return manager.prefill_private_slots_for(seq)
+
+        def prefill_step_free_slots_for(self, seq):
+            return manager.prefill_step_free_slots_for(seq)
+
+        def prefill_step_reservation_cost(self, seq, scheduled_tokens):
+            return manager.prefill_step_reservation_cost(seq, scheduled_tokens)
+
+    scheduler = make_scheduler(PREFILL_POLICY_ALL_CHUNKED, method="kivi", chunk=32, max_tokens=64,
+                               oracle=PageOracle(free_slots=0, execution_mode=PREFILL_EXECUTION_CHUNKED))
+    scheduler.waiting.extend([first, second])
+    scheduled, is_prefill, _ = scheduler.schedule()
+    assert is_prefill and set(seq.seq_id for seq in scheduled) == {first.seq_id, second.seq_id}
+    assert sum(seq.current_chunk_size for seq in scheduled) == 32
+    for seq in scheduled:
+        assert pool.append_cost(seq.seq_id, seq.current_chunk_size) == 0
+        pool.append(seq.seq_id, seq.current_chunk_size)
 
 
 def identity_runtime_layout(num_layers):
@@ -750,6 +787,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
     def test_deltakv_legacy_graph_method_does_not_enable_graph(self):
         cfg = self.make_config(
             sparse_method="deltakv-less-memory-cudagraph",
+            decode_graph=False,
             allow_missing_deltakv_path=True,
             deltakv_latent_quant_bits=0,
         )
@@ -760,6 +798,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires decode_graph"):
             self.make_config(
                 sparse_method="omnikv",
+                decode_graph=False,
                 decode_graph_capture_sampling=True,
             )
 

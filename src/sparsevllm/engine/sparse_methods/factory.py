@@ -14,6 +14,9 @@ from .streamingllm import StreamingLLMRuntime
 
 
 RUNTIME_BINDINGS: dict[str, type[SparseMethodRuntime]] = {
+    "kivi": PassThroughRuntime,
+    "turboquant": PassThroughRuntime,
+    "fp8_kv": PassThroughRuntime,
     "": PassThroughRuntime,
     "streamingllm": StreamingLLMRuntime,
     "snapkv": SnapKVRuntime,

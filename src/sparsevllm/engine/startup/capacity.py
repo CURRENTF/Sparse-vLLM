@@ -196,6 +196,27 @@ def profiling_kv_budget_bytes(config, num_slots: int) -> int:
     num_slots = int(num_slots)
     if num_slots <= 0:
         raise ValueError(f"Profiling KV slots must be positive, got {num_slots}.")
+    from sparsevllm.method_registry import QUANTIZED_KV_METHODS
+    if config.sparse_method in QUANTIZED_KV_METHODS:
+        from sparsevllm.engine.cache_manager.storage.quantized_kv import QuantizedKVStorage, quantized_kv_reserved_bytes
+        g = int(config.kv_quant_page_size)
+        # Match CacheManager's attention shard, not the global or MoE TP shape.
+        tp_size = int(config.parallel_topology.attention_tp_size)
+        local_shapes = config.runtime_layout.local_kv_shapes(tp_size)
+        if local_shapes:
+            h, d = local_shapes[0]
+        else:
+            h = int(config.hf_config.num_key_value_heads) // tp_size
+            d = resolve_attention_qk_head_dim(config.hf_config)
+        layers = int(config.runtime_layout.num_kv_layers)
+        bits = config.kivi_bits if config.sparse_method == "kivi" else config.turboquant_bits if config.sparse_method == "turboquant" else 8
+        storage = QuantizedKVStorage(format=config.sparse_method, bits=bits, page_size=g,
+                                     num_kv_heads=h, head_dim=d, dtype=config.hf_config.dtype,
+                                     seed=config.turboquant_seed)
+        # Each profiling request owns a distinct rounded final page.
+        pages = ceil(num_slots / g) + max(int(config.max_num_seqs_in_batch), int(config.max_decoding_seqs))
+        return (quantized_kv_reserved_bytes(config, num_layers=layers, num_heads=h, head_dim=d)
+                + pages * (layers * storage.bytes_per_page_per_layer() + g * 4))
     dtype_size = torch.empty((), dtype=config.hf_config.dtype).element_size()
     layout = config.runtime_layout
     tp_size = int(config.parallel_topology.attention_tp_size)

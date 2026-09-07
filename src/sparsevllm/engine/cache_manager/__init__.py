@@ -35,6 +35,7 @@ __all__ = [
     "PrefillComputeView",
     "SparseSelection",
     "StandardCacheManager",
+    "QuantizedCacheManager",
     "StreamingLLMCacheManager",
     "SnapKVCacheManager",
     "H2OCacheManager",
@@ -50,6 +51,10 @@ __all__ = [
 
 
 def __getattr__(name: str):
+    if name == "QuantizedCacheManager":
+        from .quantized import QuantizedCacheManager
+
+        return QuantizedCacheManager
     if name == "StandardCacheManager":
         from .standard import StandardCacheManager
 

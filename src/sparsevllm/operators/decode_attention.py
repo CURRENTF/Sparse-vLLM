@@ -98,8 +98,11 @@ class DecodeAttentionOpSpec:
     full_layer_kivi_decode_block_n: int = 16
     full_layer_kivi_decode_num_warps: int = 2
     full_layer_kivi_decode_num_stages: int = 3
+    kv_storage_format: str = "dense"
 
     def __post_init__(self) -> None:
+        if self.kv_storage_format not in {"dense", "kivi", "turboquant", "fp8_kv"}:
+            raise ValueError(f"Unknown decode KV storage format {self.kv_storage_format!r}.")
         if self.num_query_heads <= 0 or self.num_kv_heads <= 0:
             raise ValueError("Decode attention head counts must be positive.")
         if self.num_query_heads % self.num_kv_heads:
@@ -333,7 +336,7 @@ DECODE_ATTENTION_REGISTRY: OpRegistry[
             "triton_paged_decode",
             "triton_fixed_grid_paged_decode",
         ),
-        repo_nonstandard=("triton_deltakv_fixed_grid_decode",),
+        repo_nonstandard=("triton_deltakv_fixed_grid_decode", "triton_quantized_pages_decode"),
     ),
 )
 
@@ -365,6 +368,8 @@ class SglFa3PagedDecodeAttentionProvider(DecodeAttentionProvider):
         spec: DecodeAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
+        if spec.kv_storage_format != "dense":
+            return SupportResult.unsupported("requires dense KV storage")
         if spec.may_use_full_layer_kivi_int4:
             return SupportResult.unsupported(
                 "does not support mixed dense and full-layer KIVI int4 storage"
@@ -523,6 +528,8 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
         spec: DecodeAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
+        if spec.kv_storage_format != "dense":
+            return SupportResult.unsupported("requires dense KV storage")
         if spec.may_use_full_layer_kivi_int4:
             return SupportResult.unsupported(
                 "does not support mixed dense and full-layer KIVI int4 storage"
@@ -778,6 +785,8 @@ class TritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
     ) -> SupportResult:
         if spec.cuda_graph:
             return SupportResult.unsupported("split count depends on context length")
+        if spec.kv_storage_format != "dense":
+            return SupportResult.unsupported("requires dense KV storage")
         return match_attention_capabilities(
             spec.kernel_request,
             caps,
@@ -923,6 +932,8 @@ class FixedGridTritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
     def supports(
         cls, spec: DecodeAttentionOpSpec, caps: DeviceCaps
     ) -> SupportResult:
+        if spec.kv_storage_format != "dense":
+            return SupportResult.unsupported("requires dense KV storage")
         if not spec.cuda_graph:
             return SupportResult.unsupported("reserved for CUDA Graph")
         if spec.may_use_full_layer_kivi_int4:
@@ -1196,6 +1207,8 @@ class DeltaKVFixedGridDecodeAttentionProvider(DecodeAttentionProvider):
     ) -> SupportResult:
         if not spec.cuda_graph:
             return SupportResult.unsupported("reserved for CUDA Graph")
+        if spec.kv_storage_format != "dense":
+            return SupportResult.unsupported("does not support standalone quantized pages")
         if not spec.may_use_full_layer_kivi_int4:
             return SupportResult.unsupported(
                 "reserved for mixed dense and full-layer KIVI int4 storage"
@@ -1433,6 +1446,75 @@ class DeltaKVFixedGridDecodeAttentionProvider(DecodeAttentionProvider):
             num_stages=plan.stage2_num_stages,
         )
         return output
+
+
+@DECODE_ATTENTION_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
+class QuantizedPagesDecodeAttentionProvider(DecodeAttentionProvider):
+    name = "triton_quantized_pages_decode"
+    supports_decode_graph = True
+
+    @classmethod
+    def supports(cls, spec, caps):
+        if spec.kv_storage_format == "dense":
+            return SupportResult.unsupported("requires quantized page storage")
+        if caps.platform is not PlatformEnum.CUDA or not caps.supports_triton:
+            return SupportResult.unsupported("requires CUDA and Triton")
+        if spec.kv_storage_format == "fp8_kv" and not caps.supports_native_fp8:
+            return SupportResult.unsupported("E4M3 KV storage requires native FP8 conversion support")
+        if spec.may_require_attention_scores or spec.may_use_full_layer_kivi_int4:
+            return SupportResult.unsupported("requires score-free quantized page decode")
+        if spec.head_dim not in {64, 128, 256} or spec.activation_dtype not in {torch.float16, torch.bfloat16}:
+            return SupportResult.unsupported("requires head_dim 64/128/256 and FP16/BF16 queries")
+        if spec.page_size != 1 or spec.context_capacity is None:
+            return SupportResult.unsupported("requires token slot maps and a bounded context capacity")
+        return SupportResult.yes()
+
+    def prepare(self, spec, *, device_index=None):
+        device = torch.device("cuda", int(device_index or 0))
+        splits = math.ceil(spec.context_capacity / 128)
+        self.mid_o = torch.empty(spec.max_batch_size * spec.num_query_heads * splits * spec.head_dim,
+                                 dtype=torch.float32, device=device)
+        self.mid_lse = torch.empty(spec.max_batch_size * spec.num_query_heads * splits,
+                                   dtype=torch.float32, device=device)
+        self.output = torch.empty(spec.max_batch_size, spec.num_query_heads, spec.head_dim,
+                                   dtype=spec.activation_dtype, device=device)
+        self.output_lse = torch.empty(spec.num_query_heads * spec.max_batch_size,
+                                       dtype=torch.float32, device=device)
+
+    def run(self, spec, q, view, **kwargs):
+        from sparsevllm.engine.cache_manager.storage.quantized_kv import QuantizedKVPayload
+        from sparsevllm.kernels.triton.quantized_kv import quantized_decode
+
+        kwargs.pop("decode_launch_op", None)
+        if kwargs:
+            raise TypeError(f"Unexpected quantized decode arguments: {sorted(kwargs)}.")
+        payload = view.payload
+        if not isinstance(payload, QuantizedKVPayload) or payload.format != spec.kv_storage_format:
+            raise TypeError("Quantized decode payload does not match the prepared storage contract.")
+        if view.meta.attn_score is not None:
+            raise ValueError("Quantized decode does not produce attention scores.")
+        batch, heads, dim = q.shape
+        if (heads, dim) != (spec.num_query_heads, spec.head_dim) or q.dtype != spec.activation_dtype:
+            raise ValueError("Quantized decode query differs from its prepared shape/dtype.")
+        length = view.meta.max_context_len
+        if length is None or not 0 < length <= spec.context_capacity or batch > spec.max_batch_size:
+            raise ValueError("Quantized decode exceeds its prepared batch/context capacity.")
+        # Graph topology depends only on the prepared capacity, never live length.
+        splits = math.ceil((spec.context_capacity if spec.cuda_graph else length) / 128)
+        mid_o = self.mid_o[:batch * heads * splits * dim].view(batch, heads, splits, dim)
+        mid_lse = self.mid_lse[:batch * heads * splits].view(batch, heads, splits)
+        query = q if payload.rotation is None else (q.float() @ payload.rotation).to(q.dtype)
+        output = quantized_decode(query, payload, view.meta.active_slots, view.meta.req_indices,
+                                  view.meta.context_lens, mid_o, mid_lse, softmax_scale=spec.softmax_scale,
+                                  output=self.output[:batch], output_lse=self.output_lse[:heads * batch].view(heads, batch))
+        return output if payload.rotation is None else (output.float() @ payload.rotation.T).to(q.dtype)
+
+    def close(self):
+        self.mid_o = self.mid_lse = self.output = self.output_lse = None
+
+    def binding_metadata(self):
+        return {"implementation_kind": "atomic_provider", "implementation_source": "repo_triton",
+                "kernel_path": "quantized_kv", "workspace_owner": "provider"}
 
 
 class PreparedDecodeAttentionOp:

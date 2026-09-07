@@ -24,7 +24,7 @@ class PrefixCacheConfig:
 class DecodeCudaGraphConfig:
     """Decode CUDA Graph capture and compatibility settings."""
 
-    decode_graph: bool = False
+    decode_graph: bool = True
     decode_graph_capture_sampling: bool = False
     decode_graph_capture_sizes: str | int | list[int] | tuple[int, ...] | None = "auto"
     decode_graph_startup_capture: bool | None = None
@@ -110,6 +110,14 @@ class PrefillSparseMethodConfig:
     flashprefill_v2_last_query_blocks: int = 8
     flashprefill_v2_min_sparse_q_len: int = 4096
     flashprefill_v2_use_mean_correction: bool = True
+
+
+@dataclass(kw_only=True)
+class KVQuantConfig:
+    kv_quant_page_size: int = 32
+    kivi_bits: int = 4
+    turboquant_bits: int = 4
+    turboquant_seed: int = 0
 
 
 @dataclass(kw_only=True)

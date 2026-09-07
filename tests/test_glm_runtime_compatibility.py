@@ -151,7 +151,7 @@ def test_glm_config_defaults_to_larger_sparse_startup_capture_budget():
 
 def test_glm_config_rejects_startup_capture_without_cuda_graph():
     with pytest.raises(ValueError, match="requires decode_graph=True"):
-        _glm_config(decode_graph_startup_capture=True)
+        _glm_config(decode_graph=False, decode_graph_startup_capture=True)
 
 
 def test_glm_config_rejects_disabling_sparse_startup_capture():

@@ -5,6 +5,7 @@ from torch import nn
 
 from sparsevllm.method_registry import (
     normalize_sparse_method,
+    QUANTIZED_KV_METHODS,
     resolve_cache_sparse_method,
     resolve_prefill_sparse_method,
     resolve_sparse_prefill_score_mode,
@@ -192,6 +193,7 @@ def build_mha_decode_attention_spec(
         normalized_method
     )
     return DecodeAttentionOpSpec(
+        kv_storage_format=cache_method if cache_method in QUANTIZED_KV_METHODS else "dense",
         num_query_heads=query_heads,
         num_kv_heads=kv_heads,
         head_dim=head_dim,

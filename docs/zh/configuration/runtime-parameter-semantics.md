@@ -23,7 +23,7 @@ Sparse-vLLM 只有一个推理后端：`src/sparsevllm/` 下的原生引擎。
 | `deltakv_latent_quant_bits` | Latent state 量化位数。 |
 | `deltakv_latent_quant_group_size` | Latent 量化 group size。 |
 | `gpu_memory_utilization` | 引擎可使用的 GPU 显存比例。 |
-| `decode_graph` | 启用 decode CUDA Graph。 |
+| `decode_graph` | 启用 decode CUDA Graph，默认 `True`。需要 eager 执行或方法不支持 CUDA Graph 时，显式设置 `False`。 |
 
 `full_attention_layers=auto` 会对模型路径或仓库名的最后一段做不区分大小写的
 精确匹配，并识别 `models--org--model/snapshots/...` 形式的 Hugging Face cache

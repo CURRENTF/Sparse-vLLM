@@ -382,6 +382,9 @@ def test_qwen35_moe_skips_single_rank_output_packing():
 
 
 class _ResidentAdmissionCache:
+    def prefill_private_slots_for(self, seq):
+        return 0
+
     def __init__(self):
         self.num_free_slots = 1_000_000
         self.freed_seq_ids = []

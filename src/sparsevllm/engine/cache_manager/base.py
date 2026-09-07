@@ -442,6 +442,12 @@ class CacheManager(ABC):
         )
         if sparse_method not in SUPPORTED_SPARSE_METHODS:
             raise ValueError(f"Unsupported sparse_method={sparse_method!r}.")
+        from sparsevllm.method_registry import QUANTIZED_KV_METHODS
+
+        if sparse_method in QUANTIZED_KV_METHODS:
+            from .quantized import QuantizedCacheManager
+
+            return create_manager(QuantizedCacheManager)
         if sparse_method == "deltakv":
             from .deltakv_runtime import DeltaKVCacheManager
 
@@ -1570,6 +1576,10 @@ class CacheManager(ABC):
     def prefill_step_free_slots_for(self, seq: Sequence) -> int:
         """Writable KV capacity for a specific prefill candidate."""
         return int(self.prefill_step_free_slots())
+
+    def prefill_private_slots_for(self, seq: Sequence) -> int:
+        """Writable tokens already owned by this request, outside the shared budget."""
+        return 0
 
     def min_final_prefill_chunk_size(self, seq: Sequence) -> int:
         """Minimum final chunk size required by method-specific prefill logic."""

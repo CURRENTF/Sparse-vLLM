@@ -34,6 +34,8 @@ METHOD_ALIASES = {
     "deltakv_less_memory_cudagraph": "deltakv",
 }
 
+QUANTIZED_KV_METHODS = frozenset({"kivi", "turboquant", "fp8_kv"})
+
 CANONICAL_SPARSE_METHODS = {
     "",
     "streamingllm",
@@ -45,6 +47,7 @@ CANONICAL_SPARSE_METHODS = {
     "rkv",
     "skipkv",
     "deltakv",
+    *QUANTIZED_KV_METHODS,
 }
 
 SUPPORTED_SPARSE_METHODS = set(CANONICAL_SPARSE_METHODS)
@@ -186,6 +189,7 @@ _PREFILL_POSTHOC_SCORE_METHODS = frozenset(
 # shared table, and QuEST does not apply its query-aware page selection until
 # decode. SnapKV-family managers and DeltaKV own per-layer physical tables.
 _PREFILL_LAYER_VARYING_PAGE_TABLE = {
+    **dict.fromkeys(QUANTIZED_KV_METHODS, False),
     "": False,
     "streamingllm": True,
     "snapkv": True,
@@ -329,27 +333,25 @@ DENSE_MODEL_COMPATIBILITY = ModelRuntimeCompatibility(
 )
 
 QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
-    sparse_methods=_MOE_SPARSE_METHODS,
+    sparse_methods=_MOE_SPARSE_METHODS | QUANTIZED_KV_METHODS,
     prefix_cache_methods=frozenset(
         {"", "omnikv", "quest", "snapkv", "h2o", "pyramidkv", "rkv"}
     ),
-    decode_graph_methods=_MOE_SPARSE_METHODS,
+    decode_graph_methods=_MOE_SPARSE_METHODS | QUANTIZED_KV_METHODS,
 )
 
 QWEN3_MOE_TP_EP_COMPATIBILITY = ModelRuntimeCompatibility(
-    sparse_methods=_MOE_SPARSE_METHODS,
+    sparse_methods=_MOE_SPARSE_METHODS | QUANTIZED_KV_METHODS,
     prefix_cache_methods=frozenset({"", "snapkv"}),
-    decode_graph_methods=_MOE_SPARSE_METHODS,
+    decode_graph_methods=_MOE_SPARSE_METHODS | QUANTIZED_KV_METHODS,
 )
 
 QWEN3_MOE_TP_COMPATIBILITY = QWEN3_MOE_TP_EP_COMPATIBILITY
 
 QWEN35_MOE_COMPATIBILITY = ModelRuntimeCompatibility(
-    sparse_methods=QWEN3_MOE_TP_EP_COMPATIBILITY.sparse_methods,
+    sparse_methods=_MOE_SPARSE_METHODS,
     prefix_cache_methods=frozenset({""}),
-    decode_graph_methods=(
-        QWEN3_MOE_TP_EP_COMPATIBILITY.decode_graph_methods
-    ),
+    decode_graph_methods=_MOE_SPARSE_METHODS,
 )
 
 MINIMAX_M2_EP_COMPATIBILITY = ModelRuntimeCompatibility(
@@ -401,9 +403,9 @@ MODEL_RUNTIME_COMPATIBILITY = {
     ("gemma4", ParallelMode.OUTER_TP_MOE): GEMMA4_COMPATIBILITY,
 }
 
-# All shipped cache managers now expose a graph-stable decode preparation path.
 DECODE_CUDA_GRAPH_SUPPORTED_METHODS = set(CANONICAL_SPARSE_METHODS)
 TP_DECODE_CUDA_GRAPH_SUPPORTED_METHODS = {
+    *QUANTIZED_KV_METHODS,
     "",
     "streamingllm",
     "snapkv",
@@ -445,6 +447,7 @@ def decode_graph_path_id(method: str, is_long_text: bool) -> str:
 
 
 _DEFAULT_PREFILL_POLICY_BY_METHOD = {
+    **dict.fromkeys(QUANTIZED_KV_METHODS, PREFILL_POLICY_ALL_CHUNKED),
     "": PREFILL_POLICY_ALL_CHUNKED,
     "streamingllm": PREFILL_POLICY_ALL_CHUNKED,
     "snapkv": PREFILL_POLICY_ALL_CHUNKED,

@@ -6,4 +6,5 @@
 - [核心稀疏方法](sparse-methods.md)
 - [FlashPrefill V2](flashprefill-v2.md)
 - [DeltaKV](deltakv.md)
+- [KV cache 量化压缩](quantized-kv.md)
 - [Tiny Random 调试模式](tiny-random-debug.md)

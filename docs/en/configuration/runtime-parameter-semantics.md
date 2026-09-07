@@ -24,7 +24,7 @@ Use semantic public names in commands, JSON configs, and benchmark manifests:
 | `deltakv_latent_quant_bits` | Quantization bits for latent state. |
 | `deltakv_latent_quant_group_size` | Latent quantization group size. |
 | `gpu_memory_utilization` | Fraction of GPU memory available to the engine. |
-| `decode_graph` | Enable decode CUDA Graph execution. |
+| `decode_graph` | Enable decode CUDA Graph execution (default: `True`). Set `False` for eager execution, including methods that do not support CUDA Graph. |
 
 The `auto` full-layer matcher compares the final model path/repository segment
 case-insensitively and also recognizes Hugging Face cache paths such as

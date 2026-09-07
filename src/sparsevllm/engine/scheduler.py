@@ -238,7 +238,7 @@ class Scheduler:
         if target_mode == PREFILL_EXECUTION_RAW_OFFLOAD:
             return not scheduled_seqs and step_free_count > 0
         return (
-            step_free_count > 0
+            (step_free_count > 0 or any(self.memory_oracle.prefill_private_slots_for(seq) > 0 for seq in self.waiting))
             and num_batched_tokens <= self.max_num_batched_tokens - margin_batched_tokens
             and num_batched_seqs < self.max_num_seqs_in_batch
         )
@@ -484,7 +484,10 @@ class Scheduler:
                     target_mode != PREFILL_EXECUTION_RAW_OFFLOAD
                     and not uses_full_prefill_staging
                 ):
-                    candidate_step_free_count = min(int(step_free_count), int(candidate_step_free_count))
+                    candidate_step_free_count = min(
+                        int(step_free_count) + self.memory_oracle.prefill_private_slots_for(seq),
+                        int(candidate_step_free_count),
+                    )
 
                 # 异常处理：如果由于某种原因已经 prefill 完却还在 waiting 队列
                 if remaining_prefill_tokens <= 0:
