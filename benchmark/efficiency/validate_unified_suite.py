@@ -5,9 +5,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from benchmark.efficiency.metrics import REQUEST_METRIC_CONTRACT
 
 SYSTEM_PROTOCOLS = {
     "svllm-vanilla": ("sparsevllm", "vanilla"),
@@ -275,6 +281,11 @@ def _validate_synthetic_rows(
             f"expected={sorted(expected_scenarios)}"
         )
     for index, row in enumerate(rows):
+        if row.get("request_metric_contract") != REQUEST_METRIC_CONTRACT:
+            errors.append(
+                f"request metric contract mismatch in {system}[{index}]; "
+                "reaggregate request artifacts or rerun before comparing"
+            )
         if row.get("status") != "success":
             errors.append(f"failed synthetic row {system}[{index}]: {row}")
             continue

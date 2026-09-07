@@ -20,6 +20,7 @@ REPO_ROOT_FOR_IMPORT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT_FOR_IMPORT))
 sys.path.insert(0, str(REPO_ROOT_FOR_IMPORT / "src"))
 
+from benchmark.efficiency.metrics import percentile
 
 CASE_PRESETS: dict[str, dict[str, Any]] = {
     "baseline_full": {
@@ -327,12 +328,10 @@ def _multiturn_reusable_prefix_len(
 
 
 def _percentile(values: list[float], pct: float) -> float:
+    # Failed/empty cache cases retain their legacy empty-summary representation.
     if not values:
         return 0.0
-    sorted_values = sorted(values)
-    idx = int(round((len(sorted_values) - 1) * pct))
-    idx = max(0, min(idx, len(sorted_values) - 1))
-    return float(sorted_values[idx])
+    return percentile(values, pct)
 
 
 def _mean(values: list[float]) -> float:
@@ -1256,6 +1255,7 @@ def _summarize_records(
         "mean_ttft_ms": _mean(ttfts) * 1000.0,
         "median_ttft_ms": _percentile(ttfts, 0.50) * 1000.0,
         "p90_ttft_ms": _percentile(ttfts, 0.90) * 1000.0,
+        "p95_ttft_ms": _percentile(ttfts, 0.95) * 1000.0,
         "p99_ttft_ms": _percentile(ttfts, 0.99) * 1000.0,
         "mean_latency_ms": _mean(latencies) * 1000.0,
         "p90_latency_ms": _percentile(latencies, 0.90) * 1000.0,

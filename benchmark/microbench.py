@@ -18,6 +18,7 @@ src_path = str(REPO_ROOT / "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
+from benchmark.efficiency.metrics import stage_throughput
 from sparsevllm.method_registry import (
     CANONICAL_SPARSE_METHODS,
     PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
@@ -339,7 +340,7 @@ def _write_output_dir(args, rows: list[dict[str, Any]]) -> None:
         f"- Batch sizes: `{args.batch_sizes}`",
         f"- Output length: `{args.output_len}`",
         "",
-        "| Method | Prompt tokens | Batch | Status | TTFT s | Prefill tok/s | Decode tok/s | Peak GB | Decode speedup |",
+        "| Method | Prompt tokens | Batch | Status | First observed token s | Prefill step tok/s | Decode step tok/s | Peak GB | Decode speedup |",
         "| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for record in records:
@@ -723,12 +724,12 @@ def benchmark_task(method, length, bs, args, results_dict):
         prefill_s = sum(prefill_times)
         decode_s = sum(decode_times)
 
-        prefill_tp = prefill_tokens / prefill_s if prefill_s > 0 else 0
+        prefill_tp = stage_throughput(prefill_tokens, prefill_s)
         used_full_admission_window = bool(decode_times_after_full)
         decode_s_effective = sum(decode_times_after_full) if used_full_admission_window else decode_s
         decode_tokens_effective = decode_tokens_after_full if used_full_admission_window else decode_tokens
-        decode_tp = decode_tokens_effective / decode_s_effective if decode_s_effective > 0 else 0
-        # ITL (Inter-token Latency) 是用户感知的生成速度：总解码时间 / 单序列平均生成的 token 数
+        decode_tp = stage_throughput(decode_tokens_effective, decode_s_effective)
+        # Legacy ITL alias: a batch-derived execution proxy, not request TPOT.
         avg_itl = (decode_s_effective / (decode_tokens_effective / bs) * 1000) if decode_tokens_effective > 0 else 0
         avg_active_bs = (
             sum(decode_bs_after_full) / len(decode_bs_after_full)
@@ -744,15 +745,27 @@ def benchmark_task(method, length, bs, args, results_dict):
             if staged_admission
             else ""
         )
-        print(f"[{method.upper()}] TTFT: {ttft:.2f}s | Prefill: {prefill_tp:.2f} tok/s | Decode: {decode_tp:.2f} tok/s | ITL: {avg_itl:.2f}ms | AvgBS: {avg_active_bs:.1f} | Mem: {peak_mem:.2f} GB{stage_mode}")
+        print(f"[{method.upper()}] First observed token: {ttft:.2f}s | Prefill step: {prefill_tp or 0.0:.2f} tok/s | Decode step: {decode_tp or 0.0:.2f} tok/s | Decode execution proxy: {avg_itl:.2f}ms | AvgBS: {avg_active_bs:.1f} | Mem: {peak_mem:.2f} GB{stage_mode}")
         
         results_dict[(method, length, bs)] = {
             "method": method,
             "sparse_method": normalized_method,
             "length": int(length),
             "batch_size": int(bs),
-            "prefill_tp": prefill_tp,
-            "decode_tp": decode_tp,
+            "prefill_tp": prefill_tp or 0.0,
+            "decode_tp": decode_tp or 0.0,
+            "stage_metrics_status": "success" if synchronize_step_timing else "not_measured",
+            "stage_timing_scope": "sum_synchronized_llm_steps" if synchronize_step_timing else "unsynchronized_host_steps",
+            "prefill_stage_elapsed_s": prefill_s if synchronize_step_timing else None,
+            "decode_stage_elapsed_s": decode_s_effective if synchronize_step_timing else None,
+            "prefill_computed_tokens": prefill_tokens,
+            "logical_input_tokens": bs * length,
+            "decode_stage_tokens": decode_tokens_effective,
+            "prefill_stage_throughput_tps": prefill_tp if synchronize_step_timing else None,
+            "decode_stage_throughput_tps": decode_tp if synchronize_step_timing else None,
+            "request_metrics_status": "not_measured",
+            "ttft_timing_scope": "batch_start_to_first_observed_token",
+            "itl_timing_scope": "batch_scaled_decode_execution_proxy",
             "ttft": ttft,
             "itl": avg_itl,
             "avg_bs": avg_active_bs,
@@ -860,13 +873,13 @@ def main():
         "--decode_warmup_steps_after_full",
         type=int,
         default=0,
-        help="Discard this many initial full-admission decode steps from throughput and ITL metrics.",
+        help="Discard this many initial full-admission decode steps from stage throughput and execution-proxy metrics.",
     )
     parser.add_argument(
         "--synchronize_step_timing",
         action="store_true",
         help=(
-            "Synchronize CUDA after each llm.step() before measuring its duration, "
+            "Opt-in stage diagnostic: synchronize CUDA after each llm.step() before measuring its duration, "
             "so post-sparse work is attributed to the step that launched it."
         ),
     )
@@ -935,7 +948,7 @@ def main():
 
     # 打印最终报表
     print(f"\n\n{'='*140}")
-    print(f"{ 'Method':<12} {'Len':<8} {'BS':<4} {'TTFT(s)':<10} {'PreTP':<12} {'DecTP':<12} {'ITL(ms)':<10} {'AvgBS':<8} {'Mem(GB)':<10} {'Speedup'}")
+    print(f"{ 'Method':<12} {'Len':<8} {'BS':<4} {'First(s)':<10} {'PreStepTP':<12} {'DecStepTP':<12} {'Proxy(ms)':<10} {'AvgBS':<8} {'Mem(GB)':<10} {'Speedup'}")
     print("-" * 140)
     
     # 获取 Vanilla 作为基准计算加速比 (按 length 和 BS 匹配)

@@ -240,38 +240,56 @@ run_efficiency_probe.sh SYSTEMS MODEL_NAME_OR_PATH PHYSICAL_GPU_IDS
 
 ## 指标与解释
 
-- Request throughput 按完整实测 workload 的耗时计算。Prefill token throughput
-  使用全部 prompt token 数除以“提交请求到最后一个请求产出首 token”的 wall-time
-  窗口。首个生成 token 由 prefill 产生，因此
-  `batch_decode_token_throughput_tps` 排除每个请求的首个生成 token，并用剩余生成
-  token 数除以“最早首 token 到最后完成”的 wall-time 窗口。旧字段
-  `decode_token_throughput_tps` 是数值相同的兼容别名。Churn workload 中
-  prefill/decode 交错执行，这两个阶段窗口可能重叠。当 `output_len=1` 时，probe
-  仍报告 TTFT 和 prefill throughput；decode throughput 和 TPOT 标记为
-  `skipped_by_policy`。
-- GPU compute activity 和 memory I/O activity 直接来自 `nvidia-smi` 采样，不是
-  理论 MFU/MBU、achieved FLOP/s 或 achieved HBM GB/s。
-- Coarse active duty 是 GPU utilization 大于 10% 的采样比例。它的补集不能把
-  idle time 归因到 CPU scheduling 或 kernel launch。
-- TTFT 和 TPOT 是端到端请求 wall-clock 指标，包含 host scheduling、同步和
-  engine overhead。两个 engine 都先对每个请求计算
-  `(完成时间 - 首 token 时间) / (生成 token 数 - 1)`，再对请求取平均。固定 batch
-  额外报告 `tpot_concurrency_proxy_tps = concurrency * 1000 / tpot_ms_mean`；在并发
-  匹配时，它的 speedup 与 TPOT speedup 代数等价，但它不是观测到的 batch
-  throughput。请求错峰进入 decode 或存在尾部偏斜时，观测到的 batch decode-window
-  throughput 可以与 TPOT proxy 不同，因此只能与另一个 engine 的同口径 batch-window
-  指标比较。
-- Churn 指标将 oversubscribed workload 与匹配的 fixed-batch setting 比较，包括
-  throughput ratio 和 tail-TTFT 变化。
+统计统一由 `benchmark/efficiency/metrics.py` 实现。Probe 的 fixed-batch 与
+churn 均合并实测逐请求样本，报告 TTFT、TPOT 的 mean/P50/P95/P99。
+旧的每批最大 TTFT 均值单独命名为 `batch_max_ttft_ms_mean`。
+请求统计契约为 `per_request_distribution_v3`，不能与旧聚合结果直接比较。
 
-只有模型 checkpoint、benchmark trace/metric contract、engine config、TP、seed、
-长度、scheduler token budget、warmup 和 iteration count 一致时，才能把结果视为
-matched comparison。
+- TTFT 从请求到达观测点计到首 token；TPOT 对输出多于一个 token 的请求计算
+  `(完成时间 - 首 token 时间) / (生成 token 数 - 1)`。不扣除调度等待或其他
+  请求的 prefill 阻塞。单 token 请求的 TPOT 为 null。
+- Sparse-vLLM 记录请求提交与 step 返回可见 token 的事件，不额外逐 step CUDA
+  同步。timing_source 为 `sparsevllm_step_token_publication_no_extra_sync_v1`，
+  不应与旧的逐 step 同步观测混比。vLLM 使用内部
+  metrics，其 legacy finished_time 与 V1 last_token_ts 边界分别记录在
+  timing_source 中。这些是引擎观测指标，不包含 HTTP 客户端网络链路。
+- Probe 不采集独立阶段时间，`stage_metrics_status=not_measured`。
+  `first_token_window_throughput_tps` 是输入 token / 首 token 事件窗口；
+  `batch_decode_token_throughput_tps` 是后续输出 token / 最早首 token 至最后
+  完成的窗口。窗口可重叠，不能称为纯 prefill/decode 阶段吞吐。
+  旧字段 `prefill_token_throughput_tps`、`decode_token_throughput_tps`
+  仅保留为兼容别名。
+- `output_token_throughput_tps` 使用全部输出 token / 完整实测 workload 时间；
+  跨 iteration 汇总按总 token / 总时间计算。它是 E2E 输出吞吐。
+  `tpot_concurrency_proxy_tps` 是 concurrency × 1000 / mean request TPOT，
+  仅为代数代理，不是观测吞吐。
+- 独立阶段诊断使用 `benchmark/microbench.py --synchronize_step_timing`。
+  逐 step 同步必须显式开启，不用于请求延迟测量；未开启时阶段吞吐为 null，
+  stage_metrics_status 为 not_measured。开启后，
+  `prefill_stage_throughput_tps` 与 `decode_stage_throughput_tps` 分别使用
+  对应实际 token 工作量 / 对应累计 step 时间，包含完整 llm.step 的工作。
+  查看 logical_input_tokens 与 prefill_computed_tokens 区分逻辑输入和计算量；
+  decode_stage_tokens 排除 prefill 产生的首 token。阶段时间不含 step 之间的
+  测试驱动代码。分批 admission、warmup 舍弃、截断的窗口设置随结果保存。
+  旧 ttft 是批次首次观测，旧 itl 是执行时间代理，不能作为请求指标。
+- GPU compute activity 和 memory I/O activity 来自 nvidia-smi 采样，不是
+  理论 MFU/MBU。Coarse active duty 也不能用于归因 CPU/launch 开销。
 
-成功的 vLLM sweep 应作为不可变 baseline artifact 保存。后续 Sparse-vLLM
-改动直接复用该 baseline，不要每次重跑 vLLM。只有 GPU 型号、checkpoint、TP、
-request trace、scheduler budget、graph/backend policy 或 metric contract 变化时才
-生成新 baseline；package 版本只记录 provenance，不能静默覆盖旧 baseline。
+可在仓库根目录对已有逐请求 artifact 重新统计，无需 GPU：
+
+```bash
+python3 benchmark/efficiency/metrics.py "<RUN_DIR>/request_samples.jsonl"
+```
+
+命令向 stdout 输出 JSON，按 engine、方法、场景、长度、并发度与 timing_source
+分组，并跨 iteration 合并请求。输入缺字段、失败样本或无效指标会明确报错；
+不会覆盖原 artifact。旧 churn artifact 若缺少 timing_source，需要先核实其
+观测边界，不能静默猜测。仅保留 batch 聚合的旧结果无法恢复请求分位数。
+
+Matched comparison 必须匹配 checkpoint、trace、metric contract、engine config、
+TP、seed、长度、scheduler budget、warmup 和 iteration count。成功的 vLLM
+baseline 应保存为不可变 artifact；上述契约或硬件、graph/backend policy 变化时
+生成新 baseline，不要覆盖旧数据。
 
 ## Artifact 与验证
 

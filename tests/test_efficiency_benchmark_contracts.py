@@ -335,7 +335,7 @@ def test_vllm_phase_metrics_average_per_request_tpot():
 
     ttft_ms, tpot_ms = _vllm_phase_metrics(outputs, 4)
 
-    assert ttft_ms == pytest.approx(300.0)
+    assert ttft_ms == pytest.approx(250.0)
     assert tpot_ms == pytest.approx(125.0)
 
 
@@ -358,7 +358,7 @@ def test_request_tpot_and_batch_decode_window_use_explicit_matched_scopes():
         generated_counts={11: 4, 12: 4},
     )
 
-    assert request_metrics["ttft_ms"] == pytest.approx(300.0)
+    assert request_metrics["ttft_ms"] == pytest.approx(250.0)
     assert request_metrics["tpot_ms"] == pytest.approx(125.0)
     assert request_metrics["prefill_elapsed_s"] == pytest.approx(0.3)
     assert request_metrics["decode_elapsed_s"] == pytest.approx(0.6)
@@ -874,6 +874,7 @@ def _write_valid_suite_fixture(root: Path, systems: list[str]) -> None:
                     "sample_count": 2,
                 }
                 fixed = {
+                    "request_metric_contract": bench_probe.REQUEST_METRIC_CONTRACT,
                     "status": "success",
                     "scenario": "fixed_batch",
                     "prompt_len": 100,

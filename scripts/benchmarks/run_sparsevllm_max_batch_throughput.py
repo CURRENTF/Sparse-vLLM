@@ -166,7 +166,7 @@ def _run_probe(args: argparse.Namespace, run_root: Path, probe: Probe, gpu: int)
     cmd = [
         sys.executable,
         "-u",
-        "scripts/benchmarks/bench_sparse_vllm.py",
+        "benchmark/microbench.py",
         "--model_path",
         args.model_path,
         "--lengths",

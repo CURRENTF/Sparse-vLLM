@@ -254,43 +254,63 @@ benchmark mode in this entrypoint.
 
 ## Metrics and Interpretation
 
-- Request throughput is computed over the complete measured workload. Prefill
-  token throughput divides all prompt tokens by the wall-time window from
-  submission through the last first token. `batch_decode_token_throughput_tps`
-  excludes each request's first generated token (which is produced by prefill)
-  and divides the remaining generated tokens by the wall-time window from the
-  earliest first token through the latest completion. The legacy
-  `decode_token_throughput_tps` field is an equal-valued compatibility alias.
-  In churn workloads these phase windows can overlap because prefill and decode
-  are interleaved. With `output_len=1`, the probe still reports TTFT and prefill
-  throughput; decode throughput and TPOT are `skipped_by_policy`.
-- GPU compute activity and memory I/O activity are directly sampled from
-  `nvidia-smi`. They are not theoretical MFU/MBU, achieved FLOP/s, or achieved
-  HBM GB/s.
-- Coarse active duty is the fraction of samples above 10% GPU utilization. Its
-  complement cannot attribute idle time to CPU scheduling or kernel launches.
-- TTFT and TPOT are end-to-end request wall-clock metrics and include host
-  scheduling, synchronization, and engine overhead. Both engines compute TPOT
-  per request as `(completion - first_token) / (generated_tokens - 1)`, then
-  average requests. For fixed batches,
-  `tpot_concurrency_proxy_tps = concurrency * 1000 / tpot_ms_mean`; its speedup
-  is algebraically identical to TPOT speedup at matched concurrency. This proxy
-  is not observed batch throughput. The observed batch decode-window throughput
-  can differ when requests enter decode at different times or finish with tail
-  skew, so compare it only with the same batch-window metric from the other
-  engine.
-- Churn metrics compare the oversubscribed workload with its matched fixed-batch
-  setting, including throughput ratio and tail-TTFT change.
+All statistics live in `benchmark/efficiency/metrics.py`. Fixed-batch and churn
+probe summaries pool individual measured requests across iterations and report
+TTFT/TPOT mean/P50/P95/P99. The historical mean of batch maxima is separately
+named `batch_max_ttft_ms_mean`. The request contract is
+`per_request_distribution_v3`; old aggregate results are not directly comparable.
 
-Use the same model checkpoint, benchmark trace/metric contract, engine
-configuration, TP, seed, lengths, scheduler token budget, warmups, and
-iteration count before treating rows as matched.
+- TTFT measures arrival to first token. TPOT is (finish - first) / (output tokens
+  - 1), only for requests with more than one output token. Scheduling waits and
+  intervening prefill remain included. Single-token TPOT is null.
+- Sparse-vLLM observes request submission and token publication at step return,
+  without extra per-step CUDA synchronization. The timing_source is
+  `sparsevllm_step_token_publication_no_extra_sync_v1`; do not mix it with older
+  synchronized observations. vLLM uses internal metrics, with legacy finished_time or V1
+  last_token_ts identified by timing_source. These are engine observations,
+  not HTTP client latencies; compare matching observation boundaries.
+- Probe does not measure execution stages: `stage_metrics_status=not_measured`.
+  `first_token_window_throughput_tps` divides input tokens by the first-token
+  event window; `batch_decode_token_throughput_tps` divides subsequent output
+  tokens by earliest first token to latest completion. These windows may overlap
+  and are not pure prefill/decode throughput. Old fields
+  `prefill_token_throughput_tps` and `decode_token_throughput_tps` remain
+  compatibility aliases only.
+- `output_token_throughput_tps` is all output tokens / complete workload time;
+  aggregation uses total tokens / total measured time across iterations. It is
+  E2E output throughput. `tpot_concurrency_proxy_tps` is concurrency × 1000 /
+  mean request TPOT, an algebraic proxy, not observed throughput.
+- Use `benchmark/microbench.py --synchronize_step_timing` for execution-stage
+  diagnostics. Step synchronization is opt-in, not the request latency protocol.
+  Without it, stage rates are null and stage_metrics_status is not_measured.
+  With it, `prefill_stage_throughput_tps` and
+  `decode_stage_throughput_tps` divide actual stage token work by summed stage
+  step durations, including all llm.step work. Driver work between steps is
+  excluded. logical_input_tokens and prefill_computed_tokens distinguish logical
+  input from computation; decode_stage_tokens excludes prefill-produced tokens.
+  Admission, warmup-discard and truncation settings accompany the selected decode
+  window. Legacy ttft/itl are a batch observation/execution proxy, not request
+  distributions.
+- GPU compute and memory I/O activity are nvidia-smi samples, not theoretical
+  MFU/MBU. Coarse active duty cannot attribute CPU scheduling or launch overhead.
 
-A successful vLLM sweep is an immutable baseline artifact. Reuse it for later
-Sparse-vLLM candidates instead of rerunning vLLM on every code change. Create a
-new baseline only when the GPU model, checkpoint, TP, request trace, scheduler
-budget, graph/backend policy, or metric contract changes; record package
-versions for provenance without silently overwriting an older baseline.
+Reaggregate existing request artifacts from the repository root without CUDA:
+
+```bash
+python3 benchmark/efficiency/metrics.py "<RUN_DIR>/request_samples.jsonl"
+```
+
+The command prints JSON to stdout, groups by engine, method, scenario, lengths,
+concurrency and timing_source, and pools iterations. Missing fields, failed
+requests and invalid metrics fail explicitly. Original artifacts are untouched.
+Older churn artifacts lacking timing_source require verification of their
+observation boundary; do not guess it. Batch-only aggregates cannot reconstruct
+request quantiles.
+
+Matched comparisons require aligned checkpoint, trace, metric contract, engine
+config, TP, seed, lengths, scheduler budget, warmups and iteration count. Preserve
+successful vLLM baselines as immutable artifacts. A changed contract, hardware or
+graph/backend policy requires a new baseline; never overwrite the old artifact.
 
 ## Artifacts and Verification
 

@@ -37,6 +37,46 @@ Follow the runbook's matched-trace, idle-GPU, artifact-validation, and metric-
 interpretation rules. Do not treat sampled GPU activity as theoretical MFU/MBU;
 use the documented Nsight diagnostic for kernel-timeline attribution.
 
+## Benchmark Entrypoints and Shared Statistics
+
+- Use `scripts/benchmarks/run_efficiency_probe.sh` (idle-GPU checks and sweeps)
+  or `benchmark/efficiency/bench_probe.py` (explicit engine/TP configuration)
+  for request TTFT/TPOT and end-to-end throughput. Do not create another runner
+  for a new model, method, or shape; extend the existing arguments if needed.
+- All latency distributions and stage-throughput math belong in
+  `benchmark/efficiency/metrics.py`. Existing runners import it. Reaggregate
+  probe artifacts with
+  `python3 benchmark/efficiency/metrics.py <RUN_DIR>/request_samples.jsonl`.
+  This command prints JSON and does not require CUDA or overwrite old artifacts.
+- Use `benchmark/microbench.py` for separately timed prefill/decode engine
+  steps. CUDA step synchronization is opt-in via `--synchronize_step_timing`,
+  for stage diagnostics only; without it, synchronized stage rates are null.
+  Do not add per-step CUDA synchronization to request TTFT/TPOT measurements:
+  timestamp token publication events and preserve the engine's execution rhythm.
+  The old
+  `scripts/benchmarks/bench_sparse_vllm.py` command remains a compatibility
+  wrapper; new callers should use the canonical microbench path.
+- TTFT and TPOT distributions pool individual measured requests across
+  iterations, reporting mean/P50/P95/P99. TPOT is `(finish-first)/(O-1)` for
+  `O > 1`; never subtract prefill interference or scheduling waits. Declare
+  the arrival/first/finish observation boundary; engine events are not HTTP
+  client latency. Keep differing vLLM timing sources separate in comparisons.
+- Stage throughput requires actual computed token counts and separately
+  accumulated, synchronized, non-overlapping stage time, including scheduling,
+  sampling, scoring, eviction/compaction and cleanup. Exclude prefix hits from
+  computed prefill tokens and prefill-produced tokens from decode token work.
+  A selected decode window must report its admission/warmup/truncation scope.
+- Probe first-token/decode event windows are diagnostic window rates, not
+  execution-stage rates, even in fixed-batch mode. Pure stages are not measured
+  by that runner. Its old `prefill_token_throughput_tps` and
+  `decode_token_throughput_tps` fields are compatibility aliases only; prefer
+  `first_token_window_throughput_tps` and `batch_decode_token_throughput_tps`.
+  Microbench's legacy `ttft`/`itl` fields are batch observations/proxies, not
+  request distributions. Never derive stage throughput from mean TTFT or TPOT.
+- `output_token_throughput_tps` is all output tokens divided by complete
+  measured workload time. A request metric contract change invalidates old
+  aggregate comparisons; reaggregate available per-request artifacts or rerun.
+
 # Kernel Provider Policy
 
 1. Separate atomic correctness eligibility, the default portfolio, exact
