@@ -254,6 +254,16 @@ def profiling_kv_budget_bytes(config, num_slots: int) -> int:
         prefill_sparse_method=getattr(config, "prefill_sparse_method", None),
     )
     if method != "quest":
+        if method == "h2o":
+            # H2O owns one physical KV pool; a doubled byte budget allocates
+            # twice the requested profiling slots before real memory sizing.
+            int32_bytes = torch.empty((), dtype=torch.int32).element_size()
+            layers = int(layout.num_kv_layers)
+            row_mapping_bytes = (
+                layers * int(config.max_num_seqs_in_gpu)
+                * int(config.max_model_len) * int32_bytes
+            )
+            return int(num_slots * (bytes_per_slot + layers * int32_bytes) + row_mapping_bytes)
         if method in {"", "vanilla", "omnikv"}:
             int32_bytes = torch.empty((), dtype=torch.int32).element_size()
             row_mapping_bytes = (
