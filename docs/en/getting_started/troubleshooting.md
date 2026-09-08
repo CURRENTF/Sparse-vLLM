@@ -15,3 +15,25 @@ short-text batch, never both.
 The engine cannot allocate enough KV slots for the prompt or prompt chunk.
 Increase `gpu_memory_utilization`, reduce `max_model_len` or batch size, or
 reduce the keep-token budgets.
+
+## TensorRT-LLM DeepGEMM compilation cache
+
+CUDA workers use separate TensorRT-LLM DeepGEMM cache directories to avoid
+concurrent cold-compilation writes. The cache root is selected in this order:
+`SPARSEVLLM_TRTLLM_DG_CACHE_ROOT`, `TRTLLM_DG_CACHE_DIR`, then
+`${XDG_CACHE_HOME:-~/.cache}/sparsevllm/trtllm-deepgemm`. Both explicit variables
+name a root; each worker uses a unique child directory, printed at startup.
+Set the root to a writable data disk when the home filesystem is space-limited.
+
+Independent worker processes, including separate servers with the same rank,
+do not share these artifacts. This duplicates compilation and disk usage across
+processes. Sequential engines in the same process reuse its directory because
+the upstream compiler retains the first path; changing the root requires a new
+process. Set cache variables before starting the engine or using this external
+kernel directly. Direct kernel users must also avoid initializing its compiler
+before the engine configures its cache.
+
+Directories are retained after exit for diagnostics; remove unused worker
+directories only after their processes stop. Other FlashInfer and Triton caches
+are unaffected. This isolates cache writes; compiler and kernel failures still
+propagate.

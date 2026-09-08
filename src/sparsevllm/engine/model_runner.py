@@ -31,6 +31,7 @@ from sparsevllm.layers.sampler import Sampler
 from sparsevllm.kernels.external.required import (
     validate_required_cuda_kernel_families,
 )
+from sparsevllm.kernels.external.flashinfer.jit_cache import configure_trtllm_cache
 from sparsevllm.method_registry import decode_sparse_long_text_threshold
 from sparsevllm.operators import registry as operator_registry
 from sparsevllm.operators.decode_attention import (
@@ -281,6 +282,7 @@ class ModelRunner:
         event: tuple[Event, Event] | list[tuple[Event, Event]],
         tp_shm_name: str | None = None,
         master_port: int | None = None,
+        trtllm_cache_root: str | None = None,
     ):
         self.config = config
         # Inference-only engine: disable autograd graph construction globally in this process.
@@ -294,6 +296,9 @@ class ModelRunner:
         self.event = event
         self.tp_shm_name = tp_shm_name
         self.platform = platforms.current_platform
+        if self.platform.enum is platforms.PlatformEnum.CUDA:
+            cache_path = configure_trtllm_cache(rank, trtllm_cache_root)
+            logger.info("Worker {} TensorRT-LLM DeepGEMM cache: {}", rank, cache_path)
         self.platform.validate_inference()
         self.platform.init_backend()
         self.device = self.platform.get_device(rank)

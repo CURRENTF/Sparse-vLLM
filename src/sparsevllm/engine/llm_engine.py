@@ -24,6 +24,7 @@ from sparsevllm.config import Config
 from sparsevllm.kernels.external.required import (
     validate_required_cuda_kernel_metadata,
 )
+from sparsevllm.kernels.external.flashinfer.jit_cache import resolve_trtllm_cache_root
 from sparsevllm.method_registry import decode_graph_path_id
 from sparsevllm.platforms.interface import PlatformEnum
 from sparsevllm.sampling_params import SamplingParams
@@ -230,8 +231,12 @@ class LLMEngine:
             )
         config = Config(model, **config_kwargs)
         self.config = config
+        trtllm_cache_root = None
         if platforms.get_current_platform().enum is PlatformEnum.CUDA:
             validate_required_cuda_kernel_metadata()
+            # Pass the original root explicitly: later engines spawn children
+            # after rank zero has already installed its process-local env path.
+            trtllm_cache_root = str(resolve_trtllm_cache_root())
         
         # 初始化 Profiler
         profiler.set_enabled(config.enable_profiler)
@@ -248,7 +253,7 @@ class LLMEngine:
             # 为每一个非零 Rank 启动一个独立的 ModelRunner 进程
             process = ctx.Process(
                 target=ModelRunner,
-                args=(config, i, event, tp_shm_name, master_port),
+                args=(config, i, event, tp_shm_name, master_port, trtllm_cache_root),
             )
             process.start()
             self.ps.append(process)
@@ -256,7 +261,9 @@ class LLMEngine:
         
         # 3. 初始化主进程的 ModelRunner (Rank 0)
         # 注意：必须先初始化 ModelRunner 以便在本地 GPU 分配 KV Cache 账本
-        self.model_runner = ModelRunner(config, 0, self.events, tp_shm_name, master_port)
+        self.model_runner = ModelRunner(
+            config, 0, self.events, tp_shm_name, master_port, trtllm_cache_root,
+        )
         
         # 加载分词器
         self.tokenizer: Qwen2Tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)

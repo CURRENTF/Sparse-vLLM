@@ -127,7 +127,14 @@ def test_gpu_engine_validates_metadata_before_starting_workers() -> None:
     get_context.assert_not_called()
 
 
-def test_model_runner_validates_binaries_after_selecting_rank_device() -> None:
+def test_model_runner_validates_binaries_after_selecting_rank_device(monkeypatch, tmp_path) -> None:
+    import os
+    from pathlib import Path
+    from sparsevllm.kernels.external.flashinfer import jit_cache
+
+    monkeypatch.setattr(jit_cache, "_configured_cache", None)
+    monkeypatch.delenv("SPARSEVLLM_TRTLLM_DG_CACHE_ROOT", raising=False)
+    monkeypatch.setenv("TRTLLM_DG_CACHE_DIR", str(tmp_path))
     events: list[tuple[str, object]] = []
 
     class CudaPlatform:
@@ -137,6 +144,8 @@ def test_model_runner_validates_binaries_after_selecting_rank_device() -> None:
             events.append(("validate_inference", None))
 
         def init_backend(self) -> None:
+            cache = Path(os.environ["TRTLLM_DG_CACHE_DIR"])
+            assert cache.parent == tmp_path and cache.is_dir()
             events.append(("init_backend", None))
 
         def get_device(self, rank: int) -> torch.device:
@@ -146,6 +155,8 @@ def test_model_runner_validates_binaries_after_selecting_rank_device() -> None:
             events.append(("set_device", device))
 
     def validate_binaries() -> None:
+        cache = Path(os.environ["TRTLLM_DG_CACHE_DIR"])
+        assert cache.parent == tmp_path and cache.is_dir()
         events.append(("validate_binaries", None))
         raise RuntimeError("stop after binary validation")
 
