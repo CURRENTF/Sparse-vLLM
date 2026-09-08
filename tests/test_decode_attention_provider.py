@@ -405,6 +405,22 @@ def test_flashinfer_lse_decode_accepts_cuda_graph_contract():
     support.assert_called_once_with()
 
 
+def test_flashinfer_rejects_width_that_fails_split_kv_merge():
+    # Observed with a 149-token H2O handoff: the 32-wide attention JIT runs
+    # for short rows, but VariableLengthMergeStates rejects this head width.
+    with patch(
+        "sparsevllm.operators.decode_attention.flashinfer_paged_decode_support",
+        return_value=(True, "available"),
+    ) as dependency:
+        result = FlashInferPagedDecodeAttentionProvider.supports(
+            _spec(head_dim=32, softmax_scale=32**-.5, cuda_graph=False),
+            _cuda_caps(device_name="NVIDIA H20", compute_capability=(9, 0)),
+        )
+    assert not result.supported
+    assert 'head_dim' in result.reason
+    dependency.assert_not_called()
+
+
 def test_prepared_h2o_decode_applies_fixed_probability_scorer():
     spec = _spec(
         may_require_attention_scores=True,

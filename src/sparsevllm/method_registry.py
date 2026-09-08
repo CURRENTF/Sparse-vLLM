@@ -170,6 +170,7 @@ class ModelRuntimeCompatibility:
 class PrefillScoreCollectionKind(Enum):
     NONE = auto()
     METHOD_OWNED_POSTHOC_REDUCED = auto()
+    METHOD_OWNED_POSTHOC_PER_HEAD = auto()
     MAIN_ATTENTION_REDUCED = auto()
 
 
@@ -243,25 +244,15 @@ def sparse_prefill_attention_contract(
         sparse_method=normalized,
     )
     cache_method = resolve_cache_sparse_method(
-        normalized,
-        prefill_sparse_method=resolved_prefill_method,
+        normalized, prefill_sparse_method=resolved_prefill_method,
     )
-    h2o_score_collection = cache_method == "h2o"
     layer_varying_page_table = _PREFILL_LAYER_VARYING_PAGE_TABLE[cache_method]
-    fused_h2o_score = (
-        h2o_score_collection
-        and resolved_prefill_method != "flashprefill_v2"
-        and resolve_sparse_prefill_score_mode(
-            normalized,
-            sparse_prefill_score_mode,
-        )
-        == "logits"
-        and int(h2o_prefill_score_window) == 0
-    )
-    if fused_h2o_score:
+    if cache_method == "h2o":
+        if resolve_sparse_prefill_score_mode(normalized, sparse_prefill_score_mode) != "probability":
+            raise ValueError("H2O requires per-head probability prefill scoring.")
         return SparsePrefillAttentionContract(
-            main_score_kind=AttentionScoreKind.RAW_QK_REDUCED,
-            score_collection=PrefillScoreCollectionKind.MAIN_ATTENTION_REDUCED,
+            main_score_kind=AttentionScoreKind.NONE,
+            score_collection=PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_PER_HEAD,
             layer_varying_page_table=layer_varying_page_table,
         )
     collection = (
@@ -273,27 +264,6 @@ def sparse_prefill_attention_contract(
         main_score_kind=AttentionScoreKind.NONE,
         score_collection=collection,
         layer_varying_page_table=layer_varying_page_table,
-    )
-
-
-def h2o_uses_fused_prefill_score(config) -> bool:
-    return (
-        resolve_cache_sparse_method(
-            getattr(config, "sparse_method", None),
-            prefill_sparse_method=getattr(config, "prefill_sparse_method", None),
-        )
-        == "h2o"
-        and resolve_prefill_sparse_method(
-            getattr(config, "prefill_sparse_method", None),
-            sparse_method=getattr(config, "sparse_method", None),
-        )
-        != "flashprefill_v2"
-        and resolve_sparse_prefill_score_mode(
-            "h2o",
-            getattr(config, "sparse_prefill_score_mode", None),
-        )
-        == "logits"
-        and int(getattr(config, "h2o_prefill_score_window", 0)) == 0
     )
 
 

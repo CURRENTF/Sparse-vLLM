@@ -571,39 +571,3 @@ def test_pyramidkv_final_prefill_groups_layers_by_effective_budget():
     assert manager.batch_calls[0][0] == 0
     assert manager.batch_calls[0][2].shape == (2, 6)
     assert not manager.scalar_calls
-
-
-def test_h2o_scalar_final_prefill_keeps_dense_relocation_dispatch():
-    manager = object.__new__(H2OCacheManager)
-    manager.config = SimpleNamespace(
-        h2o_decode_budget=4,
-        h2o_prefill_budget=8,
-        h2o_recent_ratio=0.5,
-    )
-    manager.kv_transformer_layer_indices = lambda: [0]
-    manager._preflight_final_prefill_dense_capacity = Mock()
-    manager._try_batched_evict = Mock(return_value=False)
-    manager._physical_row_len = Mock(return_value=6)
-    score = torch.arange(6, dtype=torch.float32)
-    manager._require_score_length = Mock(return_value=score)
-    keep = torch.tensor([1, 3, 4, 5], dtype=torch.long)
-    manager.select_h2o_indices = Mock(return_value=keep)
-    manager._compact_final_prefill_dense_batch = Mock()
-    manager.free_part_slots = Mock()
-    manager._score_key = lambda layer_idx, seq_id: (int(layer_idx), int(seq_id))
-    manager._h2o_scores = {}
-    manager._h2o_counters = {
-        "intermediate_prefill_evictions": 0,
-        "final_prefill_evictions": 0,
-        "decode_evictions": 0,
-        "dropped_tokens": 0,
-    }
-    seq = _final_prefill_seq(30, 6)
-
-    manager._evict([seq], is_prefill=True)
-
-    manager._compact_final_prefill_dense_batch.assert_called_once()
-    manager.free_part_slots.assert_not_called()
-    assert torch.equal(manager._h2o_scores[(0, 30)], score[keep])
-    assert manager._h2o_counters["final_prefill_evictions"] == 1
-    assert manager._h2o_counters["dropped_tokens"] == 2

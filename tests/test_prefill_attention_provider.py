@@ -168,7 +168,7 @@ def _mock_flashinfer_paged_prefill_contract():
         ("", AttentionScoreKind.NONE, PrefillScoreCollectionKind.NONE),
         ("snapkv", AttentionScoreKind.NONE, PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED),
         ("pyramidkv", AttentionScoreKind.NONE, PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED),
-        ("h2o", AttentionScoreKind.NONE, PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED),
+        ("h2o", AttentionScoreKind.NONE, PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_PER_HEAD),
         ("rkv", AttentionScoreKind.NONE, PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED),
         ("omnikv", AttentionScoreKind.NONE, PrefillScoreCollectionKind.NONE),
         ("deltakv", AttentionScoreKind.NONE, PrefillScoreCollectionKind.NONE),
@@ -228,18 +228,9 @@ def test_sm120_dense_prefill_sparse_method_selects_flashinfer_fa2(method):
     assert resolved.report.selection_basis == "upstream_default"
 
 
-def test_h2o_full_query_logits_request_fused_reduced_prefill_score():
-    contract = sparse_prefill_attention_contract(
-        "h2o",
-        sparse_prefill_score_mode="logits",
-        h2o_prefill_score_window=0,
-    )
-
-    assert contract.main_score_kind is AttentionScoreKind.RAW_QK_REDUCED
-    assert (
-        contract.score_collection
-        is PrefillScoreCollectionKind.MAIN_ATTENTION_REDUCED
-    )
+def test_h2o_rejects_reduced_logits_before_provider_binding():
+    with pytest.raises(ValueError, match="per-head probability"):
+        sparse_prefill_attention_contract("h2o", sparse_prefill_score_mode="logits")
 
 
 @pytest.mark.parametrize(
@@ -260,7 +251,7 @@ def test_independent_h2o_axes_keep_prompt_score_and_page_table_contract(
     assert contract.main_score_kind is AttentionScoreKind.NONE
     assert (
         contract.score_collection
-        is PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED
+        is PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_PER_HEAD
     )
 
 
@@ -300,14 +291,14 @@ def test_h2o_flashprefill_uses_method_owned_posthoc_prefill_scoring():
     contract = sparse_prefill_attention_contract(
         "h2o",
         prefill_sparse_method="flashprefill_v2",
-        sparse_prefill_score_mode="logits",
+        sparse_prefill_score_mode="probability",
         h2o_prefill_score_window=0,
     )
 
     assert contract.main_score_kind is AttentionScoreKind.NONE
     assert (
         contract.score_collection
-        is PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED
+        is PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_PER_HEAD
     )
 
 
@@ -919,6 +910,7 @@ def test_attention_forward_runs_sgl_before_posthoc_cache_manager_hooks():
     )
     sparse_controller = SimpleNamespace(
         get_prefill_selection=Mock(return_value=object()),
+        collect_prefill_attention_score=cache_manager.collect_prefill_attention_score,
         on_layer_attention_end=Mock(),
     )
     context = SimpleNamespace(

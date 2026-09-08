@@ -992,12 +992,13 @@ class MLAAttention:
                     chunk_lens=chunk_lens,
                 )
                 explicit_view = self.build_prefill_explicit_view(workset)
-                cache_manager.collect_prefill_attention_score(
+                sparse_controller.collect_prefill_attention_score(
                     layer_idx,
                     q,
                     explicit_view,
                     b_start_loc=b_start_loc,
                     chunk_lens=chunk_lens,
+                    softmax_scale=self.spec.softmax_scale,
                 )
                 cache_manager.record_prefill_query(
                     layer_idx,

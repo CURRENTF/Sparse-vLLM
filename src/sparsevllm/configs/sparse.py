@@ -148,6 +148,8 @@ def _normalize_snapkv(config) -> None:
 
 
 def _normalize_h2o(config) -> None:
+    if getattr(config, "sparse_prefill_score_mode", "probability") != "probability":
+        raise ValueError("H2O per-head accumulation requires sparse_prefill_score_mode='probability'.")
     _normalize_positive_int(config, "h2o_decode_budget", fallback=0)
     _normalize_positive_int(config, "h2o_decode_eviction_interval", fallback=0)
     _normalize_int_attr(config, "h2o_prefill_budget", fallback=0)
@@ -162,14 +164,7 @@ def _normalize_h2o(config) -> None:
             f"h2o_recent_ratio must be in (0, 1), got {config.h2o_recent_ratio}."
         )
     _normalize_int_attr(config, "h2o_prefill_score_window", fallback=0)
-    score_mode = getattr(config, "sparse_prefill_score_mode", "probability")
-    if score_mode == "logits":
-        if config.h2o_prefill_score_window < 0:
-            raise ValueError(
-                "h2o_prefill_score_window must be non-negative in logits "
-                f"mode (0 means the full chunk), got {config.h2o_prefill_score_window}."
-            )
-    elif not 0 <= config.h2o_prefill_score_window <= 128:
+    if not 0 <= config.h2o_prefill_score_window <= 128:
         raise ValueError(
             "h2o_prefill_score_window must be in [0, 128] in probability mode "
             "(0 means the full current chunk), got "

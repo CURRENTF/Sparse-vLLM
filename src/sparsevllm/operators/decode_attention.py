@@ -511,6 +511,9 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
     capabilities = AttentionKernelCapabilities(
         platforms=frozenset({PlatformEnum.CUDA}),
         activation_dtypes=frozenset({torch.bfloat16, torch.float16}),
+        # Split-KV merge uses FlashInfer's DISPATCH_HEAD_DIM, even when the
+        # attention JIT itself can compile another width for a short context.
+        head_dims=frozenset({64, 128, 256, 512}),
         page_sizes=None,
         score_outputs=frozenset({AttentionScoreKind.NONE}),
         returns_softmax_lse=True,
