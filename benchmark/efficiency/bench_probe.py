@@ -620,12 +620,19 @@ def run_sparsevllm_probe(
 
     max_len_needed = max(args.prompt_lens) + max(args.output_lens) + 128
     max_concurrency = max(args.batch_sizes)
+    wave_size = int(getattr(args, "prefill_wave_size", 0))
+    if wave_size < 0 or (wave_size and (args.sparse_method != "h2o" or args.scenario != "fixed")):
+        raise ValueError("--prefill-wave-size requires native H2O with --scenario fixed")
+    if wave_size:
+        protocol = {**protocol, "prefill_wave_size": wave_size,
+                    "wave_barrier": "previous wave first-token publication after H2O final-prefill compaction",
+                    "arrival_scope": "all requests available at workload start; wave admission wait included"}
     engine_kwargs = {
         **hyper_params,
         "max_model_len": max_len_needed,
         "enable_prefix_caching": False,
         **sparse_kwargs,
-        "max_num_seqs_in_batch": max_concurrency,
+        "max_num_seqs_in_batch": min(wave_size, max_concurrency) if wave_size else max_concurrency,
         "max_decoding_seqs": max_concurrency,
         "max_num_seqs_in_gpu": max_concurrency,
     }
@@ -653,17 +660,24 @@ def run_sparsevllm_probe(
                         request_count=bs,
                         vary_output_lengths=False,
                     )
-                    for request in warmup_trace:
-                        llm.add_request(
-                            request.prompt_token_ids,
-                            SamplingParams(
-                                temperature=0.0,
-                                top_p=1.0,
-                                top_k=1,
-                                ignore_eos=True,
-                                max_tokens=request.output_len,
-                            ),
-                        )
+                    width = wave_size or len(warmup_trace)
+                    for offset in range(0, len(warmup_trace), width):
+                        waiting_for_first = set()
+                        for request in warmup_trace[offset:offset + width]:
+                            waiting_for_first.add(int(llm.add_request(
+                                request.prompt_token_ids,
+                                SamplingParams(temperature=0.0, top_p=1.0, top_k=1,
+                                               ignore_eos=True, max_tokens=request.output_len),
+                            )))
+                        if wave_size:
+                            while waiting_for_first:
+                                finished, _ = llm.step()
+                                for seq_id, tokens in getattr(llm, "last_step_token_outputs", []):
+                                    if tokens:
+                                        waiting_for_first.discard(int(seq_id))
+                                for seq_id, tokens, *_ in finished:
+                                    if tokens:
+                                        waiting_for_first.discard(int(seq_id))
                     while not llm.is_finished():
                         llm.step()
 
@@ -696,28 +710,35 @@ def run_sparsevllm_probe(
                         first_token_times: dict[int, float] = {}
                         finished_times: dict[int, float] = {}
                         generated_counts: dict[int, int] = {}
-                        for request in trace:
-                            arrival = time.perf_counter()
-                            seq_id = int(
-                                llm.add_request(
+                        next_request = 0
+                        wave_events = []
+                        current_wave = set()
+                        peak_first_token_live_requests = 0
+                        peak_scheduler_decoding_requests = 0
+                        peak_decode_free_slot_stats = None
+                        def admit_wave():
+                            nonlocal next_request, current_wave
+                            current_wave = set()
+                            width = wave_size or len(trace)
+                            for request in trace[next_request:next_request + width]:
+                                arrival = t_start if wave_size else time.perf_counter()
+                                seq_id = int(llm.add_request(
                                     request.prompt_token_ids,
-                                    SamplingParams(
-                                        temperature=0.0,
-                                        top_p=1.0,
-                                        top_k=1,
-                                        ignore_eos=True,
-                                        max_tokens=request.output_len,
-                                    ),
-                                )
-                            )
-                            if seq_id in seq_to_request:
-                                raise RuntimeError(
-                                    "Sparse-vLLM returned a duplicate request sequence ID: "
-                                    f"seq_id={seq_id}."
-                                )
-                            seq_to_request[seq_id] = request
-                            arrival_times[seq_id] = arrival
-                        request_seq_ids = set(seq_to_request)
+                                    SamplingParams(temperature=0.0, top_p=1.0, top_k=1,
+                                                   ignore_eos=True, max_tokens=request.output_len),
+                                ))
+                                if seq_id in seq_to_request:
+                                    raise RuntimeError(f"Duplicate request sequence ID: {seq_id}")
+                                seq_to_request[seq_id] = request
+                                arrival_times[seq_id] = arrival
+                                current_wave.add(seq_id)
+                            next_request += len(current_wave)
+                            if wave_size:
+                                wave_events.append({"admitted_seq_ids": sorted(current_wave),
+                                                    "time_since_start_s": time.perf_counter() - t_start,
+                                                    "previous_first_tokens": len(first_token_times),
+                                                    "free_slot_stats": llm.scheduler.memory_oracle.free_slot_stats()})
+                        admit_wave()
 
                         while not llm.is_finished():
                             finished_outputs, _num_tokens = llm.step()
@@ -726,14 +747,27 @@ def run_sparsevllm_probe(
                                 llm, "last_step_token_outputs", []
                             ):
                                 seq_id = int(seq_id)
-                                if token_ids and seq_id in request_seq_ids:
+                                if token_ids and seq_id in seq_to_request:
                                     first_token_times.setdefault(seq_id, now)
                             for seq_id, token_ids, _token_logprobs, _top_logprobs in finished_outputs:
                                 seq_id = int(seq_id)
-                                if token_ids and seq_id in request_seq_ids:
+                                if token_ids and seq_id in seq_to_request:
                                     first_token_times.setdefault(seq_id, now)
                                 finished_times[seq_id] = now
                                 generated_counts[seq_id] = len(token_ids)
+
+                            peak_first_token_live_requests = max(
+                                peak_first_token_live_requests,
+                                len(first_token_times.keys() - finished_times.keys()),
+                            )
+                            if len(llm.scheduler.decoding) > peak_scheduler_decoding_requests:
+                                peak_scheduler_decoding_requests = len(llm.scheduler.decoding)
+                                if wave_size:
+                                    peak_decode_free_slot_stats = llm.scheduler.memory_oracle.free_slot_stats()
+                            if next_request < len(trace) and current_wave <= first_token_times.keys():
+                                admit_wave()
+                        if len(seq_to_request) != len(trace):
+                            raise RuntimeError("Wave workload ended before all requests were admitted")
 
                         elapsed_s = time.perf_counter() - t_start
                         graph_after = llm.debug_sparse_state_summaries()[0]["decode_graph"]
@@ -769,7 +803,8 @@ def run_sparsevllm_probe(
                                     **seq_to_request[seq_id].metadata(),
                                     **timing,
                                     "seq_id": seq_id,
-                                    "timing_source": "sparsevllm_step_token_publication_no_extra_sync_v1",
+                                    "timing_source": ("sparsevllm_wave_workload_arrival_step_publication_v1" if wave_size
+                                                      else "sparsevllm_step_token_publication_no_extra_sync_v1"),
                                 }
                             )
                         profiler_snap = profiler.snapshot()
@@ -800,6 +835,10 @@ def run_sparsevllm_probe(
                             "profiler_breakdown": profiler_snap,
                             "profiler_status": "success" if profiler_snap else "skipped_by_policy",
                             "protocol": protocol,
+                            "prefill_wave_events": wave_events,
+                            "peak_first_token_live_requests": peak_first_token_live_requests,
+                            "peak_scheduler_decoding_requests": peak_scheduler_decoding_requests,
+                            "peak_decode_free_slot_stats": peak_decode_free_slot_stats,
                             "protocol_label": protocol_label,
                             "decode_metric_status": "success" if tpot_ms is not None else "skipped_by_policy",
                             "trace": trace_metadata(trace),
@@ -1716,6 +1755,8 @@ def parse_args():
         help="Matched scheduler token budget used by Sparse-vLLM and vLLM.",
     )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    parser.add_argument("--prefill-wave-size", type=int, default=0,
+                        help="Native fixed H2O only: admit next wave after prior first tokens/final-prefill pruning; retain workload-start arrival timestamps.")
     parser.add_argument("--num-warmups", type=int, default=1)
     parser.add_argument("--num-iters", type=int, default=3)
     parser.add_argument("--output-dir", type=str, required=True)
@@ -1753,6 +1794,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.prefill_wave_size < 0 or (
+        args.prefill_wave_size
+        and (args.engine != "sparsevllm" or args.sparse_method != "h2o" or args.scenario != "fixed")
+    ):
+        raise ValueError("--prefill-wave-size requires native H2O with --scenario fixed")
     for name in ("prompt_lens", "output_lens", "batch_sizes"):
         values = getattr(args, name)
         if not values or any(int(value) <= 0 for value in values):
