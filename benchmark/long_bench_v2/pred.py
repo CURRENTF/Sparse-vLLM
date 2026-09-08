@@ -20,7 +20,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from transformers import AutoTokenizer, GenerationConfig
+from transformers import AutoConfig, AutoTokenizer, GenerationConfig
 
 from benchmark.long_bench.pred import build_chat
 from benchmark.long_bench_v2.contracts import (
@@ -120,9 +120,12 @@ def _submodule_commit(path: Path) -> str:
 
 
 def _eos_token_ids(model_path: str, tokenizer: Any) -> list[int]:
-    generation_config = GenerationConfig.from_pretrained(
-        model_path, trust_remote_code=True
-    )
+    if os.path.isdir(model_path) and not os.path.exists(os.path.join(model_path, "generation_config.json")):
+        generation_config = GenerationConfig.from_model_config(
+            AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        )
+    else:
+        generation_config = GenerationConfig.from_pretrained(model_path, trust_remote_code=True)
     configured = generation_config.eos_token_id
     if configured is None:
         values: list[int] = []
