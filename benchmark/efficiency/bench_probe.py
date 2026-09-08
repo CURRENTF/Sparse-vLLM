@@ -786,6 +786,10 @@ def run_sparsevllm_probe(
                                     peak_decode_free_slot_stats = llm.scheduler.memory_oracle.free_slot_stats()
                             if next_request < len(trace) and current_wave <= first_token_times.keys():
                                 admit_wave()
+                        if decode_window is not None:
+                            # The last measured step may also finish the workload,
+                            # leaving no next iteration to close its timing window.
+                            decode_window.boundary()
                         if len(seq_to_request) != len(trace):
                             raise RuntimeError("Wave workload ended before all requests were admitted")
                         window_result = None if decode_window is None else decode_window.require_result()
