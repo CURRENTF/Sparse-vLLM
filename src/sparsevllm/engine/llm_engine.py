@@ -1264,6 +1264,8 @@ class LLMEngine:
             "max_num_batched_tokens",
             "prefill_schedule_policy",
             "engine_prefill_chunk_size",
+            "mla_prefill_history_chunk_size",
+            "mla_prefill_workspace_bytes",
             "long_prefill_offload_threshold",
             "sink_keep_tokens",
             "recent_keep_tokens",

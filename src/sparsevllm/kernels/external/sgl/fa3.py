@@ -611,8 +611,10 @@ class SglFa3DecodeKernel:
         cu_seqlens_k: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
-    ) -> torch.Tensor:
-        """Run causal varlen attention over packed contiguous KV."""
+        causal: bool = True,
+        return_softmax_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Run varlen attention over packed contiguous KV."""
 
         args: list[object] = [
             q,
@@ -639,7 +641,7 @@ class SglFa3DecodeKernel:
             None,
             None,
             self.softmax_scale,
-            True,
+            causal,
             -1,
             -1,
         ]
@@ -648,6 +650,11 @@ class SglFa3DecodeKernel:
         result: Sequence[torch.Tensor] = self._op(*args)
         if not result or result[0].data_ptr() != output.data_ptr():
             raise RuntimeError("sglang-kernel FA3 did not write to the supplied output")
+        if return_softmax_lse:
+            lse = result[1]
+            if lse.dtype != torch.float32 or lse.shape != (q.shape[1], q.shape[0]):
+                raise RuntimeError("FA3 returned invalid packed prefill LSE.")
+            return output, lse
         return output
 
 

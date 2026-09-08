@@ -15,7 +15,7 @@ from sparsevllm.method_registry import (
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.profiler import profiler
 
-from .base import ExplicitKVPayload, PrefillComputeView
+from .base import ExplicitKVPayload, PrefillComputeView, PrefillScoreRequest
 from .snapkv import SnapKVCacheManager
 from .storage import ExplicitKVStorage
 
@@ -790,6 +790,15 @@ class H2OCacheManager(SnapKVCacheManager):
             ranges.append((batch_idx, seq, prompt_cache_len, score_start, score_end))
         return ranges
 
+    def prefill_score_request(self, layer_idx, seqs):
+        rows = self.prefill_score_ranges(layer_idx, seqs)
+        if not rows:
+            return None
+        ranges = [(0, 0)] * len(seqs)
+        for batch_idx, _seq, _cached, start, end in rows:
+            ranges[batch_idx] = (start, end)
+        return PrefillScoreRequest(tuple(ranges), self.config.sparse_prefill_score_mode)
+
     @torch.no_grad()
     def collect_prefill_attention_score(
         self,
@@ -815,7 +824,7 @@ class H2OCacheManager(SnapKVCacheManager):
         ranges = self.prefill_score_ranges(layer_idx, seqs)
         if not ranges:
             return None
-        if not isinstance(view.payload, ExplicitKVPayload):
+        if view.token_scores is None and not isinstance(view.payload, ExplicitKVPayload):
             raise TypeError(
                 "H2O prefill scoring requires ExplicitKVPayload, got "
                 f"{type(view.payload).__name__}."
@@ -861,7 +870,9 @@ class H2OCacheManager(SnapKVCacheManager):
             score_ends=score_ends_cpu,
         )
         max_context_len = max(context_lens)
-        if meta.attn_score is None:
+        if view.token_scores is not None:
+            step_score = view.token_scores.to(self._prefill_score_dtype())
+        elif meta.attn_score is None:
             step_score = self._prefill_step_score_buffer(
                 batch_size=len(seqs),
                 max_context_len=max_context_len,

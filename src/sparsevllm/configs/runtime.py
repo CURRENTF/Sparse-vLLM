@@ -72,6 +72,7 @@ class Config(
     long_prefill_offload_threshold: int = 64 * 1024
     mlp_chunk_size: int = 16384
     mla_prefill_workspace_bytes: int = 6 * 1024**3
+    mla_prefill_history_chunk_size: int = 16384
     prefill_schedule_policy: str = PREFILL_POLICY_AUTO
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1

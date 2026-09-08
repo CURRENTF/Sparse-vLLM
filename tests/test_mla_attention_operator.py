@@ -11,7 +11,6 @@ from sparsevllm.engine.cache_manager import (
     DecodeComputeView,
     ExplicitKVPayload,
     MlaLatentPayload,
-    PrefillComputeView,
 )
 from sparsevllm.kernels.external.sgl.fa3 import sgl_fa3_device_support
 from sparsevllm.kernels.triton.mla import (
@@ -391,7 +390,8 @@ def test_mla_provider_rejects_explicit_kv_before_kernel() -> None:
     kernel.assert_not_called()
 
 
-def test_sgl_provider_uses_packed_varlen_prefill_metadata() -> None:
+@pytest.mark.parametrize("causal", [False, True])
+def test_sgl_provider_returns_chunk_output_and_lse(causal) -> None:
     spec = _spec(tp_size=4)
     workspace = _cpu_workspace(batch_size=1, head_count=5)
     fa3 = Mock()
@@ -411,45 +411,31 @@ def test_sgl_provider_uses_packed_varlen_prefill_metadata() -> None:
             max_batch_size=1,
         )
     q = torch.empty(2, 5, 256, dtype=torch.bfloat16)
-    output = torch.empty_like(q)
+    k = torch.empty(4, 5, 256, dtype=torch.bfloat16)
+    v = torch.empty_like(k)
     cu_seqlens_q = torch.tensor([0, 2], dtype=torch.int32)
     cu_seqlens_k = torch.tensor([0, 4], dtype=torch.int32)
-    view = PrefillComputeView(
-        meta=AttentionViewMeta(
-            active_slots=torch.arange(4, dtype=torch.int32).view(1, 4),
-            req_indices=torch.tensor([0], dtype=torch.int32),
-            context_lens=torch.tensor([4], dtype=torch.int32),
-            max_context_len=4,
-        ),
-        payload=ExplicitKVPayload(
-            k_cache=torch.empty(4, 5, 256, dtype=torch.bfloat16),
-            v_cache=torch.empty(4, 5, 256, dtype=torch.bfloat16),
-            metadata={
-                "layout": "mla_packed_varlen",
-                "cu_seqlens_k": cu_seqlens_k,
-            },
-        ),
-    )
-    fa3.run_contiguous_explicit_varlen.return_value = output
+    lse = torch.empty(5, 2, dtype=torch.float32)
+    fa3.run_contiguous_explicit_varlen.side_effect = lambda q, k, v, out, **kw: (out, lse)
 
-    actual = provider.run_explicit_prefill(
-        q,
-        view,
-        output,
-        cu_seqlens_q=cu_seqlens_q,
-        max_seqlen_q=2,
+    output, actual_lse = provider.run_prefill_chunk(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, 2, 4, causal=causal
     )
 
-    assert actual is output
+    assert output.shape == q.shape
+    assert output.dtype == q.dtype
+    assert actual_lse is lse
     fa3.run_contiguous_explicit_varlen.assert_called_once_with(
         q,
-        view.payload.k_cache,
-        view.payload.v_cache,
+        k,
+        v,
         output,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=2,
         max_seqlen_k=4,
+        causal=causal,
+        return_softmax_lse=True,
     )
     fa3.run_explicit_varlen.assert_not_called()
 

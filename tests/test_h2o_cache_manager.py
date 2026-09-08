@@ -14,6 +14,7 @@ from sparsevllm.engine.cache_manager.base import (
     DecodeComputeView,
     ExplicitKVPayload,
     LayerBatchStates,
+    MlaLatentPayload,
     PrefillComputeView,
 )
 from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
@@ -501,7 +502,8 @@ def test_h2o_logit_prefill_score_rejects_nan_or_all_inf():
         )
 
 
-def test_h2o_prefill_score_collection_accumulates_in_physical_coordinates():
+@pytest.mark.parametrize("precomputed", [False, True])
+def test_h2o_prefill_score_collection_accumulates_in_physical_coordinates(precomputed):
     manager = _manager_with_rows([6])
     seq = _seq(0, 20, prefilled=8, chunk=2)
     manager._h2o_scores[(0, 0)] = torch.tensor([1.0, 2.0, 3.0, 4.0])
@@ -517,6 +519,16 @@ def test_h2o_prefill_score_collection_accumulates_in_physical_coordinates():
             v_cache=torch.empty((16, 1, 1)),
         ),
     )
+    if precomputed:
+        # The latent operator hands off scores; the manager still owns weighted
+        # accumulation in physical coordinates after previous KV compaction.
+        view = PrefillComputeView(
+            view.meta, MlaLatentPayload(torch.empty(16, 1, 512), torch.empty(16, 1, 64)),
+            token_scores=torch.tensor([[0.1, 0.2, 0.3, 0.4, 0.5, 0.6]]),
+        )
+    request = manager.prefill_score_request(0, [seq])
+    assert request.query_ranges == ((4, 6),)
+    assert request.candidate_start == request.recent_keep_tokens == 0
     set_context(is_prefill=True, cache_manager=manager, seqs=[seq])
 
     def fake_run_prefill_score(
@@ -542,7 +554,7 @@ def test_h2o_prefill_score_collection_accumulates_in_physical_coordinates():
         manager,
         "_run_prefill_score",
         side_effect=fake_run_prefill_score,
-    ):
+    ) as scorer:
         manager.collect_prefill_attention_score(
             0,
             torch.empty((2, 1, 1)),
@@ -551,6 +563,7 @@ def test_h2o_prefill_score_collection_accumulates_in_physical_coordinates():
             chunk_lens=torch.tensor([2], dtype=torch.int32),
         )
 
+    assert scorer.call_count == (0 if precomputed else 1)
     assert manager._h2o_scores[(0, 0)].tolist() == pytest.approx(
         [1.2, 2.4, 3.6, 4.8, 1.0, 1.2]
     )

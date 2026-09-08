@@ -343,3 +343,64 @@ def test_omnikv_observation_selects_mla_latent_active_slots():
         payload.rope_cache[selected_slots, 0, 0],
         selected_slots.to(torch.bfloat16) + 100,
     )
+
+
+def test_snapkv_latent_score_handoff_preserves_final_window_and_accumulation():
+    # Precomputed MLA scores must enter the same final-chunk accumulator and
+    # selection lifecycle as explicit KV, without attempting another QK kernel.
+    from sparsevllm.engine.cache_manager.base import (
+        AttentionViewMeta,
+        PrefillComputeView,
+    )
+
+    manager, payload = _latent_snap_family_manager(SnapKVCacheManager, row_len=8)
+    manager.config = SimpleNamespace(
+        sparse_method="snapkv",
+        snapkv_num_full_layers=0,
+        snapkv_window_size=2,
+        sink_keep_tokens=1,
+        recent_keep_tokens=1,
+        decode_keep_tokens=2,
+        sparse_prefill_score_mode="logits",
+        sparse_attn_score_dtype="float32",
+    )
+    manager._prefill_attn_score_accumulators = {}
+    manager._prefill_context_lens_cpu_by_layer = {0: (8,)}
+    seq = Sequence(list(range(8)))
+    seq.seq_id = 0
+    seq.current_chunk_size = 4
+    seq.num_prefilled_tokens = 0
+    assert manager.prefill_score_request(0, [seq]) is None
+    seq.num_prefilled_tokens = 4
+    request = manager.prefill_score_request(0, [seq])
+    assert request.query_ranges == ((6, 8),)
+    assert request.candidate_start == request.recent_keep_tokens == 1
+    score = torch.tensor([[-torch.inf, 1.0, 2.0, 9.0, 3.0, 8.0, 4.0, -torch.inf]])
+    view = PrefillComputeView(
+        AttentionViewMeta(
+            manager.buffer_req_to_token_slots[0],
+            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([8], dtype=torch.int32),
+        ),
+        payload,
+        score,
+    )
+    set_context(True, cache_manager=manager, seqs=[seq])
+    try:
+        with patch.object(
+            manager,
+            "_run_prefill_score",
+            side_effect=AssertionError("unexpected explicit QK"),
+        ):
+            manager.collect_prefill_attention_score(
+                0,
+                torch.empty(4, 20, 256),
+                view,
+                b_start_loc=torch.tensor([0], dtype=torch.int32),
+                chunk_lens=torch.tensor([4], dtype=torch.int32),
+            )
+        torch.testing.assert_close(
+            manager._prefill_attn_score_accumulators[0, 0], score[0]
+        )
+    finally:
+        reset_context()

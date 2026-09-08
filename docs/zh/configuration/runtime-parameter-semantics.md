@@ -58,6 +58,14 @@ Prefill policy 的唯一事实来源是 `src/sparsevllm/method_registry.py`：
 不要在 benchmark script 中复制 method policy。运行报告应记录解析后的
 method、policy、chunk size、context length、batch size 和 checkpoint 路径。
 
+### MLA 历史工作区
+
+`mla_prefill_history_chunk_size` 为正整数，默认 `16384`，限制 MLA prefill
+一次 gather 和展开的历史 KV token 数，与控制新 token 的
+`engine_prefill_chunk_size` 独立。较小的值降低历史工作区，但增加 attention
+调用和结果合并次数。当前 token 激活和稀疏分数状态仍需显存，因此该参数不是
+完整 prefill 峰值的上限。观察窗口和 `sparse_prefill_score_mode` 的语义保持不变。
+
 ## Prefill 稀疏
 
 `prefill_sparse_method` 独立选择 prefill 加速，不替代 `sparse_method`。当前有
