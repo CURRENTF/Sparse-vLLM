@@ -246,6 +246,17 @@ def profiling_kv_budget_bytes(config, num_slots: int) -> int:
         prefill_sparse_method=getattr(config, "prefill_sparse_method", None),
     )
     if method != "quest":
+        if method == "snapkv":
+            # SnapKV's allocator consumes a total byte budget: one KV payload,
+            # one free-slot vector per layer, and layer-local row-slot maps.
+            # Doubling the payload can exhaust VRAM before workspace profiling.
+            int32_bytes = torch.empty((), dtype=torch.int32).element_size()
+            layers = int(layout.num_kv_layers)
+            return int(
+                num_slots * (bytes_per_slot + layers * int32_bytes)
+                + layers * int(config.max_num_seqs_in_gpu)
+                * int(config.max_model_len) * int32_bytes
+            )
         if method in {"", "vanilla", "omnikv"}:
             int32_bytes = torch.empty((), dtype=torch.int32).element_size()
             row_mapping_bytes = (

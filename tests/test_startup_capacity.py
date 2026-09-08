@@ -115,6 +115,38 @@ def test_h2o_prefill_only_uses_h2o_physical_cache_budget():
     assert budget == 10 * bytes_per_slot * 2
 
 
+def test_snapkv_profiling_budget_matches_storage_and_metadata_tensor_bytes():
+    # Regression: a doubled temporary KV payload OOMed Qwen's MoE warmup at
+    # batch32 even though the required graph-family KV storage fitted VRAM.
+    config = _config(sparse_method="snapkv")
+    slots = 10
+    tensors = []
+    for heads, dim in config.runtime_layout.local_kv_shapes(2):
+        tensors.extend([
+            torch.empty(2, slots, heads, dim, dtype=config.hf_config.dtype),
+            torch.empty(slots, dtype=torch.int32),
+            torch.empty(config.max_num_seqs_in_gpu, config.max_model_len, dtype=torch.int32),
+        ])
+    assert profiling_kv_budget_bytes(config, slots) == sum(t.numel() * t.element_size() for t in tensors)
+
+
+def test_snapkv_mla_profiling_budget_preserves_replicated_latent_width():
+    config = _config(sparse_method="snapkv")
+    config.attention_cache_layout = CacheLayout.MLA_LATENT
+    config.hf_config.kv_lora_rank = 512
+    config.hf_config.qk_rope_head_dim = 64
+    slots = 10
+    tensors = []
+    for _ in range(config.runtime_layout.num_kv_layers):
+        tensors.extend([
+            torch.empty(slots, 512, dtype=config.hf_config.dtype),
+            torch.empty(slots, 64, dtype=config.hf_config.dtype),
+            torch.empty(slots, dtype=torch.int32),
+            torch.empty(config.max_num_seqs_in_gpu, config.max_model_len, dtype=torch.int32),
+        ])
+    assert profiling_kv_budget_bytes(config, slots) == sum(t.numel() * t.element_size() for t in tensors)
+
+
 @pytest.mark.parametrize("token_budget, resident_rows", [(17, 8), (2, 8), (100, 2)])
 def test_prefill_profile_balances_chunks_within_token_and_row_limits(token_budget, resident_rows):
     config = _config()
