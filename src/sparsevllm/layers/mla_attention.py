@@ -304,15 +304,15 @@ class MLAAttention:
         self.prefill_backend = TritonAttentionBackend()
         self._prefill_plan: _MlaPrefillPlan | None = None
         self._prefill_query_plan: _MlaPrefillQueryPlan | None = None
-        self._key_materializer_bindings: dict[int, tuple[object, Callable]] = {}
+        self._key_materializer_bindings: dict[tuple[int, int], tuple[object, Callable]] = {}
 
     def release_cache_runtime_bindings(self, cache_manager: object) -> None:
         """Drop layer bindings owned by a retiring cache runtime."""
         self._prefill_plan = None
         self._prefill_query_plan = None
-        for layer_idx, binding in tuple(self._key_materializer_bindings.items()):
+        for key, binding in tuple(self._key_materializer_bindings.items()):
             if binding[0] is cache_manager:
-                del self._key_materializer_bindings[layer_idx]
+                del self._key_materializer_bindings[key]
 
     @classmethod
     def bind(
@@ -897,7 +897,8 @@ class MLAAttention:
         project_latent: Callable[[torch.Tensor], torch.Tensor],
     ) -> None:
         layer_idx = int(layer_idx)
-        binding = self._key_materializer_bindings.get(layer_idx)
+        key = (id(cache_manager), layer_idx)
+        binding = self._key_materializer_bindings.get(key)
         if binding is not None and binding[0] is cache_manager:
             return
 
@@ -908,7 +909,7 @@ class MLAAttention:
             )
 
         cache_manager.register_attention_key_materializer(layer_idx, materialize)
-        self._key_materializer_bindings[layer_idx] = (cache_manager, materialize)
+        self._key_materializer_bindings[key] = (cache_manager, materialize)
 
     def run_cached_attention(
         self,

@@ -16,6 +16,7 @@ from sparsevllm.engine.cache_manager import (
     MlaLatentPayload,
     PrefillComputeView,
 )
+from sparsevllm.engine.cache_manager.base import CacheManager
 from sparsevllm.layers.mla_attention import (
     MLAAttention,
     estimate_mla_prefill_workspace_bytes,
@@ -136,6 +137,37 @@ def test_mla_binds_key_materializer_once_per_manager_and_layer() -> None:
 
     assert first_manager.register_attention_key_materializer.call_count == 2
     second_manager.register_attention_key_materializer.assert_called_once()
+
+
+def test_mla_restores_original_materializer_after_history_profiling() -> None:
+    # Registration mocks cannot catch the duplicate callback rejected when
+    # startup returns to its original manager after a synthetic-history probe.
+    class Manager:
+        register_attention_key_materializer = CacheManager.register_attention_key_materializer
+
+        def kv_layer_index(self, layer_idx):
+            return layer_idx
+
+    attention = _attention()
+    project_latent = Mock()
+    original = Manager()
+    probe = Manager()
+    probe_ref = weakref.ref(probe)
+
+    for layer_idx in (0, 1):
+        attention._ensure_key_materializer(original, layer_idx, project_latent)
+    original_callbacks = original._attention_key_materializers.copy()
+    for layer_idx in (0, 1):
+        attention._ensure_key_materializer(probe, layer_idx, project_latent)
+    attention.release_cache_runtime_bindings(probe)
+    del probe
+    assert probe_ref() is None
+
+    for layer_idx, callback in original_callbacks.items():
+        attention._ensure_key_materializer(original, layer_idx, project_latent)
+        assert original._attention_key_materializers[layer_idx] is callback
+        with pytest.raises(RuntimeError, match="already bound"):
+            original.register_attention_key_materializer(layer_idx, Mock())
 
 
 def test_mla_releases_only_bindings_for_the_retiring_cache_runtime() -> None:
