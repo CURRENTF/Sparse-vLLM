@@ -282,11 +282,26 @@ class DecodeComputeView:
 
 
 @dataclass(frozen=True)
+class PrefillScoreRequest:
+    """Method-owned score semantics in each request's physical coordinates.
+
+    Half-open query ranges select current queries; (0, 0) skips a request.
+    Probability denominators use eligible causal keys after sink/recent masks.
+    """
+
+    query_ranges: tuple[tuple[int, int], ...]
+    mode: str
+    candidate_start: int = 0
+    recent_keep_tokens: int = 0
+
+
+@dataclass(frozen=True)
 class PrefillComputeView:
     """Prefill metadata paired with exactly one physical payload layout."""
 
     meta: AttentionViewMeta
     payload: AttentionPayload
+    token_scores: torch.Tensor | None = None  # Temporary [batch, max_context] scores.
 
 
 @dataclass(frozen=True)
@@ -1118,6 +1133,10 @@ class CacheManager(ABC):
             ),
             payload=payload,
         )
+
+    def prefill_score_request(self, layer_idx: int, seqs) -> PrefillScoreRequest | None:
+        """Describe optional scores before attention without changing score state."""
+        return None
 
     def collect_prefill_attention_score(
         self,

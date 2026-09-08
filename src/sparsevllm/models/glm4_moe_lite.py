@@ -80,6 +80,7 @@ def build_glm4_moe_lite_mla_attention(
     context_capacity: int,
     projection_chunk_size: int,
     score_output: AttentionScoreKind = AttentionScoreKind.NONE,
+    history_chunk_size: int = 16384,
 ) -> MLAAttention:
     """Bind the one process-local MLA operator from explicit runtime inputs."""
 
@@ -106,6 +107,7 @@ def build_glm4_moe_lite_mla_attention(
         prefill_workspace_bytes=prefill_workspace_bytes,
         hidden_size=int(config.hidden_size),
         projection_chunk_size=projection_chunk_size,
+        history_chunk_size=history_chunk_size,
     )
 
 
@@ -922,6 +924,7 @@ class Glm4MoeLiteForCausalLM(nn.Module):
                     engine_config.max_decoding_seqs,
                 ),
                 prefill_workspace_bytes=engine_config.mla_prefill_workspace_bytes,
+                history_chunk_size=engine_config.mla_prefill_history_chunk_size,
                 decode_graph=decode_graph,
                 context_capacity=decode_context_capacity,
                 projection_chunk_size=engine_config.mlp_chunk_size,

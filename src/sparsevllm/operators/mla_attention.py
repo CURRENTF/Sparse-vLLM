@@ -8,7 +8,6 @@ import sparsevllm.platforms as platforms
 from sparsevllm.platforms import device_runtime
 from sparsevllm.engine.cache_manager.base import (
     DecodeComputeView,
-    ExplicitKVPayload,
     MlaLatentPayload,
     PrefillComputeView,
 )
@@ -127,7 +126,6 @@ class MlaAttentionOpSpec:
 class MlaAttentionProvider:
     name = ""
     capabilities: AttentionKernelCapabilities
-    supports_explicit_prefill = False
 
     def run(
         self,
@@ -544,7 +542,6 @@ class MlaSglFa3Provider(MlaTritonProvider):
     """SGL FA3 decode with the score-producing Triton path kept explicit."""
 
     name = "sgl_fa3_sm90"
-    supports_explicit_prefill = True
     supports_decode_graph = True
 
     def __init__(
@@ -635,134 +632,20 @@ class MlaSglFa3Provider(MlaTritonProvider):
         )
 
     @torch.no_grad()
-    def run_explicit_prefill(
-        self,
-        q: torch.Tensor,
-        view: PrefillComputeView,
-        output: torch.Tensor,
-        *,
-        cu_seqlens_q: torch.Tensor,
-        max_seqlen_q: int,
-        validation_scope: object | None = None,
-    ) -> torch.Tensor:
-        if not isinstance(view, PrefillComputeView):
-            raise TypeError(
-                "MlaSglFa3Provider.run_explicit_prefill requires "
-                "PrefillComputeView, got "
-                f"{type(view).__name__}."
-            )
-        if not isinstance(view.payload, ExplicitKVPayload):
-            raise TypeError(
-                "MLA explicit prefill requires ExplicitKVPayload, got "
-                f"{type(view.payload).__name__}."
-            )
-        query_tokens = int(q.shape[0])
-        expected_q_shape = (
-            query_tokens,
-            self.spec.local_q_heads,
-            self.spec.qk_head_dim,
-        )
-        if tuple(q.shape) != expected_q_shape:
-            raise ValueError(
-                f"q must have shape {expected_q_shape}, got {tuple(q.shape)}."
-            )
-        expected_output_shape = (
-            query_tokens,
-            self.spec.local_q_heads,
-            self.spec.value_head_dim,
-        )
-        if tuple(output.shape) != expected_output_shape:
-            raise ValueError(
-                f"output must have shape {expected_output_shape}, got "
-                f"{tuple(output.shape)}."
-            )
-        batch_size = int(view.meta.context_lens.numel())
-        if batch_size > self.max_batch_size:
-            raise ValueError(
-                "MLA prefill batch exceeds provider capacity: "
-                f"batch={batch_size} max_batch_size={self.max_batch_size}."
-            )
-        if cu_seqlens_q.shape != (batch_size + 1,):
-            raise ValueError(
-                f"cu_seqlens_q must have shape ({batch_size + 1},), got "
-                f"{tuple(cu_seqlens_q.shape)}."
-            )
-        if cu_seqlens_q.device != self.device or cu_seqlens_q.dtype != torch.int32:
-            raise TypeError(
-                "cu_seqlens_q must be int32 on the provider device, got "
-                f"{cu_seqlens_q.device}/{cu_seqlens_q.dtype}."
-            )
-        if not 0 < int(max_seqlen_q) <= query_tokens:
-            raise ValueError(
-                "max_seqlen_q must be in [1, query_tokens], got "
-                f"{max_seqlen_q} for {query_tokens}."
-            )
-        payload = view.payload
-        tensors = {
-            "q": q,
-            "output": output,
-            "k_cache": payload.k_cache,
-            "v_cache": payload.v_cache,
-        }
-        for name, tensor in tensors.items():
-            if tensor.device != self.device:
-                raise ValueError(
-                    f"{name} is on {tensor.device}, expected {self.device}."
-                )
-            expected_dtype = (
-                self.spec.activation_dtype
-            )
-            if tensor.dtype != expected_dtype:
-                raise TypeError(
-                    f"{name} must use {expected_dtype}, got {tensor.dtype}."
-                )
-        metadata = payload.metadata or {}
-        if metadata.get("layout") == "mla_packed_varlen":
-            cu_seqlens_k = metadata.get("cu_seqlens_k")
-            if not isinstance(cu_seqlens_k, torch.Tensor):
-                raise TypeError(
-                    "MLA packed varlen prefill requires tensor cu_seqlens_k."
-                )
-            if cu_seqlens_k.shape != (batch_size + 1,):
-                raise ValueError(
-                    f"cu_seqlens_k must have shape ({batch_size + 1},), got "
-                    f"{tuple(cu_seqlens_k.shape)}."
-                )
-            if (
-                cu_seqlens_k.device != self.device
-                or cu_seqlens_k.dtype != torch.int32
-            ):
-                raise TypeError(
-                    "cu_seqlens_k must be int32 on the provider device, got "
-                    f"{cu_seqlens_k.device}/{cu_seqlens_k.dtype}."
-                )
-            if view.meta.max_context_len is None:
-                raise ValueError(
-                    "MLA packed varlen prefill requires max_context_len."
-                )
-            self._record_runtime_kernel_path("sgl_fa3_prefill_contiguous")
-            return self.fa3.run_contiguous_explicit_varlen(
-                q,
-                payload.k_cache,
-                payload.v_cache,
-                output,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=int(max_seqlen_q),
-                max_seqlen_k=int(view.meta.max_context_len),
-            )
-        self._record_runtime_kernel_path("sgl_fa3_prefill_paged")
-        return self.fa3.run_explicit_varlen(
+    def run_prefill_chunk(self, q, k, v, cu_q, cu_k, max_q, max_k, *, causal):
+        output = torch.empty((*q.shape[:2], v.shape[-1]), dtype=q.dtype, device=q.device)
+        self._record_runtime_kernel_path("sgl_fa3_prefill_contiguous")
+        return self.fa3.run_contiguous_explicit_varlen(
             q,
-            payload.k_cache,
-            payload.v_cache,
-            view.meta.active_slots,
-            view.meta.req_indices,
-            view.meta.context_lens,
+            k,
+            v,
             output,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=int(max_seqlen_q),
-            validation_scope=validation_scope,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_k,
+            causal=causal,
+            return_softmax_lse=True,
         )
 
 

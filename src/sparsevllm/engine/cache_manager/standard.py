@@ -37,6 +37,7 @@ from .base import (
     ExplicitKVPayload,
     LayerBatchStates,
     PrefillComputeView,
+    PrefillScoreRequest,
     SparseSelection,
 )
 from .prefix_cache_mixin import PrefixCacheMixin
@@ -1134,6 +1135,14 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             raise RuntimeError("prefix-prune scoring forward produced no attention scores.")
         return state["score"]  # type: ignore[return-value]
 
+    def prefill_score_request(self, layer_idx, seqs):
+        state = self._prefix_prune_scoring
+        if state is None:
+            return None
+        start, end = int(state["query_start"]), int(state["query_end"])
+        return PrefillScoreRequest(((start, end),), "probability",
+                                  int(state["candidate_start"]), end - start)
+
     @torch.no_grad()
     def collect_prefill_attention_score(
         self,
@@ -1159,7 +1168,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                 "prefix-prune query window length mismatch: "
                 f"expected={query_end - query_start} actual={int(q.shape[0])}."
             )
-        if not isinstance(view.payload, ExplicitKVPayload):
+        if view.token_scores is None and not isinstance(view.payload, ExplicitKVPayload):
             raise TypeError(
                 "prefix-prune scoring requires explicit KV storage, got "
                 f"{type(view.payload).__name__}."
@@ -1170,25 +1179,28 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                 "prefix-prune scoring currently requires an unpruned dense target path: "
                 f"physical_context={context_len} logical_context={query_end}."
             )
-        step_score = torch.zeros(
-            (1, context_len), dtype=torch.float32, device=q.device
-        )
-        prefill_score_fwd(
-            q,
-            view.payload.k_cache,
-            step_score,
-            view.meta.req_indices,
-            b_start_loc,
-            view.meta.context_lens,
-            torch.tensor([query_start], dtype=torch.int32, device=q.device),
-            query_end - query_start,
-            view.meta.active_slots,
-            torch.tensor([query_start], dtype=torch.int32, device=q.device),
-            torch.tensor([query_end], dtype=torch.int32, device=q.device),
-            candidate_start=candidate_start,
-            recent_keep_tokens=query_end - query_start,
-            score_mode="probability",
-        )
+        if view.token_scores is not None:
+            step_score = view.token_scores
+        else:
+            step_score = torch.zeros(
+                (1, context_len), dtype=torch.float32, device=q.device
+            )
+            prefill_score_fwd(
+                q,
+                view.payload.k_cache,
+                step_score,
+                view.meta.req_indices,
+                b_start_loc,
+                view.meta.context_lens,
+                torch.tensor([query_start], dtype=torch.int32, device=q.device),
+                query_end - query_start,
+                view.meta.active_slots,
+                torch.tensor([query_start], dtype=torch.int32, device=q.device),
+                torch.tensor([query_end], dtype=torch.int32, device=q.device),
+                candidate_start=candidate_start,
+                recent_keep_tokens=query_end - query_start,
+                score_mode="probability",
+            )
         score = step_score[0]
         accumulated = state.get("score")
         state["score"] = (

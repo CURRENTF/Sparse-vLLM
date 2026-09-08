@@ -31,6 +31,7 @@ from .base import (
     ExplicitKVPayload,
     LayerBatchStates,
     PrefillComputeView,
+    PrefillScoreRequest,
     SparseSelection,
 )
 from .raw_kv_offload import RawKVOffloadBuffer
@@ -1258,6 +1259,18 @@ class SnapKVCacheManager(CacheManager):
             buffers[key] = buffer
         return buffer[:batch_size, :max_context_len]
 
+    def prefill_score_request(self, layer_idx, seqs):
+        rows = self._prefill_score_rows(layer_idx, seqs)
+        if not rows:
+            return None
+        ranges = [(0, 0)] * len(seqs)
+        for batch_idx, _seq, start, end in rows:
+            ranges[batch_idx] = (start, end)
+        return PrefillScoreRequest(
+            tuple(ranges), self.config.sparse_prefill_score_mode,
+            int(self.config.sink_keep_tokens), int(self.config.recent_keep_tokens),
+        )
+
     @torch.no_grad()
     def collect_prefill_attention_score(
         self,
@@ -1282,7 +1295,7 @@ class SnapKVCacheManager(CacheManager):
         rows = self._prefill_score_rows(layer_idx, seqs)
         if not rows:
             return None
-        if not isinstance(view.payload, ExplicitKVPayload):
+        if view.token_scores is None and not isinstance(view.payload, ExplicitKVPayload):
             raise TypeError(
                 "SnapKV prefill scoring requires ExplicitKVPayload, got "
                 f"{type(view.payload).__name__}."
@@ -1320,20 +1333,25 @@ class SnapKVCacheManager(CacheManager):
             max_context_len=max_context_len,
             device=q.device,
         )
-        self._run_prefill_score(
-            q,
-            payload.k_cache,
-            step_score,
-            meta,
-            b_start_loc,
-            b_prompt_cache_len,
-            max_score_len,
-            score_starts,
-            score_ends,
-            candidate_start=int(self.config.sink_keep_tokens),
-            recent_keep_tokens=int(self.config.recent_keep_tokens),
-            batch_indices=score_batch_indices,
-        )
+        if view.token_scores is not None:
+            step_score.copy_(view.token_scores[:, :max_context_len].index_select(
+                0, score_batch_indices.long(),
+            ))
+        else:
+            self._run_prefill_score(
+                q,
+                payload.k_cache,
+                step_score,
+                meta,
+                b_start_loc,
+                b_prompt_cache_len,
+                max_score_len,
+                score_starts,
+                score_ends,
+                candidate_start=int(self.config.sink_keep_tokens),
+                recent_keep_tokens=int(self.config.recent_keep_tokens),
+                batch_indices=score_batch_indices,
+            )
 
         for score_row_idx, (b_idx, seq, _score_start, _score_end) in enumerate(rows):
             context_len = int(context_lens[b_idx])

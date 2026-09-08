@@ -62,6 +62,16 @@ Do not duplicate method policy decisions in benchmark scripts. Runtime reports
 should record the resolved method, policy, chunk size, context length, batch
 size, and checkpoint path.
 
+### MLA history workspace
+
+`mla_prefill_history_chunk_size` is a positive integer (default: `16384`).
+It limits the historical KV tokens gathered and expanded at once during MLA
+prefill, independently of the new-token limit `engine_prefill_chunk_size`.
+Smaller values reduce history workspace but add attention calls and merges.
+Current-token activations and sparse score state still require memory; this
+parameter is not a cap on the complete prefill peak. Sparse observation windows
+and the selected `sparse_prefill_score_mode` retain their existing meanings.
+
 ## Prefill sparsity
 
 `prefill_sparse_method` selects prefill acceleration independently from
