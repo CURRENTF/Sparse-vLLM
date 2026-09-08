@@ -28,7 +28,6 @@ def test_engine_rebuilds_production_runtime_before_final_graph_warmup():
 
     def profile_record(phase):
         measurement = {
-            "prefill": MemoryProfileMeasurement(0, 100),
             "cuda_graph": MemoryProfileMeasurement(50, 20),
             "decode": MemoryProfileMeasurement(0, 120),
         }[phase]
@@ -41,7 +40,7 @@ def test_engine_rebuilds_production_runtime_before_final_graph_warmup():
         calls.append((method, *args))
         if method == "finish_startup_memory_profile":
             return profile_record(args[0])
-        if method == "profile_startup_prefill_history":
+        if method == "profile_startup_prefill":
             return [{"world_rank": 0, "measurement": MemoryProfileMeasurement(0, 180)}]
         if method == "release_profiling_cache_runtime":
             assert engine.scheduler is None
@@ -89,12 +88,13 @@ def test_engine_rebuilds_production_runtime_before_final_graph_warmup():
     assert engine.scheduler == "production-scheduler"
     assert [batch[1:] for batch in batches] == [
         (1, False),
-        (1, False),
         (2, True),
         (2, True),
     ]
     assert [call[0] for call in calls].count("capture_graphs") == 2
-    assert calls.index(("profile_startup_prefill_history",)) < calls.index(
+    assert calls.count(("profile_startup_prefill",)) == 1
+    assert ("begin_startup_memory_profile", "prefill") not in calls
+    assert calls.index(("profile_startup_prefill",)) < calls.index(
         ("begin_startup_memory_profile", "cuda_graph")
     )
     assert calls.index(("build_production_cache_runtime", 370)) < calls.index(

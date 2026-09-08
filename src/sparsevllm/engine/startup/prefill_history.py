@@ -17,6 +17,7 @@ from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.utils.context import reset_context
 from sparsevllm.utils.log import logger
 
+from .capacity import profiling_prefill_chunk_lengths
 from .profiling import StartupMemoryProfiler
 
 
@@ -24,8 +25,7 @@ class PrefillHistoryCacheManager(StandardCacheManager):
     """Startup-only dense cache with synthetic history shared across layers."""
 
     def allocate_kv_cache(self) -> None:
-        slots = int(self.config.max_model_len) - 1
-        self.config.num_kvcache_slots = slots
+        slots = int(self.config.num_kvcache_slots)
         storage = self.attention_cache_storage
         if isinstance(storage, HeterogeneousExplicitKVStorage):
             caches = {
@@ -58,30 +58,34 @@ class PrefillHistoryCacheManager(StandardCacheManager):
 
 @torch.inference_mode()
 def profile_prefill_history(runner):
-    """Measure one maximum-context suffix through the ordinary model forward.
+    """Measure a full token batch with one maximum-context request in one step.
 
     Dense synthetic history covers history-dependent attention allocations.
-    Sparse compression/scoring and concurrent long requests remain covered only
-    by the ordinary startup workload and the utilization headroom.
+    Sparse compression/scoring and concurrent long requests rely on utilization
+    headroom rather than method-specific history reconstruction.
     """
     config = copy.copy(runner.config)
     context_len = int(config.max_model_len) - 1
-    chunk_size = min(int(config.engine_prefill_chunk_size), int(config.max_num_batched_tokens))
-    if context_len <= chunk_size:
-        return None
+    chunk_lengths = profiling_prefill_chunk_lengths(config)
+    prompt_lengths = (context_len, *chunk_lengths[1:])
     config.sparse_method = ""
     config.prefill_sparse_method = None
     config.enable_prefix_caching = False
     config.enable_prefix_cache_offload = False
     config.resolved_prefix_cache_mode = "disabled"
     config.startup_cache_phase = "profiling"
+    config.num_kvcache_slots = sum(prompt_lengths)
     manager = PrefillHistoryCacheManager(config, runner.parallel_context)
     controller = SparseController(config, manager)
     runtime = RuntimeState(config, manager, runner.recurrent_state_manager)
-    seq = Sequence([0] * context_len, SamplingParams(max_tokens=1, temperature=0.0))
-    seq.num_prefilled_tokens = context_len - chunk_size
-    seq.current_chunk_size = chunk_size
-    manager.seed_history(seq)
+    seqs = []
+    for prompt_len, chunk_len in zip(prompt_lengths, chunk_lengths):
+        seq = Sequence([0] * prompt_len, SamplingParams(max_tokens=1, temperature=0.0))
+        seq.num_prefilled_tokens = prompt_len - chunk_len
+        seq.current_chunk_size = chunk_len
+        seqs.append(seq)
+    if seqs[0].num_prefilled_tokens:
+        manager.seed_history(seqs[0])
 
     model = runner.model.model
     previous = runner.cache_manager, runner.sparse_controller, runner.runtime_state
@@ -94,16 +98,18 @@ def profile_prefill_history(runner):
         model.sparse_controller = controller
         controller.set_modules(model.layers)
         logger.info(
-            "Startup profile phase=prefill_history context={} history={} chunk={} batch=1.",
-            context_len, seq.num_prefilled_tokens, chunk_size,
+            "Startup profile phase=prefill tokens={} batch={} max_context={} "
+            "history={} max_chunk={} visible_tokens={}.",
+            sum(chunk_lengths), len(seqs), context_len,
+            seqs[0].num_prefilled_tokens, max(chunk_lengths), sum(prompt_lengths),
         )
         # Keep the synthetic cache alive across both snapshots so its persistent
         # bytes are not counted as transient model memory.
-        profiler.begin("prefill_history")
-        runner.run([seq], is_prefill=True)
-        result = profiler.finish("prefill_history")
+        profiler.begin("prefill")
+        runner.run(seqs, is_prefill=True)
+        result = profiler.finish("prefill")
         logger.info(
-            "Startup prefill_history transient_peak={:.2f} GiB.",
+            "Startup prefill transient_peak={:.2f} GiB.",
             result.measurement.transient_peak_bytes / 1024**3,
         )
         return result
@@ -111,7 +117,8 @@ def profile_prefill_history(runner):
         runner.cache_manager, runner.sparse_controller, runner.runtime_state = previous
         model.sparse_controller = previous_controller
         reset_context()
-        runtime.free_seq(seq.seq_id)
+        for seq in seqs:
+            runtime.free_seq(seq.seq_id)
         runtime.reset_after_warmup()
         release_bindings = getattr(runner.model, "release_cache_runtime_bindings", None)
         if callable(release_bindings):

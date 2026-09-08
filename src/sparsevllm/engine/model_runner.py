@@ -200,7 +200,7 @@ STARTUP_HOST_STATUS_SYNC_METHODS = {
     "build_production_cache_runtime",
     "capture_startup_memory_snapshot",
     "finish_startup_memory_profile",
-    "profile_startup_prefill_history",
+    "profile_startup_prefill",
     "release_profiling_cache_runtime",
     "resolve_startup_decode_graph_plan",
 }
@@ -604,12 +604,10 @@ class ModelRunner:
             }
         )
 
-    def profile_startup_prefill_history(self):
+    def profile_startup_prefill(self):
         from sparsevllm.engine.startup.prefill_history import profile_prefill_history
 
         result = profile_prefill_history(self)
-        if result is None:
-            return None
         return self._gather_startup_record(
             {"world_rank": int(self.rank), "measurement": result.measurement}
         )

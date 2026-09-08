@@ -27,7 +27,7 @@ def test_history_storage_reuses_layers_without_aliasing_token_slots(layout):
     else:
         storage = HeterogeneousExplicitKVStorage(layer_shapes=shapes, dtype=torch.bfloat16)
     manager = object.__new__(prefill_history.PrefillHistoryCacheManager)
-    manager.config = SimpleNamespace(max_model_len=33)
+    manager.config = SimpleNamespace(num_kvcache_slots=32)
     manager.device = torch.device("cpu")
     manager.num_kv_layers = len(shapes)
     manager.attention_cache_storage = storage
@@ -47,8 +47,13 @@ def test_history_storage_reuses_layers_without_aliasing_token_slots(layout):
         assert storage.layer_payload(1).k_cache.data_ptr() != first_tensor.data_ptr()
 
 
-@pytest.mark.parametrize("token_budget, fail_forward", [(64, False), (16, True)])
-def test_history_probe_runs_only_suffix_and_restores_runtime(monkeypatch, token_budget, fail_forward):
+@pytest.mark.parametrize(
+    "token_budget, fail_forward, max_model_len",
+    [(64, False, 128), (16, True, 128), (64, False, 3)],
+)
+def test_history_probe_runs_one_full_batch_and_restores_runtime(
+    monkeypatch, token_budget, fail_forward, max_model_len,
+):
     # Exercise the actual dense allocator/prepare path without GPU arithmetic.
     # Existing startup tests do not cover seeding history or restoring a probe
     # runtime after a model failure.
@@ -66,6 +71,7 @@ def test_history_probe_runs_only_suffix_and_restores_runtime(monkeypatch, token_
     monkeypatch.setattr("sparsevllm.engine.startup.profiling.release_unused_device_memory", lambda _: None)
     config = _glm_config(sparse_method="h2o", enable_prefix_caching=False)
     config.max_num_batched_tokens = token_budget
+    config.max_model_len = max_model_len
     original_slots = config.num_kvcache_slots
     previous = object(), object(), object()
     model = SimpleNamespace(sparse_controller=previous[1], layers=[])
@@ -84,7 +90,6 @@ def test_history_probe_runs_only_suffix_and_restores_runtime(monkeypatch, token_
     calls = []
 
     def run(seqs, is_prefill):
-        seq, = seqs
         manager = runner.cache_manager
         assert manager.config is not config
         assert manager.config.sparse_method == ""
@@ -94,14 +99,28 @@ def test_history_probe_runs_only_suffix_and_restores_runtime(monkeypatch, token_
         set_context(True, cu_seqlens_q=cu_seqlens, cache_manager=manager, seqs=seqs)
         get_context().sparse_controller = runner.sparse_controller
         runner.sparse_controller.prepare_forward(seqs, is_prefill)
-        assert input_ids.numel() == seq.current_chunk_size
-        assert positions.tolist() == list(range(seq.num_prefilled_tokens, config.max_model_len - 1))
-        row = manager.seq_id_to_row[seq.seq_id]
-        slots = manager.buffer_req_to_token_slots[row, :config.max_model_len - 1]
+        assert input_ids.numel() == token_budget
+        assert len(seqs) == min(config.max_num_seqs_in_batch, config.max_num_seqs_in_gpu, token_budget)
+        assert seqs[0].num_prefilled_tokens + seqs[0].current_chunk_size == config.max_model_len - 1
+        assert all(seq.num_prefilled_tokens == 0 for seq in seqs[1:])
+        all_slots = []
+        context_lens = []
+        for index, seq in enumerate(seqs):
+            end = seq.num_prefilled_tokens + seq.current_chunk_size
+            assert positions[cu_seqlens[index]:cu_seqlens[index + 1]].tolist() == list(
+                range(seq.num_prefilled_tokens, end)
+            )
+            row = manager.seq_id_to_row[seq.seq_id]
+            all_slots.append(manager.buffer_req_to_token_slots[row, :end])
+            context_lens.append(end)
+        slots = torch.cat(all_slots)
         assert slots.unique().numel() == slots.numel()
-        assert manager.layer_batch_state.context_lens.tolist() == [config.max_model_len - 1]
+        assert manager.layer_batch_state.context_lens.tolist() == context_lens
         assert manager.num_free_slots == 0
-        calls.append(seq.current_chunk_size)
+        assert slots.numel() == config.max_model_len - 1 + sum(
+            seq.current_chunk_size for seq in seqs[1:]
+        )
+        calls.append(input_ids.numel())
         platform.peak = 350
         if fail_forward:
             raise RuntimeError("model failed")
@@ -114,7 +133,7 @@ def test_history_probe_runs_only_suffix_and_restores_runtime(monkeypatch, token_
         result = prefill_history.profile_prefill_history(runner)
         assert result.measurement.transient_peak_bytes == 250
     assert len(calls) == 1
-    assert 0 < calls[0] <= min(config.engine_prefill_chunk_size, token_budget)
+    assert calls[0] == token_budget
     assert (runner.cache_manager, runner.sparse_controller, runner.runtime_state) == previous
     assert model.sparse_controller is previous[1]
     assert config.sparse_method == "h2o"
@@ -122,10 +141,3 @@ def test_history_probe_runs_only_suffix_and_restores_runtime(monkeypatch, token_
     assert get_context().cache_manager is None
     assert len(released) == 1
     assert not released[0].seq_id_to_row
-
-
-def test_history_probe_skips_when_chunk_covers_entire_context():
-    runner = SimpleNamespace(config=SimpleNamespace(
-        max_model_len=17, engine_prefill_chunk_size=32, max_num_batched_tokens=32,
-    ))
-    assert prefill_history.profile_prefill_history(runner) is None

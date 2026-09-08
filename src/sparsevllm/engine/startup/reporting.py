@@ -40,7 +40,6 @@ def build_startup_capacity_decision(
     decode_records: list[dict[str, Any]],
     persistent_records: list[dict[str, Any]],
     gpu_memory_utilization: float,
-    prefill_history_records: list[dict[str, Any]] | None = None,
 ) -> StartupCapacityDecision:
     phases = {
         "prefill": _records_by_rank(prefill_records, "prefill"),
@@ -48,12 +47,6 @@ def build_startup_capacity_decision(
         "decode": _records_by_rank(decode_records, "decode"),
         "persistent": _records_by_rank(persistent_records, "persistent"),
     }
-    prefill_phases = ["prefill"]
-    if prefill_history_records is not None:
-        phases["prefill_history"] = _records_by_rank(
-            prefill_history_records, "prefill_history",
-        )
-        prefill_phases.append("prefill_history")
     rank_sets = {label: set(records) for label, records in phases.items()}
     expected_ranks = rank_sets["persistent"]
     mismatched = {
@@ -82,10 +75,7 @@ def build_startup_capacity_decision(
         )
         build = phases["persistent"][rank]["runtime_build"]
         profile_persistent_growth = (
-            sum(
-                int(phases[phase][rank]["measurement"].consumed_bytes)
-                for phase in prefill_phases
-            )
+            int(phases["prefill"][rank]["measurement"].consumed_bytes)
             + int(phases["decode"][rank]["measurement"].consumed_bytes)
             + max(
                 0,
@@ -110,9 +100,8 @@ def build_startup_capacity_decision(
             persistent_bytes=int(snapshot.total_bytes - snapshot.free_bytes),
             runtime_persistent_bytes=runtime_persistent_bytes,
             profile_persistent_growth_bytes=profile_persistent_growth,
-            prefill_transient_bytes=max(
-                int(phases[phase][rank]["measurement"].transient_peak_bytes)
-                for phase in prefill_phases
+            prefill_transient_bytes=int(
+                phases["prefill"][rank]["measurement"].transient_peak_bytes
             ),
             decode_transient_bytes=int(
                 phases["decode"][rank]["measurement"].transient_peak_bytes

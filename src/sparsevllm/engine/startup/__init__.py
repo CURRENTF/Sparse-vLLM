@@ -4,7 +4,7 @@ from .capacity import (
     feasible_startup_graph_plan,
     profiling_kv_budget_bytes,
     profiling_kv_slots,
-    profiling_prefill_prompt_lengths,
+    profiling_prefill_chunk_lengths,
     startup_graph_family_kv_slots,
 )
 from .memory import (
@@ -40,7 +40,7 @@ __all__ = [
     "validate_production_kv_records",
     "profiling_kv_budget_bytes",
     "profiling_kv_slots",
-    "profiling_prefill_prompt_lengths",
+    "profiling_prefill_chunk_lengths",
     "startup_graph_family_kv_slots",
     "release_unused_device_memory",
 ]

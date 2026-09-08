@@ -37,8 +37,8 @@ def test_capacity_decision_uses_each_rank_profile_and_global_minimum_budget():
         },
     ]
     prefill = [
-        {"world_rank": 0, "measurement": _measurement(transient=100)},
         {"world_rank": 1, "measurement": _measurement(transient=80)},
+        {"world_rank": 0, "measurement": _measurement(transient=160)},
     ]
     graph = [
         {
@@ -59,10 +59,6 @@ def test_capacity_decision_uses_each_rank_profile_and_global_minimum_budget():
 
     decision = build_startup_capacity_decision(
         prefill_records=prefill,
-        prefill_history_records=[
-            {"world_rank": 1, "measurement": _measurement(transient=60)},
-            {"world_rank": 0, "measurement": _measurement(transient=160)},
-        ],
         graph_records=graph,
         decode_records=decode,
         persistent_records=persistent,

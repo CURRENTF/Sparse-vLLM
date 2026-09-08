@@ -97,7 +97,7 @@ def profiling_kv_slots(config) -> int:
             for prompt_len in prompt_lengths
         )
 
-    prefill_lengths = profiling_prefill_prompt_lengths(config)
+    prefill_lengths = profiling_prefill_chunk_lengths(config)
     required = max(
         batch_slots(prefill_lengths, 2),
         batch_slots((1,) * int(config.max_decoding_seqs), 2),
@@ -165,9 +165,11 @@ def feasible_startup_graph_plan(
     return feasible, skipped
 
 
-def profiling_prefill_prompt_lengths(config) -> tuple[int, ...]:
+def profiling_prefill_chunk_lengths(config) -> tuple[int, ...]:
     token_budget = int(config.max_num_batched_tokens)
-    batch_size = min(int(config.max_num_seqs_in_batch), token_budget)
+    batch_size = min(
+        int(config.max_num_seqs_in_batch), int(config.max_num_seqs_in_gpu), token_budget,
+    )
     per_prompt_limit = min(
         int(config.engine_prefill_chunk_size),
         int(config.max_model_len) - 1,
@@ -178,18 +180,8 @@ def profiling_prefill_prompt_lengths(config) -> tuple[int, ...]:
             f"batch_size={batch_size} per_prompt_limit={per_prompt_limit}."
         )
     target_tokens = min(token_budget, batch_size * per_prompt_limit)
-    prompt_lengths = [1] * batch_size
-    remaining = target_tokens - batch_size
-    for index in range(batch_size):
-        extra = min(per_prompt_limit - 1, remaining)
-        prompt_lengths[index] += extra
-        remaining -= extra
-    if remaining != 0:
-        raise RuntimeError(
-            "Startup prefill profiling could not fill its scheduler token budget: "
-            f"remaining={remaining}."
-        )
-    return tuple(prompt_lengths)
+    chunk_size, remainder = divmod(target_tokens, batch_size)
+    return tuple(chunk_size + (index < remainder) for index in range(batch_size))
 
 
 def profiling_kv_budget_bytes(config, num_slots: int) -> int:
@@ -296,7 +288,7 @@ __all__ = [
     "StartupMemoryProfile",
     "profiling_kv_budget_bytes",
     "profiling_kv_slots",
-    "profiling_prefill_prompt_lengths",
+    "profiling_prefill_chunk_lengths",
     "feasible_startup_graph_plan",
     "startup_graph_family_kv_slots",
 ]

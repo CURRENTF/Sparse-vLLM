@@ -4,6 +4,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
+import pytest
 
 from sparsevllm.engine.cache_manager.storage import CacheLayout
 from sparsevllm.engine.cache_manager.standard import StandardCacheManager
@@ -14,7 +15,7 @@ from sparsevllm.engine.startup import (
     feasible_startup_graph_plan,
     profiling_kv_budget_bytes,
     profiling_kv_slots,
-    profiling_prefill_prompt_lengths,
+    profiling_prefill_chunk_lengths,
 )
 from sparsevllm.models.layout import RuntimeLayout
 
@@ -114,11 +115,19 @@ def test_h2o_prefill_only_uses_h2o_physical_cache_budget():
     assert budget == 10 * bytes_per_slot * 2
 
 
-def test_prefill_profile_fills_token_chunk_and_batch_limits_together():
-    lengths = profiling_prefill_prompt_lengths(_config())
+@pytest.mark.parametrize("token_budget, resident_rows", [(17, 8), (2, 8), (100, 2)])
+def test_prefill_profile_balances_chunks_within_token_and_row_limits(token_budget, resident_rows):
+    config = _config()
+    config.max_num_batched_tokens = token_budget
+    config.max_num_seqs_in_gpu = resident_rows
+    lengths = profiling_prefill_chunk_lengths(config)
 
-    assert lengths == (8, 6, 1, 1)
-    assert sum(lengths) == 16
+    assert len(lengths) == min(config.max_num_seqs_in_batch, resident_rows, token_budget)
+    assert 0 < min(lengths) <= max(lengths) <= config.engine_prefill_chunk_size
+    assert max(lengths) - min(lengths) <= 1
+    assert sum(lengths) <= token_budget
+    if sum(lengths) < token_budget:
+        assert all(length == config.engine_prefill_chunk_size for length in lengths)
 
 
 def test_profiling_kv_slots_cover_runtime_steps_not_maximum_context():

@@ -35,7 +35,6 @@ from sparsevllm.engine.startup import (
     build_startup_capacity_decision,
     log_startup_capacity_decision,
     log_startup_completion,
-    profiling_prefill_prompt_lengths,
     validate_production_kv_records,
 )
 from sparsevllm.multimodal.inputs import (
@@ -536,25 +535,7 @@ class LLMEngine:
         self._warmup_moe_workspaces()
         self._after_warmup_debug_cleanup()
 
-        prefill_lengths = profiling_prefill_prompt_lengths(self.config)
-        logger.info(
-            "Startup profile phase=prefill tokens={} batch={} max_prompt={}.",
-            sum(prefill_lengths),
-            len(prefill_lengths),
-            max(prefill_lengths),
-        )
-        self.model_runner.call("begin_startup_memory_profile", "prefill")
-        prompt_offset = self._run_startup_batch(
-            prefill_lengths,
-            SamplingParams(max_tokens=1, temperature=0.0),
-            prompt_offset,
-        )
-        self._after_warmup_debug_cleanup()
-        prefill_records = self.model_runner.call(
-            "finish_startup_memory_profile",
-            "prefill",
-        )
-        prefill_history_records = self.model_runner.call("profile_startup_prefill_history")
+        prefill_records = self.model_runner.call("profile_startup_prefill")
 
         logger.info("Startup profile phase=cuda_graph.")
         self.model_runner.call("begin_startup_memory_profile", "cuda_graph")
@@ -583,7 +564,6 @@ class LLMEngine:
         persistent_records = self.model_runner.call("release_profiling_cache_runtime")
         decision = build_startup_capacity_decision(
             prefill_records=prefill_records,
-            prefill_history_records=prefill_history_records,
             graph_records=graph_records,
             decode_records=decode_records,
             persistent_records=persistent_records,
