@@ -41,6 +41,8 @@ def test_engine_rebuilds_production_runtime_before_final_graph_warmup():
         calls.append((method, *args))
         if method == "finish_startup_memory_profile":
             return profile_record(args[0])
+        if method == "profile_startup_prefill_history":
+            return [{"world_rank": 0, "measurement": MemoryProfileMeasurement(0, 180)}]
         if method == "release_profiling_cache_runtime":
             assert engine.scheduler is None
             return [
@@ -58,7 +60,7 @@ def test_engine_rebuilds_production_runtime_before_final_graph_warmup():
                 }
             ]
         if method == "build_production_cache_runtime":
-            assert args == (430,)
+            assert args == (370,)
             return [{"world_rank": 0, "num_kvcache_slots": 64}]
         if method == "capture_startup_memory_snapshot":
             return [{"world_rank": 0, "snapshot": snapshot}]
@@ -92,7 +94,10 @@ def test_engine_rebuilds_production_runtime_before_final_graph_warmup():
         (2, True),
     ]
     assert [call[0] for call in calls].count("capture_graphs") == 2
-    assert calls.index(("build_production_cache_runtime", 430)) < calls.index(
+    assert calls.index(("profile_startup_prefill_history",)) < calls.index(
+        ("begin_startup_memory_profile", "cuda_graph")
+    )
+    assert calls.index(("build_production_cache_runtime", 370)) < calls.index(
         ("capture_graphs", 0, {"respect_runtime_capacity": True})
     )
 

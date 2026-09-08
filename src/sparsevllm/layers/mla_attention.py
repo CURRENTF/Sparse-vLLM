@@ -308,6 +308,8 @@ class MLAAttention:
 
     def release_cache_runtime_bindings(self, cache_manager: object) -> None:
         """Drop layer bindings owned by a retiring cache runtime."""
+        self._prefill_plan = None
+        self._prefill_query_plan = None
         for layer_idx, binding in tuple(self._key_materializer_bindings.items()):
             if binding[0] is cache_manager:
                 del self._key_materializer_bindings[layer_idx]

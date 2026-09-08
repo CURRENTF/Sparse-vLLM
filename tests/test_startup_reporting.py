@@ -59,13 +59,18 @@ def test_capacity_decision_uses_each_rank_profile_and_global_minimum_budget():
 
     decision = build_startup_capacity_decision(
         prefill_records=prefill,
+        prefill_history_records=[
+            {"world_rank": 1, "measurement": _measurement(transient=60)},
+            {"world_rank": 0, "measurement": _measurement(transient=160)},
+        ],
         graph_records=graph,
         decode_records=decode,
         persistent_records=persistent,
         gpu_memory_utilization=0.9,
     )
 
-    assert [plan.capacity.local_kv_budget_bytes for plan in decision.rank_plans] == [450, 370]
+    assert [plan.profile.prefill_transient_bytes for plan in decision.rank_plans] == [160, 80]
+    assert [plan.capacity.local_kv_budget_bytes for plan in decision.rank_plans] == [390, 370]
     assert decision.selected_kv_budget_bytes == 370
     assert decision.limiting_rank == 1
 

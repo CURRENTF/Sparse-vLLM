@@ -554,6 +554,7 @@ class LLMEngine:
             "finish_startup_memory_profile",
             "prefill",
         )
+        prefill_history_records = self.model_runner.call("profile_startup_prefill_history")
 
         logger.info("Startup profile phase=cuda_graph.")
         self.model_runner.call("begin_startup_memory_profile", "cuda_graph")
@@ -582,6 +583,7 @@ class LLMEngine:
         persistent_records = self.model_runner.call("release_profiling_cache_runtime")
         decision = build_startup_capacity_decision(
             prefill_records=prefill_records,
+            prefill_history_records=prefill_history_records,
             graph_records=graph_records,
             decode_records=decode_records,
             persistent_records=persistent_records,

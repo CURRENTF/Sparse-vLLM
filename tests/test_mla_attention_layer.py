@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -153,6 +154,23 @@ def test_mla_releases_only_bindings_for_the_retiring_cache_runtime() -> None:
     attention._ensure_key_materializer(first_manager, 1, project_latent)
     second_manager.register_attention_key_materializer.assert_called_once()
     assert first_manager.register_attention_key_materializer.call_count == 3
+
+
+def test_mla_runtime_release_drops_cached_history_mapping() -> None:
+    # The startup history cache must not survive through the shared MLA plan
+    # after its cache manager is retired.
+    attention = _attention()
+    meta = AttentionViewMeta(
+        active_slots=torch.tensor([[0, 1]], dtype=torch.int32),
+        req_indices=torch.tensor([0], dtype=torch.int32),
+        context_lens=torch.tensor([2], dtype=torch.int32),
+    )
+    mapping = weakref.ref(meta.active_slots)
+    attention._get_prefill_plan(meta, cache_slot_count=2, query_tokens=1)
+    del meta
+    assert mapping() is not None
+    attention.release_cache_runtime_bindings(object())
+    assert mapping() is None
 
 
 def _expand_history(attention: MLAAttention, history):
