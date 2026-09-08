@@ -60,11 +60,11 @@ vLLM vanilla, SnapKV, QuEST, and OmniKV.
 ## Run a new sweep
 
 GPU execution needs a compatible benchmark checkout, explicitly selected by
-`--repo`. It must include the synchronized full-batch stage adapters for both
-engines and the SnapKV bootstrap capacity repair. This package contains the
-orchestration layer, not those engine changes. Use a compatible checkout or the
-exact archived source identified in `data/provenance.json`; the recorded base
-commit alone is insufficient to reconstruct that source.
+`--repo`. The repository's canonical microbench supports synchronized full-batch
+stage adapters for both engines, and includes the SnapKV bootstrap capacity
+repair. Set `BENCHMARK_REPO` to this checkout for new runs. For exact historical
+source reproduction, use the archive identified in `data/provenance.json`; the
+recorded base commit alone is insufficient to reconstruct that source.
 
 Set these environment variables to your actual absolute paths:
 

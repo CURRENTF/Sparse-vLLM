@@ -36,6 +36,180 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             handle.write("\n")
 
 
+def _synchronize_worker(worker) -> None:
+    import torch
+    torch.cuda.synchronize()
+
+
+def _worker_peak_memory(worker) -> float:
+    import torch
+    return torch.cuda.max_memory_allocated() / 1024**3
+
+
+def benchmark_decode_stage(method, length, bs, args, results_dict):
+    """Synchronized V1 step diagnostic, called by the canonical microbench CLI.
+
+    The in-process core exposes the scheduled token work before postprocessing
+    changes request state. Mixed prefill/decode steps and falling-batch tails
+    are never included in the fixed-concurrency decode rate.
+    """
+    from benchmark.efficiency.metrics import stage_throughput
+
+    row = {"engine": "vllm", "method": method, "length": length,
+           "batch_size": bs, "output_len": args.output_len, "status": "FAILED"}
+    steps, raw_outputs = [], []
+    llm = None
+    case_dir = Path(args.output_dir) / f"{method}-{length}-{bs}" if args.output_dir else None
+    try:
+        if method != "vanilla":
+            raise ValueError("vLLM stage baseline supports vanilla only")
+        if not args.synchronize_step_timing or not args.require_full_decode_batch:
+            raise ValueError("vLLM stage baseline requires synchronized full-batch timing")
+        if args.max_decode_steps_after_full or args.decode_warmup_steps_after_full < 0:
+            raise ValueError("Stage baseline requires untruncated outputs and non-negative warmup")
+        if args.admission_wave_size or args.wave_decode_gap_steps or args.require_prefix_cache_hit:
+            raise ValueError("vLLM stage baseline does not support admission waves or required prefix hits")
+        if length <= 0 or bs <= 0 or args.output_len <= 1:
+            raise ValueError("Stage baseline requires positive input/batch and output_len > 1")
+        if args.max_model_len_override is not None and args.max_model_len_override < length + args.output_len:
+            raise ValueError("max_model_len_override must cover length + output_len")
+        if os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING") != "0":
+            raise ValueError("Set VLLM_ENABLE_V1_MULTIPROCESSING=0 for the inspectable synchronized V1 core")
+        hp = args.hyper_params_dict
+        allowed = {"tensor_parallel_size", "expert_parallel_size", "data_parallel_size",
+                   "gpu_memory_utilization", "max_num_batched_tokens", "decode_graph",
+                   "engine_prefill_chunk_size", "enable_prefix_caching"}
+        unknown = set(hp) - allowed
+        if unknown:
+            raise ValueError(f"Unmapped vLLM stage parameters: {sorted(unknown)}")
+        if hp.get("data_parallel_size", 1) != 1 or hp.get("enable_prefix_caching", False):
+            raise ValueError("Stage baseline requires DP1 and disabled prefix caching")
+        tp = hp.get("tensor_parallel_size", 1)
+        if hp.get("expert_parallel_size", 1) not in (1, tp):
+            raise ValueError("vLLM stage baseline requires EP1 or EP equal to TP")
+        if hp.get("engine_prefill_chunk_size", hp.get("max_num_batched_tokens", 8192)) != hp.get("max_num_batched_tokens", 8192):
+            raise ValueError("vLLM has no independent engine_prefill_chunk_size; it must equal max_num_batched_tokens")
+        import vllm
+        from vllm import LLM, SamplingParams
+
+        config = dict(model=args.model_path, tensor_parallel_size=hp.get("tensor_parallel_size", 1),
+                      enable_expert_parallel=hp.get("expert_parallel_size", 1) > 1,
+                      gpu_memory_utilization=hp.get("gpu_memory_utilization", 0.9),
+                      max_model_len=args.max_model_len_override or length + args.output_len,
+                      max_num_seqs=bs, max_num_batched_tokens=hp.get("max_num_batched_tokens", 8192),
+                      enable_prefix_caching=False, enable_chunked_prefill=True,
+                      async_scheduling=False, enforce_eager=not hp.get("decode_graph", True),
+                      seed=42, disable_log_stats=True,
+                      compilation_config={"cudagraph_capture_sizes": [bs], "max_cudagraph_capture_size": bs})
+        row["engine_hyper_params"] = config
+        row["resolved_parallel_topology"] = {
+            "tensor_parallel_size": tp,
+            "expert_parallel_size": tp if config["enable_expert_parallel"] else 1,
+            "data_parallel_size": 1,
+        }
+        row["vllm_version"] = vllm.__version__
+        llm = LLM(**config)
+        engine = llm.llm_engine
+        core = engine.engine_core.engine_core
+        if core.batch_queue is not None or core.async_scheduling:
+            raise RuntimeError("Stage diagnostic requires synchronous, non-pipelined EngineCore.step")
+        scheduler = core.scheduler
+        original_schedule = scheduler.schedule
+        scheduled = {}
+
+        def observe_schedule(*schedule_args, **schedule_kwargs):
+            before = {key: (request.num_computed_tokens, request.num_prompt_tokens)
+                      for key, request in scheduler.requests.items()}
+            output = original_schedule(*schedule_args, **schedule_kwargs)
+            counts = output.num_scheduled_tokens
+            pure = bool(counts) and all(
+                before[key][0] >= before[key][1]
+                for key in counts
+            )
+            scheduled.update(tokens=sum(counts.values()), pure_decode=pure,
+                             pure_prefill=bool(counts) and all(
+                                 before[key][0] < before[key][1]
+                                 for key in counts),
+                             active=len(counts), preempted=len(output.preempted_req_ids or ()))
+            return output
+
+        scheduler.schedule = observe_schedule
+        params = SamplingParams(temperature=args.temperature, top_p=args.top_p,
+                                ignore_eos=True, max_tokens=args.output_len, detokenize=False)
+        for index in range(bs):
+            engine.add_request(str(index), {"prompt_token_ids": [100] * length}, params)
+        core.model_executor.collective_rpc(_synchronize_worker)
+        full_steps = peak = preemptions = 0
+        started = perf_counter()
+        first_token_s = None
+        while engine.has_unfinished_requests():
+            scheduled.clear()
+            begin = perf_counter()
+            outputs = engine.step()
+            core.model_executor.collective_rpc(_synchronize_worker)
+            elapsed = perf_counter() - begin
+            if not scheduled:
+                raise RuntimeError("V1 step bypassed the inspected scheduler")
+            preemptions += scheduled["preempted"]
+            if preemptions:
+                raise RuntimeError("Full decode batch capacity exceeded: scheduler preemption")
+            if scheduled["pure_decode"]:
+                peak = max(peak, scheduled["active"])
+            full = scheduled["pure_decode"] and scheduled["active"] == bs
+            if full:
+                if scheduled["tokens"] != bs:
+                    raise RuntimeError("Expected one computed decode token per request")
+                full_steps += 1
+            steps.append({**scheduled, "elapsed_s": elapsed,
+                          "measured": full and full_steps > args.decode_warmup_steps_after_full})
+            for output in outputs:
+                if output.outputs and output.outputs[0].token_ids and first_token_s is None:
+                    first_token_s = perf_counter() - started
+                if output.finished:
+                    tokens = list(output.outputs[0].token_ids)
+                    raw_outputs.append({"request_id": output.request_id, "token_ids": tokens,
+                                        "status": "success" if len(tokens) == args.output_len else "model_failed"})
+                    if peak != bs:
+                        raise RuntimeError("Full decode batch capacity exceeded: requests finished before full decode admission")
+        if len(raw_outputs) != bs or any(item["status"] != "success" for item in raw_outputs):
+            raise RuntimeError("Incomplete output: every request must finish the requested output length")
+        measured = [step for step in steps if step["measured"]]
+        if not measured:
+            raise RuntimeError("No full-batch decode steps remain after warmup")
+        elapsed = sum(step["elapsed_s"] for step in measured)
+        tokens = sum(step["tokens"] for step in measured)
+        throughput = stage_throughput(tokens, elapsed)
+        prefill_steps = [step for step in steps if step["pure_prefill"]]
+        prefill_throughput = stage_throughput(sum(step["tokens"] for step in prefill_steps),
+                                            sum(step["elapsed_s"] for step in prefill_steps))
+        if prefill_throughput is None:
+            raise RuntimeError("No separately measured prefill work")
+        peak_memory = max(core.model_executor.collective_rpc(_worker_peak_memory))
+        row.update(status="SUCCESS", stage_metrics_status="success",
+                   stage_timing_scope="sum_synchronized_llm_steps",
+                   synchronization_boundary="LLMEngine.step plus all-worker CUDA synchronization RPC",
+                   measurement_scope="full_batch_pure_decode_steps", require_full_decode_batch=True,
+                   synchronize_step_timing=True, decode_stage_tokens=tokens,
+                   decode_stage_elapsed_s=elapsed, decode_stage_throughput_tps=throughput,
+                   actual_decode_peak=peak, completed_requests=len(raw_outputs),
+                   full_admission_reached=peak == bs, scheduler_preemptions=preemptions,
+                   measured_decode_steps_after_full=len(measured),
+                   decode_warmup_steps_after_full=args.decode_warmup_steps_after_full,
+                   decode_tp=throughput, prefill_tp=prefill_throughput, avg_bs=bs, mem=peak_memory,
+                   ttft=first_token_s, itl=elapsed / len(measured) * 1000,
+                   request_metrics_status="not_measured")
+    except Exception as error:
+        row.update(error=repr(error), traceback=traceback.format_exc())
+        traceback.print_exc()
+    finally:
+        if case_dir is not None:
+            _write_jsonl(case_dir / "steps.jsonl", steps)
+            _write_jsonl(case_dir / "raw_outputs.jsonl", raw_outputs)
+        results_dict[(method, length, bs)] = row
+        if llm is not None:
+            llm.llm_engine.engine_core.shutdown()
+
+
 def _parse_positive_ints(value: str) -> list[int]:
     values = [int(part.strip()) for part in value.split(",") if part.strip()]
     if not values or any(item <= 0 for item in values):

@@ -272,6 +272,15 @@ churn 均合并实测逐请求样本，报告 TTFT、TPOT 的 mean/P50/P95/P99�
   decode_stage_tokens 排除 prefill 产生的首 token。阶段时间不含 step 之间的
   测试驱动代码。分批 admission、warmup 舍弃、截断的窗口设置随结果保存。
   旧 ttft 是批次首次观测，旧 itl 是执行时间代理，不能作为请求指标。
+- 固定并发的纯 decode 测量可在同步 microbench 中添加
+  `--require_full_decode_batch --decode_warmup_steps_after_full N`。
+  所有请求必须无抢占地生成完整输出；只统计 warmup 后的满批 decode 步骤，
+  排除批次缩小时的尾部，拒绝截断。指定 `--output_dir` 后保存原始输出与逐步记录。
+  `--engine vllm --methods vanilla` 选择同步 vLLM V1 阶段适配器
+  （验证版本 v0.26.0；需设 `VLLM_ENABLE_V1_MULTIPROCESSING=0`）。
+  step 时间包含所有 worker 的 CUDA 同步 RPC 开销。此模式要求 DP1、EP1 或 EP=TP，
+  禁用 prefix cache 和 admission wave；若提供 `engine_prefill_chunk_size`，
+  它必须等于 `max_num_batched_tokens`。无法映射的参数会明确失败。
 - GPU compute activity 和 memory I/O activity 来自 nvidia-smi 采样，不是
   理论 MFU/MBU。Coarse active duty 也不能用于归因 CPU/launch 开销。
 

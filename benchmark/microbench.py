@@ -478,7 +478,19 @@ def _finished_outputs_have_tokens(finished_outputs) -> bool:
     return False
 
 
+def _completed_output_records(outputs, output_len):
+    return [
+        {"request_id": row[0], "token_ids": row[1],
+         "status": "success" if len(row[1]) == output_len else "model_failed"}
+        for row in outputs
+    ]
+
+
 def benchmark_task(method, length, bs, args, results_dict):
+    if getattr(args, "engine", "sparsevllm") == "vllm":
+        from benchmark.vllm_microbench import benchmark_decode_stage
+        benchmark_decode_stage(method, length, bs, args, results_dict)
+        return
     # 为每个子进程重置显存统计
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.empty_cache()
@@ -523,8 +535,12 @@ def benchmark_task(method, length, bs, args, results_dict):
     
     llm = None
     resolved_engine_config: dict[str, Any] = {}
+    step_rows = []
+    completed_outputs = []
+    completed_requests = 0
+    actual_decode_peak = 0
     try:
-        m_len = length + args.output_len + 100
+        m_len = length + args.output_len + (0 if getattr(args, "require_full_decode_batch", False) else 100)
         if args.max_model_len_override is not None:
             if args.max_model_len_override < length + args.output_len:
                 raise ValueError(
@@ -562,6 +578,10 @@ def benchmark_task(method, length, bs, args, results_dict):
         ]
         admission_wave_size = int(getattr(args, "admission_wave_size", 0) or 0)
         staged_admission = 0 < admission_wave_size < bs
+        strict_batch = bool(getattr(args, "require_full_decode_batch", False))
+        step_rows = []
+        completed_outputs = []
+        actual_decode_peak = 0
         wave_decode_gap_steps = int(getattr(args, "wave_decode_gap_steps", 0) or 0)
 
         # --- 关键修改：重置并开始正式测量 ---
@@ -578,7 +598,7 @@ def benchmark_task(method, length, bs, args, results_dict):
         decode_tokens_after_full = 0
         decode_times_after_full = []
         decode_bs_after_full = []
-        full_admission_reached = not staged_admission
+        full_admission_reached = not (staged_admission or strict_batch)
         impossible_full_admission = False
         decode_steps_after_full = 0
         decode_warmup_steps_after_full = int(getattr(args, "decode_warmup_steps_after_full", 0) or 0)
@@ -634,6 +654,13 @@ def benchmark_task(method, length, bs, args, results_dict):
             if synchronize_step_timing:
                 torch.cuda.synchronize()
             step_dt = perf_counter() - step_start
+            completed_requests += len(finished_outputs)
+            actual_decode_peak = max(actual_decode_peak, -num_tokens)
+            if strict_batch:
+                completed_outputs.extend(finished_outputs)
+                step_rows.append({"tokens": num_tokens, "elapsed_s": step_dt, "measured": False})
+                if int(getattr(llm.scheduler, "total_preemptions", 0)):
+                    raise RuntimeError("Full decode batch capacity exceeded: scheduler preemption")
             _observe_prefix_cache_hits(llm, prefix_hits_by_seq_id)
             
             if num_tokens > 0:
@@ -655,12 +682,14 @@ def benchmark_task(method, length, bs, args, results_dict):
                 decode_steps_since_last_wave += 1
                 decode_times.append(step_dt)
                 decode_tokens += (-num_tokens)
-                if full_admission_reached:
+                if full_admission_reached and (not strict_batch or -num_tokens == bs):
                     decode_steps_after_full += 1
                     if decode_steps_after_full > decode_warmup_steps_after_full:
+                        if strict_batch:
+                            step_rows[-1]["measured"] = True
                         decode_times_after_full.append(step_dt)
                         decode_tokens_after_full += (-num_tokens)
-                        decode_bs_after_full.append(len(llm.scheduler.decoding))
+                        decode_bs_after_full.append(-num_tokens)
                 zero_steps = 0
                 # Fallback: if output_len==0/1 or internal behavior changes, ensure TTFT is set.
                 if ttft is None:
@@ -670,16 +699,29 @@ def benchmark_task(method, length, bs, args, results_dict):
                 if zero_steps >= 50:
                     raise RuntimeError("llm.step() returned 0 tokens repeatedly; scheduler may be stuck.")
 
-            if staged_admission and not full_admission_reached and next_request_idx == bs:
+            if (staged_admission or strict_batch) and not full_admission_reached and next_request_idx == bs:
                 if len(llm.scheduler.waiting) == 0 and len(llm.scheduler.decoding) == bs:
                     full_admission_reached = True
                 elif finished_outputs:
                     impossible_full_admission = True
                     break
 
+            if strict_batch and finished_outputs and not full_admission_reached:
+                raise RuntimeError("Full decode batch capacity exceeded: request finished before all admission waves completed")
+
             if full_admission_reached and max_decode_steps_after_full > 0 and decode_steps_after_full >= max_decode_steps_after_full:
                 break
 
+        if strict_batch:
+            if not full_admission_reached or actual_decode_peak != bs:
+                raise RuntimeError("Full decode batch capacity exceeded: not all requests entered decode together")
+            if len(completed_outputs) != bs or any(len(row[1]) != args.output_len for row in completed_outputs):
+                raise RuntimeError("Incomplete output: every request must finish the requested output length")
+            if args.output_dir:
+                case_path = Path(args.output_dir) / f"{method}-{length}-{bs}"
+                _write_jsonl_rows(case_path / "steps.jsonl", step_rows)
+                _write_jsonl_rows(case_path / "raw_outputs.jsonl",
+                                  _completed_output_records(completed_outputs, args.output_len))
         if decode_warmup_steps_after_full > 0 and not decode_times_after_full:
             raise RuntimeError(
                 "No measured decode steps remained after discarding "
@@ -753,6 +795,12 @@ def benchmark_task(method, length, bs, args, results_dict):
             "length": int(length),
             "batch_size": int(bs),
             "prefill_tp": prefill_tp or 0.0,
+            "engine": "sparsevllm",
+            "actual_decode_peak": actual_decode_peak,
+            "completed_requests": completed_requests,
+            "output_len": int(args.output_len),
+            "require_full_decode_batch": strict_batch,
+            "measurement_scope": "full_batch_pure_decode_steps" if strict_batch else "legacy_stage_scope",
             "decode_tp": decode_tp or 0.0,
             "stage_metrics_status": "success" if synchronize_step_timing else "not_measured",
             "stage_timing_scope": "sum_synchronized_llm_steps" if synchronize_step_timing else "unsynchronized_host_steps",
@@ -808,11 +856,18 @@ def benchmark_task(method, length, bs, args, results_dict):
     except Exception as e:
         print(f"Error at {method}/{length}/{bs}: {e}")
         traceback.print_exc()
+        if getattr(args, "require_full_decode_batch", False) and args.output_dir:
+            case_path = Path(args.output_dir) / f"{method}-{length}-{bs}"
+            _write_jsonl_rows(case_path / "steps.jsonl", step_rows)
+            _write_jsonl_rows(case_path / "raw_outputs.jsonl",
+                              _completed_output_records(completed_outputs, args.output_len))
         results_dict[(method, length, bs)] = {
             "method": method,
             "sparse_method": normalized_method,
             "length": int(length),
             "batch_size": int(bs),
+            "actual_decode_peak": actual_decode_peak,
+            "completed_requests": completed_requests,
             "status": "FAILED",
             "error": repr(e),
             "traceback": traceback.format_exc(),
@@ -827,6 +882,9 @@ def benchmark_task(method, length, bs, args, results_dict):
 def main():
     parser = argparse.ArgumentParser(description="Professional benchmark for sparsevllm.")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the model")
+    parser.add_argument("--engine", choices=("sparsevllm", "vllm"), default="sparsevllm")
+    parser.add_argument("--require_full_decode_batch", action="store_true",
+                        help="Measure only pure decode steps with all requested sequences resident; require complete outputs and no preemption.")
     parser.add_argument("--lengths", type=str, default="16000,32000,64000", help="Context lengths to test")
     parser.add_argument("--batch_sizes", type=str, default="4", help="Batch sizes to test")
     parser.add_argument(
@@ -919,6 +977,10 @@ def main():
     )
     
     args = parser.parse_args()
+    if args.require_full_decode_batch and (not args.synchronize_step_timing or args.max_decode_steps_after_full):
+        parser.error("Full decode batch measurement requires synchronized timing and untruncated outputs")
+    if args.engine == "vllm" and not args.require_full_decode_batch:
+        parser.error("vLLM stage adapter requires --require_full_decode_batch")
     try:
         args.hyper_params_dict = _build_engine_hyper_params(args)
     except ValueError as e:

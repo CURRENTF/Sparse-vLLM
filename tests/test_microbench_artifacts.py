@@ -5,10 +5,19 @@ import pytest
 
 from benchmark.microbench import (
     _benchmark_sparse_method,
+    _completed_output_records,
     _decode_cuda_graph_status,
     _record_child_exit_failure,
     _write_output_dir,
 )
+
+
+def test_partial_output_artifact_does_not_label_short_generation_success():
+    """A failed strict run must retain a failure status on its short raw output."""
+    outputs = [(12, [1, 2, 3]), (13, [4])]
+    rows = _completed_output_records(outputs, output_len=3)
+    assert [row["status"] for row in rows] == ["success", "model_failed"]
+    assert [(row["request_id"], row["token_ids"]) for row in rows] == outputs
 
 
 def test_decode_cuda_graph_status_records_execution_counters():

@@ -291,6 +291,16 @@ named `batch_max_ttft_ms_mean`. The request contract is
   Admission, warmup-discard and truncation settings accompany the selected decode
   window. Legacy ttft/itl are a batch observation/execution proxy, not request
   distributions.
+- For fixed-concurrency pure decode, add `--require_full_decode_batch` and
+  `--decode_warmup_steps_after_full N` to the synchronized microbench. All requests
+  must finish the requested output length without preemption; only full-batch
+  decode steps after warmup count, excluding falling-batch tails. Truncation is
+  rejected. With `--output_dir`, raw outputs and measured-step records are saved.
+  `--engine vllm --methods vanilla` selects the synchronous vLLM V1 stage adapter
+  (validated against v0.26.0; set `VLLM_ENABLE_V1_MULTIPROCESSING=0`). Its step time
+  includes all-worker CUDA synchronization RPC overhead. It requires DP1, EP1 or
+  EP=TP, no prefix caching or admission waves, and `engine_prefill_chunk_size`
+  equal to `max_num_batched_tokens` when supplied; unsupported mappings fail.
 - GPU compute and memory I/O activity are nvidia-smi samples, not theoretical
   MFU/MBU. Coarse active duty cannot attribute CPU scheduling or launch overhead.
 
