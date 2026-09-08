@@ -1,8 +1,27 @@
 """Bounded MLA attention partials and online output merging."""
 
+from functools import lru_cache
+
 import torch
 import triton
 import triton.language as tl
+
+from sparsevllm.platforms import device_runtime
+
+
+@lru_cache(maxsize=None)
+def _launch_config(device_index, head_dim):
+    from sparsevllm.kernels.triton.context_flashattention_nopad import (
+        _device_max_shared_memory,
+        select_context_attention_launch_config,
+    )
+
+    # Reuse the existing prefill tiles and shared-memory compatibility bound.
+    return select_context_attention_launch_config(
+        head_dim,
+        max_shared_memory=_device_max_shared_memory(device_index),
+        is_tesla="Tesla" in device_runtime.optional_device_name(device_index),
+    )
 
 
 @triton.jit
@@ -25,10 +44,10 @@ def _attention(
     D: tl.constexpr,
     SCALE: tl.constexpr,
     CAUSAL: tl.constexpr,
-    M: tl.constexpr = 32,
-    N: tl.constexpr = 64,
+    M: tl.constexpr,
+    N: tl.constexpr,
 ):
-    batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    block, head, batch = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     qs, qe = tl.load(CQ + batch), tl.load(CQ + batch + 1)
     ks, ke = tl.load(CK + batch), tl.load(CK + batch + 1)
     qi = block * M + tl.arange(0, M)
@@ -39,28 +58,35 @@ def _attention(
     maximum = tl.full((M,), -float("inf"), tl.float32)
     denominator = tl.zeros((M,), tl.float32)
     acc = tl.zeros((M, D), tl.float32)
-    for start in range(0, ke - ks, N):
+    # Match the causal traversal of context_flashattention_nopad: later keys
+    # cannot contribute to this query tile. Ragged-batch padding does no work.
+    end = ke - ks
+    if CAUSAL:
+        end = tl.minimum(end, (block + 1) * M + (ke - ks) - (qe - qs))
+    end = tl.where(block * M < qe - qs, tl.maximum(end, 0), 0)
+    for start in range(0, end, N):
         ki = start + tl.arange(0, N)
         k = tl.load(
             K + (ks + ki[None, :]) * k0 + head * k1 + di[:, None],
             ki[None, :] < ke - ks,
             0,
         )
-        z = tl.dot(q, k) * SCALE
+        z = tl.dot(q, k) * (SCALE * 1.4426950408889634)
         valid = ki[None, :] < ke - ks
         if CAUSAL:
             valid = valid & (ki[None, :] <= qi[:, None] + (ke - ks) - (qe - qs))
         z = tl.where(valid, z, -float("inf"))
         updated = tl.maximum(maximum, tl.max(z, 1))
         safe = tl.where(updated == -float("inf"), 0.0, updated)
-        p = tl.exp(z - safe[:, None])
-        alpha = tl.exp(maximum - safe)
+        p = tl.exp2(z - safe[:, None])
+        alpha = tl.exp2(maximum - safe)
         v = tl.load(
             V + (ks + ki[:, None]) * v0 + head * v1 + di[None, :],
             ki[:, None] < ke - ks,
             0,
         )
-        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        acc = acc * alpha[:, None]
+        acc = tl.dot(p.to(v.dtype), v, acc)
         denominator = denominator * alpha + tl.sum(p, 1)
         maximum = updated
     out = acc / tl.where(denominator > 0, denominator, 1.0)[:, None]
@@ -69,13 +95,20 @@ def _attention(
         out,
         qi[:, None] < qe - qs,
     )
-    tl.store(L + head * TOTAL_Q + qs + qi, maximum + tl.log(denominator), qi < qe - qs)
+    # The merge and score APIs consume natural-log LSE, despite exp2 internally.
+    lse = (maximum + tl.log2(denominator)) * 0.6931471805599453
+    tl.store(L + head * TOTAL_Q + qs + qi, lse, qi < qe - qs)
 
 
 def attention_partial(q, k, v, cu_q, cu_k, max_q, max_k, *, scale, causal):
-    output = torch.empty_like(q)
+    output = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     lse = torch.empty((q.shape[1], q.shape[0]), device=q.device, dtype=torch.float32)
-    _attention[(cu_q.numel() - 1, q.shape[1], triton.cdiv(max_q, 32))](
+    block_m, block_n, num_warps, num_stages = _launch_config(q.device.index, q.shape[2])
+    # Observation-window chunks have few queries but can scan long history.
+    # Retain the original narrow, pipelined tile for these small batches.
+    if max_q < 1024:
+        block_m, block_n, num_warps, num_stages = 32, 64, 4, 3
+    _attention[(triton.cdiv(max_q, block_m), q.shape[1], cu_q.numel() - 1)](
         q,
         k,
         v,
@@ -91,6 +124,10 @@ def attention_partial(q, k, v, cu_q, cu_k, max_q, max_k, *, scale, causal):
         q.shape[2],
         scale,
         causal,
+        block_m,
+        block_n,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return output, lse
 

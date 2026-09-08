@@ -9,8 +9,55 @@ from sparsevllm.engine.cache_manager.base import (
     PrefillComputeView,
     PrefillScoreRequest,
 )
+from sparsevllm.kernels.triton.mla.prefill import attention_partial
 from sparsevllm.operators.mla_attention import MlaAttentionOpSpec, MlaSglFa3Provider
 from sparsevllm.operators.mla_prefill import ChunkedMlaPrefill
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize(
+    "queries,keys",
+    [((1025, 7), (1025, 7)), ((65, 3), (193, 131)), ((1025, 7), (17, 0))],
+)
+def test_triton_partial_ragged_causal_bounds_and_lse(causal, queries, keys):
+    # Loop clipping must preserve bottom-right causal alignment, partial tiles,
+    # and fully masked rows. Existing chunked tests use only short query tiles
+    # and cannot catch a wrong bound after increasing the attention tile size.
+    torch.manual_seed(51)
+    device = "cuda"
+    q = (
+        torch.randn(5, sum(queries), 256, device=device, dtype=torch.bfloat16) * 0.2
+    ).transpose(0, 1)
+    k = torch.randn(sum(keys), 5, 256, device=device, dtype=torch.bfloat16) * 0.2
+    # V is a strided view of the joint KV projection in the serving path.
+    v = torch.randn(sum(keys), 5, 448, device=device, dtype=torch.bfloat16)[..., 192:]
+    cu_q = torch.tensor([0, queries[0], sum(queries)], device=device, dtype=torch.int32)
+    cu_k = torch.tensor([0, keys[0], sum(keys)], device=device, dtype=torch.int32)
+    output, lse = attention_partial(
+        q, k, v, cu_q, cu_k, max(queries), max(keys), scale=0.0625, causal=causal
+    )
+    qa = ka = 0
+    for qn, kn in zip(queries, keys):
+        logits = torch.einsum(
+            "qhd,khd->hqk", q[qa : qa + qn].float(), k[ka : ka + kn].float()
+        ) * 0.0625
+        if causal:
+            mask = torch.arange(kn, device=device)[None] <= (
+                torch.arange(qn, device=device)[:, None] + kn - qn
+            )
+            logits.masked_fill_(~mask[None], -torch.inf)
+        expected_lse = logits.logsumexp(-1)
+        probabilities = logits.softmax(-1).nan_to_num(0)
+        expected = torch.einsum("hqk,khd->qhd", probabilities, v[ka : ka + kn].float())
+        torch.testing.assert_close(
+            output[qa : qa + qn].float(), expected, atol=0.006, rtol=0.03
+        )
+        torch.testing.assert_close(
+            lse[:, qa : qa + qn], expected_lse, atol=0.003, rtol=0.001
+        )
+        qa += qn
+        ka += kn
 
 
 def make_case(contexts=(73, 29, 41), queries=(17, 29, 9), heads=5):
