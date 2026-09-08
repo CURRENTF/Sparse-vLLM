@@ -269,13 +269,23 @@ named `batch_max_ttft_ms_mean`. The request contract is
   synchronized observations. vLLM uses internal metrics, with legacy finished_time or V1
   last_token_ts identified by timing_source. These are engine observations,
   not HTTP client latencies; compare matching observation boundaries.
-- Probe does not measure execution stages: `stage_metrics_status=not_measured`.
+- By default, probe does not measure execution stages: `stage_metrics_status=not_measured`.
   `first_token_window_throughput_tps` divides input tokens by the first-token
   event window; `batch_decode_token_throughput_tps` divides subsequent output
   tokens by earliest first token to latest completion. These windows may overlap
   and are not pure prefill/decode throughput. Old fields
   `prefill_token_throughput_tps` and `decode_token_throughput_tps` remain
   compatibility aliases only.
+- For a TP1 native fixed-batch decode-only diagnostic, pass
+  `--decode-only-steps 256 --decode-only-warmup-steps 8` with CUDA Graph enabled.
+  Each raw iteration's `decode_only_window` counts actual decode tokens over a
+  contiguous full-residency window, synchronized only at its two edges. All
+  prefill and wave admission precede the window; scheduling, sampling, scoring,
+  eviction and intervening driver work remain timed. Prefill, partial batches,
+  request turnover, graph capture/eager execution, or an incomplete window fail
+  the run. This is engine throughput, not isolated GPU kernel time. Request
+  latencies from this diagnostic are boundary-perturbed and have a separate
+  timing source; the default event-window fields keep their existing meaning.
 - `output_token_throughput_tps` is all output tokens / complete workload time;
   aggregation uses total tokens / total measured time across iterations. It is
   E2E output throughput. `tpot_concurrency_proxy_tps` is concurrency × 1000 /

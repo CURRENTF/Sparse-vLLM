@@ -108,6 +108,88 @@ def stage_throughput(tokens: int, elapsed_s: float) -> float | None:
     return tokens / elapsed_s
 
 
+class DecodeOnlyWindow:
+    """Contiguous full-residency engine window, synchronized only at its edges.
+
+    Adapters call boundary before scheduling and observe after each engine step.
+    All intervening driver, scheduling and GPU work remains in the denominator.
+    This opt-in diagnostic perturbs its two boundary iterations, not every step.
+    """
+
+    def __init__(self, concurrency, steps, warmup_steps, *, synchronize, clock,
+                 graph_stats):
+        if concurrency < 1 or steps < 1 or warmup_steps < 1:
+            raise ValueError("Decode window requires positive concurrency, steps and warmup")
+        self.concurrency = concurrency
+        self.target_steps = steps
+        self.warmup_steps = warmup_steps
+        self.synchronize = synchronize
+        self.clock = clock
+        self.graph_stats = graph_stats
+        self.ids = None
+        self.warmed = 0
+        self.steps = 0
+        self.tokens = 0
+        self.started = None
+        self.result = None
+
+    def boundary(self):
+        if self.result is not None:
+            return
+        if self.started is not None and self.steps == self.target_steps:
+            self.synchronize()
+            finished = self.clock()
+            after = self.graph_stats()
+            delta = {key: after[key] - value for key, value in self.graph_before.items()}
+            if delta["capture_count"] or delta["eager_decode_count"] or delta["replay_count"] != self.steps:
+                raise RuntimeError(f"Decode-only window violated captured graph contract: {delta}")
+            elapsed = finished - self.started
+            self.result = {
+                "status": "success",
+                "scope": "full_residency_contiguous_decode_only_boundary_sync_v1",
+                "timing_boundary": "before_scheduler_iteration_to_before_scheduler_iteration",
+                "concurrency": self.concurrency,
+                "request_ids": list(self.ids),
+                "discarded_full_decode_steps": self.warmup_steps,
+                "decode_steps": self.steps,
+                "decode_stage_tokens": self.tokens,
+                "decode_stage_elapsed_s": elapsed,
+                "decode_stage_throughput_tps": stage_throughput(self.tokens, elapsed),
+                "prefill_steps": 0,
+                "cuda_synchronizations": 2,
+                "graph_counter_delta": delta,
+                "started_monotonic_s": self.started,
+                "finished_monotonic_s": finished,
+            }
+        elif self.started is None and self.warmed == self.warmup_steps:
+            self.synchronize()
+            self.graph_before = self.graph_stats()
+            self.started = self.clock()
+
+    def observe(self, *, is_decode, request_ids, tokens, admission_complete):
+        if self.result is not None:
+            return
+        ids = tuple(sorted(request_ids))
+        eligible = (is_decode and admission_complete and len(ids) == self.concurrency
+                    and len(set(ids)) == self.concurrency and tokens == self.concurrency)
+        if self.started is not None:
+            if not eligible or ids != self.ids:
+                raise RuntimeError("Prefill, admission, request turnover or partial batch inside decode-only window")
+            self.steps += 1
+            self.tokens += tokens
+        elif eligible:
+            if ids != self.ids:
+                self.ids, self.warmed = ids, 0
+            self.warmed += 1
+        else:
+            self.ids, self.warmed = None, 0
+
+    def require_result(self):
+        if self.result is None:
+            raise RuntimeError("Workload ended without the requested full-residency decode-only window")
+        return self.result
+
+
 def request_timeline_metrics(
     *,
     arrival_times: dict[int, float],

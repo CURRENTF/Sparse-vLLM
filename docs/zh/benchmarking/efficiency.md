@@ -253,12 +253,20 @@ churn 均合并实测逐请求样本，报告 TTFT、TPOT 的 mean/P50/P95/P99�
   不应与旧的逐 step 同步观测混比。vLLM 使用内部
   metrics，其 legacy finished_time 与 V1 last_token_ts 边界分别记录在
   timing_source 中。这些是引擎观测指标，不包含 HTTP 客户端网络链路。
-- Probe 不采集独立阶段时间，`stage_metrics_status=not_measured`。
+- Probe 默认不采集独立阶段时间，`stage_metrics_status=not_measured`。
   `first_token_window_throughput_tps` 是输入 token / 首 token 事件窗口；
   `batch_decode_token_throughput_tps` 是后续输出 token / 最早首 token 至最后
   完成的窗口。窗口可重叠，不能称为纯 prefill/decode 阶段吞吐。
   旧字段 `prefill_token_throughput_tps`、`decode_token_throughput_tps`
   仅保留为兼容别名。
+- 原生 TP1 fixed-batch 可显式开启 CUDA Graph，并传入
+  `--decode-only-steps 256 --decode-only-warmup-steps 8`，诊断满并发的纯 decode
+  窗口。每个 raw iteration 的 `decode_only_window` 使用实际 decode token 数 /
+  连续窗口耗时，仅在两端同步 CUDA。prefill 和 wave 入场在窗口之前；窗口内保留
+  调度、采样、评分、淘汰以及 step 之间的驱动开销。混入 prefill、并发下降、请求
+  替换、Graph capture/eager 执行或窗口不足均报错。这是引擎吞吐，不是孤立 GPU
+  kernel 时间；该诊断的请求延迟受两端同步扰动，使用独立 timing_source，不替代
+  默认请求测量。原有事件窗口字段的含义不变。
 - `output_token_throughput_tps` 使用全部输出 token / 完整实测 workload 时间；
   跨 iteration 汇总按总 token / 总时间计算。它是 E2E 输出吞吐。
   `tpot_concurrency_proxy_tps` 是 concurrency × 1000 / mean request TPOT，
