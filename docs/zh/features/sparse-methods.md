@@ -36,17 +36,18 @@ prefill attention 计算。它们是同一条轴上的备选项，可以分别�
 > H2O 更新，是让当前 score-free decode runtime 向原始 H2O 算法补齐；周期性的 batch
 > 淘汰则是进一步的系统变体。
 
-SnapKV 的 `sparse_prefill_score_mode` 默认值改为 `logits`；`probability`
-仍可显式启用以复现实验，但它需要额外执行归一化 QK sweep，在已测长上下文
-prefill 中开销明显更高。PyramidKV 和 H2O 继续默认使用 `probability`。对两个阶段
-共享的 H2O prompt scoring state 而言，这是 canonical 路径：每个 KV layer 都独立地对
-完整当前 query chunk 的归一化 softmax attention probability 求和，并在
-prefill chunk 之间累计 attention mass。当前明确关闭 decode score 收集与
-淘汰。Sparse-vLLM 复用 FA3 的
-softmax LSE；由于 FlashAttention 不物化 probability matrix，还需额外执行
-一遍 QK。`h2o_prefill_score_window=0` 表示完整当前 chunk，是 canonical
-默认设置；`[1, 128]` 的非零 window 或显式 `logits` 模式均属于非 canonical
-近似，但都不会改变每个 H2O KV layer 必须独立计算并保存 prefill score 的要求。
+SnapKV 的 `sparse_prefill_score_mode` 默认为 `logits`，PyramidKV 默认为
+`probability`。H2O（含独立的 `h2o_prefill`）默认使用
+`sparse_prefill_score_mode="logits"` 和 `h2o_prefill_score_window=128`。
+显式指定的 score mode 和 window 会覆盖默认值。
+
+H2O 默认采用有限 query window 的近似评分。如需使用完整 chunk 的归一化
+attention mass 评分，请显式设置 `sparse_prefill_score_mode="probability"`
+和 `h2o_prefill_score_window=0`。此时每个 KV layer 独立地对完整当前 query
+chunk 的归一化 attention probability 求和，并在 prefill chunk 之间累计
+attention mass。H2O probability 模式会输出性能警告，因为即使复用 attention
+LSE，仍需额外计算 QK 评分。两种模式都要求每个 H2O KV layer 独立保存评分；
+decode score 收集与周期淘汰仍处于关闭状态。
 
 ## Prefill Scheduling Policy
 

@@ -208,6 +208,18 @@ def _normalize_sparse_prefill_score(config) -> None:
             f"{config.sparse_attn_score_dtype!r}."
         )
     config.sparse_prefill_score_mode = mode
+    if mode == "probability" and cache_method == "h2o":
+        # TODO(h2o-probability-efficiency): avoid duplicate QK work in H2O
+        # probability scoring, including the path with reused attention LSE,
+        # while preserving score semantics.
+        log_once(
+            "TODO(h2o-probability-efficiency): H2O selects probability "
+            "scoring with a known efficiency issue: separate score kernels "
+            "recompute QK and reduce probabilities in addition to main attention. "
+            "Reusing attention LSE, when available, does not eliminate this extra "
+            "QK work. Probability scoring remains enabled with unchanged semantics.",
+            level="WARNING",
+        )
 
 def _normalize_rkv(config) -> None:
     _normalize_positive_int(config, "rkv_compression_interval", fallback=0)

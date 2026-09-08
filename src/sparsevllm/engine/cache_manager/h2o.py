@@ -887,6 +887,9 @@ class H2OCacheManager(SnapKVCacheManager):
                     raise RuntimeError(
                         "FA3 softmax LSE is only valid for probability H2O scoring."
                     )
+                # TODO(h2o-probability-efficiency): optimize full-chunk scoring;
+                # matched H100/Qwen3-4B runs show substantial TTFT overhead versus
+                # logits. Preserve normalized-attention score semantics.
                 from sparsevllm.kernels.triton.prefill_score import (
                     prefill_score_from_lse_fwd,
                 )

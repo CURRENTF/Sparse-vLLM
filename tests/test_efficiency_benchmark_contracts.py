@@ -595,7 +595,7 @@ def test_snapkv_probe_requires_and_records_explicit_score_mode():
 
 def test_h2o_probe_records_explicit_budget_protocol():
     args = SimpleNamespace(
-        hyper_params="{}",
+        hyper_params='{"h2o_prefill_score_window": 0}',
         tensor_parallel_size=2,
         gpu_memory_utilization=0.85,
         max_num_batched_tokens=8192,

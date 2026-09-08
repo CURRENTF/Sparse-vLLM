@@ -224,7 +224,7 @@ def resolve_sparse_prefill_score_mode(
 
     normalized = normalize_sparse_method(method)
     if configured_mode is None:
-        return "logits" if normalized == "snapkv" else "probability"
+        return "logits" if normalized in {"snapkv", "h2o"} else "probability"
     return str(configured_mode).strip().lower()
 
 
@@ -233,7 +233,7 @@ def sparse_prefill_attention_contract(
     *,
     prefill_sparse_method: str | None = None,
     sparse_prefill_score_mode: str | None = None,
-    h2o_prefill_score_window: int = 0,
+    h2o_prefill_score_window: int = 128,
 ) -> SparsePrefillAttentionContract:
     normalized = normalize_sparse_method(method)
     if normalized not in CANONICAL_SPARSE_METHODS:
@@ -252,7 +252,7 @@ def sparse_prefill_attention_contract(
         h2o_score_collection
         and resolved_prefill_method != "flashprefill_v2"
         and resolve_sparse_prefill_score_mode(
-            normalized,
+            cache_method,
             sparse_prefill_score_mode,
         )
         == "logits"
@@ -293,7 +293,7 @@ def h2o_uses_fused_prefill_score(config) -> bool:
             getattr(config, "sparse_prefill_score_mode", None),
         )
         == "logits"
-        and int(getattr(config, "h2o_prefill_score_window", 0)) == 0
+        and int(getattr(config, "h2o_prefill_score_window", 128)) == 0
     )
 
 

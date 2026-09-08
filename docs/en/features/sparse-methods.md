@@ -46,19 +46,20 @@ compatibility rule.
 > the original H2O algorithm; periodic batched eviction would be an additional
 > systems variant.
 
-SnapKV defaults `sparse_prefill_score_mode` to `logits`; `probability` remains
-an explicit reproducibility option because its additional normalized QK sweep
-is substantially more expensive in measured long-context prefill. PyramidKV
-and H2O continue to default to `probability`. For the shared H2O prompt-scoring
-state this is the canonical path: every KV layer independently sums its
-normalized softmax attention probabilities over the full current query chunk,
-then accumulates that attention mass across prefill chunks. Decode score
-collection and eviction are intentionally disabled. Sparse-vLLM
-reuses FA3's softmax LSE and performs one additional QK sweep because FlashAttention
-does not materialize its probability matrix. `h2o_prefill_score_window=0` selects
-the full current chunk and is the canonical default. A nonzero window in `[1, 128]`
-or explicit `logits` mode is a non-canonical approximation; neither changes the
-requirement that every H2O KV layer computes and retains its own prefill score.
+SnapKV defaults `sparse_prefill_score_mode` to `logits`, while PyramidKV defaults
+to `probability`. H2O (including standalone `h2o_prefill`) defaults to
+`sparse_prefill_score_mode="logits"` and `h2o_prefill_score_window=128`.
+Explicit score-mode and window settings override these defaults.
+
+The H2O default is an approximation using a bounded query window. To select
+full-chunk normalized attention-mass scoring, explicitly set
+`sparse_prefill_score_mode="probability"` and `h2o_prefill_score_window=0`.
+In that mode, every KV layer independently sums normalized attention
+probabilities over the full current query chunk and accumulates attention mass
+across prefill chunks. H2O probability mode emits a performance warning because
+it needs additional QK scoring even when attention LSE is reused. Both modes
+retain independent scores for every H2O KV layer; decode score collection and
+periodic eviction remain disabled.
 
 ## Prefill Scheduling Policies
 

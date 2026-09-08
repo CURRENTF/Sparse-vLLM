@@ -83,10 +83,6 @@ def build_mha_prefill_attention_spec(
     )
     normalized_method = normalize_sparse_method(sparse_method)
     score_config = config if runtime_config is None else runtime_config
-    score_mode = resolve_sparse_prefill_score_mode(
-        normalized_method,
-        getattr(score_config, "sparse_prefill_score_mode", None),
-    )
     prefill_sparse_method = resolve_prefill_sparse_method(
         getattr(score_config, "prefill_sparse_method", None),
         sparse_method=normalized_method,
@@ -95,12 +91,16 @@ def build_mha_prefill_attention_spec(
         normalized_method,
         prefill_sparse_method=prefill_sparse_method,
     )
+    score_mode = resolve_sparse_prefill_score_mode(
+        cache_method,
+        getattr(score_config, "sparse_prefill_score_mode", None),
+    )
     contract = sparse_prefill_attention_contract(
         normalized_method,
         prefill_sparse_method=prefill_sparse_method,
         sparse_prefill_score_mode=score_mode,
         h2o_prefill_score_window=getattr(
-            score_config, "h2o_prefill_score_window", 0
+            score_config, "h2o_prefill_score_window", 128
         ),
     )
     flashprefill_v2 = None

@@ -9,7 +9,7 @@ cd "${REPO_ROOT}"
 MODE="${1:-smoke}" # smoke | full
 MODEL_NAME="${2:-qwen3_30b}" # qwen3_30b | qwen3_8b | qwen25_7b
 GPUS="${3:-2,3}"
-SPARSE_PREFILL_SCORE_MODE="${SPARSE_PREFILL_SCORE_MODE:-probability}"
+SPARSE_PREFILL_SCORE_MODE="${SPARSE_PREFILL_SCORE_MODE:-logits}"
 case "${SPARSE_PREFILL_SCORE_MODE}" in
   probability|logits) ;;
   *)
@@ -17,11 +17,7 @@ case "${SPARSE_PREFILL_SCORE_MODE}" in
     exit 2
     ;;
 esac
-if [ "${SPARSE_PREFILL_SCORE_MODE}" = "logits" ]; then
-  H2O_PREFILL_SCORE_WINDOW="${H2O_PREFILL_SCORE_WINDOW:-0}"
-else
-  H2O_PREFILL_SCORE_WINDOW="${H2O_PREFILL_SCORE_WINDOW:-128}"
-fi
+H2O_PREFILL_SCORE_WINDOW="${H2O_PREFILL_SCORE_WINDOW:-128}"
 
 # 1. Environment & Python Setup
 PYTHON_BIN="${PYTHON_BIN:-python3}"
