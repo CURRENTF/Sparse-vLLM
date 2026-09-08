@@ -1,0 +1,37 @@
+{
+  "native": {
+    "python": "3.12.13 | packaged by Anaconda, Inc. | (main, Jul  9 2026, 14:38:16) [GCC 14.3.0]",
+    "torch_cuda": "13.0",
+    "packages": {
+      "torch": "2.11.0",
+      "triton": "3.6.0",
+      "matplotlib": "3.11.1",
+      "sglang-kernel": "0.4.5",
+      "torchaudio": "2.11.0",
+      "transformers": "5.13.1",
+      "flashinfer-jit-cache": "0.6.17+cu130",
+      "torchcodec": "0.15.0",
+      "tokenspeed-triton": "3.8.10.post20260721",
+      "torch_c_dlpack_ext": "0.1.5",
+      "seaborn": "0.13.2",
+      "torchvision": "0.26.0",
+      "flashinfer-python": "0.6.17"
+    }
+  },
+  "vllm": {
+    "python": "3.12.13 | packaged by Anaconda, Inc. | (main, Jul  9 2026, 14:38:16) [GCC 14.3.0]",
+    "torch_cuda": "13.0",
+    "packages": {
+      "torch": "2.11.0",
+      "triton": "3.6.0",
+      "transformers": "5.14.1",
+      "vllm": "0.26.0"
+    }
+  },
+  "hardware": {
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "memory_mib": 81559,
+    "driver": "580.65.06",
+    "glm_interconnect": "NV18"
+  }
+}

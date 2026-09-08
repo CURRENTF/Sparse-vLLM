@@ -1,0 +1,10 @@
+{
+  "name": "fresh_modern",
+  "colors": {
+    "vllm-vanilla": "#7396D2",
+    "svllm-vanilla": "#91A7AE",
+    "svllm-snapkv": "#43B6A4",
+    "svllm-quest": "#E3AD58",
+    "svllm-omnikv": "#AD8BC7"
+  }
+}

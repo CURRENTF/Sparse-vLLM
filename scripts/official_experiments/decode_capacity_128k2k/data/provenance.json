@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "experiment": "decode_capacity_128k2k",
+  "completed": "2026-09-08T19:42:26+08:00",
+  "accepted_points": 44,
+  "curves": 10,
+  "measured_source": {
+    "base_commit": "f239c9491320f9ce36051c13881afafd71fb029d",
+    "dirty": true,
+    "archive": "source-final.tar.gz",
+    "archive_sha256": "ae4380c9bd299d9df926e9e7a63afe73838646063fe37ad34c1f4452836d1d15",
+    "note": "The base commit alone is insufficient; use the archived source or preserved experiment checkout. Per-case identities in the original campaign bind historical stage versions."
+  },
+  "original_artifacts": {
+    "plot_data_sha256": "baf48b79ace1128f9634ddef7c5a84429f532a3b93378b7a67f7982eb76eda8a",
+    "linear_png_sha256": "c03cd5fae2df795acbf883f0c1d9784866cda07e0aaa0887fc12745e62b0a89e",
+    "logy_png_sha256": "c63b6695be5c234bfcc0f5a47cbb45d56fc1ad52305eef8107c50b63445ec24b"
+  },
+  "packaging": {
+    "data_transformation": "Private runtime config paths replaced with environment placeholders; artifact paths made relative to original campaign root. Numerical values and failed-attempt evidence preserved.",
+    "runner_changes": "Explicit benchmark checkout, configuration environment expansion, GPU-free path/option preflight, sibling guard/validator imports, resolved campaign config and orchestrator hashes.",
+    "raw_artifacts_included": false,
+    "original_records_preserved": true
+  }
+}

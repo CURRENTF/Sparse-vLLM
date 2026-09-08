@@ -3,6 +3,7 @@
 Top-level scripts are grouped by their primary use:
 
 - `benchmarks/`: full benchmark drivers, experiment runners, and job queues.
+- `official_experiments/`: reproducible experiment packages with parameters, plotting scripts, and lightweight result data.
 - `data/`: dataset download and background-download wrappers.
 - `profiling/`: low-level performance microbenchmarks and kernel benchmarks.
 - `validation/`: correctness checks, output comparisons, and implementation smoke tests.
