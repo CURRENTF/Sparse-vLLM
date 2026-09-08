@@ -246,8 +246,8 @@ def profiling_kv_budget_bytes(config, num_slots: int) -> int:
         prefill_sparse_method=getattr(config, "prefill_sparse_method", None),
     )
     if method != "quest":
-        if method == "snapkv":
-            # SnapKV's allocator consumes a total byte budget: one KV payload,
+        if method in {"snapkv", "h2o"}:
+            # SnapKV and H2O share an allocator with one KV payload,
             # one free-slot vector per layer, and layer-local row-slot maps.
             # Doubling the payload can exhaust VRAM before workspace profiling.
             int32_bytes = torch.empty((), dtype=torch.int32).element_size()

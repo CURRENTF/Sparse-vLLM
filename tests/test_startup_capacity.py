@@ -111,8 +111,15 @@ def test_h2o_prefill_only_uses_h2o_physical_cache_budget():
 
     budget = profiling_kv_budget_bytes(config, 10)
 
-    bytes_per_slot = 4 * 2 * 4 * 128 * 2
-    assert budget == 10 * bytes_per_slot * 2
+    from sparsevllm.engine.cache_manager.snapkv import resolve_snapkv_cache_capacity
+
+    # Regression: a doubled startup budget made high-concurrency H2O OOM
+    # before profiling, despite its pruned resident rows fitting in memory.
+    slots, _, _ = resolve_snapkv_cache_capacity(
+        available_bytes=budget, slot_bytes_per_layer=2 * 4 * 128 * 2,
+        num_kv_layers=4, max_buffer_rows=8, max_model_len=32,
+    )
+    assert slots == 10
 
 
 def test_snapkv_profiling_budget_matches_storage_and_metadata_tensor_bytes():
