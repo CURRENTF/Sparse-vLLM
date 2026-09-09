@@ -5,7 +5,9 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+# Absorbed Q is a transposed [head, query, latent] BMM output: its head
+# stride changes with the observation length, even for one fixed model.
+@triton.jit(do_not_specialize=["q1"])
 def _score(
     Q,
     K,
@@ -15,7 +17,7 @@ def _score(
     OUT,
     STATS,
     q0: tl.constexpr,
-    q1: tl.constexpr,
+    q1,
     k0: tl.constexpr,
     k1: tl.constexpr,
     qr0: tl.constexpr,

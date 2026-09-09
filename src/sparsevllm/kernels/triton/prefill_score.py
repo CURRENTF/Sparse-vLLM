@@ -72,7 +72,9 @@ class PrefillScoreWorkspace:
         )
 
 # Exact request lengths stay runtime values; tile shapes remain specialized.
-@triton.jit(do_not_specialize=["NUM_BLOCKS"])
+@triton.jit(
+    do_not_specialize=["NUM_BLOCKS", "QUERY_BLOCKS", "candidate_start", "recent_keep_tokens"]
+)
 def _prefill_score_partial_lse_kernel(
     Q,
     K,
@@ -96,10 +98,10 @@ def _prefill_score_partial_lse_kernel(
     H_PER_KV: tl.constexpr,
     H_KV: tl.constexpr,
     HEAD_BLOCKS: tl.constexpr,
-    QUERY_BLOCKS: tl.constexpr,
+    QUERY_BLOCKS,
     USE_BATCH_INDICES: tl.constexpr,
-    candidate_start: tl.constexpr,
-    recent_keep_tokens: tl.constexpr,
+    candidate_start,
+    recent_keep_tokens,
     sm_scale: tl.constexpr,
     NUM_BLOCKS,
     BLOCK_H: tl.constexpr,
@@ -209,7 +211,9 @@ def _prefill_score_reduce_lse_kernel(
     tl.store(Global_LSE + out_offs, m_i + tl.log(l_i), mask=offs_rows < BLOCK_ROWS)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["QUERY_BLOCKS", "candidate_start", "recent_keep_tokens"]
+)
 def _prefill_score_final_kernel(
     Q,
     K,
@@ -240,11 +244,11 @@ def _prefill_score_final_kernel(
     H_PER_KV: tl.constexpr,
     H_KV: tl.constexpr,
     HEAD_BLOCKS: tl.constexpr,
-    QUERY_BLOCKS: tl.constexpr,
+    QUERY_BLOCKS,
     WRITE_PER_HEAD: tl.constexpr,
     USE_BATCH_INDICES: tl.constexpr,
-    candidate_start: tl.constexpr,
-    recent_keep_tokens: tl.constexpr,
+    candidate_start,
+    recent_keep_tokens,
     sm_scale: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
@@ -346,7 +350,7 @@ def _prefill_score_final_kernel(
         )
 
 
-@triton.jit(do_not_specialize=["SCORE_WIDTH"])
+@triton.jit(do_not_specialize=["SCORE_WIDTH", "QUERY_BLOCKS"])
 def _prefill_probability_from_lse_kernel(
     Q,
     K,
@@ -378,7 +382,7 @@ def _prefill_probability_from_lse_kernel(
     H_PER_KV: tl.constexpr,
     H_KV: tl.constexpr,
     HEAD_BLOCKS: tl.constexpr,
-    QUERY_BLOCKS: tl.constexpr,
+    QUERY_BLOCKS,
     WRITE_PER_HEAD: tl.constexpr,
     SCORE_WIDTH,
     FULL_K_TILES: tl.constexpr,
@@ -521,7 +525,9 @@ def _prefill_probability_head_reduce_kernel(
     )
 
 
-@triton.jit
+# Logits callers use configured sink/recent budgets; variable prefix-prune
+# intervals use the probability kernels above. Keep these fixed bounds specialized.
+@triton.jit(do_not_specialize=["QUERY_BLOCKS"])
 def _prefill_logit_score_kernel(
     Q,
     K,
@@ -547,7 +553,7 @@ def _prefill_logit_score_kernel(
     H_PER_KV: tl.constexpr,
     H_KV: tl.constexpr,
     HEAD_BLOCKS: tl.constexpr,
-    QUERY_BLOCKS: tl.constexpr,
+    QUERY_BLOCKS,
     USE_BATCH_INDICES: tl.constexpr,
     candidate_start: tl.constexpr,
     recent_keep_tokens: tl.constexpr,
