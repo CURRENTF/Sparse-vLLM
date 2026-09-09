@@ -312,6 +312,161 @@ def test_h2o_flashprefill_uses_posthoc_scoring_and_preserves_eviction():
     runtime.cache_manager.compact_final_prefill_for_decode.assert_called_once_with([])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("fusion", [False, True])
+def test_mla_reduced_logits_accumulate_only_live_tokens_before_eviction(fusion):
+    manager = _manager_with_layer_rows([[4, 3], [4, 3]], decode_budget=16)
+    manager.device = torch.device("cuda")
+    config = manager.config
+    config.h2o_decode_eviction = True
+    config.h2o_decode_score_fusion = fusion
+    config.attention_cache_layout = "mla_latent"
+    config.hf_config = SimpleNamespace(
+        num_hidden_layers=2, hidden_size=8, num_attention_heads=2,
+        qk_nope_head_dim=2, qk_rope_head_dim=2, dtype=torch.float32,
+    )
+    config.runtime_layout = manager.runtime_layout
+    config.tensor_parallel_size = 1
+    config.full_attention_layers = []
+    config.sink_keep_tokens = config.recent_keep_tokens = 0
+    config.decode_keep_tokens = 16
+    config.sparse_attn_score_dtype = "float32"
+    config.decode_graph = False
+    runtime = H2ORuntime(config, manager)
+    seqs = [_seq(i, length, prefilled=length, chunk=1)
+            for i, length in enumerate([4, 3])]
+    manager.evict_after_decode = Mock(wraps=manager.evict_after_decode)
+    expected = {}
+    for layer in range(2):
+        for seq, length in zip(seqs, [4, 3]):
+            expected[layer, seq.seq_id] = torch.arange(length - 1).float()
+            manager._h2o_scores[layer, seq.seq_id] = expected[layer, seq.seq_id].to(manager.device)
+    for lengths in ([4, 3], [5, 4]):
+        scores = runtime._get_h2o_decode_score_buffer(2, 2, 8)
+        assert scores.ndim == 3  # MLA cannot use the explicit-KV headwise buffer.
+        scores.fill_(10000.0)  # Stale Graph padding must never enter softmax.
+        for layer in range(2):
+            runtime.layer_batch_sparse_states[layer].attn_score = scores[layer]
+            runtime.layer_batch_sparse_states[layer].context_lens = torch.tensor(
+                lengths, device=manager.device
+            )
+            manager.row_seq_lens[layer][:] = lengths
+            for row, (seq, length) in enumerate(zip(seqs, lengths)):
+                heads = torch.stack((torch.arange(length).float(),
+                                     torch.arange(length).float().flip(0) + layer))
+                scores[layer, row, :length] = heads.amax(0)
+                probability = torch.softmax(heads.amax(0) / 2, dim=-1)
+                expected[layer, seq.seq_id] = torch.cat(
+                    (expected[layer, seq.seq_id], torch.zeros(1))
+                ) + probability
+        runtime._h2o_decode_eviction(seqs)
+        for key, reference in expected.items():
+            torch.testing.assert_close(manager._h2o_scores[key].cpu(), reference)
+    assert manager.evict_after_decode.call_count == 2
+
+
+@pytest.mark.parametrize("eviction", [False, True])
+@pytest.mark.parametrize("fusion", [False, True])
+def test_h2o_decode_switch_drives_score_update_before_physical_eviction(eviction, fusion):
+    manager = _manager_with_layer_rows([[7, 6], [7, 6]])
+    config = manager.config
+    config.h2o_decode_eviction = eviction
+    config.h2o_decode_score_fusion = fusion
+    config.hf_config = SimpleNamespace(
+        num_hidden_layers=2, hidden_size=4, num_attention_heads=2,
+        head_dim=2, dtype=torch.float32,
+    )
+    config.runtime_layout = manager.runtime_layout
+    config.tensor_parallel_size = 1
+    config.full_attention_layers = []
+    config.sink_keep_tokens = config.recent_keep_tokens = 0
+    config.decode_keep_tokens = 4
+    config.sparse_attn_score_dtype = "float32"
+    config.decode_graph = False
+    seqs = [_seq(i, length, prefilled=length, chunk=1) for i, length in enumerate([7, 6])]
+    for layer in range(2):
+        for seq, length in zip(seqs, [7, 6]):
+            manager._h2o_scores[(layer, seq.seq_id)] = torch.zeros(length - 1)
+    runtime = H2ORuntime(config, manager)
+    manager.get_layer_batch_states = lambda _layer: LayerBatchStates(
+        context_lens=torch.tensor([7, 6], dtype=torch.int32),
+        max_context_len=7,
+        req_indices=torch.tensor([0, 1], dtype=torch.int32),
+    )
+    before_slots = manager.buffer_req_to_token_slots_tensor.clone()
+    before_free = list(manager._num_free_slots)
+    step = SparseStepContext(seqs=seqs, is_prefill=False, forward_context=SimpleNamespace(is_prefill=False))
+    runtime.prepare_step(step)
+    for layer in range(2):
+        score = runtime.layer_batch_sparse_states[layer].attn_score
+        if not eviction:
+            assert score is None
+            continue
+        assert score.shape == (2, 7)
+        score.zero_()
+        # The second token wins only if this step's scores are accumulated
+        # before top-k; the two most recent tokens must remain protected.
+        score[:, 1] = 0.9
+        score[:, 0] = 0.1
+    runtime.finish_step(step)
+    if eviction:
+        assert [row.tolist() for row in manager.row_seq_lens] == [[4, 6], [4, 6]]
+        for layer in range(2):
+            assert torch.equal(manager.buffer_req_to_token_slots_tensor[layer, 0, :4], before_slots[layer, 0, [0, 1, 5, 6]])
+            assert manager._h2o_scores[(layer, 0)].tolist() == pytest.approx([0.1, 0.9, 0, 0])
+            assert manager._h2o_scores[(layer, 1)].tolist() == pytest.approx([0.1, 0.9, 0, 0, 0, 0])
+            assert manager._num_free_slots[layer] == before_free[layer] + 3
+    else:
+        assert torch.equal(manager.buffer_req_to_token_slots_tensor, before_slots)
+        assert manager._num_free_slots == before_free
+        assert runtime.decode_graph_keepalive_tensors() == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_h2o_headwise_accumulation_preserves_eviction_and_reordered_history():
+    """Catch scores revived/misaligned after real slot eviction and batch reorder."""
+    torch.manual_seed(61)
+    manager = _manager_with_layer_rows([[7, 6], [7, 6]], validate_runtime_invariants=True)
+    manager.device = torch.device("cuda")
+    manager.kv_cache = manager.kv_cache.cuda()
+    manager.buffer_req_to_token_slots_tensor = manager.buffer_req_to_token_slots_tensor.cuda()
+    manager.buffer_req_to_token_slots = list(manager.buffer_req_to_token_slots_tensor.unbind(0))
+    manager.free_slots_stack = [row.cuda() for row in manager.free_slots_stack]
+    seqs = [_seq(i, length, prefilled=length, chunk=1) for i, length in enumerate([7, 6])]
+    expected = {}
+    for layer in range(2):
+        for seq, length in zip(seqs, [7, 6]):
+            initial = torch.rand(length - 1, device="cuda")
+            manager._h2o_scores[(layer, seq.seq_id)] = initial.clone()
+            expected[(layer, seq.seq_id)] = initial.clone()
+    for step in range(3):
+        logits = torch.randn(2, 2, 5, 12, device="cuda") * 5
+        for layer in range(2):
+            for batch, seq in enumerate(seqs):
+                length = manager._physical_row_len(layer, seq)
+                logits[layer, batch, :, length:] = torch.nan
+                key = (layer, seq.seq_id)
+                expected[key] = torch.nn.functional.pad(expected[key], (0, 1)) + (
+                    logits[layer, batch, :, :length] * 0.25
+                ).softmax(-1).sum(0)
+        manager.accumulate_decode_headwise_logits([0, 1], seqs, logits, softmax_scale=0.25)
+        for key, reference in expected.items():
+            torch.testing.assert_close(manager._h2o_scores[key], reference, atol=2e-6, rtol=2e-6)
+        if step == 0:
+            before = manager.buffer_req_to_token_slots_tensor.clone()
+            manager.evict_after_decode(seqs)
+            for layer in range(2):
+                retained = manager.buffer_req_to_token_slots_tensor[layer, 0, :4]
+                positions = (retained[:, None] == before[layer, 0, :7][None, :]).nonzero()[:, 1]
+                expected[(layer, 0)] = expected[(layer, 0)][positions]
+                torch.testing.assert_close(manager._h2o_scores[(layer, 0)], expected[(layer, 0)])
+            assert manager._h2o_decode_score_signature is None
+        if step == 1:
+            seqs = list(reversed(seqs))
+        for layer in range(2):
+            manager.row_seq_lens[layer] += 1
+
+
 @pytest.mark.parametrize(
     ("sparse_method", "prefill_sparse_method", "intermediate", "final"),
     [
@@ -907,7 +1062,119 @@ def test_h2o_all_layer_score_update_reuses_persistent_workspace():
             assert torch.equal(manager._h2o_scores[(layer_idx, seq_id)], expected)
 
 
-def test_h2o_all_layer_score_update_explicitly_falls_back_for_nonuniform_rows():
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("lengths", [[[1, 17], [9, 33]], [[17, 17], [9, 9]]])
+@pytest.mark.parametrize("validate", [False, True])
+def test_h2o_mla_ragged_logits_fuse_updates_and_reuse_history(lengths, validate):
+    """Catch scalar fallback, padding in softmax, and stale history after batch reorder.
+
+    Unlike the probability-only tests, this executes the MLA normalization
+    boundary and its real CUDA kernel, including lengths that differ by layer.
+    """
+    torch.manual_seed(719)
+    manager = _manager_with_layer_rows(
+        lengths, decode_budget=48, validate_runtime_invariants=validate
+    )
+    seqs = [_seq(i, 40, prefilled=40, chunk=1) for i in range(2)]
+    for layer in range(2):
+        for seq in seqs:
+            length = int(manager.row_seq_lens[layer][seq.seq_id])
+            manager._h2o_scores[(layer, seq.seq_id)] = torch.rand(length - 1, device="cuda")
+
+    # Graph score views can have spare batch capacity and non-contiguous strides.
+    logits = torch.empty(2, 4, 258, device="cuda")[:, :2, ::2]
+    scale = 128**-0.5
+    workspace = None
+    for step in range(3):
+        if step:
+            for row_lengths in manager.row_seq_lens:
+                row_lengths += 1
+        if step == 2:
+            seqs.reverse()
+        logits.normal_()
+        expected = {}
+        for layer in range(2):
+            for batch, seq in enumerate(seqs):
+                length = int(manager.row_seq_lens[layer][seq.seq_id])
+                key = (layer, seq.seq_id)
+                expected[key] = torch.nn.functional.pad(manager._h2o_scores[key], (0, 1))
+                expected[key] += torch.softmax(logits[layer, batch, :length] * scale, -1)
+                logits[layer, batch, length:] = torch.nan
+
+        with (
+            patch("torch.softmax", side_effect=AssertionError("per-row softmax fallback")),
+            patch.object(manager, "update_decode_attention_scores",
+                         side_effect=AssertionError("per-layer accumulation fallback")),
+        ):
+            assert manager.update_decode_attention_scores_all_layers(
+                [0, 1], seqs, logits, normalize_logits=True, softmax_scale=scale
+            )
+        if step == 1:
+            assert manager._h2o_decode_score_workspace is workspace
+        if step == 2:
+            assert manager._h2o_decode_score_workspace is not workspace
+        workspace = manager._h2o_decode_score_workspace
+        logits.fill_(torch.nan)
+        for key, reference in expected.items():
+            torch.testing.assert_close(manager._h2o_scores[key], reference, atol=1e-6, rtol=1e-5)
+            assert manager._h2o_scores[key].untyped_storage().data_ptr() == (
+                workspace.untyped_storage().data_ptr()
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_h2o_mla_logits_preserve_scores_across_compacted_row_shapes():
+    """Catch incompatible workspace reuse when eviction changes uniform/ragged rows."""
+    torch.manual_seed(720)
+    manager = _manager_with_layer_rows([[6, 4], [5, 3]], decode_budget=16)
+    seqs = [_seq(i, 10, prefilled=10, chunk=1) for i in range(2)]
+    expected = {}
+    for layer in range(2):
+        for seq in seqs:
+            length = int(manager.row_seq_lens[layer][seq.seq_id])
+            key = (layer, seq.seq_id)
+            expected[key] = torch.rand(length - 1, device="cuda")
+            manager._h2o_scores[key] = expected[key].clone()
+
+    for lengths in ([[6, 4], [5, 3]], [[3, 3], [3, 3]], [[4, 2], [3, 4]]):
+        manager._invalidate_h2o_decode_score_workspace()
+        logits = torch.randn(2, 2, 16, device="cuda")
+        for layer in range(2):
+            manager.row_seq_lens[layer][:] = lengths[layer]
+            for seq in seqs:
+                key = (layer, seq.seq_id)
+                length = lengths[layer][seq.seq_id]
+                # Retained scores stay in physical KV order after compaction.
+                retained = expected[key][:length - 1].flip(0).clone()
+                manager._h2o_scores[key] = retained.clone()
+                expected[key] = torch.nn.functional.pad(retained, (0, 1))
+                expected[key] += torch.softmax(logits[layer, seq.seq_id, :length] * 0.25, -1)
+                logits[layer, seq.seq_id, length:] = torch.nan
+        assert manager.update_decode_attention_scores_all_layers(
+            [0, 1], seqs, logits, normalize_logits=True, softmax_scale=0.25
+        )
+        for key, reference in expected.items():
+            torch.testing.assert_close(manager._h2o_scores[key], reference, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("lengths", [[[4, 0], [4, 3]], [[4, 3], [4, 9]]])
+def test_h2o_mla_ragged_logits_reject_invalid_rows_before_mutation(lengths):
+    """Reject empty or uncovered later-layer rows before any score is changed."""
+    manager = _manager_with_layer_rows(lengths)
+    seqs = [_seq(i, 10, prefilled=10, chunk=1) for i in range(2)]
+    for layer in range(2):
+        for seq in seqs:
+            manager._h2o_scores[(layer, seq.seq_id)] = torch.ones(max(0, lengths[layer][seq.seq_id] - 1))
+    previous = {key: score.clone() for key, score in manager._h2o_scores.items()}
+    with pytest.raises(ValueError, match="do not cover the physical rows"):
+        manager.update_decode_attention_scores_all_layers(
+            [0, 1], seqs, torch.zeros(2, 2, 8), normalize_logits=True, softmax_scale=0.25
+        )
+    for key, reference in previous.items():
+        torch.testing.assert_close(manager._h2o_scores[key], reference)
+
+
+def test_h2o_all_layer_probability_update_uses_per_layer_path_for_nonuniform_rows():
     manager = _manager_with_layer_rows([[4, 3], [4, 3]])
     seqs = [
         _seq(0, 10, prefilled=10, chunk=1),
@@ -2041,6 +2308,16 @@ def test_h2o_contiguous_decode_buffer_handles_padded_graph_batch_and_low_dtype()
     assert same_scores.dtype == torch.float32
     assert torch.all(same_scores == 7.0)
 
+    # Startup subsequently prepares another batch. Replay must use the restored
+    # four-row graph slices below, not this most recently prepared one-row view.
+    manager._decode_static_max_context_len = 4
+    for state in controller.layer_batch_sparse_states.values():
+        state.context_lens = torch.tensor([2], dtype=torch.int32)
+        state.max_context_len = 2
+    controller.runtime._prepare_h2o_decode_attn_score_buffer(
+        [_seq(0, 2, prefilled=2, chunk=1)]
+    )
+
     valid_lens = torch.tensor([4, 3, 2, 0], dtype=torch.int32)
     for layer_idx in range(2):
         for batch_idx, valid_len in enumerate(valid_lens.tolist()):
@@ -2155,6 +2432,25 @@ def test_h2o_capacity_follows_independent_prefill_and_decode_axes():
         needs_resident_row=False,
     )
     assert required == (8,)
+
+
+@pytest.mark.parametrize("existing", [4, 9])
+@pytest.mark.parametrize("generation", [1, 2, 12])
+def test_h2o_chain_online_eviction_reserves_peak_including_next_append(existing, generation):
+    manager = _manager_with_rows([existing], decode_budget=4, decode_eviction_interval=3)
+    manager.config.h2o_decode_eviction = True
+    manager.free_rows = [deque([0])]
+    resident = peak = existing
+    for _ in range(generation - 1):
+        resident += 1
+        peak = max(peak, resident)
+        if resident >= 7:
+            resident = 4
+    required, _, _, _ = manager.chain_capacity_deficits(
+        suffix_tokens=0, generation_tokens=generation,
+        existing_slots_by_layer=(existing,), needs_resident_row=False,
+    )
+    assert required == (peak - existing,)
 
 
 def test_h2o_capacity_hooks_reserve_prefill_peak_and_gate_chunk_with_real_free_slots():

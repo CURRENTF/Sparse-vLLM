@@ -178,6 +178,25 @@ def _normalize_h2o(config) -> None:
 
 
 def _normalize_sparse_prefill_score(config) -> None:
+    config.h2o_decode_score_fusion = _coerce_bool_config(
+        "h2o_decode_score_fusion", getattr(config, "h2o_decode_score_fusion", True)
+    )
+    config.h2o_decode_eviction = _coerce_bool_config(
+        "h2o_decode_eviction", getattr(config, "h2o_decode_eviction", False)
+    )
+    if config.h2o_decode_eviction:
+        if normalize_sparse_method(config.sparse_method) != "h2o":
+            raise ValueError("h2o_decode_eviction=True requires sparse_method='h2o'.")
+        if getattr(config, "attention_cache_layout", "explicit_kv") == "mla_latent":
+            # TODO(h2o-mla-parity): normalize each head before reduction instead
+            # of approximating attention mass with softmax(head-max raw QK).
+            log_once(
+                "TODO(h2o-mla-parity): MLA H2O decode uses softmax(scale * "
+                "RAW_QK_REDUCED), reducing heads before normalization. This "
+                "approximation is not fully aligned with original H2O "
+                "attention-probability accumulation; prefill scoring is unchanged.",
+                level="WARNING",
+            )
     cache_method = resolve_cache_sparse_method(
         config.sparse_method,
         prefill_sparse_method=config.prefill_sparse_method,
@@ -192,6 +211,14 @@ def _normalize_sparse_prefill_score(config) -> None:
             "sparse_prefill_score_mode must be one of "
             f"{sorted(allowed)}, got {config.sparse_prefill_score_mode!r}."
         )
+    if config.h2o_decode_eviction:
+        if mode != "probability":
+            log_once(
+                "h2o_decode_eviction=True forces sparse_prefill_score_mode='probability' "
+                "instead of mixing prefill logits with decode probabilities.",
+                level="WARNING",
+            )
+        mode = "probability"
     if mode != "probability" and cache_method not in {
         "snapkv",
         "pyramidkv",

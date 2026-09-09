@@ -204,6 +204,8 @@ STARTUP_HOST_STATUS_SYNC_METHODS = {
     "profile_startup_prefill",
     "release_profiling_cache_runtime",
     "resolve_startup_decode_graph_plan",
+    "startup_capture_prefill_fits",
+    "startup_capture_decode_fits",
 }
 RECOVERABLE_TP_CONTROL_RPC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "chain_validate_admission_plan",
@@ -712,6 +714,24 @@ class ModelRunner:
                 "world_rank": int(self.rank),
                 "feasible": feasible,
                 "skipped": skipped,
+            }
+        )
+
+    def startup_capture_prefill_fits(self, prompt_len: int):
+        return self._gather_startup_record(
+            {
+                "world_rank": int(self.rank),
+                "fits": self.runtime_state.startup_batch_fits(
+                    (int(prompt_len),), max_tokens=2,
+                ),
+            }
+        )
+
+    def startup_capture_decode_fits(self, seqs: list[Sequence]):
+        return self._gather_startup_record(
+            {
+                "world_rank": int(self.rank),
+                "fits": self.runtime_state.startup_decode_batch_fits(seqs),
             }
         )
 

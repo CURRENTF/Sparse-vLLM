@@ -91,6 +91,21 @@ configuration.
 | `h2o_prefill` | `h2o` | Compact to `h2o_prefill_budget` | Compact to `h2o_decode_budget`, then score-free decode |
 | `flashprefill_v2` | `h2o` | FlashPrefill V2 computation; no H2O intermediate compaction | Collect H2O posthoc prompt scores, compact to `h2o_decode_budget`, then score-free decode |
 
+The table shows the default `h2o_decode_eviction=False`. For explicit-KV H2O,
+set `h2o_decode_eviction=True` to accumulate decode probability scores and evict
+at `h2o_decode_budget + h2o_decode_eviction_interval` (earlier under memory
+pressure). This forces `sparse_prefill_score_mode="probability"` while preserving
+the prefill window; any supported value in `[0, 128]` is allowed, including
+nonzero windows. MLA latent storage supports this switch through the approximate
+`softmax(scale * RAW_QK_REDUCED)` decode score, with a once-per-process warning
+that it is not fully aligned with original H2O. Prefill scoring is unchanged.
+
+With decode eviction enabled, `h2o_decode_score_fusion=True` reuses attention's
+per-head logits for probability accumulation. Set it to `False` to use separate
+probability scoring for an implementation comparison. Both paths normalize each
+query head over retained tokens before summing heads and adding history; the
+switch does not change prefill scoring, budgets, or eviction policy.
+
 Omitting `prefill_sparse_method` with `sparse_method="h2o"` preserves the old
 combined behavior. An explicit empty string disables prefill acceleration and
 therefore selects decode-only H2O. Sparse-vLLM's intermediate-chunk H2O

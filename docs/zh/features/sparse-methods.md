@@ -12,7 +12,7 @@ Sparse-vLLM 围绕 cache-manager-first sparse runtime 构建。engine 支持 phy
 | `streamingllm` | Physical eviction | StreamingLLM 风格的固定 sink 加 recent-window cache。保留 prefix/tail 策略之外的 token 会从 active KV cache 中被物理淘汰。 | `sink_keep_tokens`, `recent_keep_tokens` |
 | `attention-sink` | Physical eviction | attention-sink alias policy，使用相同的 sink-token 和 recent-window 保留模型。适合将 sink-window 行为与其他 physical eviction 方法对比。 | `sink_keep_tokens`, `recent_keep_tokens` |
 | `snapkv` | Physical eviction | SnapKV 风格的 token selection 使用 prompt 末尾的 observation window，在生成前选出并保留紧凑的重要 prompt KV。当前与论文对齐的 decode 路径不再评分，也不会再次执行 SnapKV selection，只追加生成 token。 | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
-| `h2o` | Physical eviction | Sparse-vLLM 的 H2O prefill 扩展将中间 prefill chunk 压缩到 `h2o_prefill_budget`，减少后续 prefill chunk 的计算。H2O decode contract 则在最后一个 prefill chunk 结束时将 prompt 状态压缩到 `h2o_decode_budget`；这个物理操作虽然发生在 final-prefill boundary，但它准备的是 score-free decode 消费的短 cache。当前关闭 decode 评分和周期淘汰，物理 row 会随生成 token 增长。 | `h2o_decode_budget`, `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window`, `sparse_prefill_score_mode` |
+| `h2o` | Physical eviction | 中间 prefill chunk 可压缩到 `h2o_prefill_budget`，最终 prompt 压缩到 `h2o_decode_budget`。默认 decode 不评分或驱逐，物理 row 随生成 token 增长；开启 `h2o_decode_eviction` 后逐步累计概率分数并周期驱逐。 | `h2o_decode_eviction`, `h2o_decode_budget`, `h2o_decode_eviction_interval`, `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window`, `sparse_prefill_score_mode` |
 | `pyramidkv` | Physical eviction | PyramidKV 风格、依赖 layer 的 KV 保留方式。它在 layer 之间分配 sparse budget，并物理存储选中的 context token。 | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
 | `omnikv` | Logical masking | OmniKV 保留 physical cache，但为选定 layer 构建 sparse attention view。适用于不改写 cache storage、同时降低 attention 计算量的场景。 | `full_attention_layers`, `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens` |
 | `quest` | Query-aware page selection | QuEST 根据持久化的 page min/max summary 选择 token page，prefill 保持 dense。显式 KV 模型在 key 坐标中评分；GLM-4.7-Flash 使用匹配的 absorbed decode query 对融合 MLA latent/RoPE cache 评分，同时 compute payload 继续保持 latent。 | `quest_chunk_size`, `quest_skip_layers`, `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens` |
@@ -32,14 +32,15 @@ prefill attention 计算。它们是同一条轴上的备选项，可以分别�
 > 重新评分和淘汰属于 Sparse-vLLM 增强。[H2O 论文](https://arxiv.org/abs/2306.14048)
 > 则定义了跨连续 decode step 的动态保留策略。Sparse-vLLM 对中间 chunk 的 H2O
 > 压缩是自己提出的 prefill 扩展。最终 prompt 压缩虽然发生在 final-prefill boundary，
-> 但它准备的是生成阶段消费的短 cache，因此属于 decode contract。实现论文式在线
-> H2O 更新，是让当前 score-free decode runtime 向原始 H2O 算法补齐；周期性的 batch
-> 淘汰则是进一步的系统变体。
+> 但它准备的是生成阶段消费的短 cache，因此属于 decode contract。可选的在线评分更新
+> 向原始 H2O 算法靠近；周期性的 batch 淘汰和有限 prefill observation window
+> 仍属于系统或算法变体。
 
 SnapKV 的 `sparse_prefill_score_mode` 默认为 `logits`，PyramidKV 默认为
 `probability`。H2O（含独立的 `h2o_prefill`）默认使用
 `sparse_prefill_score_mode="logits"` 和 `h2o_prefill_score_window=128`。
-显式指定的 score mode 和 window 会覆盖默认值。
+显式指定的 score mode 和 window 会覆盖默认值，但 `h2o_decode_eviction=True`
+会强制使用 `sparse_prefill_score_mode="probability"`。
 
 H2O 默认采用有限 query window 的近似评分。如需使用完整 chunk 的归一化
 attention mass 评分，请显式设置 `sparse_prefill_score_mode="probability"`
@@ -47,7 +48,17 @@ attention mass 评分，请显式设置 `sparse_prefill_score_mode="probability"
 chunk 的归一化 attention probability 求和，并在 prefill chunk 之间累计
 attention mass。H2O probability 模式会输出性能警告，因为即使复用 attention
 LSE，仍需额外计算 QK 评分。两种模式都要求每个 H2O KV layer 独立保存评分；
-decode score 收集与周期淘汰仍处于关闭状态。
+decode score 收集与周期淘汰默认关闭，可通过 `h2o_decode_eviction=True` 开启。
+
+该开关要求 `sparse_method="h2o"`。开启后每个 decode step 累计归一化 attention
+mass，物理 row 达到 `h2o_decode_budget + h2o_decode_eviction_interval` 时保留
+heavy hitters 和 recent tokens，压缩回 decode budget；显存容量压力可使超预算的
+active row 提前驱逐。即使显式设置 `logits`，也会强制改为 `probability` 并输出警告。
+`h2o_prefill_score_window` 保持用户设置，允许非零值；沿用概率模式的 `[0, 128]`
+范围。MLA latent 模型使用显式近似：对跨 head 取 max 的 decode logits 计算
+`softmax(scale * RAW_QK_REDUCED)`，再累计和驱逐。这不等价于每个 head 先归一化
+再归约，尚未与原 H2O 完全对齐；启用时每个进程仅警告一次。MLA prefill 评分和
+默认的 score-free decode 路径不受影响。
 
 ## Prefill Scheduling Policy
 

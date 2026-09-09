@@ -56,6 +56,8 @@ class SparseMethodConfig:
     sparse_prefill_score_mode: str | None = None
 
     h2o_decode_budget: int = 4096
+    h2o_decode_eviction: bool = False
+    h2o_decode_score_fusion: bool = True
     h2o_decode_eviction_interval: int = 128
     h2o_prefill_budget: int = 8192
     h2o_recent_ratio: float = 0.5

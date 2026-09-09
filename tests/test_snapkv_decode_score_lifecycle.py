@@ -13,6 +13,23 @@ from sparsevllm.utils.context import get_context, reset_context, set_context
 
 
 class WorkerInfoTest(unittest.TestCase):
+    def test_h2o_fusion_choice_survives_worker_metadata_serialization(self):
+        """Keep fused and baseline runs distinguishable in exported metadata."""
+        engine = object.__new__(LLMEngine)
+        engine.config = SimpleNamespace(
+            model="model",
+            hf_config=SimpleNamespace(),
+            sparse_method="h2o",
+            h2o_decode_eviction=True,
+        )
+        for enabled in (False, True):
+            with self.subTest(fusion=enabled):
+                engine.config.h2o_decode_score_fusion = enabled
+                info = json.loads(json.dumps(engine.worker_info()))
+                self.assertIs(
+                    info["benchmark_config"]["h2o_decode_score_fusion"], enabled
+                )
+
     def test_prefix_offload_capacity_config_is_reported_json_safely(self):
         engine = object.__new__(LLMEngine)
         engine.config = SimpleNamespace(

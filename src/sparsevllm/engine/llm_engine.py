@@ -393,27 +393,59 @@ class LLMEngine:
         *,
         batch_size: int,
         prompt_len: int,
-    ) -> tuple[list[Sequence], int]:
+        sequential_prefill: bool = False,
+    ) -> tuple[list[Sequence] | None, int]:
         seq_ids = []
-        for request_idx in range(batch_size):
-            dummy_prompt = [prompt_offset + request_idx] + [0] * (prompt_len - 1)
-            seq_ids.append(self.add_request(dummy_prompt, sampling_params))
-
         parked: list[Sequence] = []
-        while self.scheduler.waiting:
-            self.step()
+        prepared = False
+
+        def park_prefilled() -> None:
+            while self.scheduler.waiting:
+                self.step()
+                while self.scheduler.decoding:
+                    parked.append(self.scheduler.decoding.popleft())
             while self.scheduler.decoding:
                 parked.append(self.scheduler.decoding.popleft())
-        while self.scheduler.decoding:
-            parked.append(self.scheduler.decoding.popleft())
-        if len(parked) != batch_size:
-            raise RuntimeError(
-                "Startup decode CUDA Graph prefill did not park the requested "
-                f"batch: expected={batch_size}, actual={len(parked)}."
-            )
-        if {int(seq.seq_id) for seq in parked} != set(seq_ids):
-            raise RuntimeError("Startup decode CUDA Graph prefill parked unexpected sequences.")
-        return parked, prompt_offset + batch_size
+
+        try:
+            for request_idx in range(batch_size):
+                if sequential_prefill:
+                    records = self.model_runner.call(
+                        "startup_capture_prefill_fits", prompt_len,
+                    )
+                    if not all(record["fits"] for record in records):
+                        return None, prompt_offset + len(seq_ids)
+                dummy_prompt = [prompt_offset + request_idx] + [0] * (prompt_len - 1)
+                seq_ids.append(self.add_request(dummy_prompt, sampling_params))
+                if sequential_prefill:
+                    # Park after final-prefill compaction. The next admission
+                    # sees actual retained KV, not a sum of all prompt peaks.
+                    park_prefilled()
+            if not sequential_prefill:
+                park_prefilled()
+            if len(parked) != batch_size:
+                raise RuntimeError(
+                    "Startup decode CUDA Graph prefill did not park the requested "
+                    f"batch: expected={batch_size}, actual={len(parked)}."
+                )
+            if {int(seq.seq_id) for seq in parked} != set(seq_ids):
+                raise RuntimeError("Startup decode CUDA Graph prefill parked unexpected sequences.")
+            # Capture prepares one decode append for every parked request.
+            # Serial prefill can fit even when that full-batch peak cannot.
+            records = self.model_runner.call("startup_capture_decode_fits", parked)
+            if not all(record["fits"] for record in records):
+                logger.info(
+                    "Startup CUDA Graph batch exceeds decode append capacity: "
+                    "batch={} rank_checks={}.", batch_size, records,
+                )
+                return None, prompt_offset + len(seq_ids)
+            prepared = True
+            return parked, prompt_offset + batch_size
+        finally:
+            if not prepared:
+                self.scheduler.decoding.extend(parked)
+                for seq_id in seq_ids:
+                    self.abort_request(int(seq_id))
 
     def _capture_startup_decode_graphs(
         self,
@@ -424,7 +456,7 @@ class LLMEngine:
         if not bool(getattr(self.config, "decode_graph_startup_capture", False)):
             return prompt_offset
         startup_plan = build_decode_cuda_graph_startup_plan(self.config)
-        skipped_plan = []
+        sequential_plan = set()
         if respect_runtime_capacity:
             plan_records = self.model_runner.call(
                 "resolve_startup_decode_graph_plan",
@@ -434,14 +466,11 @@ class LLMEngine:
                 {tuple(entry) for entry in record["feasible"]}
                 for record in plan_records
             ]
-            skipped_plan = [
+            sequential_plan = {
                 entry
                 for entry in startup_plan
                 if not all(tuple(entry) in feasible for feasible in feasible_by_rank)
-            ]
-            startup_plan = [
-                entry for entry in startup_plan if entry not in skipped_plan
-            ]
+            }
         if not startup_plan:
             raise RuntimeError(
                 "Production KV capacity cannot capture any configured decode CUDA Graph."
@@ -459,23 +488,33 @@ class LLMEngine:
         short_graphs = sum(not is_long for _, _, is_long in startup_plan)
         logger.info(
             "Startup CUDA Graph capture: graphs={} short={} long={} "
-            "skipped_for_kv_capacity={}.",
+            "sequential_prefill_candidates={}.",
             len(startup_plan),
             short_graphs,
             len(startup_plan) - short_graphs,
-            len(skipped_plan),
+            len(sequential_plan),
         )
         logger.debug("Startup CUDA Graph capture plan: {}.", startup_plan)
         capture_params = SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True)
         threshold = self.scheduler._long_text_threshold(is_prefill=False)
-        for batch_size, _, is_long_text in startup_plan:
+        skipped_plan = []
+        for entry in startup_plan:
+            batch_size, _, is_long_text = entry
             prompt_len = int(threshold) if is_long_text else 1
             parked, prompt_offset = self._prepare_startup_capture_batch(
                 capture_params,
                 prompt_offset,
                 batch_size=batch_size,
                 prompt_len=prompt_len,
+                sequential_prefill=entry in sequential_plan,
             )
+            if parked is None:
+                skipped_plan.append(entry)
+                logger.info(
+                    "Startup CUDA Graph family exceeds KV capacity during "
+                    "prefill or decode preparation: batch={} long={}.", batch_size, is_long_text,
+                )
+                continue
             try:
                 observed_long = self.scheduler._is_long_text(parked[0], is_prefill=False)
                 if bool(observed_long) != bool(is_long_text):
@@ -506,7 +545,12 @@ class LLMEngine:
         expected = {
             (batch_size, context_capacity, decode_graph_path_id(method, is_long_text))
             for batch_size, context_capacity, is_long_text in startup_plan
+            if (batch_size, context_capacity, is_long_text) not in skipped_plan
         }
+        if not expected:
+            raise RuntimeError(
+                "Production KV capacity cannot capture any configured decode CUDA Graph."
+            )
         missing = sorted(expected - captured)
         if missing:
             raise RuntimeError(
@@ -518,10 +562,12 @@ class LLMEngine:
         self.model_runner.call("register_decode_cuda_graph_buffers")
         self.model_runner.call("seal_decode_cuda_graph_startup_plan")
         logger.info(
-            "Startup CUDA Graph capture complete: cached={} capture_count={} replay_count={}.",
+            "Startup CUDA Graph capture complete: cached={} capture_count={} "
+            "replay_count={} skipped_for_kv_capacity={}.",
             len(captured),
             graph_runner.capture_count,
             graph_runner.replay_count,
+            len(skipped_plan),
         )
         return prompt_offset
 
@@ -1293,6 +1339,9 @@ class LLMEngine:
             "flashprefill_v2_min_sparse_q_len",
             "flashprefill_v2_use_mean_correction",
             "h2o_decode_budget",
+            "h2o_decode_eviction",
+            "h2o_decode_score_fusion",
+            "h2o_decode_eviction_interval",
             "h2o_prefill_budget",
             "h2o_recent_ratio",
             "h2o_prefill_score_window",

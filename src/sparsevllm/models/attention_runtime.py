@@ -190,7 +190,8 @@ def build_mha_decode_attention_spec(
         ),
     )
     requires_decode_scores = sparse_decode_attention_requires_scores(
-        normalized_method
+        normalized_method,
+        h2o_decode_eviction=getattr(runtime_config, "h2o_decode_eviction", False),
     )
     return DecodeAttentionOpSpec(
         kv_storage_format=cache_method if cache_method in QUANTIZED_KV_METHODS else "dense",
@@ -214,6 +215,11 @@ def build_mha_decode_attention_spec(
         cuda_graph=bool(cuda_graph),
         h2o_layerwise_probability_scores=(
             normalized_method == "h2o" and requires_decode_scores
+            and not getattr(runtime_config, "h2o_decode_score_fusion", True)
+        ),
+        h2o_headwise_logits=(
+            normalized_method == "h2o" and requires_decode_scores
+            and getattr(runtime_config, "h2o_decode_score_fusion", True)
         ),
         context_capacity=int(getattr(runtime_config, "max_model_len", 0) or 0)
         or None,

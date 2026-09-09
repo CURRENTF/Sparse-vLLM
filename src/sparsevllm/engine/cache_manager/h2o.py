@@ -190,7 +190,7 @@ class H2OCacheManager(SnapKVCacheManager):
         outstanding_reserved_rows: int = 0,
         needs_resident_row: bool,
     ) -> tuple[tuple[int, ...], int, tuple[int, ...], int]:
-        """Reserve H2O's prefill peak and score-free decode growth."""
+        """Reserve prefill and decode peaks under the selected retention policy."""
         suffix_tokens = max(0, int(suffix_tokens))
         generated_kv_tokens = max(0, int(generation_tokens) - 1)
         chunk_size = max(1, int(self.config.engine_prefill_chunk_size))
@@ -220,6 +220,9 @@ class H2OCacheManager(SnapKVCacheManager):
             else:
                 resident_after_prefill = prefill_peak
             decode_peak = resident_after_prefill + generated_kv_tokens
+            if getattr(self.config, "h2o_decode_eviction", False) and generated_kv_tokens:
+                trigger = self.h2o_decode_budget + self.h2o_decode_eviction_interval
+                decode_peak = min(decode_peak, max(resident_after_prefill + 1, trigger))
             required_by_layer.append(
                 max(0, max(prefill_peak, decode_peak) - existing)
             )
@@ -1033,6 +1036,85 @@ class H2OCacheManager(SnapKVCacheManager):
             self._h2o_scores[key] = cumulative
 
     @torch.no_grad()
+    def accumulate_decode_headwise_logits(
+        self,
+        layer_indices: list[int],
+        seqs: list[Sequence],
+        raw_logits: torch.Tensor,
+        *,
+        softmax_scale: float,
+    ) -> None:
+        """Normalize per query head and accumulate in retained physical order.
+
+        Runs at finish_step, outside model capture, like the probability baseline.
+        Eviction, batch changes and prefill invalidate/rebuild the existing score
+        workspace; no captured graph points to this persistent history.
+        """
+        from sparsevllm.kernels.triton.h2o_score import h2o_headwise_softmax_accumulate
+
+        if raw_logits.ndim != 4 or tuple(raw_logits.shape[:2]) != (len(layer_indices), len(seqs)):
+            raise ValueError("H2O raw decode logits must be [layers, batch, heads, width]")
+        if not layer_indices or not seqs:
+            return
+        lengths = tuple(
+            self._physical_row_len(layer, seq) for layer in layer_indices for seq in seqs
+        )
+        if min(lengths) <= 0 or max(lengths) > raw_logits.shape[-1]:
+            raise ValueError("H2O raw decode logits do not cover the physical rows")
+        previous_lengths = tuple(length - 1 for length in lengths)
+        signature = ("headwise", tuple(layer_indices), tuple(int(seq.seq_id) for seq in seqs))
+        workspace = getattr(self, "_h2o_decode_score_workspace", None)
+        reuse = (
+            workspace is not None
+            and getattr(self, "_h2o_decode_score_signature", None) == signature
+            and getattr(self, "_h2o_decode_score_length", None) == previous_lengths
+            and workspace.shape[-1] >= max(lengths)
+        )
+        if not reuse or self.validate_runtime_invariants:
+            previous_rows = []
+            for index, (layer, seq) in enumerate(
+                (layer, seq) for layer in layer_indices for seq in seqs
+            ):
+                previous = self._h2o_scores.get(self._score_key(layer, seq.seq_id))
+                if previous is None or previous.numel() != previous_lengths[index]:
+                    raise RuntimeError(
+                        "H2O headwise score vector must align before appending: "
+                        f"layer={layer} seq_id={seq.seq_id} expected={previous_lengths[index]}"
+                    )
+                previous_rows.append(previous)
+            if reuse:
+                reuse = all(
+                    row.data_ptr() == workspace[i // len(seqs), i % len(seqs)].data_ptr()
+                    for i, row in enumerate(previous_rows)
+                )
+        if not reuse:
+            capacity = max(max(lengths), self.h2o_decode_budget + self.h2o_decode_eviction_interval)
+            workspace = torch.empty(
+                (len(layer_indices), len(seqs), capacity),
+                dtype=torch.float32, device=raw_logits.device,
+            )
+            for index, previous in enumerate(previous_rows):
+                workspace[index // len(seqs), index % len(seqs), :previous.numel()].copy_(previous)
+        context_lens = torch.tensor(lengths, dtype=torch.int32, device=raw_logits.device).view(
+            len(layer_indices), len(seqs)
+        )
+        h2o_headwise_softmax_accumulate(
+            # finish_step is graph-out: avoid reducing the unused logical
+            # context capacity while keeping the captured logits storage fixed.
+            raw_logits[..., :max(lengths)], workspace, context_lens,
+            softmax_scale=softmax_scale,
+        )
+        self._h2o_decode_score_workspace = workspace
+        self._h2o_decode_score_signature = signature
+        self._h2o_decode_score_length = lengths
+        for index, (layer, seq) in enumerate(
+            (layer, seq) for layer in layer_indices for seq in seqs
+        ):
+            self._h2o_scores[self._score_key(layer, seq.seq_id)] = workspace[
+                index // len(seqs), index % len(seqs), :lengths[index]
+            ]
+
+    @torch.no_grad()
     def update_decode_attention_scores_all_layers(
         self,
         layer_indices: list[int],
@@ -1044,10 +1126,9 @@ class H2OCacheManager(SnapKVCacheManager):
     ) -> bool:
         """Accumulate one reduced [layers, batch, width] decode score tensor.
 
-        Returns True when all persistent rows shared one physical length and the
-        cross-layer fast path was used. Non-uniform rows use the existing
-        per-layer implementation without changing its semantics. Raw QK logits
-        can be normalized and accumulated across all rows in one CUDA launch.
+        Returns True when the cross-layer path was used. Raw QK logits are
+        normalized and accumulated in one CUDA launch, including non-uniform
+        rows. Already-normalized non-uniform scores use the per-layer path.
         """
         if reduced_scores.dim() != 3:
             raise ValueError(
@@ -1070,7 +1151,7 @@ class H2OCacheManager(SnapKVCacheManager):
         physical_lens = [
             self._physical_row_len(layer_indices[0], seq) for seq in seqs
         ]
-        if self.validate_runtime_invariants:
+        if normalize_logits or self.validate_runtime_invariants:
             physical_lens.extend(
                 self._physical_row_len(layer_idx, seq)
                 for layer_idx in layer_indices[1:]
@@ -1079,10 +1160,16 @@ class H2OCacheManager(SnapKVCacheManager):
         kv_len = int(physical_lens[0])
         if any(int(length) != kv_len for length in physical_lens[1:]):
             if normalize_logits:
-                reduced_scores = torch.softmax(
-                    reduced_scores.float() * float(softmax_scale),
-                    dim=-1,
+                # MLA has already reduced its query heads. A singleton head
+                # preserves softmax(head-reduced QK), while the fused updater
+                # masks each physical row and appends its new token separately.
+                self.accumulate_decode_headwise_logits(
+                    layer_indices,
+                    seqs,
+                    reduced_scores.unsqueeze(2),
+                    softmax_scale=float(softmax_scale),
                 )
+                return True
             for local_layer, layer_idx in enumerate(layer_indices):
                 self.update_decode_attention_scores(
                     layer_idx,

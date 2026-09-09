@@ -72,7 +72,9 @@ def test_h100_gqa_launch_config_is_independent_of_context_length() -> None:
     assert short == long == (1024, 128, 4)
 
 
-def test_h2o_runtime_decode_spec_is_score_free_while_eviction_is_disabled():
+@pytest.mark.parametrize("eviction", [False, True])
+@pytest.mark.parametrize("fusion", [False, True])
+def test_h2o_runtime_decode_spec_binds_score_contract_before_execution(eviction, fusion):
     config = SimpleNamespace(
         num_attention_heads=32,
         num_key_value_heads=8,
@@ -86,11 +88,13 @@ def test_h2o_runtime_decode_spec_is_score_free_while_eviction_is_disabled():
         attention_tp_size=1,
         max_batch_size=8,
         cuda_graph=True,
+        runtime_config=SimpleNamespace(h2o_decode_eviction=eviction, h2o_decode_score_fusion=fusion),
     )
 
-    assert not spec.may_require_attention_scores
-    assert not spec.h2o_layerwise_probability_scores
-    assert not spec.kernel_request.requires_softmax_lse
+    assert spec.may_require_attention_scores is eviction
+    assert spec.h2o_layerwise_probability_scores is (eviction and not fusion)
+    assert spec.h2o_headwise_logits is (eviction and fusion)
+    assert spec.kernel_request.requires_softmax_lse is eviction
 
 
 def test_h2o_prefill_decode_spec_preserves_physical_cache_contract():

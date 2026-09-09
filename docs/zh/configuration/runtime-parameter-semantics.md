@@ -83,6 +83,19 @@ method、policy、chunk size、context length、batch size 和 checkpoint 路径
 | `h2o_prefill` | `h2o` | 压缩到 `h2o_prefill_budget` | 压缩到 `h2o_decode_budget`，随后 score-free decode |
 | `flashprefill_v2` | `h2o` | 使用 FlashPrefill V2 计算，不做 H2O 中间压缩 | 收集 H2O posthoc prompt 分数，压缩到 `h2o_decode_budget`，随后 score-free decode |
 
+上表描述默认的 `h2o_decode_eviction=False`。Explicit-KV H2O 可设置
+`h2o_decode_eviction=True`，每步累计概率分数，在
+`h2o_decode_budget + h2o_decode_eviction_interval` 处驱逐（容量压力下可提前）。
+开启时强制使用 `sparse_prefill_score_mode="probability"`，但保持 prefill window
+不变；允许 `[0, 128]` 内的非零 window。MLA latent 模型通过近似的
+`softmax(scale * RAW_QK_REDUCED)` decode 分数支持此开关，每个进程仅警告一次
+其尚未与原 H2O 完全对齐；prefill 评分不变。
+
+开启 decode 驱逐后，`h2o_decode_score_fusion=True` 会复用 attention 的逐 head
+logits 来累计概率。设为 `False` 可使用独立概率评分路径做实现对照。两条路径都先在
+每个 query head 的保留 token 维做 softmax，再跨 head 求和并累计历史；此开关不改变
+prefill 评分、预算或驱逐策略。
+
 `sparse_method="h2o"` 时省略 `prefill_sparse_method` 会保留旧的组合行为；显式传入
 空字符串则关闭 prefill 加速，得到 decode-only H2O。Sparse-vLLM 扩展的中间 chunk
 压缩属于 prefill；最终 prompt 压缩则准备 decode 消费的短 cache。

@@ -297,25 +297,43 @@ def h2o_uses_fused_prefill_score(config) -> bool:
     )
 
 
-def sparse_decode_attention_requires_scores(method: str | None) -> bool:
+def sparse_decode_attention_requires_scores(
+    method: str | None,
+    *,
+    h2o_decode_eviction: bool = False,
+) -> bool:
     """Return whether a prepared decode implementation must support scores."""
 
-    return sparse_decode_attention_score_kind(method) is not AttentionScoreKind.NONE
+    return (
+        sparse_decode_attention_score_kind(
+            method, h2o_decode_eviction=h2o_decode_eviction,
+        )
+        is not AttentionScoreKind.NONE
+    )
 
 
 def sparse_decode_attention_score_kind(
     method: str | None,
+    *,
+    h2o_decode_eviction: bool = False,
+    attention_cache_layout: str = "explicit_kv",
 ) -> AttentionScoreKind:
     """Return the score representation consumed by sparse decode logic.
 
     OmniKV, SkipKV, and DeltaKV normalize each head in ``SparseController``
     before reducing across heads, so providers must preserve raw per-head QK.
     PyramidKV consumes the existing fused head-reduced raw-QK representation.
+    Explicit-KV H2O consumes probabilities summed over heads. MLA H2O uses
+    an explicit head-reduced-logit softmax approximation in its runtime.
     """
 
     normalized = normalize_sparse_method(method)
     if normalized not in CANONICAL_SPARSE_METHODS:
         raise ValueError(f"Unknown sparse method {normalized!r}.")
+    if normalized == "h2o" and h2o_decode_eviction:
+        if attention_cache_layout == "mla_latent":
+            return AttentionScoreKind.RAW_QK_REDUCED
+        return AttentionScoreKind.ATTENTION_PROBABILITY_REDUCED
     return _DECODE_ATTENTION_SCORE_KINDS.get(
         normalized,
         AttentionScoreKind.NONE,

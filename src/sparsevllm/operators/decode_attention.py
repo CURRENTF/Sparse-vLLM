@@ -91,6 +91,7 @@ class DecodeAttentionOpSpec:
     layer_varying_page_table: bool = False
     cuda_graph: bool = True
     h2o_layerwise_probability_scores: bool = False
+    h2o_headwise_logits: bool = False
     context_capacity: int | None = None
     sparse_context_budget: int | None = None
     may_use_full_layer_kivi_int4: bool = False
@@ -112,12 +113,14 @@ class DecodeAttentionOpSpec:
         if self.softmax_scale <= 0:
             raise ValueError("Decode attention softmax_scale must be positive.")
         if (
-            self.h2o_layerwise_probability_scores
+            (self.h2o_layerwise_probability_scores or self.h2o_headwise_logits)
             and not self.may_require_attention_scores
         ):
             raise ValueError(
                 "H2O layer-wise probability scoring requires decode score output."
             )
+        if self.h2o_layerwise_probability_scores and self.h2o_headwise_logits:
+            raise ValueError("Decode cannot request both probabilities and raw H2O logits.")
         if self.context_capacity is not None and self.context_capacity <= 0:
             raise ValueError("Decode attention context_capacity must be positive.")
         if (
@@ -181,7 +184,7 @@ class DecodeAttentionOpSpec:
                 and not self.h2o_layerwise_probability_scores
                 else AttentionScoreKind.NONE
             ),
-            requires_softmax_lse=self.h2o_layerwise_probability_scores,
+            requires_softmax_lse=(self.h2o_layerwise_probability_scores or self.h2o_headwise_logits),
             layer_varying_page_table=self.layer_varying_page_table,
             varlen=True,
             cuda_graph=self.cuda_graph,
@@ -785,6 +788,8 @@ class TritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
     ) -> SupportResult:
         if spec.cuda_graph:
             return SupportResult.unsupported("split count depends on context length")
+        if spec.h2o_headwise_logits:
+            return SupportResult.unsupported("H2O logits use the shared fixed-grid eager/graph path")
         if spec.kv_storage_format != "dense":
             return SupportResult.unsupported("requires dense KV storage")
         return match_attention_capabilities(
@@ -913,6 +918,7 @@ class FixedGridTritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
         self._mid_o: torch.Tensor | None = None
         self._mid_lse: torch.Tensor | None = None
         self._softmax_lse: torch.Tensor | None = None
+        self._headwise_logits: torch.Tensor | None = None
 
     @classmethod
     def bind(
@@ -934,8 +940,8 @@ class FixedGridTritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
     ) -> SupportResult:
         if spec.kv_storage_format != "dense":
             return SupportResult.unsupported("requires dense KV storage")
-        if not spec.cuda_graph:
-            return SupportResult.unsupported("reserved for CUDA Graph")
+        if not spec.cuda_graph and not spec.h2o_headwise_logits:
+            return SupportResult.unsupported("reserved for CUDA Graph or H2O headwise logits")
         if spec.may_use_full_layer_kivi_int4:
             return SupportResult.unsupported(
                 "full-layer KIVI int4 requires the DeltaKV fixed-grid provider"
@@ -987,11 +993,19 @@ class FixedGridTritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
             dtype=torch.float32,
             device=device,
         )
+        if spec.h2o_headwise_logits:
+            # One prepared provider serves sequential layers and graph replays.
+            # Consume each layer's raw logits before this shared storage is reused.
+            self._headwise_logits = torch.empty(
+                (spec.max_batch_size, spec.num_query_heads, spec.context_capacity),
+                dtype=torch.float32, device=device,
+            )
 
     def close(self) -> None:
         self._mid_o = None
         self._mid_lse = None
         self._softmax_lse = None
+        self._headwise_logits = None
 
     def binding_metadata(self) -> dict[str, object]:
         return {
@@ -1001,6 +1015,13 @@ class FixedGridTritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
             "cuda_graph_mode": "batch_indexed",
             "launch_plan": self.launch_plan.as_dict(),
             "workspace_owner": "provider",
+            "headwise_logits_workspace_shape": (
+                list(self._headwise_logits.shape) if self._headwise_logits is not None else None
+            ),
+            "headwise_logits_workspace_bytes": (
+                self._headwise_logits.numel() * self._headwise_logits.element_size()
+                if self._headwise_logits is not None else 0
+            ),
         }
 
     def run(
@@ -1028,6 +1049,17 @@ class FixedGridTritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
                 "Fixed-grid decode requires dense explicit KV storage."
             )
         batch_size = int(q.shape[0])
+        score = view.meta.attn_score
+        raw_logits = None
+        if spec.h2o_headwise_logits:
+            if (
+                self._headwise_logits is None or score is None or score.ndim != 2
+                or score.shape[0] != batch_size
+                or batch_size > self._headwise_logits.shape[0]
+                or not 0 < score.shape[1] <= self._headwise_logits.shape[2]
+            ):
+                raise ValueError("H2O reduced score exceeds the prepared shared logits workspace.")
+            raw_logits = self._headwise_logits[:batch_size, :, :score.shape[1]]
         from sparsevllm.kernels.triton.paged_flash_decoding import (
             paged_flash_decode,
         )
@@ -1041,11 +1073,8 @@ class FixedGridTritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
             view.meta.context_lens,
             self._mid_o[:batch_size],
             self._mid_lse[:batch_size],
-            attn_score=(
-                None
-                if spec.h2o_layerwise_probability_scores
-                else view.meta.attn_score
-            ),
+            attn_score=(raw_logits if spec.h2o_headwise_logits else
+                        (None if spec.h2o_layerwise_probability_scores else score)),
             softmax_scale=spec.softmax_scale,
             target_tokens_per_split=self.launch_plan.target_tokens_per_split,
             block_n=self.launch_plan.block_n,
@@ -1053,9 +1082,19 @@ class FixedGridTritonPagedDecodeAttentionProvider(DecodeAttentionProvider):
             num_stages=self.launch_plan.stage1_num_stages,
             stage2_num_warps=self.launch_plan.stage2_num_warps,
             stage2_num_stages=self.launch_plan.stage2_num_stages,
-            return_softmax_lse=spec.h2o_layerwise_probability_scores,
+            return_softmax_lse=(spec.h2o_layerwise_probability_scores or spec.h2o_headwise_logits),
             output_lse=self._softmax_lse[:, :batch_size],
         )
+        if spec.h2o_headwise_logits:
+            from sparsevllm.kernels.triton.h2o_decode_score import h2o_headwise_probability_from_lse
+
+            if not isinstance(result, tuple):
+                raise RuntimeError("Shared-logits H2O decode did not return softmax LSE.")
+            h2o_headwise_probability_from_lse(
+                raw_logits, result[1], view.meta.context_lens, score,
+                softmax_scale=spec.softmax_scale,
+            )
+            return result[0]
         if not spec.h2o_layerwise_probability_scores:
             return result
         if not isinstance(result, tuple):

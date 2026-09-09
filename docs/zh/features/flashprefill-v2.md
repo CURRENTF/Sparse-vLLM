@@ -65,8 +65,8 @@ llm = LLM(
 posthoc scorer 计算重要性分数，并执行最终 decode cache 准备；它不会同时执行
 `h2o_prefill` 的中间 chunk 压缩，因为两者是同一 prefill 轴上的备选方法。SnapKV
 同样保留已有的 posthoc 评分和压缩生命周期。这些额外 scorer 仍属于 cache method
-的开销，匹配性能测量时必须计入。H2O decode 评分和周期淘汰当前关闭，与这里的
-prefill 选择无关。
+的开销，匹配性能测量时必须计入。H2O decode 评分和周期淘汰默认关闭，可通过
+独立的 `h2o_decode_eviction=True` 开启；开启时强制使用概率评分。
 
 示例中的 threshold 只适合作为 Qwen3-4B 的校准起点，不是模型无关的推荐值。
 Prefix-cache hit 已支持：CacheManager 提供包含完整 prefix 的物理 page table 和

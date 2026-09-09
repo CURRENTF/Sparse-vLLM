@@ -470,6 +470,19 @@ class RuntimeState:
                 return False
             return logical_cost <= int(self.prompt_admission_free_slots())
 
+    def startup_decode_batch_fits(self, seqs: list[Sequence]) -> bool:
+        """Check a parked batch's next append without reserving or mutating KV."""
+        if not seqs:
+            raise ValueError("Startup decode capacity check requires a non-empty batch.")
+        with self.scheduler_capacity_snapshot():
+            remaining = self.decode_step_free_slots()
+            for seq in seqs:
+                cost = self.decode_step_reservation_cost(seq)
+                if min(remaining, self.decode_step_free_slots_for(seq)) < cost:
+                    return False
+                remaining -= cost
+        return True
+
     def prefill_step_free_slots(self) -> int:
         return int(
             self.cache_manager.prefill_step_free_slots()

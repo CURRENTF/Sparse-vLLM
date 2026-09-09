@@ -4,15 +4,48 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphKey, DecodeCudaGraphState
+
 from scripts.debug.compare_decode_graph_eager_logits import (
     _build_method_trigger_evidence,
     _compare_logits,
+    _canonicalize_decode_logits,
+    _generated_token_ids,
+    _graph_runtime_summary,
     _save_full_logits_artifact,
     _start_graph_measurement,
     _validate_eager_runtime,
     _validate_graph_runtime,
     _validate_method_trigger,
 )
+
+
+def test_logit_comparison_aligns_request_identity_across_batch_schedules():
+    def event(requests):
+        return {
+            "round": 0, "stage": "decode",
+            "token_outputs": [
+                {"request_idx": request, "token_ids": [token]}
+                for request, token in requests
+            ],
+        }
+
+    eager = {"generated_token_outputs": [
+        event([(0, 10)]), event([(0, 11)]),
+        event([(1, 20)]), event([(1, 21)]),
+    ]}
+    graph = {"generated_token_outputs": [
+        event([(1, 20), (0, 10)]), event([(1, 21), (0, 11)]),
+    ]}
+    expected = torch.tensor([[10.0], [11.0], [20.0], [21.0]])
+    actual = torch.tensor([[20.0], [10.0], [21.0], [11.0]])
+    torch.testing.assert_close(
+        _canonicalize_decode_logits(expected, eager),
+        _canonicalize_decode_logits(actual, graph),
+    )
+    assert _generated_token_ids(eager) == _generated_token_ids(graph)
+    with pytest.raises(RuntimeError, match="rows do not match"):
+        _canonicalize_decode_logits(actual[:2], graph)
 
 
 def _trace(*, row_len=4, logical_context_len=8, h2o=None, omni=False, rkv=False):
@@ -69,6 +102,29 @@ def test_graph_measurement_preserves_warmup_graph_pool_ownership():
         "force_eager_count": 0,
         "graph_count": 1,
     }
+
+
+def test_graph_summary_reads_capacity_from_capture_state_not_batch_only_key():
+    state = DecodeCudaGraphState(
+        key=DecodeCudaGraphKey("h2o", 2, False, "short"),
+        capture_context_capacity=129,
+        graph=object(),
+    )
+    runner = SimpleNamespace(
+        _graphs={state.key: state}, method="h2o", capture_count=1,
+        replay_count=3, eager_static_count=0, force_eager_count=0,
+    )
+    llm = SimpleNamespace(
+        config=SimpleNamespace(decode_graph=True, model="test", sparse_method="h2o", hf_config=SimpleNamespace()),
+        model_runner=SimpleNamespace(decode_graph_runner=runner),
+    )
+    summary = _graph_runtime_summary(
+        llm, use_graph=True,
+        counters_before={"capture_count": 1, "replay_count": 0, "eager_static_count": 0, "force_eager_count": 0},
+    )
+    assert summary["graph_keys"][0]["context_capacity"] == state.capture_context_capacity
+    assert summary["graph_keys"][0]["graph_path_id"] == state.key.graph_path_id
+    _validate_graph_runtime(summary)
 
 
 @pytest.mark.parametrize(

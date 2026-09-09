@@ -254,3 +254,65 @@ def test_startup_batch_feasibility_uses_all_memory_oracle_budgets():
 
     assert runtime.startup_batch_fits((16, 16), max_tokens=2)
     assert not runtime.startup_batch_fits((16, 16, 16), max_tokens=2)
+
+
+@pytest.mark.parametrize("free_by_layer,expected", [([4, 4], True), ([4, 3], False)])
+def test_startup_decode_checks_all_h2o_layers_without_allocating(free_by_layer, expected):
+    # A later layer can lack the fourth append even when the first layer fits.
+    from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
+
+    manager = object.__new__(H2OCacheManager)
+    manager._num_free_slots = list(free_by_layer)
+    manager.kv_transformer_layer_indices = lambda: (0, 1)
+    runtime = RuntimeState(SimpleNamespace(), manager)
+    seqs = [SimpleNamespace(seq_id=i) for i in range(4)]
+
+    assert runtime.startup_decode_batch_fits(seqs) is expected
+    assert manager._num_free_slots == free_by_layer
+
+
+@pytest.mark.parametrize("free_pages,lengths,expected", [
+    (1, [15, 16], True),
+    (1, [16, 32], False),
+    (0, [15], True),
+    (0, [16], False),
+])
+def test_startup_decode_uses_page_append_costs(free_pages, lengths, expected):
+    # One token may consume a whole new page, or no shared capacity at all.
+    # A len(seqs) <= free_slots check would get both boundary cases wrong.
+    from sparsevllm.engine.cache_manager.quantized import QuantizedCacheManager
+    from sparsevllm.engine.cache_manager.quantized_pages import QuantizedPagePool
+
+    manager = object.__new__(QuantizedCacheManager)
+    manager.page_size = 16
+    manager.config = SimpleNamespace(max_decoding_seqs=4)
+    manager.prefix_cache = None
+    manager._scheduler_capacity_snapshot_depth = 0
+    manager.page_pool = QuantizedPagePool(
+        free_pages + sum((length + 15) // 16 for length in lengths), 16, 64,
+    )
+    for seq_id, length in enumerate(lengths):
+        manager.page_pool.append(seq_id, length)
+    before_free = list(manager.page_pool.free)
+    before_pages = {key: list(pages) for key, pages in manager.page_pool.pages.items()}
+    runtime = RuntimeState(SimpleNamespace(), manager)
+
+    assert runtime.startup_decode_batch_fits(
+        [SimpleNamespace(seq_id=i) for i in range(len(lengths))],
+    ) is expected
+    assert manager.page_pool.lengths == dict(enumerate(lengths))
+    assert manager.page_pool.free == before_free
+    assert manager.page_pool.pages == before_pages
+
+
+def test_startup_decode_rejects_request_local_capacity_limit():
+    manager = SimpleNamespace(
+        decode_step_free_slots=lambda: 32,
+        decode_step_free_slots_for=lambda seq: 0 if seq.seq_id == 1 else 32,
+        decode_step_reservation_cost=lambda seq: 1,
+    )
+    runtime = RuntimeState(SimpleNamespace(), manager)
+
+    assert not runtime.startup_decode_batch_fits(
+        [SimpleNamespace(seq_id=0), SimpleNamespace(seq_id=1)],
+    )

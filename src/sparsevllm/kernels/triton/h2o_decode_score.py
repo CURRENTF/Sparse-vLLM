@@ -6,6 +6,72 @@ import triton.language as tl
 
 
 @triton.jit
+def _h2o_headwise_probability_from_lse_kernel(
+    Raw, Lse, Lengths, Score,
+    stride_rb, stride_rh, stride_rt, stride_lh, stride_lb, stride_len,
+    stride_sb, stride_st,
+    HEADS: tl.constexpr, CAPACITY: tl.constexpr, SCALE: tl.constexpr,
+    BLOCK_H: tl.constexpr, BLOCK_T: tl.constexpr,
+):
+    batch = tl.program_id(0)
+    start = tl.program_id(1) * BLOCK_T
+    tokens = start + tl.arange(0, BLOCK_T)
+    heads = tl.arange(0, BLOCK_H)
+    length = tl.load(Lengths + batch * stride_len)
+    if start < length:
+        valid = ((heads[:, None] < HEADS) & (tokens[None, :] < length)
+                 & (tokens[None, :] < CAPACITY))
+        raw = tl.load(Raw + batch * stride_rb + heads[:, None] * stride_rh
+                      + tokens[None, :] * stride_rt, mask=valid, other=0.0)
+        lse = tl.load(Lse + heads * stride_lh + batch * stride_lb,
+                      mask=heads < HEADS, other=0.0)
+        probability = tl.where(valid, tl.exp(raw * SCALE - lse[:, None]), 0.0)
+        mass = tl.sum(probability, axis=0)
+    else:
+        mass = tl.full((BLOCK_T,), 0.0, tl.float32)
+    tl.store(Score + batch * stride_sb + tokens * stride_st, mass, mask=tokens < CAPACITY)
+
+
+@torch.no_grad()
+def h2o_headwise_probability_from_lse(
+    raw_logits: torch.Tensor,
+    attention_lse: torch.Tensor,
+    context_lens: torch.Tensor,
+    score: torch.Tensor,
+    *,
+    softmax_scale: float,
+) -> None:
+    """Consume shared [B,H,L] raw QK into per-layer sum_h softmax(QK) [B,L].
+
+    The attention kernel supplies natural-log LSE of scaled QK. Token tiles
+    beyond each device length skip logits/LSE reads and overwrite scores with
+    zero, including inactive rows. Launch shape depends only on capacity.
+    """
+    if raw_logits.ndim != 3 or score.ndim != 2:
+        raise ValueError("H2O shared logits/probability output must be rank 3/2.")
+    batch, heads, capacity = map(int, raw_logits.shape)
+    if min(batch, heads, capacity) <= 0 or tuple(score.shape) != (batch, capacity):
+        raise ValueError("H2O shared logits and output disagree on positive batch/capacity.")
+    if tuple(attention_lse.shape) != (heads, batch) or tuple(context_lens.shape) != (batch,):
+        raise ValueError("H2O LSE/lengths must be [heads,batch]/[batch].")
+    if any(t.dtype != torch.float32 for t in (raw_logits, attention_lse, score)):
+        raise TypeError("H2O shared logits, LSE and reduced scores must be FP32.")
+    if context_lens.dtype != torch.int32:
+        raise TypeError("H2O context lengths must be int32.")
+    if not raw_logits.is_cuda or any(t.device != raw_logits.device for t in (attention_lse, context_lens, score)):
+        raise TypeError("H2O shared score tensors must be on the same CUDA device.")
+    if not 0 < softmax_scale < float("inf"):
+        raise ValueError("H2O softmax scale must be finite and positive.")
+    _h2o_headwise_probability_from_lse_kernel[(batch, triton.cdiv(capacity, 128))](
+        raw_logits, attention_lse, context_lens, score,
+        *raw_logits.stride(), *attention_lse.stride(), context_lens.stride(0), *score.stride(),
+        HEADS=heads, CAPACITY=capacity, SCALE=float(softmax_scale),
+        BLOCK_H=triton.next_power_of_2(heads), BLOCK_T=128,
+        num_warps=4, num_stages=1,
+    )
+
+
+@triton.jit
 def _h2o_probability_from_lse_kernel(
     q,
     k,

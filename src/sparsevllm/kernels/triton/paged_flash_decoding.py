@@ -295,6 +295,10 @@ def _paged_decode_stage2(
     batch_id = tl.program_id(0)
     head_id = tl.program_id(1)
     seq_len = tl.load(B_Seqlen + batch_id)
+    if seq_len <= 0:
+        tl.store(O + batch_id * stride_ob + head_id * stride_oh + tl.arange(0, HEAD_DIM), 0.0)
+        tl.store(Out_Lse + head_id * stride_out_lse_h + batch_id * stride_out_lse_b, -float("inf"))
+        return
     num_splits = tl.maximum(
         1,
         tl.minimum(

@@ -929,7 +929,9 @@ class Glm4MoeLiteForCausalLM(nn.Module):
                 context_capacity=decode_context_capacity,
                 projection_chunk_size=engine_config.mlp_chunk_size,
                 score_output=sparse_decode_attention_score_kind(
-                    engine_config.sparse_method
+                    engine_config.sparse_method,
+                    h2o_decode_eviction=getattr(engine_config, "h2o_decode_eviction", False),
+                    attention_cache_layout=engine_config.attention_cache_layout,
                 ),
             ),
             "mlp_chunk_size": engine_config.mlp_chunk_size,

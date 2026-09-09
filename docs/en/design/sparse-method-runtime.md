@@ -134,9 +134,29 @@ mechanics:
 | `PassThroughRuntime` | vanilla, QuEST | Controller selection is full; any native query-aware physical view remains cache-manager/provider owned. |
 | `StreamingLLMRuntime` | StreamingLLM | Pass-through attention view followed by physical sink/recent retention. |
 | `ScoredCompactionRuntime` | SnapKV, PyramidKV | Shared score lifecycle and physical compaction; PyramidKV specializes layer budgets and triggers. |
-| `H2ORuntime` | H2O prefill and/or H2O decode | H2O prompt-score workspace; independently triggers intermediate-chunk prefill compaction and final-prompt decode-cache preparation. |
+| `H2ORuntime` | H2O prefill and/or H2O decode | Prompt-score workspace and independent prefill/final-prompt compaction; optional decode probability accumulation and periodic eviction. |
 | `JointDecodeRuntime` | R-KV, SkipKV | Shared decode compaction pipeline with different score sources and selectors. |
 | `DynamicSelectionRuntime` | OmniKV, DeltaKV | Observation-layer scoring and cross-layer dynamic selection; physical payload semantics remain method-specific. |
+
+The optional H2O decode switch reuses the existing scoring kernels: prefill
+probability scores reduce query observations per head and then take a head-wise
+maximum, whereas decode probabilities are summed across query heads. Forcing
+probability mode avoids mixing raw logits with probabilities; it does not unify
+these head reductions or establish original-H2O scoring parity. MLA decode is
+an explicit approximation: providers output head-max raw QK, then the H2O
+runtime requests softmax normalization and accumulation over retained tokens.
+It uses the existing reduced-score workspace and eviction lifecycle, regardless
+of the explicit-KV headwise score-fusion setting; a TODO and one-time warning
+mark the missing per-head probability parity.
+
+Explicit-KV H2O score fusion keeps one provider-owned `[batch, heads, capacity]`
+raw-QK workspace, shared by sequential layers and graph executions. Each layer
+immediately converts its logits using attention's natural-log LSE, sums over
+heads, and writes its own `[batch, capacity]` probability output before the next
+layer reuses the workspace. Only reduced scores survive to `finish_step`, where
+history accumulation and physical eviction remain cache-manager-owned. This
+removes layer- and graph-multiplied raw-logit storage without changing scoring
+or eviction policy; captured pointers and launch capacities stay fixed.
 
 Subclass a runtime only when its score representation, trigger order, selection
 domain, mutation order, prefix behavior, and CUDA Graph workspace lifecycle

@@ -72,8 +72,8 @@ compaction because both are alternatives on the same prefill axis. SnapKV likewi
 preserves its existing
 posthoc score-and-compact lifecycle. These extra scorers remain part of the
 cache method's cost and must be included in matched performance measurements.
-H2O decode scoring and periodic eviction are currently disabled independently
-of this prefill choice.
+H2O decode scoring and periodic eviction default to disabled; the independent
+`h2o_decode_eviction=True` switch enables them and forces probability scoring.
 
 The threshold in this example is only a Qwen3-4B calibration starting point;
 it is not a model-independent recommendation. Prefix-cache hits are supported:

@@ -1011,6 +1011,8 @@ def _h2o_fingerprint_config(**overrides):
     [
         ("prefill_sparse_method", "flashprefill_v2"),
         ("h2o_decode_budget", 5),
+        ("h2o_decode_eviction", True),
+        ("h2o_decode_eviction_interval", 2),
         ("h2o_prefill_budget", 9),
         ("h2o_recent_ratio", 0.25),
         ("h2o_prefill_score_window", 8),

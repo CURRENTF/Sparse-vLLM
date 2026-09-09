@@ -201,6 +201,7 @@ def _install_method_instrumentation(llm) -> dict[str, int]:
                 "free_part_slots",
                 "evict_after_decode",
                 "update_decode_attention_scores_all_layers",
+                "accumulate_decode_headwise_logits",
                 "rkv_query_attention_scores_batch",
                 "rkv_query_attention_scores",
                 "select_rkv_indices_batch",
@@ -299,8 +300,8 @@ def _graph_runtime_summary(
             {
                 "method": str(state.key.method or "vanilla"),
                 "batch_size": int(state.key.batch_size),
-                "context_capacity": int(state.key.context_capacity),
-                "is_long_text": bool(state.key.is_long_text),
+                "context_capacity": int(state.capture_context_capacity),
+                "graph_path_id": str(state.key.graph_path_id),
                 "capture_sampling": bool(state.key.capture_sampling),
             }
             for state in graph_states
@@ -576,18 +577,29 @@ def _run_decode_logits(
     from sparsevllm import LLM, SamplingParams
 
     construct_with_graph = bool(use_graph or same_provider_eager)
-    if (
-        os.getenv("SPARSEVLLM_DEBUG_SKIP_ENGINE_WARMUP", "0") == "1"
-        or (same_provider_eager and not use_graph)
-    ):
+    if os.getenv("SPARSEVLLM_DEBUG_SKIP_ENGINE_WARMUP", "0") == "1":
         LLM._warmup = lambda self: None
+    elif same_provider_eager and not use_graph:
+        original_warmup = LLM._warmup
 
+        def eager_warmup(self):
+            # Providers are already prepared with Graph-compatible contracts.
+            # Keep capacity profiling, but do not capture or replay any graphs.
+            self.config.decode_graph = False
+            self.config.decode_graph_startup_capture = False
+            original_warmup(self)
+
+        LLM._warmup = eager_warmup
+
+    decode_capacity = int(hyper_params.get("max_decoding_seqs", batch_size))
+    if decode_capacity < batch_size:
+        raise ValueError("max_decoding_seqs must cover the oracle's real batch")
     engine_kwargs = {
         **hyper_params,
         **_sparse_kwargs(method),
         "max_model_len": max(prompt_lens) + max_tokens + 100,
         "max_num_seqs_in_batch": batch_size,
-        "max_decoding_seqs": batch_size,
+        "max_decoding_seqs": decode_capacity,
         "decode_graph": construct_with_graph,
         "decode_graph_capture_sampling": False,
         "throughput_log_interval_s": 0.0,
@@ -611,7 +623,12 @@ def _run_decode_logits(
         def wrapped_run_model(input_ids, positions, is_prefill):
             logits = original_run_model(input_ids, positions, is_prefill)
             if not is_prefill:
-                captured.append(logits.detach().float().cpu())
+                from sparsevllm.utils.context import get_context
+
+                # Eager-static invokes this hook before trimming its padded
+                # model output; token events contain only live request rows.
+                real_rows = len(get_context().seqs)
+                captured.append(logits[:real_rows].detach().float().cpu())
             return logits
 
         runner.run_model = wrapped_run_model
@@ -643,8 +660,12 @@ def _run_decode_logits(
                 SamplingParams(temperature=0.0, top_p=1.0, ignore_eos=True, max_tokens=max_tokens)
                 for _ in range(batch_size)
             ]
-            for prompt, params in zip(prompt_token_ids, sampling_params):
-                llm.add_request(prompt, params)
+            request_indices = {
+                int(llm.add_request(prompt, params)): request_idx
+                for request_idx, (prompt, params) in enumerate(
+                    zip(prompt_token_ids, sampling_params)
+                )
+            }
 
             while not llm.is_finished():
                 _, num_tokens = llm.step()
@@ -672,6 +693,7 @@ def _run_decode_logits(
                         "token_outputs": [
                             {
                                 "seq_id": int(seq_id),
+                                "request_idx": request_indices[int(seq_id)],
                                 "token_ids": [int(token_id) for token_id in token_ids],
                             }
                             for seq_id, token_ids in llm.last_step_token_outputs
@@ -714,7 +736,11 @@ def _run_decode_logits(
     if not captured:
         raise RuntimeError("No decode logits captured. Use max_tokens >= 3.")
     del trace_selection
-    return torch.cat(captured, dim=0), trace, runtime_evidence
+    return (
+        _canonicalize_decode_logits(torch.cat(captured, dim=0), runtime_evidence),
+        trace,
+        runtime_evidence,
+    )
 
 
 def _run_decode_logits_worker(result_queue, kwargs: dict[str, Any]):
@@ -800,12 +826,39 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _generated_token_ids(runtime: dict[str, Any]) -> list[int]:
+    requests: dict[tuple[int, int], list[int]] = {}
+    for step in runtime["generated_token_outputs"]:
+        for record in step["token_outputs"]:
+            key = (int(step["round"]), int(record["request_idx"]))
+            requests.setdefault(key, []).extend(map(int, record["token_ids"]))
     return [
-        int(token_id)
-        for step in runtime["generated_token_outputs"]
-        for record in step["token_outputs"]
-        for token_id in record["token_ids"]
+        token_id for key in sorted(requests) for token_id in requests[key]
     ]
+
+
+def _canonicalize_decode_logits(
+    logits: torch.Tensor, runtime: dict[str, Any]
+) -> torch.Tensor:
+    # Admission and physical row order may differ after Graph startup. Compare
+    # the same submitted request and decode position, not execution batch order.
+    positions: dict[tuple[int, int], int] = {}
+    row_keys = []
+    for step in runtime["generated_token_outputs"]:
+        if step["stage"] != "decode":
+            continue
+        for record in step["token_outputs"]:
+            if len(record["token_ids"]) != 1:
+                raise RuntimeError("Decode logit comparison requires one token per row.")
+            key = (int(step["round"]), int(record["request_idx"]))
+            position = positions.get(key, 0)
+            row_keys.append((*key, position))
+            positions[key] = position + 1
+    if len(row_keys) != logits.shape[0]:
+        raise RuntimeError(
+            f"Decode logit rows do not match token events: {logits.shape[0]} vs {len(row_keys)}."
+        )
+    order = sorted(range(len(row_keys)), key=row_keys.__getitem__)
+    return logits[order]
 
 
 def _save_full_logits_artifact(

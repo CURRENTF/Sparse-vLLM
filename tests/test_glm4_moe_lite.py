@@ -218,6 +218,7 @@ def test_glm_runtime_kwargs_bind_shared_operators(
         mlp_chunk_size=16,
         tiny_random=False,
         sparse_method=sparse_method,
+        attention_cache_layout="mla_latent",
     )
     mla = object()
     all_reduce = object()

@@ -14,7 +14,7 @@ Set `sparse_method` to one of the following method names.
 | `streamingllm` | Physical eviction | StreamingLLM-style fixed sink plus recent-window cache. Tokens outside the retained prefix/tail policy are physically evicted from the active KV cache. | `sink_keep_tokens`, `recent_keep_tokens` |
 | `attention-sink` | Physical eviction | Alias-style attention-sink policy with the same sink-token and recent-window retention model. It is useful for comparing sink-window behavior against other physical eviction methods. | `sink_keep_tokens`, `recent_keep_tokens` |
 | `snapkv` | Physical eviction | SnapKV-style token selection uses an end-of-prompt observation window to keep a compact set of important prompt KV positions before generation. The current paper-aligned decode path is score-free and appends generated tokens without another SnapKV selection pass. | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
-| `h2o` | Physical eviction | Sparse-vLLM's H2O prefill extension compacts intermediate prefill chunks to `h2o_prefill_budget`, reducing work in later prefill chunks. Separately, the H2O decode contract compacts the final prompt state to `h2o_decode_budget`; although this mutation runs at the final-prefill boundary, it prepares the shorter cache consumed by score-free decode. Decode scoring and periodic eviction are currently disabled, so physical rows grow with generated tokens. | `h2o_decode_budget`, `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window`, `sparse_prefill_score_mode` |
+| `h2o` | Physical eviction | Intermediate prefill chunks can be compacted to `h2o_prefill_budget`; the final prompt is compacted to `h2o_decode_budget`. Decode is score-free by default and grows with generated tokens. Optional `h2o_decode_eviction` accumulates decode probabilities and periodically evicts physical KV. | `h2o_decode_eviction`, `h2o_decode_budget`, `h2o_decode_eviction_interval`, `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window`, `sparse_prefill_score_mode` |
 | `pyramidkv` | Physical eviction | PyramidKV-style layer-dependent KV retention. It allocates sparse budgets across layers and physically stores the selected context tokens. | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
 | `omnikv` | Logical masking | OmniKV keeps the physical cache available but constructs sparse attention views for selected layers. This is useful when the method should avoid rewriting cache storage while still reducing attention work. | `full_attention_layers`, `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens` |
 | `quest` | Query-aware page selection | QuEST selects token pages from persistent min/max page summaries. Prefill stays dense. Explicit-KV models score in key coordinates; GLM-4.7-Flash scores the fused MLA latent/RoPE cache with the matching absorbed decode query while keeping the compute payload latent. | `quest_chunk_size`, `quest_skip_layers`, `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens` |
@@ -41,15 +41,15 @@ compatibility rule.
 > over successive decode steps. Sparse-vLLM's intermediate-chunk H2O compaction
 > is its own prefill extension. Final-prompt compaction instead belongs to the
 > decode contract because it creates the shorter cache used during generation,
-> even though the mutation executes at the final-prefill boundary. Paper-style
-> online H2O updates would extend the current score-free decode runtime toward
-> the original H2O algorithm; periodic batched eviction would be an additional
-> systems variant.
+> even though the mutation executes at the final-prefill boundary. Optional
+> online score updates move toward the original H2O algorithm; periodic batched
+> eviction and bounded prefill observation remain system/algorithm variants.
 
 SnapKV defaults `sparse_prefill_score_mode` to `logits`, while PyramidKV defaults
 to `probability`. H2O (including standalone `h2o_prefill`) defaults to
 `sparse_prefill_score_mode="logits"` and `h2o_prefill_score_window=128`.
-Explicit score-mode and window settings override these defaults.
+Explicit score-mode and window settings override these defaults, except that
+`h2o_decode_eviction=True` forces `sparse_prefill_score_mode="probability"`.
 
 The H2O default is an approximation using a bounded query window. To select
 full-chunk normalized attention-mass scoring, explicitly set
@@ -58,8 +58,20 @@ In that mode, every KV layer independently sums normalized attention
 probabilities over the full current query chunk and accumulates attention mass
 across prefill chunks. H2O probability mode emits a performance warning because
 it needs additional QK scoring even when attention LSE is reused. Both modes
-retain independent scores for every H2O KV layer; decode score collection and
-periodic eviction remain disabled.
+retain independent scores for every H2O KV layer.
+
+`h2o_decode_eviction` defaults to `False`. Enable it with `sparse_method="h2o"`
+to accumulate normalized attention mass at every decode step and physically
+retain heavy hitters plus recent tokens. Eviction returns each triggered row
+to `h2o_decode_budget` at `budget + h2o_decode_eviction_interval`; memory pressure
+can trigger earlier eviction of over-budget active rows. The switch forces
+probability scoring even if `logits` was requested, with a warning. It preserves
+`h2o_prefill_score_window`: probability mode accepts 0 through 128, and a nonzero
+window is allowed. MLA latent models use an explicit approximation: apply
+`softmax(scale * RAW_QK_REDUCED)` to head-max decode logits, then accumulate and
+evict. This is not equivalent to normalizing each head before reduction and is
+not fully aligned with original H2O; enabling it emits a once-per-process warning.
+MLA prefill scoring and the default score-free decode behavior are unchanged.
 
 ## Prefill Scheduling Policies
 

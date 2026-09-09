@@ -121,9 +121,27 @@ CacheManager/Runtime ownership。逐层执行时不再查询注册表，也不�
 | `PassThroughRuntime` | vanilla、QuEST | Controller 侧返回完整逻辑选择，特殊物理视图由 CacheManager 或 Provider 构造。 |
 | `StreamingLLMRuntime` | StreamingLLM | Attention 使用普通视图，结束后按 sink 和 recent window 物理淘汰。 |
 | `ScoredCompactionRuntime` | SnapKV、PyramidKV | 共用打分和物理压缩流程；PyramidKV 使用逐层预算。 |
-| `H2ORuntime` | H2O prefill 和/或 H2O decode | 准备 H2O prompt 分数；分别触发中间 chunk prefill 压缩和最终 prompt 的 decode cache 准备。 |
+| `H2ORuntime` | H2O prefill 和/或 H2O decode | 准备 prompt 分数并独立触发 prefill/final-prompt 压缩；可选 decode 概率累计和周期驱逐。 |
 | `JointDecodeRuntime` | R-KV、SkipKV | 共用 decode 压缩流程，但分数来源和选择算法不同。 |
 | `DynamicSelectionRuntime` | OmniKV、DeltaKV | 在观察层收集分数，并把动态选择结果传给后续层。 |
+
+H2O 的可选 decode 开关复用现有评分 kernel：prefill 概率评分先按 head
+汇总 query 观测，再取 head-wise max；decode 概率则对 query heads 求和。
+强制 probability 避免混加 raw logits 与概率，但不统一这两种 head reduction，
+也不代表已经与原始 H2O 评分完全对齐。
+
+MLA decode 是显式近似：provider 输出 head-max raw QK，H2O runtime 再对保留
+token 做 softmax 和累计。它复用 reduced-score 缓冲区与驱逐生命周期，不受
+explicit-KV 的逐 head score-fusion 设置影响；TODO 和一次性警告标明尚未实现
+逐 head 概率等价性。
+
+Explicit-KV H2O 的 score fusion 由 provider 持有一份
+`[batch, heads, capacity]` raw-QK workspace，供顺序执行的各层和 Graph 复用。
+每层立即利用 attention 的自然对数 LSE 将 logits 归一化并对 head 求和，
+写入该层独立的 `[batch, capacity]` 概率后，下一层才复用 workspace。
+只有 reduced 分数保留到 `finish_step`；历史累计和物理驱逐仍由 CacheManager
+负责。这样消除逐层、逐 Graph 的 raw-logit 副本，不改变评分和驱逐策略，
+也不改变已捕获的地址与 launch 容量。
 
 只有以下行为确实一致时，才应继承同一个 Runtime：
 
