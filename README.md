@@ -115,13 +115,13 @@ conda create -n sparse-vllm-cu130-py312 python=3.12 -y
 conda activate sparse-vllm-cu130-py312
 
 python -m pip config --site set global.extra-index-url \
-  "https://download.pytorch.org/whl/cu130 https://flashinfer.ai/whl/cu130"
+  "https://download.pytorch.org/whl/cu130 https://flashinfer.ai/whl"
 python -m pip install "transformers==5.13.1" -e ".[cu130]"
 python -m pip check
 
 # Optional
 MAX_JOBS=8 pip install flash-attn --no-build-isolation
-pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
+pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130
 ```
 
 PyTorch wheels include their CUDA runtime, while compiled extensions such as
@@ -137,7 +137,7 @@ uv pip install -e ".[cu130]"
 
 # Optional
 MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
-uv pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
+uv pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130
 ```
 
 Use `cu129` instead of `cu130` for CUDA 12.9.

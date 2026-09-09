@@ -93,12 +93,12 @@ conda activate svllm
 
 CUDA_VERSION=cu130
 python -m pip config --site set global.extra-index-url \
-  "https://download.pytorch.org/whl/${CUDA_VERSION} https://flashinfer.ai/whl/${CUDA_VERSION}"
+  "https://download.pytorch.org/whl/${CUDA_VERSION} https://flashinfer.ai/whl"
 python -m pip install -e ".[${CUDA_VERSION}]"
 
 # 可选安装
 MAX_JOBS=8 pip install flash-attn --no-build-isolation
-pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
+pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130
 ```
 
 PyTorch wheel 自带 CUDA 运行时，而 `flash-attn` 等编译扩展使用当前环境中
@@ -114,7 +114,7 @@ uv pip install -e ".[cu130]"
 
 # 可选安装
 MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
-uv pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
+uv pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130
 ```
 
 CUDA 12.9 环境将 `cu130` 换成 `cu129`。

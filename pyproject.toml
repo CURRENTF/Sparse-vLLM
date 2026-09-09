@@ -50,12 +50,12 @@ dependencies = [
 cu129 = [
     "torch==2.11.0",
     "flashinfer-python[cu12]>=0.6.15,<0.7",
-    "flashinfer-jit-cache>=0.6.15,<0.7",
+    "flashinfer-cubin>=0.6.15,<0.7",
 ]
 cu130 = [
     "torch==2.11.0",
     "flashinfer-python[cu13]>=0.6.15,<0.7",
-    "flashinfer-jit-cache>=0.6.15,<0.7",
+    "flashinfer-cubin>=0.6.15,<0.7",
 ]
 
 [project.scripts]
@@ -90,10 +90,7 @@ torch = [
     { index = "pytorch-cu129", extra = "cu129" },
     { index = "pytorch-cu130", extra = "cu130" },
 ]
-flashinfer-jit-cache = [
-    { index = "flashinfer-cu129", extra = "cu129" },
-    { index = "flashinfer-cu130", extra = "cu130" },
-]
+flashinfer-cubin = { index = "flashinfer" }
 
 [[tool.uv.index]]
 name = "pytorch-cu129"
@@ -106,11 +103,6 @@ url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [[tool.uv.index]]
-name = "flashinfer-cu129"
-url = "https://flashinfer.ai/whl/cu129"
-explicit = true
-
-[[tool.uv.index]]
-name = "flashinfer-cu130"
-url = "https://flashinfer.ai/whl/cu130"
+name = "flashinfer"
+url = "https://flashinfer.ai/whl"
 explicit = true

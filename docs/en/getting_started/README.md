@@ -11,7 +11,7 @@ conda create -n sparse-vllm-cu130-py312 python=3.12 -y
 conda activate sparse-vllm-cu130-py312
 
 python -m pip config --site set global.extra-index-url \
-  "https://download.pytorch.org/whl/cu130 https://flashinfer.ai/whl/cu130"
+  "https://download.pytorch.org/whl/cu130 https://flashinfer.ai/whl"
 python -m pip install "transformers==5.13.1" -e ".[cu130]"
 python -m pip check
 
@@ -60,10 +60,10 @@ while preserving the configured BF16 or FP32 repo runtime state. Provider
 resolution validates the public dispatcher signature and the architecture-specific
 kernel symbol before execution.
 
-`flashinfer-cubin` is an optional acceleration package:
+`flashinfer-jit-cache` is an optional acceleration package:
 
 ```bash
-pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
+pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130
 ```
 
 Block-scaled FP8 Linear selects an implementation from the local operator

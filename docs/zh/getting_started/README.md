@@ -9,7 +9,7 @@ conda create -n sparse-vllm-cu130-py312 python=3.12 -y
 conda activate sparse-vllm-cu130-py312
 
 python -m pip config --site set global.extra-index-url \
-  "https://download.pytorch.org/whl/cu130 https://flashinfer.ai/whl/cu130"
+  "https://download.pytorch.org/whl/cu130 https://flashinfer.ai/whl"
 python -m pip install "transformers==5.13.1" -e ".[cu130]"
 python -m pip check
 
@@ -53,10 +53,10 @@ head 数必须等于 key head 数或是其整数倍；adapter 在 FlashInfer 边
 initial/final state，同时保留仓库配置的 BF16 或 FP32 runtime state。Provider
 resolution 会在执行前验证公开 dispatcher 的签名和对应架构的 kernel symbol。
 
-`flashinfer-cubin` 是可选加速 package：
+`flashinfer-jit-cache` 是可选加速 package：
 
 ```bash
-pip install flashinfer-cubin --index-url https://flashinfer.ai/whl
+pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130
 ```
 
 Block-scaled FP8 Linear 会根据当前 CUDA device capability，从本地 operator
