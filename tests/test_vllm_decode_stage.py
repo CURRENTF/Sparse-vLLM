@@ -87,7 +87,7 @@ def install_engine(monkeypatch, *, preempt=False, short_output=False):
         return SimpleNamespace(llm_engine=Engine())
 
     monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(
-        __version__="fixture", LLM=llm, SamplingParams=lambda **kwargs: kwargs))
+        __version__="fixture", __file__=__file__, LLM=llm, SamplingParams=lambda **kwargs: kwargs))
     monkeypatch.setattr(bench, "perf_counter", lambda: state.clock)
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     return state
@@ -146,3 +146,28 @@ def test_unrepresentable_protocol_fails_before_model_loading(tmp_path, monkeypat
     bench.benchmark_decode_stage("vanilla", 4, 2, args, rows)
     assert rows[("vanilla", 4, 2)]["status"] == "FAILED"
     assert not state.constructed
+
+
+@pytest.mark.parametrize("extra", [{"model": "different"}, {"seed": 17}, {"async_scheduling": True}])
+def test_fork_options_cannot_override_measured_workload(tmp_path, monkeypatch, extra):
+    args = stage_args(tmp_path)
+    args.engine_kwargs_dict = extra
+    state = install_engine(monkeypatch)
+    rows = {}
+    bench.benchmark_decode_stage("vanilla", 4, 2, args, rows)
+    assert rows[("vanilla", 4, 2)]["status"] == "FAILED"
+    assert not state.constructed
+
+
+def test_labelled_fork_retains_stage_accounting(tmp_path, monkeypatch):
+    args = stage_args(tmp_path)
+    args.backend_label = "tangram-snapkv"
+    args.engine_kwargs_dict = {"compression_scorer": "snapkv", "compression_budget_tokens": 4096}
+    state = install_engine(monkeypatch)
+    rows = {}
+    bench.benchmark_decode_stage("snapkv", 4, 2, args, rows)
+    row = rows[("snapkv", 4, 2)]
+    assert row["status"] == "SUCCESS"
+    assert row["decode_stage_tokens"] == 2
+    assert row["decode_stage_elapsed_s"] == 1.25
+    assert state.closed

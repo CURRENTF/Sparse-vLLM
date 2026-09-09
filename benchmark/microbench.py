@@ -487,6 +487,10 @@ def _completed_output_records(outputs, output_len):
 
 
 def benchmark_task(method, length, bs, args, results_dict):
+    if getattr(args, "engine", "sparsevllm") == "hisparse":
+        from benchmark.hisparse_microbench import benchmark_decode_stage
+        benchmark_decode_stage(method, length, bs, args, results_dict)
+        return
     if getattr(args, "engine", "sparsevllm") == "vllm":
         from benchmark.vllm_microbench import benchmark_decode_stage
         benchmark_decode_stage(method, length, bs, args, results_dict)
@@ -882,7 +886,9 @@ def benchmark_task(method, length, bs, args, results_dict):
 def main():
     parser = argparse.ArgumentParser(description="Professional benchmark for sparsevllm.")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the model")
-    parser.add_argument("--engine", choices=("sparsevllm", "vllm"), default="sparsevllm")
+    parser.add_argument("--engine", choices=("sparsevllm", "vllm", "hisparse"), default="sparsevllm")
+    parser.add_argument("--engine_kwargs", default="{}", help="External-engine constructor options, JSON or @file; workload/timing keys remain protected.")
+    parser.add_argument("--backend_label", default=None)
     parser.add_argument("--require_full_decode_batch", action="store_true",
                         help="Measure only pure decode steps with all requested sequences resident; require complete outputs and no preemption.")
     parser.add_argument("--lengths", type=str, default="16000,32000,64000", help="Context lengths to test")
@@ -977,6 +983,11 @@ def main():
     )
     
     args = parser.parse_args()
+    args.engine_kwargs_dict = _load_json_arg(args.engine_kwargs)
+    if args.engine == "sparsevllm" and (args.engine_kwargs_dict or args.backend_label):
+        parser.error("engine_kwargs/backend_label are for external stage adapters only")
+    if args.engine == "hisparse" and not args.output_dir:
+        parser.error("HiSparse stage adapter requires --output_dir for worker-side raw steps")
     if args.require_full_decode_batch and (not args.synchronize_step_timing or args.max_decode_steps_after_full):
         parser.error("Full decode batch measurement requires synchronized timing and untruncated outputs")
     if args.engine == "vllm" and not args.require_full_decode_batch:

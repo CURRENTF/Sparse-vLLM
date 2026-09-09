@@ -1,0 +1,563 @@
+{
+  "status": "success",
+  "metric": "full_batch_pure_decode_steps",
+  "aggregation": "arithmetic mean of two independent runs per variant; no confidence interval",
+  "rows": [
+    {
+      "name": "bs4-1-profile",
+      "variant": "profile",
+      "concurrency": 4,
+      "decode_throughput_tps": 337.28873487490415,
+      "decode_tokens": 8060,
+      "decode_elapsed_s": 23.89643995370716,
+      "artifact": "bs4-1-profile/performance.jsonl",
+      "measured_steps": 2015,
+      "rank_launch_plans": [
+        {
+          "context_capacity": 133120,
+          "local_q_heads": 10,
+          "max_batch_size": 4,
+          "need_score": true,
+          "batch_size": 4,
+          "block_h": 16,
+          "block_n": 64,
+          "num_split": 32,
+          "score_mode": "per_head"
+        },
+        {
+          "context_capacity": 133120,
+          "local_q_heads": 10,
+          "max_batch_size": 4,
+          "need_score": true,
+          "batch_size": 4,
+          "block_h": 16,
+          "block_n": 64,
+          "num_split": 32,
+          "score_mode": "per_head"
+        }
+      ]
+    },
+    {
+      "name": "bs4-2-fixed32",
+      "variant": "fixed32",
+      "concurrency": 4,
+      "decode_throughput_tps": 337.29447838758654,
+      "decode_tokens": 8060,
+      "decode_elapsed_s": 23.89603304071352,
+      "artifact": "bs4-2-fixed32/performance.jsonl",
+      "measured_steps": 2015,
+      "rank_launch_plans": [
+        {
+          "context_capacity": 133120,
+          "local_q_heads": 10,
+          "max_batch_size": 4,
+          "need_score": true,
+          "batch_size": 4,
+          "block_h": 16,
+          "block_n": 64,
+          "num_split": 32,
+          "score_mode": "per_head"
+        },
+        {
+          "context_capacity": 133120,
+          "local_q_heads": 10,
+          "max_batch_size": 4,
+          "need_score": true,
+          "batch_size": 4,
+          "block_h": 16,
+          "block_n": 64,
+          "num_split": 32,
+          "score_mode": "per_head"
+        }
+      ]
+    },
+    {
+      "name": "bs4-3-fixed32",
+      "variant": "fixed32",
+      "concurrency": 4,
+      "decode_throughput_tps": 335.09641500805793,
+      "decode_tokens": 8060,
+      "decode_elapsed_s": 24.0527789585758,
+      "artifact": "bs4-3-fixed32/performance.jsonl",
+      "measured_steps": 2015,
+      "rank_launch_plans": [
+        {
+          "context_capacity": 133120,
+          "local_q_heads": 10,
+          "max_batch_size": 4,
+          "need_score": true,
+          "batch_size": 4,
+          "block_h": 16,
+          "block_n": 64,
+          "num_split": 32,
+          "score_mode": "per_head"
+        },
+        {
+          "context_capacity": 133120,
+          "local_q_heads": 10,
+          "max_batch_size": 4,
+          "need_score": true,
+          "batch_size": 4,
+          "block_h": 16,
+          "block_n": 64,
+          "num_split": 32,
+          "score_mode": "per_head"
+        }
+      ]
+    },
+    {
+      "name": "bs4-4-profile",
+      "variant": "profile",
+      "concurrency": 4,
+      "decode_throughput_tps": 355.54621306996575,
+      "decode_tokens": 8060,
+      "decode_elapsed_s": 22.669345653848723,
+      "artifact": "bs4-4-profile/performance.jsonl",
+      "measured_steps": 2015,
+      "rank_launch_plans": [
+        {
+          "context_capacity": 133120,
+          "local_q_heads": 10,
+          "max_batch_size": 4,
+          "need_score": true,
+          "batch_size": 4,
+          "block_h": 16,
+          "block_n": 64,
+          "num_split": 32,
+          "score_mode": "per_head"
+        },
+        {
+          "context_capacity": 133120,
+          "local_q_heads": 10,
+          "max_batch_size": 4,
+          "need_score": true,
+          "batch_size": 4,
+          "block_h": 16,
+          "block_n": 64,
+          "num_split": 32,
+          "score_mode": "per_head"
+        }
+      ]
+    },
+    {
+      "name": "bs5-1-profile",
+      "variant": "profile",
+      "concurrency": 5,
+      "decode_throughput_tps": 319.19556173897263,
+      "decode_tokens": 10075,
+      "decode_elapsed_s": 31.563722080318257,
+      "artifact": "bs5-1-profile/performance.jsonl",
+      "measured_steps": 2015,
+      "rank_launch_plans": [
+        {
+          "context_capacity": 133120,
+          "local_q_heads": 10,
+          "max_batch_size": 5,
+          "need_score": true,
+          "batch_size": 5,
+          "block_h": 16,
+          "block_n": 64,
+          "num_split": 8,
+          "score_mode": "per_head"
+        },
+        {
+          "context_capacity": 133120,
+          "local_q_heads": 10,
+          "max_batch_size": 5,
+          "need_score": true,
+          "batch_size": 5,
+          "block_h": 16,
+          "block_n": 64,
+          "num_split": 8,
+          "score_mode": "per_head"
+        }
+      ]
+    },
+    {
+      "name": "bs5-2-fixed32",
+      "variant": "fixed32",
+      "concurrency": 5,
+      "decode_throughput_tps": 396.07389104167197,
+      "decode_tokens": 10075,
+      "decode_elapsed_s": 25.43717277981341,
+      "artifact": "bs5-2-fixed32/performance.jsonl",
+      "measured_steps": 2015,
+      "rank_launch_plans": [
+        {
+          "context_capacity": 133120,
+          "local_q_heads": 10,
+          "max_batch_size": 5,
+          "need_score": true,
+          "batch_size": 5,
+          "block_h": 16,
+          "block_n": 64,
+          "num_split": 32,
+          "score_mode": "per_head"
+        },
+        {
+          "context_capacity": 133120,
+          "local_q_heads": 10,
+          "max_batch_size": 5,
+          "need_score": true,
+          "batch_size": 5,
+          "block_h": 16,
+          "block_n": 64,
+          "num_split": 32,
+          "score_mode": "per_head"
+        }
+      ]
+    },
+    {
+      "name": "bs5-3-fixed32",
+      "variant": "fixed32",
+      "concurrency": 5,
+      "decode_throughput_tps": 375.9406175556826,
+      "decode_tokens": 10075,
+      "decode_elapsed_s": 26.799445256823674,
+      "artifact": "bs5-3-fixed32/performance.jsonl",
+      "measured_steps": 2015,
+      "rank_launch_plans": [
+        {
+          "context_capacity": 133120,
+          "local_q_heads": 10,
+          "max_batch_size": 5,
+          "need_score": true,
+          "batch_size": 5,
+          "block_h": 16,
+          "block_n": 64,
+          "num_split": 32,
+          "score_mode": "per_head"
+        },
+        {
+          "context_capacity": 133120,
+          "local_q_heads": 10,
+          "max_batch_size": 5,
+          "need_score": true,
+          "batch_size": 5,
+          "block_h": 16,
+          "block_n": 64,
+          "num_split": 32,
+          "score_mode": "per_head"
+        }
+      ]
+    },
+    {
+      "name": "bs5-4-profile",
+      "variant": "profile",
+      "concurrency": 5,
+      "decode_throughput_tps": 306.736212614134,
+      "decode_tokens": 10075,
+      "decode_elapsed_s": 32.845812087645754,
+      "artifact": "bs5-4-profile/performance.jsonl",
+      "measured_steps": 2015,
+      "rank_launch_plans": [
+        {
+          "context_capacity": 133120,
+          "local_q_heads": 10,
+          "max_batch_size": 5,
+          "need_score": true,
+          "batch_size": 5,
+          "block_h": 16,
+          "block_n": 64,
+          "num_split": 8,
+          "score_mode": "per_head"
+        },
+        {
+          "context_capacity": 133120,
+          "local_q_heads": 10,
+          "max_batch_size": 5,
+          "need_score": true,
+          "batch_size": 5,
+          "block_h": 16,
+          "block_n": 64,
+          "num_split": 8,
+          "score_mode": "per_head"
+        }
+      ]
+    }
+  ],
+  "comparisons": [
+    {
+      "concurrency": 4,
+      "mean_tps": {
+        "profile": 346.41747397243495,
+        "fixed32": 336.19544669782226
+      },
+      "other_operator_metadata_identical": true,
+      "fixed32_change_percent": -2.9507828105189815,
+      "tokens_equal_to_first_run": {
+        "bs4-1-profile": true,
+        "bs4-2-fixed32": true,
+        "bs4-3-fixed32": true,
+        "bs4-4-profile": true
+      },
+      "mismatch_positions_per_request": {
+        "bs4-1-profile": [
+          [],
+          [],
+          [],
+          []
+        ],
+        "bs4-2-fixed32": [
+          [],
+          [],
+          [],
+          []
+        ],
+        "bs4-3-fixed32": [
+          [],
+          [],
+          [],
+          []
+        ],
+        "bs4-4-profile": [
+          [],
+          [],
+          [],
+          []
+        ]
+      }
+    },
+    {
+      "concurrency": 5,
+      "mean_tps": {
+        "profile": 312.96588717655334,
+        "fixed32": 386.00725429867725
+      },
+      "other_operator_metadata_identical": true,
+      "fixed32_change_percent": 23.33844361795223,
+      "tokens_equal_to_first_run": {
+        "bs5-1-profile": true,
+        "bs5-2-fixed32": false,
+        "bs5-3-fixed32": false,
+        "bs5-4-profile": true
+      },
+      "mismatch_positions_per_request": {
+        "bs5-1-profile": [
+          [],
+          [],
+          [],
+          [],
+          []
+        ],
+        "bs5-2-fixed32": [
+          [
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17
+          ],
+          [
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17
+          ],
+          [
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17
+          ],
+          [
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17
+          ],
+          [
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17
+          ]
+        ],
+        "bs5-3-fixed32": [
+          [
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17
+          ],
+          [
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17
+          ],
+          [
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17
+          ],
+          [
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17
+          ],
+          [
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17
+          ]
+        ],
+        "bs5-4-profile": [
+          [],
+          [],
+          [],
+          [],
+          []
+        ]
+      }
+    }
+  ],
+  "artifact_sha256": {
+    "bs4-1-profile/run_info.json": "b72d63a2f42ddaecc196561f6b970df71b40b0cf6545bbfc7a3bfd3b3fb2f485",
+    "bs4-1-profile/hyper_params.json": "bb4ac96b0fd1ced3035a3caa98372b87e33293872834971391b4afe12ed2c951",
+    "bs4-1-profile/performance.jsonl": "a72f323c4e1075aa0e6f16bb7cf9d6c4c61151c380629d0fb480af1d3de81923",
+    "bs4-1-profile/command.json": "00b874748aabd6144678c7f8313f0886b38b0aaabc383c9362d0a9a3739fea55",
+    "bs4-1-profile/aggregate_metrics.json": "1342ca19a86024a968b6bcba4c26faccfa9647abae1343ca2ae84306be4e326a",
+    "bs4-1-profile/per_sample_results.jsonl": "a72f323c4e1075aa0e6f16bb7cf9d6c4c61151c380629d0fb480af1d3de81923",
+    "bs4-1-profile/omnikv-131072-4/raw_outputs.jsonl": "88c7d1aba6e97452d492c0a1d2f9db95977bb9db1439c9bbad26b38e04bfb74b",
+    "bs4-1-profile/omnikv-131072-4/steps.jsonl": "5260618b5d71833e31f2aab9a7325b0a5c68e0e226aa6a0b1c93ea37284297ea",
+    "bs4-2-fixed32/run_info.json": "be95b0aa385b41eb3fb8597123ad5644897003437b65a155fa9d9115a43ebc35",
+    "bs4-2-fixed32/hyper_params.json": "bb4ac96b0fd1ced3035a3caa98372b87e33293872834971391b4afe12ed2c951",
+    "bs4-2-fixed32/performance.jsonl": "de69e9cb6dcf1a15a2a28538ab219c0c6dcd1df7fec4d380ba7da41e86851f71",
+    "bs4-2-fixed32/command.json": "578412f55c0ba1150be646e98bbd79255e32a9488835cd1509b7f63dd388701f",
+    "bs4-2-fixed32/aggregate_metrics.json": "d77e16bb0dfaebf0c3fb223eac6326ee18fe470a528747b61f5e055fe2e97dba",
+    "bs4-2-fixed32/per_sample_results.jsonl": "de69e9cb6dcf1a15a2a28538ab219c0c6dcd1df7fec4d380ba7da41e86851f71",
+    "bs4-2-fixed32/omnikv-131072-4/raw_outputs.jsonl": "88c7d1aba6e97452d492c0a1d2f9db95977bb9db1439c9bbad26b38e04bfb74b",
+    "bs4-2-fixed32/omnikv-131072-4/steps.jsonl": "d8ab9a8466e7d91d92b53e9fe8bdf38ae22ccfbc01ea9788ef5b7504a1667c26",
+    "bs4-3-fixed32/run_info.json": "e0dd5ae647a750181c34580e6557254a2581e8cb8714f26764c15f977690f1fe",
+    "bs4-3-fixed32/hyper_params.json": "bb4ac96b0fd1ced3035a3caa98372b87e33293872834971391b4afe12ed2c951",
+    "bs4-3-fixed32/performance.jsonl": "786bd681622849dd270dbf978f870b5292480fe0662388ddd1955760e91af51e",
+    "bs4-3-fixed32/command.json": "5790624fe6043196cc8b032e4ab748ba9f798f347908d4982f29eb9ef0949e5b",
+    "bs4-3-fixed32/aggregate_metrics.json": "50f50b44690f0d2f4c9a73d98b80bd0f557d1ada0b8c2338933ff931a09c204c",
+    "bs4-3-fixed32/per_sample_results.jsonl": "786bd681622849dd270dbf978f870b5292480fe0662388ddd1955760e91af51e",
+    "bs4-3-fixed32/omnikv-131072-4/raw_outputs.jsonl": "88c7d1aba6e97452d492c0a1d2f9db95977bb9db1439c9bbad26b38e04bfb74b",
+    "bs4-3-fixed32/omnikv-131072-4/steps.jsonl": "15ee4305dd5a12e21643376092235f8700ea6a1fd412517d9e326dbc47227aaf",
+    "bs4-4-profile/run_info.json": "2950d578e2e4d4037fbcabab3105cb7cb79232ed8368d4174886a31ff79231b6",
+    "bs4-4-profile/hyper_params.json": "bb4ac96b0fd1ced3035a3caa98372b87e33293872834971391b4afe12ed2c951",
+    "bs4-4-profile/performance.jsonl": "539fec28e45cdbb9af97f9c5e38aa6dc14c70a31e6aa07d8331ce05fee864ac7",
+    "bs4-4-profile/command.json": "81f2915feb64925acfa8ef3e100a5bd851d35d10c3c07a7c75fea7d25e46191b",
+    "bs4-4-profile/aggregate_metrics.json": "5eced447452e320991cc77407cba7e3f3c539883516bd3be51c8fce25f1e8263",
+    "bs4-4-profile/per_sample_results.jsonl": "539fec28e45cdbb9af97f9c5e38aa6dc14c70a31e6aa07d8331ce05fee864ac7",
+    "bs4-4-profile/omnikv-131072-4/raw_outputs.jsonl": "88c7d1aba6e97452d492c0a1d2f9db95977bb9db1439c9bbad26b38e04bfb74b",
+    "bs4-4-profile/omnikv-131072-4/steps.jsonl": "a8dc468ccfa3b3587be7d7e4e400ef232e422adeaf860b04308f76a4df775933",
+    "bs5-1-profile/run_info.json": "1e7675c69a27b35adcfbe749820a186e91bbd85e5fe443d4d38f464dea024e61",
+    "bs5-1-profile/hyper_params.json": "16726e8df72e1758e1aec9c017ad7ace7abc556a62cc407786225b5b466455d2",
+    "bs5-1-profile/performance.jsonl": "af5405a5ccb5185aba19f5ae59d43da8e4551851d995f20232640604e55347a1",
+    "bs5-1-profile/command.json": "66b4caa8ea1fc783828851c5b9ae7a046eb930bbf559199282fd65bdc1142b72",
+    "bs5-1-profile/aggregate_metrics.json": "32954b6d9fb32b3bb0073bec2d40cdf11ee0ebd27390d4d937377ea33d36402e",
+    "bs5-1-profile/per_sample_results.jsonl": "af5405a5ccb5185aba19f5ae59d43da8e4551851d995f20232640604e55347a1",
+    "bs5-1-profile/omnikv-131072-5/raw_outputs.jsonl": "8418e461a49feab02d282c41dc06d872738e7b4a19fe026f1d948c17a1e90561",
+    "bs5-1-profile/omnikv-131072-5/steps.jsonl": "38558bca79b3fd66ee003272a3f8b455b8aa92bc87605858476fa3fce2f871b0",
+    "bs5-2-fixed32/run_info.json": "d06cb132c6f546d3f5b89daf63b8d918aca53e0cc5d0ad71865d576482c9976f",
+    "bs5-2-fixed32/hyper_params.json": "16726e8df72e1758e1aec9c017ad7ace7abc556a62cc407786225b5b466455d2",
+    "bs5-2-fixed32/performance.jsonl": "cc8fb8dc411aad8a492908c993e0cd871be4ef6121ff3f6025c748eb0a0246b9",
+    "bs5-2-fixed32/command.json": "0c172b033ea552022d38542cb3cfba4f11ee0df399e641ffaba1bbc4bda8b768",
+    "bs5-2-fixed32/aggregate_metrics.json": "36be149b4da095d9f80184e29ec03b7c935365e1fac460afb02ec41839e8562b",
+    "bs5-2-fixed32/per_sample_results.jsonl": "cc8fb8dc411aad8a492908c993e0cd871be4ef6121ff3f6025c748eb0a0246b9",
+    "bs5-2-fixed32/omnikv-131072-5/raw_outputs.jsonl": "baab5702081b2452d43ba2a16f13fb9e5e0b0bb4ba1842907d7079c119200089",
+    "bs5-2-fixed32/omnikv-131072-5/steps.jsonl": "a2916ff733e2108b6db1f883f047a820fbcefeaea371787085807f78b6d396c0",
+    "bs5-3-fixed32/run_info.json": "456fa4d50fcd879f67716c64eec5f513225f078cdb578af42be3d92c7c7fe89d",
+    "bs5-3-fixed32/hyper_params.json": "16726e8df72e1758e1aec9c017ad7ace7abc556a62cc407786225b5b466455d2",
+    "bs5-3-fixed32/performance.jsonl": "9e7f8f78efa9509ddd6f11a70d8e49f7dbad6c6ad796b17cb9eb37bd2e460c33",
+    "bs5-3-fixed32/command.json": "934e66e8f695558065d35584f082ccccf582d362fe5af9fda038f6b6a5b57849",
+    "bs5-3-fixed32/aggregate_metrics.json": "433cf25a2799103983a4263a76476ab774fef00decc5acf402f81b7e938870cf",
+    "bs5-3-fixed32/per_sample_results.jsonl": "9e7f8f78efa9509ddd6f11a70d8e49f7dbad6c6ad796b17cb9eb37bd2e460c33",
+    "bs5-3-fixed32/omnikv-131072-5/raw_outputs.jsonl": "baab5702081b2452d43ba2a16f13fb9e5e0b0bb4ba1842907d7079c119200089",
+    "bs5-3-fixed32/omnikv-131072-5/steps.jsonl": "1ec93195c1e6260142606f563806ed26a7fb317d418b98c0ff10191c23552fc8",
+    "bs5-4-profile/run_info.json": "3a5045951cf4158038759ba4621271a71f3c82542bad3c6e0a8f87fe2f24f4fb",
+    "bs5-4-profile/hyper_params.json": "16726e8df72e1758e1aec9c017ad7ace7abc556a62cc407786225b5b466455d2",
+    "bs5-4-profile/performance.jsonl": "10de67e382d89fe094b8c6bf8c18dbf46df9f20996d22bed45da6ce8f49ebb45",
+    "bs5-4-profile/command.json": "f39823868854eca6dc018ff7ae4bbcd23ebb0e8b13cdb172ac6b8867cba30a94",
+    "bs5-4-profile/aggregate_metrics.json": "e2ce460fbcd59471960e4f0e9f25582018091fea47ea25ed5d51a39b0321bac7",
+    "bs5-4-profile/per_sample_results.jsonl": "10de67e382d89fe094b8c6bf8c18dbf46df9f20996d22bed45da6ce8f49ebb45",
+    "bs5-4-profile/omnikv-131072-5/raw_outputs.jsonl": "8418e461a49feab02d282c41dc06d872738e7b4a19fe026f1d948c17a1e90561",
+    "bs5-4-profile/omnikv-131072-5/steps.jsonl": "2a75dcdd79b543a6aebbb0d1d2bab5d8b5867d7953c71bd8156df8a1b86f06cd"
+  }
+}

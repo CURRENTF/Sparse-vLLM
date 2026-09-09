@@ -183,6 +183,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokenizer-path", default=None)
     parser.add_argument("--deltakv-checkpoint-path", default=None)
     parser.add_argument("--sparse-method", default="vanilla")
+    parser.add_argument("--engine", choices=("sparsevllm", "vllm", "sglang-http"), default="sparsevllm")
+    parser.add_argument("--engine-kwargs", default=None)
+    parser.add_argument("--server-url", default=None)
+    parser.add_argument("--official-length", choices=("short", "medium", "long"))
+    parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--prepared-samples", default=None)
     parser.add_argument("--hyper-param-json", default=None)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--data-path", default=os.getenv(DEFAULT_DATA_ENV))
@@ -211,6 +217,10 @@ def main() -> int:
     _write_json(output_dir / "run_status.json", {"status": "running"})
     phase = "input"
     try:
+        if args.engine == "sparsevllm" and (args.engine_kwargs or args.server_url):
+            raise ValueError("Native quality does not accept external engine/server options.")
+        if args.engine != "sparsevllm" and args.hyper_param_json:
+            raise ValueError("External quality does not accept native --hyper-param-json.")
         if not args.data_path:
             raise FileNotFoundError(
                 "LongBench v2 data is not configured. Pass --data-path or set "
@@ -247,6 +257,10 @@ def main() -> int:
         template = prompt_path.read_text(encoding="utf-8")
         source_rows = load_dataset(data_path)
         source_sha256 = file_sha256(data_path)
+        if args.official_length:
+            source_rows = [row for row in source_rows if row["length"] == args.official_length]
+            if not source_rows:
+                raise ValueError("The requested official length cohort is empty.")
 
         phase = "tokenizer"
         tokenizer_path = args.tokenizer_path or args.model_path
@@ -280,13 +294,28 @@ def main() -> int:
             return prompt, token_ids
 
         phase = "selection"
-        selected = select_samples(
-            source_rows,
-            buckets=buckets,
-            seed=args.seed,
-            prepare_prompt=prepare_prompt,
-            max_prompt_tokens=max_prompt_tokens,
-        )
+        if args.prepared_samples:
+            prepared = json.loads(Path(args.prepared_samples).read_text())
+            expected = {"data_sha256": source_sha256,
+                        "prompt_template_sha256": file_sha256(prompt_path),
+                        "tokenizer_path": str(Path(tokenizer_path).resolve()),
+                        "seed": args.seed, "no_chat_template": args.no_chat_template,
+                        "official_length": args.official_length,
+                        "token_buckets": [bucket.__dict__ for bucket in buckets]}
+            prepared_identity = dict(prepared["identity"])
+            prepared_identity["tokenizer_path"] = str(Path(prepared_identity["tokenizer_path"]).resolve())
+            if prepared_identity != expected:
+                different = [key for key in expected if prepared_identity.get(key) != expected[key]]
+                raise ValueError(f"Prepared sample identity mismatch: {different}.")
+            selected = prepared["samples"]
+            if any(len(item["prompt_token_ids"]) != item["prompt_tokens"] or
+                   not 0 < item["prompt_tokens"] <= max_prompt_tokens for item in selected):
+                raise ValueError("Prepared samples have invalid or oversized token sequences.")
+        else:
+            selected = select_samples(
+                source_rows, buckets=buckets, seed=args.seed,
+                prepare_prompt=prepare_prompt, max_prompt_tokens=max_prompt_tokens,
+            )
         identities = [_identity(item) for item in selected]
         _write_jsonl(output_dir / "dataset.jsonl", identities)
 
@@ -297,6 +326,11 @@ def main() -> int:
             "model_path": str(Path(args.model_path).resolve()),
             "tokenizer_path": str(Path(tokenizer_path).resolve()),
             "sparse_method": args.sparse_method,
+            "engine": args.engine,
+            "engine_kwargs": _load_json_object(args.engine_kwargs),
+            "server_url": args.server_url,
+            "official_length": args.official_length,
+            "prepared_samples_sha256": file_sha256(args.prepared_samples) if args.prepared_samples else None,
             "deltakv_checkpoint_path": args.deltakv_checkpoint_path,
             "data_path": str(data_path),
             "data_sha256": source_sha256,
@@ -317,23 +351,38 @@ def main() -> int:
             "requested_runtime": infer_config,
         }
         _write_json(output_dir / "resolved_config.json", resolved_config)
+        if args.prepare_only:
+            _write_json(output_dir / "prepared_samples.json", {
+                "identity": {key: resolved_config[key] for key in (
+                    "data_sha256", "prompt_template_sha256", "tokenizer_path", "seed",
+                    "no_chat_template", "official_length", "token_buckets")},
+                "samples": selected,
+            })
+            _write_json(output_dir / "run_status.json", {"status": "prepared", "samples": len(selected)})
+            return 0
 
         phase = "model"
         eos_token_ids = _eos_token_ids(args.model_path, tokenizer)
-        generate = get_sparsevllm_generate_api(
-            model_path=args.model_path,
-            infer_config=infer_config,
-            deltakv_checkpoint_path=args.deltakv_checkpoint_path,
-            sparse_method=args.sparse_method,
-        )
-        llm = getattr(generate, "_sparsevllm_llm", None)
-        if llm is None:
-            raise RuntimeError(
-                "Sparse-vLLM adapter did not expose runtime provenance."
+        llm = None
+        if args.engine == "sparsevllm":
+            generate = get_sparsevllm_generate_api(
+                model_path=args.model_path, infer_config=infer_config,
+                deltakv_checkpoint_path=args.deltakv_checkpoint_path,
+                sparse_method=args.sparse_method,
             )
-        resolved_config["effective_runtime"] = llm.worker_info(
-            tags=["longbench-v2-quality"]
-        )
+            llm = getattr(generate, "_sparsevllm_llm", None)
+            if llm is None:
+                raise RuntimeError("Sparse-vLLM adapter did not expose runtime provenance.")
+            resolved_config["effective_runtime"] = llm.worker_info(tags=["longbench-v2-quality"])
+        else:
+            from benchmark.long_bench_v2.external import get_generate_api
+            generate, runtime = get_generate_api(
+                engine=args.engine, model_path=args.model_path,
+                max_model_len=args.max_model_len, seed=args.seed,
+                engine_kwargs=resolved_config["engine_kwargs"], server_url=args.server_url,
+                sparse_method=args.sparse_method,
+            )
+            resolved_config["effective_runtime"] = runtime
         _write_json(output_dir / "resolved_config.json", resolved_config)
 
         phase = "generation"
@@ -411,6 +460,12 @@ def main() -> int:
                         "correct": predicted == item["sample"]["answer"],
                     }
                 )
+            _write_jsonl(output_dir / "sample_results.partial.jsonl", results)
+            _write_json(output_dir / "progress.json", {
+                "finished": len(results), "expected": len(selected),
+                "last_sample": batch[-1]["sample"]["_id"],
+            })
+            print(f"LongBench v2 progress: {len(results)}/{len(selected)}", flush=True)
 
         if len(results) != len(selected):
             raise RuntimeError(
@@ -452,7 +507,8 @@ def main() -> int:
         _write_json(output_dir / "aggregate_metrics.json", aggregate)
         _write_json(
             output_dir / "operator_runtime_stats.json",
-            {"status": "success", "world_ranks": llm.operator_runtime_stats()},
+            {"status": "success", "world_ranks": llm.operator_runtime_stats()}
+            if llm is not None else {"status": "not_available", "engine": args.engine},
         )
         if aggregate["status"] != "success":
             raise RuntimeError(

@@ -79,3 +79,51 @@ def test_baseline_source_drift_or_missing_file_fails_explicitly(tmp_path):
     source.unlink()
     with pytest.raises(ValueError, match='baseline mismatch'):
         check_vortex_sources(tmp_path, provenance)
+
+
+def test_quality_smoke_failure_never_starts_full_cohort(tmp_path, monkeypatch):
+    # Consolidating the phase runner must not turn a failed smoke into a full run.
+    from types import SimpleNamespace
+    from scripts.official_experiments.sparsevllm_vs_vortex.session import run_quality
+    prepared = tmp_path / 'prepared.json'
+    prepared.write_text(json.dumps({'identity': {'token_buckets': [{'samples': 1}]},
+        'samples': [{'sample': {'_id': 'a'}, 'prompt_tokens': 4, 'index': 0}]}))
+    output = tmp_path / 'output'
+    spec = tmp_path / 'spec.json'
+    spec.write_text(json.dumps({'output': str(output), 'prepared': str(prepared),
+                               'cwd': str(tmp_path), 'command': ['model-runner']}))
+    calls = []
+    def failed(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=1)
+    monkeypatch.setattr(run_quality.subprocess, 'run', failed)
+    with pytest.raises(RuntimeError, match='smoke failed'):
+        run_quality.main(spec)
+    assert len(calls) == 1
+    assert not (output / 'full').exists()
+    assert (output / 'status.tsv').read_text().startswith('smoke\t1\t')
+
+
+def test_external_quality_failure_cleans_up_only_owned_server(tmp_path, monkeypatch):
+    # The separate server process group must not outlive a failing quality job.
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from scripts.official_experiments.sparsevllm_vs_vortex.session import serve_quality
+    spec = tmp_path / 'server.json'
+    spec.write_text(json.dumps({'output': str(tmp_path / 'output'),
+        'server_command': ['server'], 'server_cwd': str(tmp_path),
+        'server_url': 'http://127.0.0.1:1234', 'quality_spec': 'quality.json'}))
+    sent, waited = [], []
+    def popen(command, **kwargs):
+        assert command == ['server'] and kwargs['start_new_session']
+        return SimpleNamespace(pid=12345, poll=lambda: None,
+                               wait=lambda timeout: waited.append(timeout))
+    monkeypatch.setattr(serve_quality.subprocess, 'Popen', popen)
+    monkeypatch.setattr(serve_quality.subprocess, 'run', lambda *a, **kw: SimpleNamespace(returncode=1))
+    monkeypatch.setattr(serve_quality, 'urlopen', lambda *a, **kw: nullcontext(SimpleNamespace(status=200)))
+    monkeypatch.setattr(serve_quality.signal, 'signal', lambda *a: None)
+    monkeypatch.setattr(serve_quality.os, 'killpg', lambda pid, sig: sent.append((pid, sig)))
+    with pytest.raises(RuntimeError, match='Quality exited'):
+        serve_quality.main(spec)
+    assert sent == [(12345, serve_quality.signal.SIGTERM)]
+    assert waited == [30]

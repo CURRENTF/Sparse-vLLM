@@ -1,0 +1,1101 @@
+{
+  "schema_version": 1,
+  "metric": "actual_decode_tokens / sum_synchronized_full_batch_decode_step_seconds",
+  "validation": "raw steps and full outputs verified at export; replot checks exported sums only",
+  "config": {
+    "output_root": "${DECODE_OUTPUT_ROOT}",
+    "scratch_root": "${DECODE_SCRATCH_ROOT}",
+    "conda": "${CONDA_EXE}",
+    "native_env": "${SPARSE_VLLM_ENV}",
+    "vllm_env": "${VLLM_ENV}",
+    "input_len": 131072,
+    "output_len": 2048,
+    "gpu_memory_utilization": 0.9,
+    "case_timeout_s": 14400,
+    "idle_timeout_s": 43200,
+    "safety_concurrency_limit": 1024,
+    "models": {
+      "qwen3-30b-fp8": {
+        "display_name": "Qwen3-30B-A3B-Instruct-2507-FP8",
+        "path": "${QWEN3_MODEL}",
+        "tp": 1,
+        "ep": 1
+      },
+      "glm4.7-flash": {
+        "display_name": "GLM-4.7-Flash (BF16)",
+        "path": "${GLM47_MODEL}",
+        "tp": 2,
+        "ep": 2
+      }
+    },
+    "methods": {
+      "snapkv": {
+        "sink_keep_tokens": 64,
+        "recent_keep_tokens": 512,
+        "decode_keep_tokens": 7616,
+        "snapkv_window_size": 32,
+        "sparse_prefill_score_mode": "probability"
+      },
+      "quest": {
+        "sink_keep_tokens": 64,
+        "recent_keep_tokens": 512,
+        "decode_keep_tokens": 1472
+      },
+      "omnikv": {
+        "full_attention_layers": "auto",
+        "sink_keep_tokens": 64,
+        "recent_keep_tokens": 512,
+        "decode_keep_tokens": 1472
+      }
+    },
+    "external_lanes": {
+      "tangram-snapkv": {
+        "environment_kind": "venv",
+        "max_num_batched_tokens": 2048,
+        "engine": "vllm",
+        "method": "snapkv",
+        "backend_label": "tangram-snapkv",
+        "env": "${TANGRAM_ENV}",
+        "engine_kwargs": {
+          "compression_scorer": "snapkv",
+          "compression_budget_scope": "uniform",
+          "compression_budget_tokens": 8192,
+          "compression_n_sink_tokens": 64,
+          "compression_window_size": 512,
+          "compression_chunk_size": 2048,
+          "compression_scorer_options": {
+            "window": "32",
+            "kernel": "7"
+          }
+        }
+      },
+      "hisparse-quest": {
+        "environment_kind": "venv",
+        "engine": "hisparse",
+        "method": "quest",
+        "backend_label": "hisparse-quest-pr-series",
+        "env": "${HISPARSE_ENV}",
+        "engine_kwargs": {
+          "hisparse_config": {
+            "algorithm": "quest",
+            "backend": "fa3",
+            "page_size": 16,
+            "sparsity_ratio": 0.011764705882352941,
+            "num_recent_pages": 32,
+            "min_sparse_prompt_len": 0,
+            "enable_cuda_graph_retrieval": true
+          }
+        }
+      }
+    },
+    "unsupported": {
+      "glm4.7-flash": {
+        "tangram-snapkv": "Pinned Tangram compression.validate_model_support rejects Glm4MoeLiteForCausalLM; supported architecture list has no MLA model.",
+        "hisparse-quest": "Pinned HiSparse QuEST hisparse_hook validates AttentionArch.MHA only (standard MHA/GQA), rejecting MLA."
+      }
+    }
+  },
+  "curves": [
+    {
+      "model": "qwen3-30b-fp8",
+      "lane": "vllm-vanilla",
+      "max_concurrency": 3,
+      "first_failed_concurrency": 4,
+      "attempts": [
+        {
+          "artifact": "original/qwen3-30b-fp8/vllm-vanilla-gpu5/vllm-vanilla/bs1/performance.jsonl",
+          "concurrency": 1,
+          "status": "success"
+        },
+        {
+          "artifact": "original/qwen3-30b-fp8/vllm-vanilla-gpu5/vllm-vanilla/bs2/performance.jsonl",
+          "concurrency": 2,
+          "status": "success"
+        },
+        {
+          "artifact": "original/qwen3-30b-fp8/vllm-vanilla-gpu5/vllm-vanilla/bs4/performance.jsonl",
+          "concurrency": 4,
+          "error": "RuntimeError('Full decode batch capacity exceeded: requests finished before full decode admission')",
+          "status": "capacity_exceeded"
+        },
+        {
+          "artifact": "original/qwen3-30b-fp8/vllm-vanilla-gpu5/vllm-vanilla/bs3/performance.jsonl",
+          "concurrency": 3,
+          "status": "success"
+        }
+      ],
+      "points": [
+        {
+          "concurrency": 1,
+          "decode_throughput_tps": 104.5058481543291,
+          "decode_tokens": 2015,
+          "decode_elapsed_s": 19.281217612093315,
+          "artifact": "original/qwen3-30b-fp8/vllm-vanilla-gpu5/vllm-vanilla/bs1/performance.jsonl",
+          "measured_steps": 2015
+        },
+        {
+          "concurrency": 2,
+          "decode_throughput_tps": 139.48990624351194,
+          "decode_tokens": 3996,
+          "decode_elapsed_s": 28.64723410899751,
+          "artifact": "original/qwen3-30b-fp8/vllm-vanilla-gpu5/vllm-vanilla/bs2/performance.jsonl",
+          "measured_steps": 1998
+        },
+        {
+          "concurrency": 3,
+          "decode_throughput_tps": 157.91973964551408,
+          "decode_tokens": 5946,
+          "decode_elapsed_s": 37.652037758845836,
+          "artifact": "original/qwen3-30b-fp8/vllm-vanilla-gpu5/vllm-vanilla/bs3/performance.jsonl",
+          "measured_steps": 1982
+        }
+      ],
+      "capacity_artifact": "original/qwen3-30b-fp8/vllm-vanilla-gpu5/vllm-vanilla/capacity.json"
+    },
+    {
+      "model": "qwen3-30b-fp8",
+      "lane": "svllm-vanilla",
+      "max_concurrency": 3,
+      "first_failed_concurrency": 4,
+      "attempts": [
+        {
+          "artifact": "original/qwen3-30b-fp8/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-stagefix2/svllm-vanilla/bs1/performance.jsonl",
+          "concurrency": 1,
+          "status": "success"
+        },
+        {
+          "artifact": "original/qwen3-30b-fp8/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-stagefix2/svllm-vanilla/bs2/performance.jsonl",
+          "concurrency": 2,
+          "status": "success"
+        },
+        {
+          "artifact": "original/qwen3-30b-fp8/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-stagefix2/svllm-vanilla/bs4/performance.jsonl",
+          "concurrency": 4,
+          "error": "RuntimeError('Full decode batch capacity exceeded: not all requests entered decode together')",
+          "status": "capacity_exceeded"
+        },
+        {
+          "artifact": "original/qwen3-30b-fp8/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-stagefix2/svllm-vanilla/bs3/performance.jsonl",
+          "concurrency": 3,
+          "status": "success"
+        }
+      ],
+      "points": [
+        {
+          "concurrency": 1,
+          "decode_throughput_tps": 100.90840943933323,
+          "decode_tokens": 2015,
+          "decode_elapsed_s": 19.968603322515264,
+          "artifact": "original/qwen3-30b-fp8/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-stagefix2/svllm-vanilla/bs1/performance.jsonl",
+          "measured_steps": 2015
+        },
+        {
+          "concurrency": 2,
+          "decode_throughput_tps": 140.18255664213618,
+          "decode_tokens": 4030,
+          "decode_elapsed_s": 28.748227286851034,
+          "artifact": "original/qwen3-30b-fp8/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-stagefix2/svllm-vanilla/bs2/performance.jsonl",
+          "measured_steps": 2015
+        },
+        {
+          "concurrency": 3,
+          "decode_throughput_tps": 161.07367636700658,
+          "decode_tokens": 6045,
+          "decode_elapsed_s": 37.529409748036414,
+          "artifact": "original/qwen3-30b-fp8/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-stagefix2/svllm-vanilla/bs3/performance.jsonl",
+          "measured_steps": 2015
+        }
+      ],
+      "capacity_artifact": "original/qwen3-30b-fp8/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-stagefix2/svllm-vanilla/capacity.json"
+    },
+    {
+      "model": "qwen3-30b-fp8",
+      "lane": "svllm-snapkv",
+      "max_concurrency": 33,
+      "first_failed_concurrency": 34,
+      "attempts": [
+        {
+          "artifact": "original/qwen3-30b-fp8/svllm-snapkv_svllm-quest_svllm-omnikv-bootstrapfix/svllm-snapkv/bs1/performance.jsonl",
+          "concurrency": 1,
+          "status": "success"
+        },
+        {
+          "artifact": "original/qwen3-30b-fp8/svllm-snapkv_svllm-quest_svllm-omnikv-bootstrapfix/svllm-snapkv/bs2/performance.jsonl",
+          "concurrency": 2,
+          "status": "success"
+        },
+        {
+          "artifact": "original/qwen3-30b-fp8/svllm-snapkv_svllm-quest_svllm-omnikv-bootstrapfix/svllm-snapkv/bs4/performance.jsonl",
+          "concurrency": 4,
+          "status": "success"
+        },
+        {
+          "artifact": "original/qwen3-30b-fp8/svllm-snapkv_svllm-quest_svllm-omnikv-bootstrapfix/svllm-snapkv/bs8/performance.jsonl",
+          "concurrency": 8,
+          "status": "success"
+        },
+        {
+          "artifact": "original/qwen3-30b-fp8/svllm-snapkv_svllm-quest_svllm-omnikv-bootstrapfix/svllm-snapkv/bs16/performance.jsonl",
+          "concurrency": 16,
+          "status": "success"
+        },
+        {
+          "artifact": "original/qwen3-30b-fp8/svllm-snapkv_svllm-quest_svllm-omnikv-bootstrapfix/svllm-snapkv/bs32/performance.jsonl",
+          "concurrency": 32,
+          "status": "success"
+        },
+        {
+          "artifact": "original/qwen3-30b-fp8/svllm-snapkv_svllm-quest_svllm-omnikv-bootstrapfix/svllm-snapkv/bs64/performance.jsonl",
+          "concurrency": 64,
+          "error": "OutOfMemoryError('CUDA out of memory. Tried to allocate 4.57 GiB. GPU 0 has a total capacity of 79.18 GiB of which 64.81 MiB is free. Process 2334448 has 612.00 MiB memory in use. Including non-PyTorch memory, this process has 78.50 GiB memory in use. Of the allocated memory 77.21 GiB is allocated by PyTorch, and 83.23 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)')",
+          "status": "capacity_exceeded"
+        },
+        {
+          "artifact": "original/qwen3-30b-fp8/svllm-snapkv_svllm-quest_svllm-omnikv-bootstrapfix/svllm-snapkv/bs48/performance.jsonl",
+          "concurrency": 48,
+          "error": "RuntimeError(\"decode CUDA Graph has no startup-captured graph for batch_size=48, path='long'.\")",
+          "status": "capacity_exceeded"
+        },
+        {
+          "artifact": "original/qwen3-30b-fp8/svllm-snapkv-resume1/svllm-snapkv/bs40/performance.jsonl",
+          "concurrency": 40,
+          "error": "RuntimeError('Full decode batch capacity exceeded: request finished before all admission waves completed')",
+          "status": "capacity_exceeded"
+        },
+        {
+          "artifact": "original/qwen3-30b-fp8/svllm-snapkv-resume1/svllm-snapkv/bs36/performance.jsonl",
+          "concurrency": 36,
+          "error": "RuntimeError('Full decode batch capacity exceeded: request finished before all admission waves completed')",
+          "status": "capacity_exceeded"
+        },
+        {
+          "artifact": "original/qwen3-30b-fp8/svllm-snapkv-resume1/svllm-snapkv/bs34/performance.jsonl",
+          "concurrency": 34,
+          "error": "RuntimeError('Full decode batch capacity exceeded: not all requests entered decode together')",
+          "status": "capacity_exceeded"
+        },
+        {
+          "artifact": "original/qwen3-30b-fp8/svllm-snapkv-resume1/svllm-snapkv/bs33/performance.jsonl",
+          "concurrency": 33,
+          "status": "success"
+        }
+      ],
+      "points": [
+        {
+          "concurrency": 1,
+          "decode_throughput_tps": 143.29035280306286,
+          "decode_tokens": 2015,
+          "decode_elapsed_s": 14.062356331618503,
+          "artifact": "original/qwen3-30b-fp8/svllm-snapkv_svllm-quest_svllm-omnikv-bootstrapfix/svllm-snapkv/bs1/performance.jsonl",
+          "measured_steps": 2015
+        },
+        {
+          "concurrency": 2,
+          "decode_throughput_tps": 269.3645232174925,
+          "decode_tokens": 4028,
+          "decode_elapsed_s": 14.953713844297454,
+          "artifact": "original/qwen3-30b-fp8/svllm-snapkv_svllm-quest_svllm-omnikv-bootstrapfix/svllm-snapkv/bs2/performance.jsonl",
+          "measured_steps": 2014
+        },
+        {
+          "concurrency": 4,
+          "decode_throughput_tps": 469.21701736730836,
+          "decode_tokens": 8048,
+          "decode_elapsed_s": 17.151978087145835,
+          "artifact": "original/qwen3-30b-fp8/svllm-snapkv_svllm-quest_svllm-omnikv-bootstrapfix/svllm-snapkv/bs4/performance.jsonl",
+          "measured_steps": 2012
+        },
+        {
+          "concurrency": 8,
+          "decode_throughput_tps": 836.1694496715874,
+          "decode_tokens": 16064,
+          "decode_elapsed_s": 19.21141702355817,
+          "artifact": "original/qwen3-30b-fp8/svllm-snapkv_svllm-quest_svllm-omnikv-bootstrapfix/svllm-snapkv/bs8/performance.jsonl",
+          "measured_steps": 2008
+        },
+        {
+          "concurrency": 16,
+          "decode_throughput_tps": 1290.9897049312988,
+          "decode_tokens": 32000,
+          "decode_elapsed_s": 24.787184497108683,
+          "artifact": "original/qwen3-30b-fp8/svllm-snapkv_svllm-quest_svllm-omnikv-bootstrapfix/svllm-snapkv/bs16/performance.jsonl",
+          "measured_steps": 2000
+        },
+        {
+          "concurrency": 32,
+          "decode_throughput_tps": 1850.462264581026,
+          "decode_tokens": 63488,
+          "decode_elapsed_s": 34.30926488758996,
+          "artifact": "original/qwen3-30b-fp8/svllm-snapkv_svllm-quest_svllm-omnikv-bootstrapfix/svllm-snapkv/bs32/performance.jsonl",
+          "measured_steps": 1984
+        },
+        {
+          "concurrency": 33,
+          "decode_throughput_tps": 1867.7178701137018,
+          "decode_tokens": 65439,
+          "decode_elapsed_s": 35.0368763115257,
+          "artifact": "original/qwen3-30b-fp8/svllm-snapkv-resume1/svllm-snapkv/bs33/performance.jsonl",
+          "measured_steps": 1983
+        }
+      ],
+      "capacity_artifact": "original/qwen3-30b-fp8/svllm-snapkv-resume1/svllm-snapkv/capacity.json"
+    },
+    {
+      "model": "qwen3-30b-fp8",
+      "lane": "svllm-quest",
+      "max_concurrency": 3,
+      "first_failed_concurrency": 4,
+      "attempts": [
+        {
+          "artifact": "original/qwen3-30b-fp8/svllm-quest_svllm-omnikv-gpu5retry1/svllm-quest/bs1/performance.jsonl",
+          "concurrency": 1,
+          "status": "success"
+        },
+        {
+          "artifact": "original/qwen3-30b-fp8/svllm-quest_svllm-omnikv-gpu5retry1/svllm-quest/bs2/performance.jsonl",
+          "concurrency": 2,
+          "status": "success"
+        },
+        {
+          "artifact": "original/qwen3-30b-fp8/svllm-quest_svllm-omnikv-gpu5retry1/svllm-quest/bs4/performance.jsonl",
+          "concurrency": 4,
+          "error": "RuntimeError('Full decode batch capacity exceeded: not all requests entered decode together')",
+          "status": "capacity_exceeded"
+        },
+        {
+          "artifact": "original/qwen3-30b-fp8/svllm-quest_svllm-omnikv-gpu5retry1/svllm-quest/bs3/performance.jsonl",
+          "concurrency": 3,
+          "status": "success"
+        }
+      ],
+      "points": [
+        {
+          "concurrency": 1,
+          "decode_throughput_tps": 128.17935321862694,
+          "decode_tokens": 2015,
+          "decode_elapsed_s": 15.720160458004102,
+          "artifact": "original/qwen3-30b-fp8/svllm-quest_svllm-omnikv-gpu5retry1/svllm-quest/bs1/performance.jsonl",
+          "measured_steps": 2015
+        },
+        {
+          "concurrency": 2,
+          "decode_throughput_tps": 218.46484332491306,
+          "decode_tokens": 4030,
+          "decode_elapsed_s": 18.446904035750777,
+          "artifact": "original/qwen3-30b-fp8/svllm-quest_svllm-omnikv-gpu5retry1/svllm-quest/bs2/performance.jsonl",
+          "measured_steps": 2015
+        },
+        {
+          "concurrency": 3,
+          "decode_throughput_tps": 289.97162763304675,
+          "decode_tokens": 6045,
+          "decode_elapsed_s": 20.84686715505086,
+          "artifact": "original/qwen3-30b-fp8/svllm-quest_svllm-omnikv-gpu5retry1/svllm-quest/bs3/performance.jsonl",
+          "measured_steps": 2015
+        }
+      ],
+      "capacity_artifact": "original/qwen3-30b-fp8/svllm-quest_svllm-omnikv-gpu5retry1/svllm-quest/capacity.json"
+    },
+    {
+      "model": "qwen3-30b-fp8",
+      "lane": "svllm-omnikv",
+      "max_concurrency": 3,
+      "first_failed_concurrency": 4,
+      "attempts": [
+        {
+          "artifact": "omnikv-total2048/qwen3-30b-fp8/svllm-omnikv-total2048/svllm-omnikv/bs1/performance.jsonl",
+          "concurrency": 1,
+          "status": "success"
+        },
+        {
+          "artifact": "omnikv-total2048/qwen3-30b-fp8/svllm-omnikv-total2048/svllm-omnikv/bs2/performance.jsonl",
+          "concurrency": 2,
+          "status": "success"
+        },
+        {
+          "artifact": "omnikv-total2048/qwen3-30b-fp8/svllm-omnikv-total2048/svllm-omnikv/bs4/performance.jsonl",
+          "concurrency": 4,
+          "error": "RuntimeError('Full decode batch capacity exceeded: not all requests entered decode together')",
+          "status": "capacity_exceeded"
+        },
+        {
+          "artifact": "omnikv-total2048/qwen3-30b-fp8/svllm-omnikv-total2048/svllm-omnikv/bs3/performance.jsonl",
+          "concurrency": 3,
+          "status": "success"
+        }
+      ],
+      "points": [
+        {
+          "concurrency": 1,
+          "decode_throughput_tps": 120.22314428484225,
+          "decode_tokens": 2015,
+          "decode_elapsed_s": 16.760499918600544,
+          "artifact": "omnikv-total2048/qwen3-30b-fp8/svllm-omnikv-total2048/svllm-omnikv/bs1/performance.jsonl",
+          "measured_steps": 2015
+        },
+        {
+          "concurrency": 2,
+          "decode_throughput_tps": 212.6954768141377,
+          "decode_tokens": 4030,
+          "decode_elapsed_s": 18.94727645535022,
+          "artifact": "omnikv-total2048/qwen3-30b-fp8/svllm-omnikv-total2048/svllm-omnikv/bs2/performance.jsonl",
+          "measured_steps": 2015
+        },
+        {
+          "concurrency": 3,
+          "decode_throughput_tps": 277.8559319966918,
+          "decode_tokens": 6045,
+          "decode_elapsed_s": 21.755878870608285,
+          "artifact": "omnikv-total2048/qwen3-30b-fp8/svllm-omnikv-total2048/svllm-omnikv/bs3/performance.jsonl",
+          "measured_steps": 2015
+        }
+      ],
+      "capacity_artifact": "omnikv-total2048/qwen3-30b-fp8/svllm-omnikv-total2048/svllm-omnikv/capacity.json"
+    },
+    {
+      "model": "glm4.7-flash",
+      "lane": "vllm-vanilla",
+      "max_concurrency": 6,
+      "first_failed_concurrency": 7,
+      "attempts": [
+        {
+          "artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/vllm-vanilla/bs1/performance.jsonl",
+          "concurrency": 1,
+          "status": "success"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/vllm-vanilla/bs2/performance.jsonl",
+          "concurrency": 2,
+          "status": "success"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/vllm-vanilla/bs4/performance.jsonl",
+          "concurrency": 4,
+          "status": "success"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/vllm-vanilla/bs8/performance.jsonl",
+          "concurrency": 8,
+          "error": "RuntimeError('Full decode batch capacity exceeded: requests finished before full decode admission')",
+          "status": "capacity_exceeded"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/vllm-vanilla/bs6/performance.jsonl",
+          "concurrency": 6,
+          "status": "success"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/vllm-vanilla/bs7/performance.jsonl",
+          "concurrency": 7,
+          "error": "RuntimeError('Full decode batch capacity exceeded: requests finished before full decode admission')",
+          "status": "capacity_exceeded"
+        }
+      ],
+      "points": [
+        {
+          "concurrency": 1,
+          "decode_throughput_tps": 87.01717333949489,
+          "decode_tokens": 2015,
+          "decode_elapsed_s": 23.156348599586636,
+          "artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/vllm-vanilla/bs1/performance.jsonl",
+          "measured_steps": 2015
+        },
+        {
+          "concurrency": 2,
+          "decode_throughput_tps": 161.86668147909833,
+          "decode_tokens": 3996,
+          "decode_elapsed_s": 24.68698291387409,
+          "artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/vllm-vanilla/bs2/performance.jsonl",
+          "measured_steps": 1998
+        },
+        {
+          "concurrency": 4,
+          "decode_throughput_tps": 236.56094098164976,
+          "decode_tokens": 7864,
+          "decode_elapsed_s": 33.243019609944895,
+          "artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/vllm-vanilla/bs4/performance.jsonl",
+          "measured_steps": 1966
+        },
+        {
+          "concurrency": 6,
+          "decode_throughput_tps": 273.66259124,
+          "decode_tokens": 11604,
+          "decode_elapsed_s": 42.402580299414694,
+          "artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/vllm-vanilla/bs6/performance.jsonl",
+          "measured_steps": 1934
+        }
+      ],
+      "capacity_artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/vllm-vanilla/capacity.json"
+    },
+    {
+      "model": "glm4.7-flash",
+      "lane": "svllm-vanilla",
+      "max_concurrency": 5,
+      "first_failed_concurrency": 6,
+      "attempts": [
+        {
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-vanilla/bs1/performance.jsonl",
+          "concurrency": 1,
+          "status": "success"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-vanilla/bs2/performance.jsonl",
+          "concurrency": 2,
+          "status": "success"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-vanilla/bs4/performance.jsonl",
+          "concurrency": 4,
+          "status": "success"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-vanilla/bs8/performance.jsonl",
+          "concurrency": 8,
+          "error": "RuntimeError('Full decode batch capacity exceeded: scheduler preemption')",
+          "status": "capacity_exceeded"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-vanilla/bs6/performance.jsonl",
+          "concurrency": 6,
+          "error": "RuntimeError('Full decode batch capacity exceeded: scheduler preemption')",
+          "status": "capacity_exceeded"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-vanilla/bs5/performance.jsonl",
+          "concurrency": 5,
+          "status": "success"
+        }
+      ],
+      "points": [
+        {
+          "concurrency": 1,
+          "decode_throughput_tps": 106.24783030838853,
+          "decode_tokens": 2015,
+          "decode_elapsed_s": 18.96509316144511,
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-vanilla/bs1/performance.jsonl",
+          "measured_steps": 2015
+        },
+        {
+          "concurrency": 2,
+          "decode_throughput_tps": 165.25882223522362,
+          "decode_tokens": 4030,
+          "decode_elapsed_s": 24.385990082053468,
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-vanilla/bs2/performance.jsonl",
+          "measured_steps": 2015
+        },
+        {
+          "concurrency": 4,
+          "decode_throughput_tps": 235.5697182569473,
+          "decode_tokens": 8060,
+          "decode_elapsed_s": 34.21492397086695,
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-vanilla/bs4/performance.jsonl",
+          "measured_steps": 2015
+        },
+        {
+          "concurrency": 5,
+          "decode_throughput_tps": 268.34746958577387,
+          "decode_tokens": 10075,
+          "decode_elapsed_s": 37.5446059377864,
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-vanilla/bs5/performance.jsonl",
+          "measured_steps": 2015
+        }
+      ],
+      "capacity_artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-vanilla/capacity.json"
+    },
+    {
+      "model": "glm4.7-flash",
+      "lane": "svllm-snapkv",
+      "max_concurrency": 60,
+      "first_failed_concurrency": 61,
+      "attempts": [
+        {
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/bs1/performance.jsonl",
+          "concurrency": 1,
+          "status": "success"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/bs2/performance.jsonl",
+          "concurrency": 2,
+          "status": "success"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/bs4/performance.jsonl",
+          "concurrency": 4,
+          "status": "success"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/bs8/performance.jsonl",
+          "concurrency": 8,
+          "status": "success"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/bs16/performance.jsonl",
+          "concurrency": 16,
+          "status": "success"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/bs32/performance.jsonl",
+          "concurrency": 32,
+          "status": "success"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/bs64/performance.jsonl",
+          "concurrency": 64,
+          "error": "RuntimeError('Full decode batch capacity exceeded: request finished before all admission waves completed')",
+          "status": "capacity_exceeded"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/bs48/performance.jsonl",
+          "concurrency": 48,
+          "status": "success"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/bs56/performance.jsonl",
+          "concurrency": 56,
+          "status": "success"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/bs60/performance.jsonl",
+          "concurrency": 60,
+          "status": "success"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/bs62/performance.jsonl",
+          "concurrency": 62,
+          "error": "RuntimeError('Full decode batch capacity exceeded: request finished before all admission waves completed')",
+          "status": "capacity_exceeded"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/bs61/performance.jsonl",
+          "concurrency": 61,
+          "error": "RuntimeError('Full decode batch capacity exceeded: not all requests entered decode together')",
+          "status": "capacity_exceeded"
+        }
+      ],
+      "points": [
+        {
+          "concurrency": 1,
+          "decode_throughput_tps": 120.47598940209704,
+          "decode_tokens": 2015,
+          "decode_elapsed_s": 16.7253243571613,
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/bs1/performance.jsonl",
+          "measured_steps": 2015
+        },
+        {
+          "concurrency": 2,
+          "decode_throughput_tps": 225.75748176043552,
+          "decode_tokens": 4028,
+          "decode_elapsed_s": 17.842155079822987,
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/bs2/performance.jsonl",
+          "measured_steps": 2014
+        },
+        {
+          "concurrency": 4,
+          "decode_throughput_tps": 427.6643663062416,
+          "decode_tokens": 8048,
+          "decode_elapsed_s": 18.8184956102632,
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/bs4/performance.jsonl",
+          "measured_steps": 2012
+        },
+        {
+          "concurrency": 8,
+          "decode_throughput_tps": 846.7138322976284,
+          "decode_tokens": 16064,
+          "decode_elapsed_s": 18.97217145538889,
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/bs8/performance.jsonl",
+          "measured_steps": 2008
+        },
+        {
+          "concurrency": 16,
+          "decode_throughput_tps": 1498.1511464782188,
+          "decode_tokens": 32000,
+          "decode_elapsed_s": 21.359660589136183,
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/bs16/performance.jsonl",
+          "measured_steps": 2000
+        },
+        {
+          "concurrency": 32,
+          "decode_throughput_tps": 2100.494641116321,
+          "decode_tokens": 63488,
+          "decode_elapsed_s": 30.225261591840535,
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/bs32/performance.jsonl",
+          "measured_steps": 1984
+        },
+        {
+          "concurrency": 48,
+          "decode_throughput_tps": 2304.379064232716,
+          "decode_tokens": 94464,
+          "decode_elapsed_s": 40.99325560894795,
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/bs48/performance.jsonl",
+          "measured_steps": 1968
+        },
+        {
+          "concurrency": 56,
+          "decode_throughput_tps": 2663.6711006048995,
+          "decode_tokens": 109760,
+          "decode_elapsed_s": 41.206288559827954,
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/bs56/performance.jsonl",
+          "measured_steps": 1960
+        },
+        {
+          "concurrency": 60,
+          "decode_throughput_tps": 2966.2333081604547,
+          "decode_tokens": 117360,
+          "decode_elapsed_s": 39.56533010303974,
+          "artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/bs60/performance.jsonl",
+          "measured_steps": 1956
+        }
+      ],
+      "capacity_artifact": "original/glm4.7-flash/svllm-vanilla_svllm-snapkv_svllm-quest_svllm-omnikv_vllm-vanilla-auto/svllm-snapkv/capacity.json"
+    },
+    {
+      "model": "glm4.7-flash",
+      "lane": "svllm-quest",
+      "max_concurrency": 5,
+      "first_failed_concurrency": 6,
+      "attempts": [
+        {
+          "artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/svllm-quest/bs1/performance.jsonl",
+          "concurrency": 1,
+          "status": "success"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/svllm-quest/bs2/performance.jsonl",
+          "concurrency": 2,
+          "status": "success"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/svllm-quest/bs4/performance.jsonl",
+          "concurrency": 4,
+          "status": "success"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/svllm-quest/bs8/performance.jsonl",
+          "concurrency": 8,
+          "error": "RuntimeError('Full decode batch capacity exceeded: not all requests entered decode together')",
+          "status": "capacity_exceeded"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/svllm-quest/bs6/performance.jsonl",
+          "concurrency": 6,
+          "error": "RuntimeError('Full decode batch capacity exceeded: not all requests entered decode together')",
+          "status": "capacity_exceeded"
+        },
+        {
+          "artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/svllm-quest/bs5/performance.jsonl",
+          "concurrency": 5,
+          "status": "success"
+        }
+      ],
+      "points": [
+        {
+          "concurrency": 1,
+          "decode_throughput_tps": 116.06436622446928,
+          "decode_tokens": 2015,
+          "decode_elapsed_s": 17.361056330613792,
+          "artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/svllm-quest/bs1/performance.jsonl",
+          "measured_steps": 2015
+        },
+        {
+          "concurrency": 2,
+          "decode_throughput_tps": 212.16485948706438,
+          "decode_tokens": 4030,
+          "decode_elapsed_s": 18.994662969838828,
+          "artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/svllm-quest/bs2/performance.jsonl",
+          "measured_steps": 2015
+        },
+        {
+          "concurrency": 4,
+          "decode_throughput_tps": 379.11071166497055,
+          "decode_tokens": 8060,
+          "decode_elapsed_s": 21.260280313901603,
+          "artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/svllm-quest/bs4/performance.jsonl",
+          "measured_steps": 2015
+        },
+        {
+          "concurrency": 5,
+          "decode_throughput_tps": 489.1096860183885,
+          "decode_tokens": 10075,
+          "decode_elapsed_s": 20.598651566309854,
+          "artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/svllm-quest/bs5/performance.jsonl",
+          "measured_steps": 2015
+        }
+      ],
+      "capacity_artifact": "original/glm4.7-flash/svllm-quest_svllm-omnikv_vllm-vanilla-tailauto1/svllm-quest/capacity.json"
+    },
+    {
+      "model": "glm4.7-flash",
+      "lane": "svllm-omnikv",
+      "max_concurrency": 5,
+      "first_failed_concurrency": 6,
+      "attempts": [
+        {
+          "artifact": "sm-parallel/glm4.7-flash/svllm-omnikv-sm-parallel/svllm-omnikv/bs1/performance.jsonl",
+          "concurrency": 1,
+          "status": "success"
+        },
+        {
+          "artifact": "sm-parallel/glm4.7-flash/svllm-omnikv-sm-parallel/svllm-omnikv/bs2/performance.jsonl",
+          "concurrency": 2,
+          "status": "success"
+        },
+        {
+          "artifact": "sm-parallel/glm4.7-flash/svllm-omnikv-sm-parallel/svllm-omnikv/bs4/performance.jsonl",
+          "concurrency": 4,
+          "status": "success"
+        },
+        {
+          "artifact": "sm-parallel/glm4.7-flash/svllm-omnikv-sm-parallel/svllm-omnikv/bs8/performance.jsonl",
+          "concurrency": 8,
+          "error": "RuntimeError('Full decode batch capacity exceeded: scheduler preemption')",
+          "status": "capacity_exceeded"
+        },
+        {
+          "artifact": "sm-parallel/glm4.7-flash/svllm-omnikv-sm-parallel/svllm-omnikv/bs6/performance.jsonl",
+          "concurrency": 6,
+          "error": "RuntimeError('Full decode batch capacity exceeded: scheduler preemption')",
+          "status": "capacity_exceeded"
+        },
+        {
+          "artifact": "sm-parallel/glm4.7-flash/svllm-omnikv-sm-parallel/svllm-omnikv/bs5/performance.jsonl",
+          "concurrency": 5,
+          "status": "success"
+        }
+      ],
+      "points": [
+        {
+          "concurrency": 1,
+          "decode_throughput_tps": 97.73959336344255,
+          "decode_tokens": 2015,
+          "decode_elapsed_s": 20.616005557822064,
+          "artifact": "sm-parallel/glm4.7-flash/svllm-omnikv-sm-parallel/svllm-omnikv/bs1/performance.jsonl",
+          "measured_steps": 2015
+        },
+        {
+          "concurrency": 2,
+          "decode_throughput_tps": 182.78879981263114,
+          "decode_tokens": 4030,
+          "decode_elapsed_s": 22.04730270197615,
+          "artifact": "sm-parallel/glm4.7-flash/svllm-omnikv-sm-parallel/svllm-omnikv/bs2/performance.jsonl",
+          "measured_steps": 2015
+        },
+        {
+          "concurrency": 4,
+          "decode_throughput_tps": 336.6918308047929,
+          "decode_tokens": 8060,
+          "decode_elapsed_s": 23.938804754288867,
+          "artifact": "sm-parallel/glm4.7-flash/svllm-omnikv-sm-parallel/svllm-omnikv/bs4/performance.jsonl",
+          "measured_steps": 2015
+        },
+        {
+          "concurrency": 5,
+          "decode_throughput_tps": 375.8830902603045,
+          "decode_tokens": 10075,
+          "decode_elapsed_s": 26.803546797018498,
+          "artifact": "sm-parallel/glm4.7-flash/svllm-omnikv-sm-parallel/svllm-omnikv/bs5/performance.jsonl",
+          "measured_steps": 2015
+        }
+      ],
+      "capacity_artifact": "sm-parallel/glm4.7-flash/svllm-omnikv-sm-parallel/svllm-omnikv/capacity.json"
+    },
+    {
+      "model": "qwen3-30b-fp8",
+      "lane": "tangram-snapkv",
+      "max_concurrency": 31,
+      "first_failed_concurrency": 32,
+      "attempts": [
+        {
+          "artifact": "external/qwen3-30b-fp8/tangram-snapkv-gpu6/tangram-snapkv/bs1/performance.jsonl",
+          "concurrency": 1,
+          "status": "success"
+        },
+        {
+          "artifact": "external/qwen3-30b-fp8/tangram-snapkv-gpu6/tangram-snapkv/bs2/performance.jsonl",
+          "concurrency": 2,
+          "status": "success"
+        },
+        {
+          "artifact": "external/qwen3-30b-fp8/tangram-snapkv-gpu6/tangram-snapkv/bs4/performance.jsonl",
+          "concurrency": 4,
+          "status": "success"
+        },
+        {
+          "artifact": "external/qwen3-30b-fp8/tangram-snapkv-gpu6/tangram-snapkv/bs8/performance.jsonl",
+          "concurrency": 8,
+          "status": "success"
+        },
+        {
+          "artifact": "external/qwen3-30b-fp8/tangram-snapkv-gpu6/tangram-snapkv/bs16/performance.jsonl",
+          "concurrency": 16,
+          "status": "success"
+        },
+        {
+          "artifact": "external/qwen3-30b-fp8/tangram-snapkv-gpu6/tangram-snapkv/bs32/performance.jsonl",
+          "concurrency": 32,
+          "error": "RuntimeError('Full decode batch capacity exceeded: requests finished before full decode admission')",
+          "status": "capacity_exceeded"
+        },
+        {
+          "artifact": "external/qwen3-30b-fp8/tangram-snapkv-gpu6/tangram-snapkv/bs24/performance.jsonl",
+          "concurrency": 24,
+          "status": "success"
+        },
+        {
+          "artifact": "external/qwen3-30b-fp8/tangram-snapkv-gpu6/tangram-snapkv/bs28/performance.jsonl",
+          "concurrency": 28,
+          "status": "success"
+        },
+        {
+          "artifact": "external/qwen3-30b-fp8/tangram-snapkv-gpu6/tangram-snapkv/bs30/performance.jsonl",
+          "concurrency": 30,
+          "status": "success"
+        },
+        {
+          "artifact": "external/qwen3-30b-fp8/tangram-snapkv-gpu6/tangram-snapkv/bs31/performance.jsonl",
+          "concurrency": 31,
+          "status": "success"
+        }
+      ],
+      "points": [
+        {
+          "concurrency": 1,
+          "decode_throughput_tps": 113.07233988815922,
+          "decode_tokens": 2015,
+          "decode_elapsed_s": 17.82045018253848,
+          "artifact": "external/qwen3-30b-fp8/tangram-snapkv-gpu6/tangram-snapkv/bs1/performance.jsonl",
+          "measured_steps": 2015
+        },
+        {
+          "concurrency": 2,
+          "decode_throughput_tps": 202.40852560154892,
+          "decode_tokens": 3774,
+          "decode_elapsed_s": 18.645459665218368,
+          "artifact": "external/qwen3-30b-fp8/tangram-snapkv-gpu6/tangram-snapkv/bs2/performance.jsonl",
+          "measured_steps": 1887
+        },
+        {
+          "concurrency": 4,
+          "decode_throughput_tps": 387.2922578530049,
+          "decode_tokens": 7036,
+          "decode_elapsed_s": 18.1671589280013,
+          "artifact": "external/qwen3-30b-fp8/tangram-snapkv-gpu6/tangram-snapkv/bs4/performance.jsonl",
+          "measured_steps": 1759
+        },
+        {
+          "concurrency": 8,
+          "decode_throughput_tps": 615.265085928509,
+          "decode_tokens": 12024,
+          "decode_elapsed_s": 19.542795902118087,
+          "artifact": "external/qwen3-30b-fp8/tangram-snapkv-gpu6/tangram-snapkv/bs8/performance.jsonl",
+          "measured_steps": 1503
+        },
+        {
+          "concurrency": 16,
+          "decode_throughput_tps": 989.6618369600524,
+          "decode_tokens": 15840,
+          "decode_elapsed_s": 16.005467128707096,
+          "artifact": "external/qwen3-30b-fp8/tangram-snapkv-gpu6/tangram-snapkv/bs16/performance.jsonl",
+          "measured_steps": 990
+        },
+        {
+          "concurrency": 24,
+          "decode_throughput_tps": 1232.7383729932128,
+          "decode_tokens": 11376,
+          "decode_elapsed_s": 9.228235487127677,
+          "artifact": "external/qwen3-30b-fp8/tangram-snapkv-gpu6/tangram-snapkv/bs24/performance.jsonl",
+          "measured_steps": 474
+        },
+        {
+          "concurrency": 28,
+          "decode_throughput_tps": 1281.6509743380118,
+          "decode_tokens": 6048,
+          "decode_elapsed_s": 4.718913433607668,
+          "artifact": "external/qwen3-30b-fp8/tangram-snapkv-gpu6/tangram-snapkv/bs28/performance.jsonl",
+          "measured_steps": 216
+        },
+        {
+          "concurrency": 30,
+          "decode_throughput_tps": 1336.3149889949116,
+          "decode_tokens": 2580,
+          "decode_elapsed_s": 1.930682527134195,
+          "artifact": "external/qwen3-30b-fp8/tangram-snapkv-gpu6/tangram-snapkv/bs30/performance.jsonl",
+          "measured_steps": 86
+        },
+        {
+          "concurrency": 31,
+          "decode_throughput_tps": 1346.2201944021492,
+          "decode_tokens": 682,
+          "decode_elapsed_s": 0.5066036023199558,
+          "artifact": "external/qwen3-30b-fp8/tangram-snapkv-gpu6/tangram-snapkv/bs31/performance.jsonl",
+          "measured_steps": 22
+        }
+      ],
+      "capacity_artifact": "external/qwen3-30b-fp8/tangram-snapkv-gpu6/tangram-snapkv/capacity.json"
+    },
+    {
+      "model": "glm4.7-flash",
+      "lane": "tangram-snapkv",
+      "status": "unsupported",
+      "reason": "Pinned Tangram compression.validate_model_support rejects Glm4MoeLiteForCausalLM; supported architecture list has no MLA model.",
+      "points": [],
+      "attempts": []
+    },
+    {
+      "model": "qwen3-30b-fp8",
+      "lane": "hisparse-quest",
+      "max_concurrency": 2,
+      "first_failed_concurrency": 3,
+      "attempts": [
+        {
+          "artifact": "external/qwen3-30b-fp8/hisparse-quest-initial/hisparse-quest/bs1/performance.jsonl",
+          "concurrency": 1,
+          "status": "success"
+        },
+        {
+          "artifact": "external/qwen3-30b-fp8/hisparse-quest-initial/hisparse-quest/bs2/performance.jsonl",
+          "concurrency": 2,
+          "status": "success"
+        },
+        {
+          "artifact": "external/qwen3-30b-fp8/hisparse-quest-initial/hisparse-quest/bs4/performance.jsonl",
+          "concurrency": 4,
+          "error": "RuntimeError('Full decode batch capacity exceeded: incomplete full residency/output')",
+          "status": "capacity_exceeded"
+        },
+        {
+          "artifact": "external/qwen3-30b-fp8/hisparse-quest-initial/hisparse-quest/bs3/performance.jsonl",
+          "concurrency": 3,
+          "error": "RuntimeError('Full decode batch capacity exceeded: incomplete full residency/output')",
+          "status": "capacity_exceeded"
+        }
+      ],
+      "points": [
+        {
+          "concurrency": 1,
+          "decode_throughput_tps": 121.11142151534406,
+          "decode_tokens": 2015,
+          "decode_elapsed_s": 16.63757203728892,
+          "artifact": "external/qwen3-30b-fp8/hisparse-quest-initial/hisparse-quest/bs1/performance.jsonl",
+          "measured_steps": 2015
+        },
+        {
+          "concurrency": 2,
+          "decode_throughput_tps": 197.34966648673716,
+          "decode_tokens": 4030,
+          "decode_elapsed_s": 20.420607096748427,
+          "artifact": "external/qwen3-30b-fp8/hisparse-quest-initial/hisparse-quest/bs2/performance.jsonl",
+          "measured_steps": 2015
+        }
+      ],
+      "capacity_artifact": "external/qwen3-30b-fp8/hisparse-quest-initial/hisparse-quest/capacity.json"
+    },
+    {
+      "model": "glm4.7-flash",
+      "lane": "hisparse-quest",
+      "status": "unsupported",
+      "reason": "Pinned HiSparse QuEST hisparse_hook validates AttentionArch.MHA only (standard MHA/GQA), rejecting MLA.",
+      "points": [],
+      "attempts": []
+    }
+  ]
+}

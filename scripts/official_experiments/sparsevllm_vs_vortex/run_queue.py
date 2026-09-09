@@ -93,7 +93,7 @@ try:
         print(job.stem, result, flush=True)
         seen.add(job.name)
         idle_since = time.monotonic()
-        if child.returncode != 0 and not spec.get('capacity_probe', False):
+        if child.returncode != 0 and not (spec.get('capacity_probe', False) or spec.get('continue_on_failure', False)):
             raise RuntimeError(f'{job.stem} failed; queue stopped')
     else:
         raise TimeoutError('Queue lifetime exceeded')

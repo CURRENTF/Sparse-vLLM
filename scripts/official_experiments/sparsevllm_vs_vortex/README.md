@@ -6,6 +6,10 @@ project, not endorsement by Vortex's authors or official algorithm parity.
 
 ## What lives here
 
+- [`session/`](session/README.md): six entry points plus one campaign config for
+  Tangram/HiSparse orchestration, paired LongBench v2 quality, raw validation and
+  efficiency-plus-quality figures. Historical H2O/GLM debugging recipes are
+  archived with their runs rather than maintained as additional entry points.
 - `configs/cases.json`: portable command/config templates for Qwen3-4B and
   GLM-4.7-Flash, including common-concurrency QuEST, H2O/H2O-like, native H2O
   wave admission, and a native smoke case.

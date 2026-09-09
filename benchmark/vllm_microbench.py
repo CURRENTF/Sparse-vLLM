@@ -61,8 +61,14 @@ def benchmark_decode_stage(method, length, bs, args, results_dict):
     llm = None
     case_dir = Path(args.output_dir) / f"{method}-{length}-{bs}" if args.output_dir else None
     try:
-        if method != "vanilla":
-            raise ValueError("vLLM stage baseline supports vanilla only")
+        extra = dict(getattr(args, "engine_kwargs_dict", {}))
+        label = getattr(args, "backend_label", None)
+        if method != "vanilla" and not (
+            method == "snapkv" and label == "tangram-snapkv"
+            and extra.get("compression_scorer") == "snapkv"
+            and extra.get("compression_budget_tokens", 0) > 0
+        ):
+            raise ValueError("Non-vanilla vLLM stage requires explicit Tangram SnapKV configuration and label")
         if not args.synchronize_step_timing or not args.require_full_decode_batch:
             raise ValueError("vLLM stage baseline requires synchronized full-batch timing")
         if args.max_decode_steps_after_full or args.decode_warmup_steps_after_full < 0:
@@ -101,6 +107,20 @@ def benchmark_decode_stage(method, length, bs, args, results_dict):
                       async_scheduling=False, enforce_eager=not hp.get("decode_graph", True),
                       seed=42, disable_log_stats=True,
                       compilation_config={"cudagraph_capture_sizes": [bs], "max_cudagraph_capture_size": bs})
+        allowed_extra = {"dtype", "compression_scorer", "compression_budget_scope",
+                         "compression_budget_tokens", "compression_n_sink_tokens",
+                         "compression_window_size", "compression_chunk_size", "compression_scorer_options"}
+        if set(extra) - allowed_extra:
+            raise ValueError(f"Unmapped or protected vLLM stage options: {sorted(set(extra) - allowed_extra)}")
+        if extra.get("compression_chunk_size", config["max_num_batched_tokens"]) != config["max_num_batched_tokens"]:
+            raise ValueError("Tangram compression chunk must equal max_num_batched_tokens")
+        config.update(extra)
+        if label == "tangram-snapkv":
+            # This pinned fork rejects persistent score storage with one row,
+            # even for a single request. Reserve two rows; still submit only bs.
+            config["max_num_seqs"] = max(2, bs)
+            row["constructor_capacity_note"] = "Tangram persistent-score guard requires at least two workspace rows; measured concurrency is unchanged"
+        row["backend_label"] = label or "vllm-vanilla"
         row["engine_hyper_params"] = config
         row["resolved_parallel_topology"] = {
             "tensor_parallel_size": tp,
@@ -108,6 +128,7 @@ def benchmark_decode_stage(method, length, bs, args, results_dict):
             "data_parallel_size": 1,
         }
         row["vllm_version"] = vllm.__version__
+        row["package_source"] = str(Path(vllm.__file__).resolve())
         llm = LLM(**config)
         engine = llm.llm_engine
         core = engine.engine_core.engine_core

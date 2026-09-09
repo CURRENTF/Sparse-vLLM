@@ -190,6 +190,14 @@ keep those IDs aligned with `CUDA_VISIBLE_DEVICES`; for example, use both
 
 Run `python3 benchmark/efficiency/bench_probe.py --help` for the complete CLI.
 
+For a vLLM-compatible fork, fixed-batch probes accept `--engine-kwargs @config.json`
+for fork-specific constructor options and `--backend-label` for an explicit
+result label. Set `--sparse-method` to the algorithm actually enabled by that
+configuration. Constructor options cannot override the model, workload capacity,
+seed, prefix-cache policy, or timing-statistics settings controlled by the probe.
+Record the fork's exact source revision and resolved configuration separately;
+sharing an algorithm name does not establish matching selection semantics.
+
 ## Unified Synthetic and LongBench Suite
 
 `run_unified_efficiency_suite.sh` runs the matched synthetic suite and then a

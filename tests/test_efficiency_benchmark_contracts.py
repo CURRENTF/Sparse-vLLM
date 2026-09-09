@@ -37,6 +37,55 @@ from benchmark.long_bench.prompt_budget import encode_prompt_with_generation_bud
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_fork_constructor_options_cannot_change_matched_workload(monkeypatch, tmp_path):
+    """Catch a fork config silently enabling prefix hits or changing concurrency."""
+    monkeypatch.setattr(sys, "argv", ["probe", "--model-path", "model",
+                                    "--output-dir", str(tmp_path), "--engine", "vllm"])
+    args = bench_probe.parse_args()
+    args.sparse_method = "snapkv"
+    args.engine_kwargs = json.dumps({"compression_scorer": "snapkv",
+                                    "compression_budget_tokens": 1024})
+    resolved = bench_probe._vllm_engine_kwargs(args)
+    assert resolved["compression_scorer"] == "snapkv"
+    assert resolved["compression_budget_tokens"] == 1024
+    for key, value in [("enable_prefix_caching", True), ("max_num_seqs", 999),
+                       ("model", "different-model"), ("disable_log_stats", True)]:
+        args.engine_kwargs = json.dumps({key: value})
+        with pytest.raises(ValueError, match="cannot override matched"):
+            bench_probe._vllm_engine_kwargs(args)
+
+
+@pytest.mark.parametrize("method,options", [
+    ("snapkv", {}),
+    ("vanilla", {"compression_scorer": "snapkv", "compression_budget_tokens": 1024}),
+    ("snapkv", {"compression_scorer": "snapkv", "compression_budget_tokens": 0}),
+    ("snapkv", {"compression_scorer": "snapkv", "compression_budget_tokens": "1024"}),
+    ("snapkv", {"compression_scorer": "snapkv", "compression_budget_tokens": True}),
+    ("h2o", {}),
+])
+def test_vllm_probe_rejects_method_labels_inconsistent_with_launch_options(
+    monkeypatch, tmp_path, method, options,
+):
+    """Prevent dense runs being reported as sparse, or compression as vanilla."""
+    monkeypatch.setattr(sys, "argv", ["probe", "--model-path", "model",
+                                    "--output-dir", str(tmp_path), "--engine", "vllm",
+                                    "--sparse-method", method])
+    args = bench_probe.parse_args()
+    args.engine_kwargs = json.dumps(options)
+    with pytest.raises(ValueError, match="method label"):
+        bench_probe._vllm_engine_kwargs(args)
+
+
+def test_vllm_probe_accepts_uncompressed_constructor_options(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "argv", ["probe", "--model-path", "model",
+                                    "--output-dir", str(tmp_path), "--engine", "vllm"])
+    args = bench_probe.parse_args()
+    args.engine_kwargs = json.dumps({"dtype": "bfloat16", "compression_scorer": "none"})
+    resolved = bench_probe._vllm_engine_kwargs(args)
+    assert resolved["dtype"] == "bfloat16"
+    assert resolved["compression_scorer"] == "none"
+
+
 def test_probe_cli_parser_builds_with_new_workload_options(monkeypatch):
     monkeypatch.setattr(
         sys,

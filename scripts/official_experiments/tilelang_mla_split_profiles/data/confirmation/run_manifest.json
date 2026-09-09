@@ -1,0 +1,190 @@
+{
+  "status": "completed",
+  "config": {
+    "seed": 20260909,
+    "heads": [
+      5,
+      10,
+      20
+    ],
+    "batches": [
+      1,
+      4,
+      5,
+      16,
+      17,
+      32,
+      128
+    ],
+    "contexts": [
+      64,
+      512,
+      2048,
+      8192,
+      32768,
+      131072
+    ],
+    "ragged_batches": [
+      5,
+      32,
+      128
+    ],
+    "ragged_contexts": [
+      2048,
+      131072
+    ],
+    "large_batch": 256,
+    "large_batch_contexts": [
+      64,
+      8192
+    ],
+    "legal_splits": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "formula": "sm_log_context_v1",
+    "warmup_calls": 10,
+    "calls_per_graph": 8,
+    "abba_rounds": 3,
+    "sample_target_ms": 20,
+    "max_graph_replays": 200,
+    "rtol": 0.03,
+    "atol": 0.03
+  },
+  "git_head": "73d254c83a655ff82d6278afabe827d39aa0b3b5",
+  "versions": {
+    "torch": "2.11.0",
+    "triton": "3.6.0",
+    "tilelang": "0.1.9",
+    "apache-tvm-ffi": "0.1.10"
+  },
+  "cuda": "13.0",
+  "gpu": {
+    "name": "NVIDIA H100 80GB HBM3",
+    "sm_count": 132,
+    "capability": [
+      9,
+      0
+    ],
+    "visible_devices": "2"
+  },
+  "protocol": "kernel wrapper CUDA Graph; split + combine; warm resident KV; no L2 flush; distinct KV per request; shuffled 64-token pages; no engine/MoE/EP",
+  "cases": [
+    {
+      "heads": 5,
+      "batch": 16,
+      "context": 2048,
+      "distribution": "uniform",
+      "id": "h5-b16-l2048-uniform"
+    },
+    {
+      "heads": 5,
+      "batch": 16,
+      "context": 512,
+      "distribution": "uniform",
+      "id": "h5-b16-l512-uniform"
+    },
+    {
+      "heads": 10,
+      "batch": 5,
+      "context": 131072,
+      "distribution": "ragged",
+      "id": "h10-b5-l131072-ragged"
+    },
+    {
+      "heads": 5,
+      "batch": 4,
+      "context": 8192,
+      "distribution": "uniform",
+      "id": "h5-b4-l8192-uniform"
+    },
+    {
+      "heads": 20,
+      "batch": 1,
+      "context": 2048,
+      "distribution": "uniform",
+      "id": "h20-b1-l2048-uniform"
+    },
+    {
+      "heads": 20,
+      "batch": 1,
+      "context": 512,
+      "distribution": "uniform",
+      "id": "h20-b1-l512-uniform"
+    },
+    {
+      "heads": 20,
+      "batch": 32,
+      "context": 2048,
+      "distribution": "uniform",
+      "id": "h20-b32-l2048-uniform"
+    },
+    {
+      "heads": 20,
+      "batch": 5,
+      "context": 131072,
+      "distribution": "uniform",
+      "id": "h20-b5-l131072-uniform"
+    },
+    {
+      "heads": 20,
+      "batch": 5,
+      "context": 131072,
+      "distribution": "ragged",
+      "id": "h20-b5-l131072-ragged"
+    },
+    {
+      "heads": 20,
+      "batch": 5,
+      "context": 32768,
+      "distribution": "uniform",
+      "id": "h20-b5-l32768-uniform"
+    },
+    {
+      "heads": 10,
+      "batch": 16,
+      "context": 512,
+      "distribution": "uniform",
+      "id": "h10-b16-l512-uniform"
+    },
+    {
+      "heads": 10,
+      "batch": 16,
+      "context": 2048,
+      "distribution": "uniform",
+      "id": "h10-b16-l2048-uniform"
+    },
+    {
+      "heads": 5,
+      "batch": 5,
+      "context": 131072,
+      "distribution": "ragged",
+      "id": "h5-b5-l131072-ragged"
+    },
+    {
+      "heads": 20,
+      "batch": 32,
+      "context": 512,
+      "distribution": "uniform",
+      "id": "h20-b32-l512-uniform"
+    },
+    {
+      "heads": 20,
+      "batch": 5,
+      "context": 2048,
+      "distribution": "ragged",
+      "id": "h20-b5-l2048-ragged"
+    }
+  ],
+  "source_sha256": {
+    "benchmark.py": "03f9dc247a4dd0f0fe9b9d0845f3fb1f622f48ca22a3c1f6118404ab2baf5962",
+    "run.py": "42cdbdbac124d71817c05f8e30bef77ba8bc6f2af3cfb8d8630d19bbd630da92",
+    "config.json": "d1c87a153bae3764a2911c0e9fc738b4c23f9042c888080eb9ab8b8eb46a6d9e",
+    "runtime.py": "7e52c304e7bc2daa35c0bb4ee75c83df6d2b07319a2d5911b154842f726b3447",
+    "decode.py": "372668008d07f59b626f765715f498bb983587d25a774c93eb558c1277b934c5"
+  }
+}

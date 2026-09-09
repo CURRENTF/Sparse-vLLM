@@ -1260,6 +1260,45 @@ def run_sparsevllm_churn(
     return results
 
 
+def _vllm_engine_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    """Allow fork-specific options without overriding the matched workload."""
+    matched = {
+        "model": args.model_path,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "max_model_len": max(args.prompt_lens) + max(args.output_lens) + 128,
+        "max_num_batched_tokens": args.max_num_batched_tokens,
+        "max_num_seqs": max(args.batch_sizes),
+        "enable_prefix_caching": False,
+        "disable_log_stats": False,
+        "trust_remote_code": True,
+        "seed": args.seed,
+    }
+    extra = _parse_json_arg(getattr(args, "engine_kwargs", "{}"))
+    if not isinstance(extra, dict):
+        raise ValueError("--engine-kwargs must be a JSON object")
+    conflicts = sorted(key for key in extra if key in matched)
+    if conflicts:
+        raise ValueError(f"--engine-kwargs cannot override matched probe options: {conflicts}")
+    scorer = extra.get("compression_scorer")
+    budget = extra.get("compression_budget_tokens")
+    if not (
+        (args.sparse_method == "vanilla" and scorer in (None, "none"))
+        or (
+            args.sparse_method == "snapkv"
+            and scorer == "snapkv"
+            and type(budget) is int
+            and budget > 0
+        )
+    ):
+        raise ValueError(
+            "vLLM method label does not match its explicit compression configuration: "
+            "vanilla requires no compression scorer; snapkv requires "
+            "compression_scorer='snapkv' and a positive integer compression_budget_tokens."
+        )
+    return {**matched, **extra}
+
+
 def run_vllm_probe(
     args: argparse.Namespace,
     model_specs: ModelArchitectureSpecs,
@@ -1277,18 +1316,7 @@ def run_vllm_probe(
 
     max_len_needed = max(args.prompt_lens) + max(args.output_lens) + 128
     print(f"[vLLM Probe] Initializing vLLM (TP={args.tensor_parallel_size}, max_model_len={max_len_needed})...")
-    llm = LLM(
-        model=args.model_path,
-        tensor_parallel_size=args.tensor_parallel_size,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_model_len=max_len_needed,
-        max_num_batched_tokens=args.max_num_batched_tokens,
-        max_num_seqs=max(args.batch_sizes),
-        enable_prefix_caching=False,
-        disable_log_stats=False,
-        trust_remote_code=True,
-        seed=args.seed,
-    )
+    llm = LLM(**_vllm_engine_kwargs(args))
 
     for p_len in args.prompt_lens:
         for o_len in args.output_lens:
@@ -1391,7 +1419,7 @@ def run_vllm_probe(
                         )
                         rec = {
                             "engine": "vllm",
-                            "sparse_method": "vanilla",
+                            "sparse_method": args.sparse_method,
                             "scenario": "fixed_batch",
                             "prompt_len": p_len,
                             "output_len": o_len,
@@ -1413,7 +1441,7 @@ def run_vllm_probe(
                             "output_token_throughput_tps": total_output / elapsed_s,
                             **phase_metrics,
                             "decode_metric_status": "success" if tpot_ms is not None else "skipped_by_policy",
-                            "protocol_label": "vllm-vanilla",
+                            "protocol_label": getattr(args, "backend_label", None) or f"vllm-{args.sparse_method}",
                             "trace": trace_metadata(trace),
                             "request_results": request_results,
                         }
@@ -1423,7 +1451,7 @@ def run_vllm_probe(
                         _append_request_samples(
                             output_dir,
                             engine="vllm",
-                            sparse_method="vanilla",
+                            sparse_method=args.sparse_method,
                             scenario="fixed_batch",
                             prompt_len=p_len,
                             output_len=o_len,
@@ -1455,7 +1483,7 @@ def run_vllm_probe(
 
                 summary_row = {
                     "engine": "vllm",
-                    "sparse_method": "vanilla",
+                    "sparse_method": args.sparse_method,
                     "scenario": "fixed_batch",
                     "prompt_len": p_len,
                     "output_len": o_len,
@@ -1480,7 +1508,7 @@ def run_vllm_probe(
                     "sequence_replacements": 0,
                     "status": "success",
                     "decode_metric_status": "success" if request_stats["tpot_request_count"] else "skipped_by_policy",
-                    "protocol_label": "vllm-vanilla",
+                    "protocol_label": getattr(args, "backend_label", None) or f"vllm-{args.sparse_method}",
                     "actual_hardware_metrics": hardware,
                     **{key: value for key, value in hardware.items() if key != "per_gpu"},
                 }
@@ -1743,7 +1771,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Standardized Synthetic Length Sweep & Efficiency Probe.")
     parser.add_argument("--engine", type=str, choices=["sparsevllm", "vllm"], default="sparsevllm")
     parser.add_argument("--model-path", type=str, required=True, help="Model path or HF name")
-    parser.add_argument("--sparse-method", type=str, default="vanilla", help="Sparse method name (for sparsevllm)")
+    parser.add_argument("--sparse-method", type=str, default="vanilla",
+                        help="Sparse method name; fixed-batch vLLM accepts vanilla or explicitly configured snapkv.")
     parser.add_argument("--prompt-lens", type=_parse_ints, default=[8192, 16384, 32768])
     parser.add_argument("--output-lens", type=_parse_ints, default=[128])
     parser.add_argument("--batch-sizes", type=_parse_ints, default=[1])
@@ -1795,6 +1824,10 @@ def parse_args():
     parser.add_argument("--num-iters", type=int, default=3)
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--hyper-params", type=str, default="{}")
+    parser.add_argument("--engine-kwargs", type=str, default="{}",
+                        help="vLLM/fork constructor options as JSON or @file; matched workload options cannot be overridden.")
+    parser.add_argument("--backend-label", default=None,
+                        help="Display label for a fixed-batch vLLM fork; does not select an engine or algorithm.")
     parser.add_argument(
         "--allow-single-omnikv-full-layer",
         action="store_true",
@@ -1828,6 +1861,12 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.engine != "vllm" and _parse_json_arg(args.engine_kwargs):
+        raise ValueError("--engine-kwargs is supported only by the vLLM adapter")
+    if args.engine == "vllm" and args.scenario != "fixed" and _parse_json_arg(args.engine_kwargs):
+        raise ValueError("Fork-specific --engine-kwargs currently require --scenario fixed")
+    if args.backend_label and (args.engine != "vllm" or args.scenario != "fixed"):
+        raise ValueError("--backend-label requires fixed-batch vLLM")
     if args.decode_only_steps < 0 or args.decode_only_warmup_steps < 1:
         raise ValueError("Invalid decode-only window length or warmup")
     if args.decode_only_steps and (args.engine != "sparsevllm" or args.scenario != "fixed"

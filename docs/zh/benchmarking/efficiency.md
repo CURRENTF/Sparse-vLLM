@@ -178,6 +178,12 @@ CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH="$PWD:$PWD/src" python3 \
 
 完整 CLI 参见 `python3 benchmark/efficiency/bench_probe.py --help`。
 
+兼容 vLLM 的 fork 可在固定 batch 模式下通过 `--engine-kwargs @config.json`
+传入专用构造参数，并通过 `--backend-label` 明确标注结果。`--sparse-method`
+应填写配置实际启用的算法。专用参数不能覆盖 probe 控制的模型、工作负载容量、
+随机种子、prefix-cache 策略及计时统计设置。还需单独保存 fork 的准确源码版本和
+最终配置；算法同名不代表 token 选择语义相同。
+
 ## Unified Synthetic 与 LongBench 套件
 
 `run_unified_efficiency_suite.sh` 先运行匹配的 synthetic suite，再运行匹配的

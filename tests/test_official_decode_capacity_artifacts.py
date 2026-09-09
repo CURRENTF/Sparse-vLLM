@@ -29,7 +29,7 @@ def persist(tmp_path, row, steps, outputs, case):
     return artifact
 
 
-@pytest.mark.parametrize("engine", ["sparsevllm", "vllm"])
+@pytest.mark.parametrize("engine", ["sparsevllm", "vllm", "hisparse"])
 def test_reconstruct_stage_rate_from_independent_token_work(tmp_path, engine):
     config, row, steps, outputs, case = make_case(tmp_path, engine)
     artifact = persist(tmp_path, row, steps, outputs, case)
@@ -73,6 +73,10 @@ def test_missing_graph_requires_explicit_capacity_evidence(tmp_path):
     log.write_text("graphs=1 short=1 long=0 skipped_for_kv_capacity=1")
     assert capacity_failure(error, log)
     assert not capacity_failure("kernel launch failed", log)
+    log.write_text("Full decode batch capacity exceeded: scheduler preemption")
+    assert capacity_failure("benchmark child exited with code -9", log)
+    log.write_text("illegal memory access")
+    assert not capacity_failure("benchmark child exited with code -9", log)
 
 
 @pytest.mark.parametrize("corruption", ["missing_failure", "wrong_boundary", "unobserved_point"])
@@ -104,4 +108,27 @@ def test_replot_rejects_unproven_capacity_before_rendering(tmp_path, monkeypatch
         pytest.fail("Invalid capacity export reached rendering")
     monkeypatch.setattr(plot, "render", unexpected_render)
     with pytest.raises(ValueError, match="capacity boundary|successful attempts"):
+        plot.main()
+
+
+@pytest.mark.parametrize("corruption", ["missing_evidence", "fabricated_zero"])
+def test_unsupported_export_cannot_hide_missing_evidence_or_become_zero(tmp_path, monkeypatch, corruption):
+    """A non-runnable combination must not silently become a measured data point."""
+    from scripts.official_experiments.decode_capacity_128k2k import plot_decode_capacity as plot
+
+    reason = "fixture rejects this attention contract"
+    unsupported = {lane: reason for lane in plot.LANES}
+    curves = [{"model": "fixture", "lane": lane, "status": "unsupported",
+               "reason": reason, "points": [], "attempts": []} for lane in plot.LANES]
+    if corruption == "missing_evidence":
+        unsupported.pop(curves[0]["lane"])
+    else:
+        curves[0]["points"] = [{"concurrency": 1, "decode_throughput_tps": 0}]
+    path = tmp_path / "export.json"
+    path.write_text(json.dumps({"schema_version": 1,
+        "config": {"models": {"fixture": {}}, "unsupported": {"fixture": unsupported}},
+        "curves": curves}))
+    monkeypatch.setattr("sys.argv", ["plot", "--plot-data", str(path)])
+    monkeypatch.setattr(plot, "render", lambda *a, **kw: pytest.fail("Invalid N/A reached rendering"))
+    with pytest.raises(ValueError, match="Unsupported curve"):
         plot.main()

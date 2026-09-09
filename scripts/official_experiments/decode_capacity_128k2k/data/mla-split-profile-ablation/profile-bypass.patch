@@ -1,0 +1,26 @@
+diff --git a/src/sparsevllm/kernels/tilelang/mla/runtime.py b/src/sparsevllm/kernels/tilelang/mla/runtime.py
+index 0bace86e..318e7603 100644
+--- a/src/sparsevllm/kernels/tilelang/mla/runtime.py
++++ b/src/sparsevllm/kernels/tilelang/mla/runtime.py
+@@ -9,6 +9,7 @@ from __future__ import annotations
+ 
+ from collections.abc import Callable
+ from dataclasses import dataclass
++import os
+ 
+ import torch
+ 
+@@ -168,6 +169,13 @@ def select_tile_mla_config(
+     _padded_head_count(local_q_heads)
+     table = _FUSED_SCORE_SPLITS if need_score else _OUTPUT_ONLY_SPLITS
+     split = table[local_q_heads][batch_bucket]
++    # Experiment-only ablation: retain the kernel/graph contract without the
++    # batch split table. This is a fixed control, not runtime autotuning.
++    disable_profile = os.environ.get("SPARSEVLLM_DISABLE_TILE_MLA_SPLIT_PROFILE", "0")
++    if disable_profile not in ("0", "1"):
++        raise ValueError("SPARSEVLLM_DISABLE_TILE_MLA_SPLIT_PROFILE must be 0 or 1")
++    if disable_profile == "1":
++        split = 32
+     block_h = 32 if local_q_heads == 20 and batch_bucket > 1 else 16
+     score_mode = "direct"
+     if need_score and local_q_heads == 20 and block_h == 16:

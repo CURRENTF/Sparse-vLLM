@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "experiment": "decode_capacity_128k2k_omnikv_total2048",
+  "completed": "2026-09-09T00:07:19+08:00",
+  "accepted_points": 44,
+  "curves": 10,
+  "original_provenance": "../provenance.json",
+  "measured_source": {
+    "base_commit": "f239c9491320f9ce36051c13881afafd71fb029d",
+    "dirty": true,
+    "archive": "source-final.tar.gz",
+    "archive_sha256": "ae4380c9bd299d9df926e9e7a63afe73838646063fe37ad34c1f4452836d1d15",
+    "validation": "All runtime and benchmark source hashes match both original OmniKV lane identities. Restored sparse-method docs differ; they are not runtime inputs. All 13 recorded native package versions match."
+  },
+  "replacement": {
+    "lane": "svllm-omnikv",
+    "models": [
+      "qwen3-30b-fp8",
+      "glm4.7-flash"
+    ],
+    "old_selected_budget": 2048,
+    "new_selected_budget": 1472,
+    "sink": 64,
+    "recent": 512,
+    "total_budget": 2048,
+    "new_successful_points": 7,
+    "other_curves": "8 original curves preserved exactly; all 44 combined points revalidated from raw steps and full outputs"
+  },
+  "artifact_prefixes": {
+    "original": "Original 128K/2K campaign root",
+    "omnikv-total2048": "Aligned-budget retry1 campaign root; exact paths in private experiment record"
+  },
+  "environment": "../environment.json",
+  "failed_attempt": "Initial smoke aborted due to foreign GPU contention; no measured points reused from that attempt.",
+  "packaging": {
+    "raw_artifacts_included": false,
+    "original_records_preserved": true,
+    "config": "../../config.omnikv-total2048.json"
+  }
+}

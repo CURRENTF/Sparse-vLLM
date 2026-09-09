@@ -16,12 +16,21 @@ from pathlib import Path
 DEFAULT_PALETTE = Path(__file__).resolve().parent / "palettes" / "fresh_modern.json"
 
 LANES = {
-    "vllm-vanilla": ("vLLM vanilla", "o"),
-    "svllm-vanilla": ("Sparse-vLLM vanilla", "s"),
-    "svllm-snapkv": ("SnapKV · 8K context", "D"),
-    "svllm-quest": ("QuEST · budget 2048", "^"),
-    "svllm-omnikv": ("OmniKV · auto / 2048", "P"),
+    "vllm-vanilla": ("vLLM Vanilla", "o"),
+    "svllm-vanilla": ("Vanilla", "s"),
+    "svllm-snapkv": ("SnapKV", "D"),
+    "svllm-quest": ("QuEST", "^"),
+    "svllm-omnikv": ("OmniKV", "P"),
 }
+EXTERNAL_LANES = {"tangram-snapkv": ("Tangram (SnapKV)", "v"),
+                  "hisparse-quest": ("HiSparse (QuEST)", "X")}
+
+
+def configured_lanes(config):
+    extras = config.get("external_lanes", {})
+    if set(extras) - EXTERNAL_LANES.keys():
+        raise ValueError("Unknown external curve identity")
+    return {**LANES, **{key: EXTERNAL_LANES[key] for key in extras}}
 
 
 def read_rows(path):
@@ -52,7 +61,7 @@ def validate_measurement(path, concurrency, config):
         raise ValueError(f"Measured step is not a full batch: {case}")
     if row["engine"] == "sparsevllm" and any(item["tokens"] >= 0 for item in steps):
         raise ValueError(f"Prefill included in native decode rate: {case}")
-    if row["engine"] == "vllm" and any(not item["pure_decode"] for item in steps):
+    if row["engine"] in ("vllm", "hisparse") and any(not item["pure_decode"] for item in steps):
         raise ValueError(f"Mixed or prefill step included in vLLM decode rate: {case}")
     tokens = sum(abs(item["tokens"]) for item in steps)
     elapsed = sum(item["elapsed_s"] for item in steps)
@@ -69,7 +78,12 @@ def load_campaign(config):
     root = Path(config["output_root"])
     curves = []
     for model in config["models"]:
-        for lane in LANES:
+        for lane in configured_lanes(config):
+            reason = config.get("unsupported", {}).get(model, {}).get(lane)
+            if reason:
+                curves.append({"model": model, "lane": lane, "status": "unsupported",
+                               "reason": reason, "points": [], "attempts": []})
+                continue
             matches = [path for path in (root / model).glob(f"*/{lane}/capacity.json")
                        if json.loads(path.read_text()).get("status") == "completed"]
             if len(matches) != 1:
@@ -113,7 +127,8 @@ def render(curves, config, output, palette_path=DEFAULT_PALETTE):
 
     palette = json.loads(Path(palette_path).read_text())
     colors = palette["colors"]
-    for lane in LANES:
+    lanes = configured_lanes(config)
+    for lane in lanes:
         if lane not in colors or not is_color_like(colors[lane]):
             raise ValueError(f"Palette {palette_path} has a missing or invalid color for {lane}")
 
@@ -124,10 +139,16 @@ def render(curves, config, output, palette_path=DEFAULT_PALETTE):
     (output / "palette.json").write_text(json.dumps(palette, indent=2) + "\n")
 
     def panel(ax, model, log_y):
+        unavailable = []
         for curve in curves:
             if curve["model"] != model:
                 continue
-            label, marker = LANES[curve["lane"]]
+            label, marker = lanes[curve["lane"]]
+            protocol = config.get("curve_protocols", {}).get(model, {}).get(curve["lane"], {})
+            label += protocol.get("label_suffix", "")
+            if curve.get("status") == "unsupported":
+                unavailable.append(label)
+                continue
             color = colors[curve["lane"]]
             xs = [point["concurrency"] for point in curve["points"]]
             ys = [point["decode_throughput_tps"] for point in curve["points"]]
@@ -135,9 +156,10 @@ def render(curves, config, output, palette_path=DEFAULT_PALETTE):
                          markersize=5 if curve["lane"] == "svllm-vanilla" else 6,
                          linestyle="--" if curve["lane"] == "svllm-vanilla" else "-",
                          linewidth=2, estimator=None, errorbar=None)
-        topology = config["models"][model]
-        ax.set_title(f"{topology.get('display_name', model)}\nTP{topology['tp']} · EP{topology['ep']}")
-        ax.set(xlabel="Concurrency", ylabel="Pure decode throughput (tokens/s)")
+        if unavailable:
+            ax.text(.02, .98, "\n".join(f"{label}: N/A" for label in unavailable), transform=ax.transAxes,
+                    va="top", fontsize=10, color="#617078")
+        ax.set(xlabel="Concurrency", ylabel="Decode throughput (tokens/s)")
         ax.set_xscale("log", base=2)
         # Integer-boundary probes can be adjacent on the log axis; keep native
         # major ticks at powers of two instead of overlapping endpoint labels.
@@ -147,7 +169,6 @@ def render(curves, config, output, palette_path=DEFAULT_PALETTE):
             ax.set_yscale("log")
             ax.yaxis.set_major_locator(LogLocator(base=10, subs=(1, 2, 5)))
             ax.yaxis.set_major_formatter(StrMethodFormatter("{x:.0f}"))
-            ax.set_ylabel("Pure decode throughput (tokens/s, log scale)")
         else:
             ax.set_ylim(bottom=0)
         ax.legend_.remove()
@@ -155,19 +176,22 @@ def render(curves, config, output, palette_path=DEFAULT_PALETTE):
     models = list(config["models"])
     for log_y in (False, True):
         suffix = "_logy" if log_y else ""
-        fig, axes = plt.subplots(1, len(models), figsize=(7 * len(models), 5.6),
+        fig, axes = plt.subplots(1, len(models), figsize=(3.5 * len(models), 2.8),
                                  layout="constrained", squeeze=False)
         for ax, model in zip(axes.flat, models):
             panel(ax, model, log_y)
+            ax.set_ylabel("")
+        fig.supylabel("Decode throughput (tokens/s)", fontsize=plt.rcParams["axes.labelsize"])
         handles, labels = axes.flat[0].get_legend_handles_labels()
         fig.legend(handles, labels, loc="outside upper center", ncols=3, frameon=False)
-        fig.supxlabel("128K input · 2K output · full-batch synchronized decode steps · first 32 steps excluded")
         for extension in ("png", "pdf", "svg"):
             fig.savefig(output / f"decode_capacity_128k2k{suffix}.{extension}", dpi=220)
         plt.close(fig)
         for model in models:
-            fig, ax = plt.subplots(figsize=(8, 5.8), layout="constrained")
+            fig, ax = plt.subplots(figsize=(4, 2.9), layout="constrained")
             panel(ax, model, log_y)
+            ax.set_ylabel("")
+            fig.supylabel("Decode throughput (tokens/s)", fontsize=plt.rcParams["axes.labelsize"])
             handles, labels = ax.get_legend_handles_labels()
             fig.legend(handles, labels, loc="outside upper center", ncols=2, frameon=False)
             for extension in ("png", "pdf", "svg"):
@@ -189,11 +213,22 @@ def main():
         if exported["schema_version"] != 1:
             raise ValueError("Unsupported plot-data schema")
         config, curves = exported["config"], exported["curves"]
-        expected = {(model, lane) for model in config["models"] for lane in LANES}
+        expected = {(model, lane) for model in config["models"] for lane in configured_lanes(config)}
         if len(curves) != len(expected) or {(c["model"], c["lane"]) for c in curves} != expected:
             raise ValueError("Portable export is missing curves or contains duplicates")
         for curve in curves:
+            if curve.get("status") == "unsupported":
+                reason = config.get("unsupported", {}).get(curve["model"], {}).get(curve["lane"])
+                if not reason or reason != curve.get("reason") or curve["points"] or curve["attempts"]:
+                    raise ValueError("Unsupported curve requires explicit evidence and no fabricated points")
+                continue
             points = curve["points"]
+            protocol = config.get("curve_protocols", {}).get(curve["model"], {}).get(curve["lane"])
+            if protocol:
+                if (not protocol.get("reason") or not protocol.get("label_suffix")
+                        or protocol["input_len"] + protocol["output_len"] != config["input_len"] + config["output_len"]
+                        or any(p["measured_steps"] < protocol["minimum_measured_steps"] for p in points)):
+                    raise ValueError("Adjusted protocol requires explicit labelling, constant span and sufficient measured steps")
             batches = [p["concurrency"] for p in points]
             maximum = curve["max_concurrency"]
             if (type(maximum) is not int or maximum < 1

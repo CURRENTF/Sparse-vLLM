@@ -23,6 +23,10 @@ def write(path, value):
 def capacity_failure(error, log_path):
     if any(text in error.lower() for text in ("out of memory", "full decode batch capacity exceeded", "no runnable sequences", "cannot fit", "cannot admit")):
         return True
+    if "Full decode batch capacity exceeded: scheduler preemption" in log_path.read_text():
+        # SGLang terminates its parent when a scheduler worker fails; retain the
+        # worker's explicit capacity diagnosis instead of inferring from SIGKILL.
+        return True
     # A missing graph is not generally a capacity error. Require the allocator's
     # explicit evidence that this run skipped capture for insufficient KV.
     return ("no startup-captured graph" in error
@@ -43,8 +47,14 @@ def main():
     parser.add_argument("--attempt", default="initial")
     parser.add_argument("--reuse-smoke-from", type=Path)
     parser.add_argument("--reuse-cases-from", type=Path)
+    parser.add_argument("--reuse-additional-cases-from", type=Path, action="append", default=[],
+                        help="Additional raw-validated probe roots, in deterministic priority order")
     parser.add_argument("--probe-concurrency", type=int)
+    parser.add_argument("--probe-only", action="store_true",
+                        help="Run one guarded probe; do not claim a complete capacity boundary")
     args = parser.parse_args()
+    if args.probe_only and (not args.probe_concurrency or args.probe_concurrency < 1 or "," in args.lanes):
+        raise ValueError("probe-only requires one lane and a positive probe concurrency")
     REPO = args.repo.resolve()
     config_text = os.path.expandvars(args.config.read_text())
     unresolved = re.findall(r"\$\{[^}]+\}", config_text)
@@ -117,17 +127,26 @@ def main():
         if case.exists():
             raise FileExistsError(f"Refusing to overwrite existing attempt: {case}")
         engine, method = ("vllm", "vanilla") if lane == "vllm-vanilla" else ("sparsevllm", lane.removeprefix("svllm-"))
+        external = config.get("external_lanes", {}).get(lane)
+        if external:
+            engine, method = external["engine"], external["method"]
         hp = dict(tensor_parallel_size=model["tp"], expert_parallel_size=model["ep"],
                   data_parallel_size=1, decode_graph=True, gpu_memory_utilization=config["gpu_memory_utilization"],
                   max_num_batched_tokens=8192, engine_prefill_chunk_size=8192,
                   enable_prefix_caching=False)
+        if external:
+            chunk = external.get("max_num_batched_tokens", 8192)
+            hp.update(max_num_batched_tokens=chunk, engine_prefill_chunk_size=chunk)
         if engine == "sparsevllm":
             hp["decode_graph_capture_sizes"] = [batch]
             if method in config["methods"]:
                 hp.update(config["methods"][method])
         length, output = (4096, 64) if smoke else (config["input_len"], config["output_len"])
-        if args.reuse_cases_from and not smoke:
-            previous = args.reuse_cases_from / lane / f"bs{batch}"
+        reuse_roots = ([args.reuse_cases_from] if args.reuse_cases_from else []) + args.reuse_additional_cases_from
+        available = [root / lane / f"bs{batch}" for root in reuse_roots
+                     if (root / lane / f"bs{batch}" / "performance.jsonl").is_file()]
+        if available and not smoke:
+            previous = available[0]
             artifact = previous / "performance.jsonl"
             if artifact.exists():
                 old_hp = json.loads((previous / "hyper_params.json").read_text())
@@ -137,7 +156,11 @@ def main():
                 old_command = identity["command"]
                 expected_args = {"--model_path": model["path"], "--lengths": str(length),
                                  "--output_len": str(output), "--batch_sizes": str(batch),
-                                 "--decode_warmup_steps_after_full": "32"}
+                                 "--decode_warmup_steps_after_full": "32", "--engine": engine, "--methods": method}
+                if external:
+                    expected_args["--backend_label"] = external["backend_label"]
+                    if json.loads((previous / "engine_kwargs.json").read_text()) != external["engine_kwargs"]:
+                        raise RuntimeError(f"Refusing changed external algorithm parameters: {previous}")
                 if (old_hp != hp or not source_matches
                         or any(old_command[old_command.index(key) + 1] != value for key, value in expected_args.items())
                         or "--require_full_decode_batch" not in old_command
@@ -161,7 +184,7 @@ def main():
         case.mkdir(parents=True)
         write(case / "hyper_params.json", hp)
         command = [config["conda"], "run", "--no-capture-output", "-p",
-                   native_env if engine == "sparsevllm" else config["vllm_env"],
+                   external["env"] if external else native_env if engine == "sparsevllm" else config["vllm_env"],
                    "python", "-u", "benchmark/microbench.py", "--engine", engine,
                    "--model_path", model["path"], "--lengths", str(length),
                    "--output_len", str(output), "--batch_sizes", str(batch),
@@ -169,16 +192,33 @@ def main():
                    "--synchronize_step_timing", "--require_full_decode_batch",
                    "--decode_warmup_steps_after_full", "8" if smoke else "32",
                    "--output_dir", str(case)]
-        if method == "snapkv":
+        if external:
+            write(case / "engine_kwargs.json", external["engine_kwargs"])
+            if external.get("environment_kind") == "venv":
+                prefix = Path(external["env"])
+                if not (prefix / "pyvenv.cfg").is_file():
+                    raise ValueError(f"Configured venv lacks pyvenv.cfg: {prefix}")
+                command = [str(prefix / "bin/python")] + command[6:]
+                env["PATH"] = str(prefix / "bin") + os.pathsep + os.environ["PATH"]
+                env["VIRTUAL_ENV"] = str(prefix)
+            command += ["--engine_kwargs", "@" + str(case / "engine_kwargs.json"),
+                        "--backend_label", external["backend_label"]]
+        if method == "snapkv" and engine == "sparsevllm":
             command += ["--admission_wave_size", "1", "--wave_decode_gap_steps", "1"]
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
             env["SPARSEVLLM_MASTER_PORT"] = str(listener.getsockname()[1])
-        tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=REPO).decode().split("\0")
+        snapshot_manifest = REPO.parent / "manifest.json"
+        if (REPO / ".git").exists():
+            tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=REPO).decode().split("\0")
+            commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip()
+        else:
+            snapshot = json.loads(snapshot_manifest.read_text())
+            tracked, commit = list(snapshot["sha256"]), snapshot["git_head"]
         hashes = {name: hashlib.sha256((REPO / name).read_bytes()).hexdigest()
                   for name in tracked if name and (REPO / name).is_file()}
         write(case / "identity.json", {"command": command, "env": {key: env[key] for key in ("CUDA_VISIBLE_DEVICES", "PYTHONPATH", "VLLM_ENABLE_V1_MULTIPROCESSING", "SPARSEVLLM_MASTER_PORT")},
-              "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
+              "git_commit": commit,
               "orchestrator_sha256": {name: hashlib.sha256((PACKAGE / name).read_bytes()).hexdigest()
                                       for name in ("sweep_decode_capacity.py", "decode_capacity_guard.py", "plot_decode_capacity.py")},
               "source_sha256": hashes, "model_config_sha256": hashlib.sha256((Path(model["path"]) / "config.json").read_bytes()).hexdigest()})
@@ -277,6 +317,9 @@ def main():
             attempts = []
             if args.probe_concurrency and lane == lanes[0]:
                 run_case(lane, args.probe_concurrency)
+                if args.probe_only:
+                    status("queue", "probe_completed", concurrency=args.probe_concurrency)
+                    return
             lower, upper, batch = 0, None, 1
             while batch <= config["safety_concurrency_limit"]:
                 result = run_case(lane, batch)

@@ -1,0 +1,51 @@
+{
+  "status": "success",
+  "oracle": "float32 torch attention and per-head raw scores",
+  "plan": {
+    "context_capacity": 133120,
+    "local_q_heads": 10,
+    "max_batch_size": 5,
+    "need_score": true,
+    "batch_configs": [
+      {
+        "batch_size": 1,
+        "num_split": 32,
+        "block_n": 64,
+        "block_h": 16,
+        "score_mode": "per_head"
+      },
+      {
+        "batch_size": 2,
+        "num_split": 32,
+        "block_n": 64,
+        "block_h": 16,
+        "score_mode": "per_head"
+      },
+      {
+        "batch_size": 3,
+        "num_split": 32,
+        "block_n": 64,
+        "block_h": 16,
+        "score_mode": "per_head"
+      },
+      {
+        "batch_size": 4,
+        "num_split": 32,
+        "block_n": 64,
+        "block_h": 16,
+        "score_mode": "per_head"
+      },
+      {
+        "batch_size": 5,
+        "num_split": 32,
+        "block_n": 64,
+        "block_h": 16,
+        "score_mode": "per_head"
+      }
+    ]
+  },
+  "graph_replays": 2,
+  "dynamic_lengths": true,
+  "rtol": 0.03,
+  "atol": 0.03
+}

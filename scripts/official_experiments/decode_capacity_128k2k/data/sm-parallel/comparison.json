@@ -1,0 +1,116 @@
+{
+  "status": "success",
+  "metric": "full_batch_pure_decode_steps",
+  "aggregation": "one complete run per concurrency; no confidence interval",
+  "comparisons": [
+    {
+      "concurrency": 1,
+      "previous_tps": 97.103231714346,
+      "new_tps": 97.73959336344255,
+      "change_percent": 0.6553454893948096,
+      "token_mismatch_positions_per_request": [
+        []
+      ]
+    },
+    {
+      "concurrency": 2,
+      "previous_tps": 182.17190479349998,
+      "new_tps": 182.78879981263114,
+      "change_percent": 0.33863345713514015,
+      "token_mismatch_positions_per_request": [
+        [],
+        []
+      ]
+    },
+    {
+      "concurrency": 4,
+      "previous_tps": 336.2213710358272,
+      "new_tps": 336.6918308047929,
+      "change_percent": 0.13992559946929273,
+      "token_mismatch_positions_per_request": [
+        [],
+        [],
+        [],
+        []
+      ]
+    },
+    {
+      "concurrency": 5,
+      "previous_tps": 304.8468002228026,
+      "new_tps": 375.8830902603045,
+      "change_percent": 23.302291506941785,
+      "token_mismatch_positions_per_request": [
+        [
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17
+        ],
+        [
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17
+        ],
+        [
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17
+        ],
+        [
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17
+        ],
+        [
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17
+        ]
+      ]
+    }
+  ]
+}

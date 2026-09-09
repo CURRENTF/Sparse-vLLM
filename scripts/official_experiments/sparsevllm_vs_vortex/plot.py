@@ -63,13 +63,13 @@ def validated_rows(payload: dict) -> list[dict]:
     return rows
 
 
-def draw_panel(ax, frame, models, series, *, show_batch, ylabel):
+def draw_panel(ax, frame, models, series, *, require_matched_batch, ylabel):
     for model in models:
         for engine in series:
             values = frame.loc[(frame.model == model) & (frame.series == engine), "concurrency"].unique()
             if len(values) != 1:
                 raise ValueError(f"Missing or inconsistent case: {model}, {engine}")
-        if not show_batch and frame.loc[frame.model == model, "concurrency"].nunique() != 1:
+        if require_matched_batch and frame.loc[frame.model == model, "concurrency"].nunique() != 1:
             raise ValueError(f"Common-concurrency panel contains unmatched batches: {model}")
     sns.barplot(data=frame, x="model", y="value", hue="series", order=models,
                 hue_order=series, palette=PALETTE, saturation=1, errorbar="sd",
@@ -78,11 +78,8 @@ def draw_panel(ax, frame, models, series, *, show_batch, ylabel):
         labels = []
         for model, value in zip(models, container.datavalues):
             batch = frame.loc[(frame.model == model) & (frame.series == engine), "concurrency"].iloc[0]
-            labels.append(f"{value:.1f}" + (f"\nB={batch}" if show_batch else ""))
+            labels.append(f"{value:.1f}\nB={batch}")
         ax.bar_label(container, labels=labels, padding=4, fontsize=9, color="#364152")
-    if not show_batch:
-        ax.set_xticks(ax.get_xticks(), [f"{model}\nB={frame.loc[frame.model == model, 'concurrency'].iloc[0]}"
-                                       for model in models])
     ax.set_ylabel(ylabel)
     ax.grid(axis="x", visible=False)
     sns.despine(ax=ax)
@@ -92,7 +89,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, default=Path(__file__).with_name("data") / "decode.json")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--width", type=float, default=10.0, help="Width in inches; height is width / 2.5")
+    parser.add_argument("--width", type=float, default=7.5, help="Width in inches; height is width / 2.5")
     args = parser.parse_args()
     if not math.isfinite(args.width) or args.width <= 0:
         raise ValueError("Width must be positive and finite")
@@ -119,13 +116,15 @@ def main():
     for ax, method in zip(axes, methods):
         hues = series if method == "QuEST" else list(PALETTE)
         selected = frame[frame.method == method]
-        draw_panel(ax, selected, models, hues, show_batch=method != "QuEST",
+        draw_panel(ax, selected, models, hues, require_matched_batch=method == "QuEST",
                    ylabel=METRICS[payload["metric"]][1])
-        ax.set_xlabel(method)
+        ax.set_xlabel("H2O" if method == "H2O / H2O-like" else method)
     # H2O supplies all three legend entries; each case appears exactly once.
     axes[0].margins(y=0.20)
     axes[0].set_ylim(bottom=0)
     handles, labels = axes[1].get_legend_handles_labels()
+    labels = [label.replace("Sparse-vLLM", "Ours").replace("wave2", "Max Avai. B")
+              for label in labels]
     for ax in axes:
         ax.get_legend().remove()
     axes[1].set_ylabel("")

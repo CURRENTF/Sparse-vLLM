@@ -27,6 +27,22 @@ fails explicitly. It saves the selected identities and hashes, raw responses,
 parsed answers, per-sample statuses, aggregate metrics, runtime configuration,
 and source/submodule provenance.
 
+For paired external-runtime evaluation, `--engine vllm` accepts constructor
+options through `--engine-kwargs`, and `--engine sglang-http --server-url ...`
+uses an already-running server with matching model identity and disabled radix
+cache. Both receive the exact prepared token IDs and use the same answer parser
+and aggregate metrics as the native runner. Preserve the external server launch
+configuration separately; a matching method label alone does not establish
+algorithm or budget parity.
+
+`--official-length medium` filters the dataset's official length label before
+token-bucket selection. `--prepare-only` exports prepared samples for reuse with
+`--prepared-samples`; model/tokenizer, dataset, prompt, seed and bucket identities
+must match. Preparation is not a model evaluation. If a common context-limited
+subset is used, retain excluded sample IDs and reasons and label its accuracy as
+a subset score, not the complete official length-cohort score. Full runs retain
+incremental per-sample output in `sample_results.partial.jsonl`.
+
 As in the official evaluator, a non-empty model response that does not contain
 the required answer pattern is retained with `status="parse_failed"` and scored
 as incorrect. Model/runtime failures remain fatal and invalidate the run.
