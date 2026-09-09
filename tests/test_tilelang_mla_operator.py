@@ -65,6 +65,7 @@ def _h100_caps(**overrides) -> DeviceCaps:
         "supports_pin_memory": True,
         "supports_bfloat16": True,
         "supports_native_fp8": True,
+        "multi_processor_count": 132,
     }
     values.update(overrides)
     return DeviceCaps(**values)
@@ -210,6 +211,7 @@ def test_tilelang_provider_binds_rank_local_head_count(
             op_spec=_spec(tp_size=tp_size),
             device="cpu",
             max_batch_size=2,
+            sm_count=_h100_caps().multi_processor_count,
         )
 
     tilelang_cls.assert_called_once()
@@ -362,23 +364,38 @@ def test_decode_graph_score_contract_binds_static_tilelang_plan() -> None:
     assert resolved.provider.tilelang_launch_plan.context_capacity == 65536
 
 
-def test_tilelang_launch_configs_are_independent_of_context_capacity() -> None:
-    short = TileMlaLaunchPlan.build(
-        context_capacity=1024,
-        local_q_heads=10,
-        max_batch_size=32,
-        need_score=True,
-        score_mode="per_head",
-    )
-    long = TileMlaLaunchPlan.build(
+def test_tilelang_bound_plan_is_not_reselected_by_replay_context() -> None:
+    """Context changes must not resize the graph's split workspace."""
+    plan = TileMlaLaunchPlan.build(
         context_capacity=65536,
         local_q_heads=10,
         max_batch_size=32,
         need_score=True,
         score_mode="per_head",
+        sm_count=_h100_caps().multi_processor_count,
     )
+    runner = TileMlaDecodeKernel(device="cpu", softmax_scale=0.0625, launch_plan=plan)
+    for length in (1, 512, 8192, plan.context_capacity):
+        assert runner._config_for(batch_size=17, context_capacity=length, need_score=True) is plan.configs[16]
+    with pytest.raises(ValueError, match="exceeds the static launch plan"):
+        runner._config_for(batch_size=17, context_capacity=plan.context_capacity + 1, need_score=True)
 
+
+def test_tilelang_launch_configs_are_independent_of_context_capacity() -> None:
+    """Storage capacity must not become a hidden context tuning bucket."""
+    kwargs = dict(local_q_heads=10, max_batch_size=32, need_score=True,
+                  score_mode="per_head", sm_count=_h100_caps().multi_processor_count)
+    short = TileMlaLaunchPlan.build(context_capacity=1024, **kwargs)
+    long = TileMlaLaunchPlan.build(context_capacity=131072, **kwargs)
     assert short.configs == long.configs
+
+
+def test_tilelang_bind_rejects_missing_sm_count_before_allocating() -> None:
+    with patch("sparsevllm.operators.mla_attention.allocate_mla_decode_workspace") as allocate:
+        with pytest.raises(ValueError, match="SM count"):
+            MlaTileLangScoreProvider.bind(_spec(), _h100_caps(multi_processor_count=None),
+                                          op_spec=_spec(), device="cpu", max_batch_size=2)
+    allocate.assert_not_called()
 
 
 def test_decode_graph_reduced_score_contract_binds_static_triton_provider() -> None:
@@ -440,6 +457,7 @@ def _provider_with_mocks() -> tuple[MlaTileLangScoreProvider, Mock, Mock]:
             op_spec=_spec(),
             device="cpu",
             max_batch_size=2,
+            sm_count=_h100_caps().multi_processor_count,
         )
     return provider, fa3, tilelang
 

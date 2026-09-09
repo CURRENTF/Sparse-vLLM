@@ -432,6 +432,49 @@ def test_mla_decode_writes_raw_attention_scores(reduce_heads: bool) -> None:
 
 
 @CUDA_REQUIRED
+@pytest.mark.parametrize("graph_mode", [False, True])
+def test_mla_h2o_reduced_score_softmax_matches_approximation(graph_mode):
+    from sparsevllm.kernels.triton.h2o_score import h2o_softmax_accumulate
+
+    torch.manual_seed(218)
+    case = _make_decode_case(batch_size=1, head_count=20, max_context_len=33)
+    q, qr, latent, rope, slots, rows, lengths = case
+    length = int(lengths[0].item())
+    output = torch.empty_like(q)
+    scores = torch.empty((1, slots.shape[1]), device="cuda", dtype=torch.float32)
+    history = torch.zeros((1, 1, slots.shape[1]), device="cuda", dtype=torch.float32)
+    workspace = allocate_mla_decode_workspace(batch_size=1, head_count=20, device="cuda")
+
+    def attention():
+        run_mla_decode(
+            q, qr, latent, rope, slots, rows, lengths, output, workspace,
+            softmax_scale=GLM_MLA_SOFTMAX_SCALE, attn_score=scores,
+        )
+
+    attention()
+    graph = None
+    if graph_mode:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            attention()
+    expected = torch.zeros(length, device="cuda")
+    active = slots[int(rows[0].item()), :length].long()
+    for _ in range(3):
+        q.mul_(0.9)
+        graph.replay() if graph is not None else attention()
+        # H2O accumulation is intentionally graph-out, following model replay.
+        h2o_softmax_accumulate(
+            scores.unsqueeze(0), history, width=length, previous_width=length,
+            softmax_scale=GLM_MLA_SOFTMAX_SCALE,
+        )
+        raw = q[0].float() @ latent[active, 0].float().T
+        raw += qr[0].float() @ rope[active, 0].float().T
+        expected += (raw.amax(0) * GLM_MLA_SOFTMAX_SCALE).softmax(-1)
+        torch.testing.assert_close(history[0, 0, :length], expected, rtol=3e-2, atol=2e-3)
+    assert torch.all(history[..., length:] == 0)
+
+
+@CUDA_REQUIRED
 def test_mla_decode_score_capacity_can_be_smaller_than_slot_table() -> None:
     torch.manual_seed(219)
     case = _make_decode_case(batch_size=1, head_count=20, max_context_len=33)

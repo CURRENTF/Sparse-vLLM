@@ -57,6 +57,7 @@ def _h100_caps(**overrides) -> DeviceCaps:
         "supports_pin_memory": True,
         "supports_bfloat16": True,
         "supports_native_fp8": True,
+        "multi_processor_count": 132,
     }
     values.update(overrides)
     return DeviceCaps(**values)
@@ -94,6 +95,20 @@ def test_mla_attention_scale_uses_qk_head_dimension() -> None:
 
     assert spec.softmax_scale == pytest.approx(256**-0.5)
     assert spec.softmax_scale != pytest.approx((512 + 64) ** -0.5)
+
+
+def test_online_h2o_requests_an_executable_mla_score_contract():
+    from sparsevllm.method_registry import sparse_decode_attention_score_kind
+    from sparsevllm.operators.attention_capabilities import AttentionScoreKind
+
+    kind = sparse_decode_attention_score_kind(
+        "h2o", h2o_decode_eviction=True, attention_cache_layout="mla_latent",
+    )
+    spec = _spec(score_output=kind, tp_size=1)
+    assert kind is AttentionScoreKind.RAW_QK_REDUCED
+    assert MlaTritonProvider.supports(spec, _h100_caps()).supported
+    # A score-free provider must not bind and silently drop the online scores.
+    assert not MlaSglFa3Provider.supports(spec, _h100_caps()).supported
 
 
 def test_mla_triton_atomic_support_is_not_narrowed_by_device_name() -> None:
@@ -176,9 +191,9 @@ def test_decode_graph_mla_launch_config_ignores_runtime_context() -> None:
             op_spec=spec,
             device="cpu",
             max_batch_size=32,
-            use_h100_launch_profile=True,
+            sm_count=132,
         )
-    launch_config = object()
+    launch_config = provider.launch_config
     with patch(
         "sparsevllm.operators.mla_attention.select_glm_mla_decode_config",
         return_value=launch_config,
@@ -196,88 +211,22 @@ def test_decode_graph_mla_launch_config_ignores_runtime_context() -> None:
 
     assert first is launch_config
     assert second is launch_config
-    assert select.call_count == 2
-    select.assert_called_with(
-        batch_size=32,
-        local_q_heads=10,
-    )
+    select.assert_not_called()
 
 
-def test_sm120_tp2_uses_portable_mla_launch_config() -> None:
+def test_mla_binding_rejects_missing_sm_before_allocation() -> None:
     spec = _spec(tp_size=2)
     workspace = _cpu_workspace(batch_size=8, head_count=10)
     with patch(
         "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
         return_value=workspace,
-    ):
-        provider = MlaTritonProvider.bind(
-            spec,
-            _h100_caps(
-                device_name="NVIDIA RTX PRO 6000 Blackwell Server Edition",
-                compute_capability=(12, 0),
-                runtime_version="13.0",
-            ),
-            op_spec=spec,
-            device="cpu",
-            max_batch_size=8,
-        )
-
-    with patch(
-        "sparsevllm.operators.mla_attention.select_glm_mla_decode_config"
-    ) as select:
-        launch_config = provider._launch_config_for(
-            batch_size=8,
-            max_context_len=4096,
-            active_slot_width=4096,
-        )
-
-    assert launch_config is provider.launch_config
-    assert provider.binding_metadata()["launch_config_source"] == "portable_default"
-    select.assert_not_called()
-
-
-@pytest.mark.parametrize("tp_size", [1, 2, 4])
-@pytest.mark.parametrize(
-    "device_name", ["NVIDIA H100 80GB HBM3", "NVIDIA H100 PCIe"]
-)
-def test_h100_family_uses_profiled_mla_launch_config_for_every_tp(
-    device_name: str,
-    tp_size: int,
-) -> None:
-    spec = _spec(tp_size=tp_size)
-    workspace = _cpu_workspace(batch_size=8, head_count=20 // tp_size)
-    with patch(
-        "sparsevllm.operators.mla_attention.allocate_mla_decode_workspace",
-        return_value=workspace,
-    ):
-        provider = MlaTritonProvider.bind(
-            spec,
-            _h100_caps(device_name=device_name),
-            op_spec=spec,
-            device="cpu",
-            max_batch_size=8,
-        )
-
-    profiled_config = object()
-    with patch(
-        "sparsevllm.operators.mla_attention.select_glm_mla_decode_config",
-        return_value=profiled_config,
-    ) as select:
-        launch_config = provider._launch_config_for(
-            batch_size=8,
-            max_context_len=4096,
-            active_slot_width=4096,
-        )
-
-    assert launch_config is profiled_config
-    assert (
-        provider.binding_metadata()["launch_config_source"]
-        == "h100_batch_head_profile"
-    )
-    select.assert_called_once_with(
-        batch_size=8,
-        local_q_heads=20 // tp_size,
-    )
+    ) as allocate:
+        with pytest.raises(ValueError, match="positive SM count"):
+            MlaTritonProvider.bind(
+                spec, _h100_caps(multi_processor_count=None),
+                op_spec=spec, device="cpu", max_batch_size=8,
+            )
+    allocate.assert_not_called()
 
 
 def test_sgl_mla_accepts_graph_stable_score_free_contract() -> None:

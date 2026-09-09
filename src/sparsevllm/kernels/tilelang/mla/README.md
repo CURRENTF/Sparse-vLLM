@@ -20,9 +20,32 @@ The module only defines kernels. Provider selection, workspace ownership,
 dependency checks, launch-config selection, and fallback policy belong under
 `sparsevllm.operators`.
 
-The production adapter binds the validated GLM TP1/TP2/TP4 H100 BF16 contract.
-It chooses an offline-calibrated split, head-tile size, and score reduction
-mode from the static batch/context table. TileLang tensors must be contiguous,
-and the reduced score/context capacity must be a multiple of the kernel's
-64-token tile. Unsupported score dtype, layout, or capacity stays on the
-existing Triton provider through an explicit pre-launch shape dispatch.
+The production score adapter uses `sm_parallel_nearest_v1` to generate its static
+split plan from the device SM count, batch and padded-head tile parallelism:
+
+```
+ideal_splits = SM_count / (batch * head_tiles)  # target one CTA per SM
+splits = nearest_absolute(ideal_splits, candidates=[4, 8, 16, 32])
+# Exact ties choose the smaller candidate.
+```
+
+The head tile remains 32 for 20 local heads with batch > 1, otherwise 16.
+Neither actual context length nor context capacity enters split selection.
+The conservative candidate range is profile policy, not a kernel correctness
+limit. The formula scales with hardware but is not a claim of optimal tuning on
+every GPU. Historical context-aware experiments remain frozen in
+`scripts/official_experiments/tilelang_mla_split_profiles`; they do not measure
+this context-independent rule. The capacity rerun recipe is in
+`scripts/official_experiments/decode_capacity_128k2k`.
+
+The provider passes SM count from `DeviceCaps` at binding. Context capacity
+remains a storage/validation bound only. Plans are indexed only by batch;
+replay changes device-side masks but does not reselect splits, resize workspaces
+or add context graph buckets. Binding metadata records the rule and its inputs.
+Direct adapter callers must provide a prepared plan, a fixed experimental
+configuration, or an explicit positive SM count.
+
+The production score contract is FP32 raw QK per local head. Strided queries and
+score staging are supported; slot tables must be contiguous. Invalid runtime
+contracts fail explicitly rather than silently switching providers. Score-free
+attention continues through SGL FA3; its selection and tuning are unchanged.

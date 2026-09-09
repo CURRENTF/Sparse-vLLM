@@ -7,7 +7,6 @@ from .copy_latent import (
 )
 from .decode_schedule import (
     DEFAULT_GLM_MLA_DECODE_CONFIG,
-    GLM_MLA_MAX_WORKSPACE_CONFIG,
     GLM_MLA_SOFTMAX_SCALE,
     MlaDecodeLaunchConfig,
     MlaDecodeWorkspace,
@@ -27,7 +26,6 @@ from .gather_latent import (
 
 __all__ = [
     "DEFAULT_GLM_MLA_DECODE_CONFIG",
-    "GLM_MLA_MAX_WORKSPACE_CONFIG",
     "GLM_MLA_SOFTMAX_SCALE",
     "MLA_LATENT_DIM",
     "MLA_ROPE_DIM",

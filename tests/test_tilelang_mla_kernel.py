@@ -258,6 +258,7 @@ def test_static_plan_replays_across_contexts_with_unaligned_capacity() -> None:
     assert not score.is_contiguous()
     plan = TileMlaLaunchPlan.build(
         context_capacity=8192,
+        sm_count=torch.cuda.get_device_properties(device).multi_processor_count,
         local_q_heads=valid_heads,
         max_batch_size=1,
         need_score=True,
@@ -324,6 +325,87 @@ def test_static_plan_replays_across_contexts_with_unaligned_capacity() -> None:
 
 
 @CUDA_REQUIRED
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_rule_bound_provider_replays_ragged_128k_without_workspace_changes(tp_size: int) -> None:
+    """Exercise real profile binding and the changed BS5 plan, not a fixed override."""
+    from sparsevllm import platforms
+    from sparsevllm.engine.cache_manager import AttentionViewMeta, DecodeComputeView, MlaLatentPayload
+    from sparsevllm.operators.attention_capabilities import AttentionScoreKind
+    from sparsevllm.operators.mla_attention import (
+        MLA_ATTENTION_REGISTRY, MlaAttentionOpSpec, MlaTileLangScoreProvider,
+    )
+    from sparsevllm.operators.registry import OpResolver
+
+    torch.manual_seed(20260909 + tp_size)
+    torch.cuda.set_device(0)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    device = torch.device("cuda:0")
+    caps = platforms.current_platform.get_device_caps(0)
+    if "H100" not in caps.device_name:
+        pytest.skip("This integration test exercises the H100 profile binding")
+    batch, capacity, heads = 5, 131072, 20 // tp_size
+    spec = MlaAttentionOpSpec(
+        num_q_heads=20, kv_lora_rank=512, rope_dim=64, qk_head_dim=256,
+        value_head_dim=256, activation_dtype=torch.bfloat16, cache_dtype=torch.bfloat16,
+        tp_size=tp_size, cuda_graph=True, score_output=AttentionScoreKind.RAW_QK_PER_HEAD,
+        context_capacity=capacity, batch_capacity=batch,
+    )
+    resolved = OpResolver(MLA_ATTENTION_REGISTRY).resolve(
+        spec, caps, op_spec=spec, device=device, max_batch_size=batch,
+    )
+    provider = resolved.provider
+    assert isinstance(provider, MlaTileLangScoreProvider)
+    assert provider.tilelang_launch_plan.sm_count == caps.multi_processor_count
+    packed = torch.randn(batch, heads, 576, device=device, dtype=torch.bfloat16)
+    q, qr = packed[..., :512], packed[..., 512:]
+    kv = torch.randn(capacity, 1, 512, device=device, dtype=torch.bfloat16)
+    kr = torch.randn(capacity, 1, 64, device=device, dtype=torch.bfloat16)
+    slots = torch.stack([torch.randperm(capacity, device=device).int() for _ in range(batch)])
+    indices = torch.tensor([0, 1, 2, 3, -1], device=device, dtype=torch.int32)
+    lengths = torch.tensor([capacity, capacity - 1, 8193, 17, 0], device=device, dtype=torch.int32)
+    output = torch.empty(batch, heads, 512, device=device, dtype=torch.bfloat16)
+    score = torch.empty(batch, heads, capacity, device=device, dtype=torch.float32)
+    view = DecodeComputeView(
+        meta=AttentionViewMeta(active_slots=slots, req_indices=indices, context_lens=lengths,
+                               max_context_len=capacity, attn_score=score),
+        payload=MlaLatentPayload(latent_cache=kv, rope_cache=kr),
+    )
+    scope = object()
+
+    def run():
+        score.fill_(-1e20)
+        provider.run(q, qr, view, output, validation_scope=scope, valid_batch_size=4)
+
+    def check():
+        for row, length in enumerate(lengths.tolist()):
+            if length:
+                expected, raw, _ = _torch_oracle(q[row], qr[row], kv, kr, slots[row, :length])
+                torch.testing.assert_close(output[row], expected, rtol=0.03, atol=0.03)
+                torch.testing.assert_close(score[row, :, :length], raw, rtol=0.03, atol=0.03)
+            else:
+                torch.testing.assert_close(output[row], torch.zeros_like(output[row]))
+            assert torch.all(score[row, :, length:] == -1e20)
+
+    run()
+    torch.cuda.synchronize()
+    check()
+    bound = provider.tilelang_score.runtime_metadata()
+    assert bound["compiled_variant_count"] == 1
+    plan = provider.tilelang_launch_plan
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for values in ([17, 2048, 65537, capacity, 0], [31, 63, 65, 511, 0],
+                   [capacity, capacity - 1, 8193, 17, 0]):
+        lengths.copy_(torch.tensor(values, device=device, dtype=torch.int32))
+        graph.replay()
+        torch.cuda.synchronize()
+        check()
+        assert provider.tilelang_score.runtime_metadata() == bound
+        assert provider.tilelang_launch_plan is plan
+
+
+@CUDA_REQUIRED
 def test_static_plan_replays_representative_contexts_through_64k() -> None:
     torch.manual_seed(20260825)
     device = torch.device("cuda")
@@ -352,6 +434,7 @@ def test_static_plan_replays_representative_contexts_through_64k() -> None:
     )
     plan = TileMlaLaunchPlan.build(
         context_capacity=capacity,
+        sm_count=torch.cuda.get_device_properties(device).multi_processor_count,
         local_q_heads=valid_heads,
         max_batch_size=1,
         need_score=True,

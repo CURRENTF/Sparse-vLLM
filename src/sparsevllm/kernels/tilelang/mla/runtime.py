@@ -22,13 +22,8 @@ _HEAD_TILE_SIZE = 16
 _LATENT_DIM = 512
 _ROPE_DIM = 64
 _BLOCK_N = 64
-_CALIBRATED_BATCH_BUCKETS = (1, 4, 16, 32)
-_FUSED_SCORE_SPLITS = {
-    5: {1: 32, 4: 32, 16: 8, 32: 4},
-    10: {1: 32, 4: 32, 16: 8, 32: 4},
-    20: {1: 32, 4: 16, 16: 4, 32: 4},
-}
-_OUTPUT_ONLY_SPLITS = _FUSED_SCORE_SPLITS
+_SPLIT_RULE = "sm_parallel_nearest_v1"
+_PROFILE_SPLITS = (4, 8, 16, 32)
 
 
 def _padded_head_count(valid_heads: int) -> int:
@@ -78,6 +73,7 @@ class TileMlaLaunchPlan:
     local_q_heads: int
     max_batch_size: int
     need_score: bool
+    sm_count: int
     configs: tuple[TileMlaLaunchConfig, ...]
 
     @classmethod
@@ -88,6 +84,7 @@ class TileMlaLaunchPlan:
         local_q_heads: int,
         max_batch_size: int,
         need_score: bool,
+        sm_count: int,
         score_mode: str | None = None,
     ) -> TileMlaLaunchPlan:
         if min(context_capacity, max_batch_size) <= 0:
@@ -102,6 +99,7 @@ class TileMlaLaunchPlan:
                 batch_size=batch_size,
                 need_score=bool(need_score),
                 local_q_heads=int(local_q_heads),
+                sm_count=sm_count,
             )
             if score_mode is not None:
                 config = TileMlaLaunchConfig(
@@ -116,6 +114,7 @@ class TileMlaLaunchPlan:
             local_q_heads=int(local_q_heads),
             max_batch_size=int(max_batch_size),
             need_score=bool(need_score),
+            sm_count=int(sm_count),
             configs=tuple(configs),
         )
 
@@ -138,6 +137,10 @@ class TileMlaLaunchPlan:
             "local_q_heads": self.local_q_heads,
             "max_batch_size": self.max_batch_size,
             "need_score": self.need_score,
+            "split_rule": _SPLIT_RULE,
+            "sm_count": self.sm_count,
+            "target_ctas_per_sm": 1,
+            "split_rounding": "nearest_absolute_ties_lower",
             "batch_configs": [
                 {
                     "batch_size": batch_size,
@@ -155,20 +158,26 @@ def select_tile_mla_config(
     *,
     batch_size: int,
     need_score: bool,
+    sm_count: int,
     local_q_heads: int = 10,
 ) -> TileMlaLaunchConfig:
-    """Select an offline-calibrated batch/head split independent of context."""
+    """Target one CTA per SM using batch/head parallelism, independent of context.
+
+    Choose the nearest split count in the conservative 4..32 profile range;
+    ties prefer fewer splits. This is a hardware-scaled heuristic, not a claim
+    of measured optimality on every GPU. Bind before CUDA Graph capture.
+    """
 
     if batch_size <= 0:
         raise ValueError(f"TileLang MLA batch must be positive, got {batch_size}.")
-    batch_bucket = next(
-        (bucket for bucket in _CALIBRATED_BATCH_BUCKETS if batch_size <= bucket),
-        _CALIBRATED_BATCH_BUCKETS[-1],
-    )
-    _padded_head_count(local_q_heads)
-    table = _FUSED_SCORE_SPLITS if need_score else _OUTPUT_ONLY_SPLITS
-    split = table[local_q_heads][batch_bucket]
-    block_h = 32 if local_q_heads == 20 and batch_bucket > 1 else 16
+    if sm_count is None or sm_count <= 0:
+        raise ValueError(f"TileLang MLA sm_count must be positive, got {sm_count}.")
+    padded_heads = _padded_head_count(local_q_heads)
+    block_h = 32 if local_q_heads == 20 and batch_size > 1 else 16
+    head_tiles = padded_heads // block_h
+    # Integer distance is equivalent to abs(split - SM_count / parallelism).
+    parallelism = batch_size * head_tiles
+    split = min(_PROFILE_SPLITS, key=lambda s: abs(s * parallelism - sm_count))
     score_mode = "direct"
     if need_score and local_q_heads == 20 and block_h == 16:
         score_mode = "partial"
@@ -218,6 +227,7 @@ class TileMlaDecodeKernel:
         valid_heads: int = 10,
         fixed_config: TileMlaLaunchConfig | None = None,
         launch_plan: TileMlaLaunchPlan | None = None,
+        sm_count: int | None = None,
     ) -> None:
         self.device = torch.device(device)
         self.softmax_scale = float(softmax_scale)
@@ -241,6 +251,9 @@ class TileMlaDecodeKernel:
                 )
         self.fixed_config = fixed_config
         self.launch_plan = launch_plan
+        if fixed_config is None and launch_plan is None and (sm_count is None or sm_count <= 0):
+            raise ValueError("TileLang MLA without a fixed config or launch plan requires a positive sm_count.")
+        self.sm_count = sm_count
         self._kernels: dict[_KernelKey, _BoundKernel] = {}
 
     def runtime_metadata(self) -> dict[str, object]:
@@ -302,6 +315,7 @@ class TileMlaDecodeKernel:
             batch_size=batch_size,
             need_score=need_score,
             local_q_heads=self.valid_heads,
+            sm_count=self.sm_count,
         )
 
     def _bind(self, key: _KernelKey) -> _BoundKernel:

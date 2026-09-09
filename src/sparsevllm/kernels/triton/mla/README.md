@@ -33,6 +33,27 @@ LightLLM Python package or runtime.
 for the initial H100 implementation. It is not recorded as tuned until the
 target GLM shape has dedicated benchmark evidence.
 
+Production Triton binding prepares an SM-driven schedule, without a device-name
+profile. Query heads use the next power-of-two tile capped at 16. The target
+split count per request is `ceil(SM_count / ceil(local_heads / head_tile))`;
+stage1 launches `4 * SM_count` persistent CTAs. Batch is not a grid axis: each
+CTA traverses requests. The schedule therefore targets per-request parallelism,
+not `batch * heads * splits` independent CTAs. These are performance heuristics,
+not a cross-GPU optimality guarantee or provider-eligibility restriction.
+
+At each replay, the GPU chooses a common block length from the sum of actual
+lengths divided by `nonempty_rows * target_splits`, rounded up to `block_n`.
+Per-request effective splits may differ for ragged input; padding does not
+increase the target. Workspace capacity covers `max_batch * (target_splits+1)`
+blocks, including ceiling-rounding slack. Launch shape, compiled variant and
+addresses stay fixed across replay lengths. Explicit fixed configs retain the
+legacy `program_count * blocks_per_program` target for controlled ablations.
+The split workspace now grows with configured maximum batch size, trading
+memory for parallelism; this is not a memory-neutral retuning. For example,
+H100/H20 at max batch64 reserves4288 blocks (about168MiB of partial outputs),
+versus2176 blocks in the old profile-wide workspace envelope. Account for this
+allocation before KV capacity planning.
+
 Synchronous slot-value validation is exposed separately so the cache manager
 can validate a mapping once and reuse it across layers. Kernel calls remain
 bounds-safe; passing `validate_slots=False` or `validate_metadata=False` means

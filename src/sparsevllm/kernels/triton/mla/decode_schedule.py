@@ -36,8 +36,11 @@ class MlaDecodeLaunchConfig:
     stage1_pipeline_stages: int = 2
     stage2_num_warps: int = 4
     stage2_pipeline_stages: int = 2
+    target_splits_per_request: int | None = None
 
     def __post_init__(self) -> None:
+        if self.target_splits_per_request is not None and self.target_splits_per_request <= 0:
+            raise ValueError("target_splits_per_request must be positive")
         positive_fields = (
             "program_count",
             "blocks_per_program",
@@ -60,86 +63,37 @@ class MlaDecodeLaunchConfig:
 
 DEFAULT_GLM_MLA_DECODE_CONFIG = MlaDecodeLaunchConfig()
 
-# Measured on H100 with GLM-4.7-Flash TP1/TP2/TP4 across 1K-64K contexts.
-# Selection is batch/head indexed and deliberately independent of context.
-_GLM_MLA_SMALL_BATCH_CONFIG = MlaDecodeLaunchConfig(
-    program_count=256,
-    blocks_per_program=4,
-    block_n=32,
-    block_q_heads=16,
-    stage1_num_warps=8,
-    stage1_pipeline_stages=6,
-    stage2_num_warps=4,
-    stage2_pipeline_stages=1,
-)
-_GLM_MLA_MEDIUM_BATCH_CONFIG = MlaDecodeLaunchConfig(
-    program_count=264,
-    blocks_per_program=2,
-    block_n=32,
-    block_q_heads=8,
-    stage1_num_warps=8,
-    stage1_pipeline_stages=4,
-    stage2_num_warps=4,
-    stage2_pipeline_stages=1,
-)
-_GLM_MLA_WIDE_SPLIT_CONFIG = MlaDecodeLaunchConfig(
-    program_count=128,
-    blocks_per_program=8,
-    block_n=32,
-    block_q_heads=8,
-    stage1_num_warps=8,
-    stage1_pipeline_stages=4,
-    stage2_num_warps=4,
-    stage2_pipeline_stages=1,
-)
-_GLM_MLA_LARGE_BATCH_CONFIG = MlaDecodeLaunchConfig(
-    program_count=256,
-    blocks_per_program=8,
-    block_n=32,
-    block_q_heads=8,
-    stage1_num_warps=8,
-    stage1_pipeline_stages=4,
-    stage2_num_warps=4,
-    stage2_pipeline_stages=1,
-)
-
-# One caller-owned allocation accommodates every measured TP2 schedule.
-GLM_MLA_MAX_WORKSPACE_CONFIG = MlaDecodeLaunchConfig(
-    program_count=264,
-    blocks_per_program=8,
-)
-
-
 def select_glm_mla_decode_config(
     *,
     batch_size: int,
     local_q_heads: int,
+    sm_count: int,
 ) -> MlaDecodeLaunchConfig:
-    """Select one H100 launch config for a static batch/head graph."""
+    """Prepare an SM-scaled persistent-CTA schedule, independent of lengths.
+
+    Stage1 loops over requests inside each CTA: batch is not a grid axis.
+    Target one SM wave of split/head work per request, not per batch. Four
+    program waves leave room for ragged requests with more than average work.
+    This is a tuning heuristic, not a cross-device performance guarantee.
+    """
 
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
     if local_q_heads <= 0:
         raise ValueError("local_q_heads must be positive")
-    if local_q_heads == 20:
-        if batch_size <= 1:
-            return _GLM_MLA_MEDIUM_BATCH_CONFIG
-        if batch_size <= 16:
-            return _GLM_MLA_SMALL_BATCH_CONFIG
-        return _GLM_MLA_WIDE_SPLIT_CONFIG
-    if local_q_heads == 10:
-        if batch_size <= 1:
-            return _GLM_MLA_MEDIUM_BATCH_CONFIG
-        if batch_size <= 4:
-            return _GLM_MLA_SMALL_BATCH_CONFIG
-        if batch_size <= 16:
-            return _GLM_MLA_WIDE_SPLIT_CONFIG
-        return _GLM_MLA_LARGE_BATCH_CONFIG
-    if local_q_heads == 5:
-        if batch_size <= 4:
-            return _GLM_MLA_MEDIUM_BATCH_CONFIG
-        return _GLM_MLA_LARGE_BATCH_CONFIG
-    return DEFAULT_GLM_MLA_DECODE_CONFIG
+    if sm_count <= 0:
+        raise ValueError("sm_count must be positive")
+    block_q_heads = min(16, 1 << (local_q_heads - 1).bit_length())
+    head_tiles = (local_q_heads + block_q_heads - 1) // block_q_heads
+    return MlaDecodeLaunchConfig(
+        program_count=4 * sm_count,
+        block_n=32,
+        block_q_heads=block_q_heads,
+        stage1_num_warps=8,
+        stage1_pipeline_stages=4,
+        stage2_pipeline_stages=1,
+        target_splits_per_request=(sm_count + head_tiles - 1) // head_tiles,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,7 +112,10 @@ def required_workspace_blocks(
 ) -> int:
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
-    return config.program_count * config.blocks_per_program + batch_size
+    target = (batch_size * config.target_splits_per_request
+              if config.target_splits_per_request is not None
+              else config.program_count * config.blocks_per_program)
+    return target + batch_size
 
 
 def allocate_mla_decode_workspace(
@@ -203,6 +160,7 @@ def _build_decode_schedule_kernel(
     batch_size,
     BLOCK_N: tl.constexpr,
     PADDED_BATCH_SIZE: tl.constexpr,
+    TARGET_SPLITS_PER_REQUEST: tl.constexpr,
 ):
     offsets = tl.arange(0, PADDED_BATCH_SIZE)
     context_mask = offsets < batch_size
@@ -213,6 +171,10 @@ def _build_decode_schedule_kernel(
     )
     total_tokens = tl.sum(lengths, axis=0)
     target_blocks = program_count * blocks_per_program
+    if TARGET_SPLITS_PER_REQUEST > 0:
+        # Padding must not inflate the partition target during graph replay.
+        active_count = tl.sum((lengths > 0).to(tl.int32), axis=0)
+        target_blocks = tl.maximum(1, active_count * TARGET_SPLITS_PER_REQUEST)
     unaligned_block_size = tl.maximum(1, tl.cdiv(total_tokens, target_blocks))
     block_size = tl.cdiv(unaligned_block_size, BLOCK_N) * BLOCK_N
 
@@ -315,6 +277,7 @@ def prepare_mla_decode_schedule(
         batch_size=batch_size,
         BLOCK_N=config.block_n,
         PADDED_BATCH_SIZE=triton.next_power_of_2(batch_size),
+        TARGET_SPLITS_PER_REQUEST=config.target_splits_per_request or 0,
         num_warps=4,
         num_stages=1,
     )

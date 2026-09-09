@@ -22,7 +22,6 @@ from sparsevllm.kernels.tilelang.mla.runtime import (
 )
 from sparsevllm.kernels.triton.mla import (
     DEFAULT_GLM_MLA_DECODE_CONFIG,
-    GLM_MLA_MAX_WORKSPACE_CONFIG,
     MlaDecodeLaunchConfig,
     allocate_mla_decode_workspace,
     run_mla_decode,
@@ -179,7 +178,7 @@ class MlaTritonProvider(MlaAttentionProvider):
         device: torch.device | str,
         max_batch_size: int,
         launch_config: MlaDecodeLaunchConfig | None = None,
-        use_h100_launch_profile: bool = False,
+        sm_count: int | None = None,
     ) -> None:
         self.spec = op_spec
         requested_device = torch.device(device)
@@ -190,18 +189,19 @@ class MlaTritonProvider(MlaAttentionProvider):
                 f"{self.max_batch_size}."
             )
         self._fixed_launch_config = launch_config
-        self._use_h100_launch_profile = bool(use_h100_launch_profile)
-        self.launch_config = launch_config or DEFAULT_GLM_MLA_DECODE_CONFIG
-        workspace_config = launch_config or (
-            GLM_MLA_MAX_WORKSPACE_CONFIG
-            if self._use_h100_launch_profile
-            else DEFAULT_GLM_MLA_DECODE_CONFIG
+        self._sm_count = sm_count
+        self.launch_config = launch_config or (
+            select_glm_mla_decode_config(
+                batch_size=self.max_batch_size,
+                local_q_heads=self.spec.local_q_heads,
+                sm_count=sm_count,
+            ) if sm_count is not None else DEFAULT_GLM_MLA_DECODE_CONFIG
         )
         self.workspace = allocate_mla_decode_workspace(
             batch_size=self.max_batch_size,
             head_count=self.spec.local_q_heads,
             device=requested_device,
-            config=workspace_config,
+            config=self.launch_config,
         )
         self.device = self.workspace.block_size.device
         self._validated_decode_metadata: tuple[
@@ -228,11 +228,10 @@ class MlaTritonProvider(MlaAttentionProvider):
     ) -> "MlaTritonProvider":
         if cls is not MlaTritonProvider:
             return cls(**kwargs)
+        if caps.multi_processor_count is None or caps.multi_processor_count <= 0:
+            raise ValueError("Triton MLA requires a positive SM count in DeviceCaps.")
         return cls(
-            use_h100_launch_profile=(
-                caps.compute_capability == (9, 0)
-                and device_name_contains(caps.device_name, _PROFILED_H100_NAME)
-            ),
+            sm_count=caps.multi_processor_count,
             **kwargs,
         )
 
@@ -242,10 +241,13 @@ class MlaTritonProvider(MlaAttentionProvider):
             "implementation_source": "repo_triton",
             "decode_kernel_path": "triton_mla_stage1_stage2",
             "launch_config_source": (
-                "h100_batch_head_profile"
-                if self._use_h100_launch_profile
-                else "portable_default"
+                "explicit_config" if self._fixed_launch_config is not None else
+                "sm_per_request_v1" if self._sm_count is not None else "portable_default"
             ),
+            "sm_count": self._sm_count,
+            "program_count": self.launch_config.program_count,
+            "target_splits_per_request": self.launch_config.target_splits_per_request,
+            "block_q_heads": self.launch_config.block_q_heads,
         }
         if not self.spec.cuda_graph:
             return metadata
@@ -253,7 +255,7 @@ class MlaTritonProvider(MlaAttentionProvider):
             **metadata,
             "cuda_graph_mode": "batch_indexed",
             "context_capacity": self.spec.context_capacity,
-            "launch_plan_source": "batch_local_heads",
+            "launch_plan_source": "device_sm_local_heads" if self._sm_count is not None else "explicit_static_config",
         }
 
     def _record_runtime_kernel_path(self, path: str) -> None:
@@ -478,15 +480,8 @@ class MlaTritonProvider(MlaAttentionProvider):
         max_context_len: int | None,
         active_slot_width: int,
     ) -> MlaDecodeLaunchConfig:
-        if self._fixed_launch_config is not None:
-            return self._fixed_launch_config
-        del max_context_len, active_slot_width
-        if not self._use_h100_launch_profile:
-            return DEFAULT_GLM_MLA_DECODE_CONFIG
-        return select_glm_mla_decode_config(
-            batch_size=batch_size,
-            local_q_heads=self.spec.local_q_heads,
-        )
+        del batch_size, max_context_len, active_slot_width
+        return self.launch_config
 
     @torch.no_grad()
     def run(
@@ -665,6 +660,7 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
         op_spec: MlaAttentionOpSpec,
         device: torch.device | str,
         max_batch_size: int,
+        sm_count: int,
         launch_config: MlaDecodeLaunchConfig | None = None,
     ) -> None:
         super().__init__(
@@ -683,6 +679,7 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
             max_batch_size=self.max_batch_size,
             need_score=True,
             score_mode="per_head",
+            sm_count=sm_count,
         )
         self.tilelang_score = TileMlaDecodeKernel(
             device=self.device,
@@ -690,6 +687,13 @@ class MlaTileLangScoreProvider(MlaSglFa3Provider):
             valid_heads=self.spec.local_q_heads,
             launch_plan=self.tilelang_launch_plan,
         )
+
+    @classmethod
+    def bind(cls, spec: MlaAttentionOpSpec, caps: DeviceCaps, **kwargs):
+        del spec
+        if caps.multi_processor_count is None or caps.multi_processor_count <= 0:
+            raise ValueError("TileLang MLA requires a positive SM count in DeviceCaps.")
+        return cls(sm_count=caps.multi_processor_count, **kwargs)
 
     @classmethod
     def supports(
@@ -866,8 +870,7 @@ class MlaTileLangScoreProfile:
 
     @classmethod
     def bind(cls, spec: MlaAttentionOpSpec, caps: DeviceCaps, **kwargs):
-        del spec, caps
-        return MlaTileLangScoreProvider(**kwargs)
+        return MlaTileLangScoreProvider.bind(spec, caps, **kwargs)
 
 
 def resolve_mla_attention_provider(
