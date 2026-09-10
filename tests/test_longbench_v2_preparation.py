@@ -1,6 +1,7 @@
 """Protect official truncation parity and prepared-input reproducibility."""
 
 import json
+from functools import partial
 from pathlib import Path
 import runpy
 import sys
@@ -9,10 +10,54 @@ from types import SimpleNamespace
 import pytest
 
 from benchmark.long_bench_v2.contracts import prepare_official_samples, render_prompt
+from benchmark.long_bench_v2.preparation import prepare_chat, prepare_official_samples_parallel
 
 
 UPSTREAM = Path(__file__).resolve().parents[1] / "benchmark/long_bench_v2/upstream"
 TEMPLATE = "$DOC$\n$Q$\n$C_A$\n$C_B$\n$C_C$\n$C_D$"
+
+
+@pytest.fixture
+def local_tokenizer(tmp_path):
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    backend = Tokenizer(models.WordLevel(
+        {"[UNK]": 0, "[BOS]": 1, "x": 2, "y": 3, "z": 4}, unk_token="[UNK]",
+    ))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]", bos_token="[BOS]")
+    tokenizer.chat_template = "{{ bos_token }} USER {{ messages[0]['content'] }} ASSISTANT"
+    tokenizer.save_pretrained(tmp_path)
+    return tokenizer, str(tmp_path)
+
+
+def test_parallel_preparation_matches_serial_with_exact_source_order(local_tokenizer):
+    # Real spawned workers must preserve inputs and metadata despite different sample costs.
+    tokenizer, path = local_tokenizer
+    rows = [{**sample(), "_id": str(i), "context": "x y z " * size}
+            for i, size in enumerate([500, 1, 10, 300, 2, 40])]
+    serial = prepare_official_samples(
+        rows, template=TEMPLATE, tokenizer=tokenizer,
+        prepare_chat=partial(prepare_chat, tokenizer, no_chat_template=False),
+        truncate_max_tokens=31, max_prompt_tokens=100,
+    )
+    parallel = prepare_official_samples_parallel(
+        rows, tokenizer_path=path, template=TEMPLATE, no_chat_template=False,
+        truncate_max_tokens=31, max_prompt_tokens=100, workers=2,
+    )
+    assert parallel == serial
+
+
+def test_parallel_worker_failure_is_propagated(local_tokenizer):
+    # A worker failure must invalidate the run instead of dropping the failing sample.
+    _, path = local_tokenizer
+    with pytest.raises(ValueError, match="does not truncate again"):
+        prepare_official_samples_parallel(
+            [sample(), {**sample(), "_id": "two"}], tokenizer_path=path,
+            template=TEMPLATE, no_chat_template=False,
+            truncate_max_tokens=31, max_prompt_tokens=1, workers=2,
+        )
 
 
 class CharacterTokenizer:
@@ -123,7 +168,8 @@ def test_full_preparation_reuse_binds_official_truncation_budget(monkeypatch, tm
     from benchmark.long_bench_v2 import pred
 
     monkeypatch.setattr(pred.AutoTokenizer, "from_pretrained", lambda *a, **kw: CharacterTokenizer())
-    monkeypatch.setattr(pred, "build_chat", lambda tokenizer, prompt, *a, **kw: "USER:" + prompt)
+    from benchmark.long_bench_v2 import preparation
+    monkeypatch.setattr(preparation, "build_chat", lambda tokenizer, prompt, *a, **kw: "USER:" + prompt)
     data = tmp_path / "data.json"
     rows = [sample(), {**sample(), "_id": "two"}]
     data.write_text(json.dumps(rows))
@@ -131,6 +177,7 @@ def test_full_preparation_reuse_binds_official_truncation_budget(monkeypatch, tm
     template.write_text(TEMPLATE)
     common = ["pred.py", "--model-path", str(tmp_path), "--data-path", str(data),
               "--prompt-template", str(template), "--all-samples", "--prepare-only",
+              "--preprocess-workers", "1",
               "--overflow-policy", "official-middle", "--max-model-len", "200",
               "--max-new-tokens", "10"]
     original = tmp_path / "original"

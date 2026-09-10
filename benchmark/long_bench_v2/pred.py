@@ -22,7 +22,10 @@ if str(SRC_ROOT) not in sys.path:
 
 from transformers import AutoConfig, AutoTokenizer, GenerationConfig
 
-from benchmark.long_bench.pred import build_chat
+from benchmark.long_bench_v2.preparation import (
+    prepare_chat as tokenize_chat,
+    prepare_official_samples_parallel,
+)
 from benchmark.long_bench_v2.contracts import (
     aggregate_results,
     extract_answer,
@@ -195,6 +198,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--official-length", choices=("short", "medium", "long"))
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--prepared-samples", default=None)
+    parser.add_argument("--preprocess-workers", type=int, default=8,
+                        help="CPU processes for full-dataset preparation (default: 8); ignored for subsets.")
     parser.add_argument("--hyper-param-json", default=None)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--data-path", default=os.getenv(DEFAULT_DATA_ENV))
@@ -229,6 +234,10 @@ def main() -> int:
     _write_json(output_dir / "run_status.json", {"status": "running"})
     phase = "input"
     try:
+        if args.preprocess_workers <= 0:
+            raise ValueError("--preprocess-workers must be positive.")
+        if not args.all_samples:
+            args.preprocess_workers = 1
         if args.all_samples and args.official_length:
             raise ValueError("--all-samples cannot be combined with --official-length.")
         if args.all_samples and args.overflow_policy != "official-middle":
@@ -294,26 +303,7 @@ def main() -> int:
         )
 
         def prepare_chat(prompt: str) -> tuple[str, list[int]]:
-            prompt = build_chat(
-                tokenizer,
-                prompt,
-                "longbench_v2",
-                no_chat_template=args.no_chat_template,
-                thinking_mode="off",
-            )
-            add_special_tokens = bool(
-                tokenizer.bos_token is not None
-                and not prompt.startswith(tokenizer.bos_token)
-            )
-            token_ids = [
-                int(token_id)
-                for token_id in tokenizer.encode(
-                    prompt, add_special_tokens=add_special_tokens
-                )
-            ]
-            if not token_ids:
-                raise ValueError("LongBench v2 prompt tokenized to zero tokens.")
-            return prompt, token_ids
+            return tokenize_chat(tokenizer, prompt, no_chat_template=args.no_chat_template)
 
         def prepare_prompt(sample: dict[str, Any]) -> tuple[str, list[int]]:
             return prepare_chat(render_prompt(template, sample))
@@ -340,6 +330,12 @@ def main() -> int:
             if any(len(item["prompt_token_ids"]) != item["prompt_tokens"] or
                    not 0 < item["prompt_tokens"] <= max_prompt_tokens for item in selected):
                 raise ValueError("Prepared samples have invalid or oversized token sequences.")
+        elif args.all_samples and args.preprocess_workers > 1:
+            selected = prepare_official_samples_parallel(
+                source_rows, tokenizer_path=tokenizer_path, template=template,
+                no_chat_template=args.no_chat_template, truncate_max_tokens=args.truncate_max_tokens,
+                max_prompt_tokens=max_prompt_tokens, workers=args.preprocess_workers,
+            )
         elif args.overflow_policy == "official-middle":
             selected = prepare_official_samples(
                 source_rows, template=template, tokenizer=tokenizer, prepare_chat=prepare_chat,
@@ -388,6 +384,7 @@ def main() -> int:
             "seed": args.seed,
             "token_buckets": [bucket.__dict__ for bucket in buckets],
             "selected_samples": len(selected),
+            "preprocess_workers": args.preprocess_workers,
             "no_chat_template": args.no_chat_template,
             "requested_runtime": infer_config,
         }

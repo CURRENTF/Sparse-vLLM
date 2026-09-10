@@ -74,6 +74,17 @@ and generation settings across vanilla and sparse runs. `--prepare-only` and
 `--prepared-samples` also support full mode and bind reuse to its prompt budget
 and overflow policy, including the pre-chat limit in official-middle mode.
 
+`--preprocess-workers N` parallelizes full-dataset tokenization, middle truncation,
+and chat preparation across CPU processes. Full-dataset preparation defaults to
+8 workers; pass 1 for serial preparation. Token-bucket subsets remain serial.
+Workers load separate tokenizers, so increasing the count also increases RAM usage.
+The queue is bounded, source order and token IDs are preserved, and any worker
+failure fails the run. Progress is printed as samples finish. This setting does
+not change GPU parallelism or generation batch size and is recorded in the run
+configuration without changing prepared-sample identity. When `--prepared-samples`
+is supplied, preparation is skipped regardless of the worker count. Preparing
+once and reusing the export across methods avoids repeating this CPU work.
+
 For paired external-runtime evaluation, `--engine vllm` accepts constructor
 options through `--engine-kwargs`, and `--engine sglang-http --server-url ...`
 uses an already-running server with matching model identity and disabled radix
