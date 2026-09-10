@@ -29,6 +29,7 @@ from benchmark.long_bench_v2.contracts import (
     file_sha256,
     load_dataset,
     parse_token_buckets,
+    prepare_official_samples,
     render_prompt,
     select_samples,
 )
@@ -62,18 +63,16 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 def _load_json_object(value: str | None) -> dict[str, Any]:
     if value is None:
         return {}
-    candidate = Path(value)
-    if candidate.is_file():
-        loaded = json.loads(candidate.read_text(encoding="utf-8"))
-    else:
-        try:
-            loaded = json.loads(value)
-        except json.JSONDecodeError as exc:
+    try:
+        loaded = json.loads(value)
+    except json.JSONDecodeError as exc:
+        if value.lstrip().startswith(("{", "[")):
             raise ValueError(
-                "--hyper-param-json must be a JSON object or a path to one."
+                "Invalid inline JSON configuration."
             ) from exc
+        loaded = json.loads(Path(value).read_text(encoding="utf-8"))
     if not isinstance(loaded, dict):
-        raise ValueError("--hyper-param-json must decode to a JSON object.")
+        raise ValueError("JSON configuration must decode to an object.")
     return loaded
 
 
@@ -154,6 +153,13 @@ def _identity(item: dict[str, Any]) -> dict[str, Any]:
         "official_length": sample["length"],
         "token_bucket": item["token_bucket"],
         "prompt_tokens": int(item["prompt_tokens"]),
+        "original_prompt_tokens": int(item.get("original_prompt_tokens", item["prompt_tokens"])),
+        "truncated": bool(item.get("truncated", False)),
+        **({"original_prompt_sha256": item["original_prompt_sha256"]}
+           if "original_prompt_sha256" in item else {}),
+        "prompt_token_ids_sha256": hashlib.sha256(
+            json.dumps(item["prompt_token_ids"], separators=(",", ":")).encode()
+        ).hexdigest(),
         "prompt_sha256": hashlib.sha256(item["prompt"].encode("utf-8")).hexdigest(),
         "context_sha256": hashlib.sha256(
             sample["context"].encode("utf-8")
@@ -177,7 +183,7 @@ def _record_failure(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a deterministic, untruncated LongBench v2 quality subset."
+        description="Run LongBench v2 on all samples or a deterministic token-stratified subset."
     )
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--tokenizer-path", default=None)
@@ -202,9 +208,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260901)
     parser.add_argument("--no-chat-template", action="store_true")
     parser.add_argument("--allow-prefix-caching", action="store_true")
-    parser.add_argument(
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--all-samples", action="store_true",
+                           help="Evaluate every source sample without token-bucket sampling.")
+    parser.add_argument("--overflow-policy", choices=("error", "official-middle"),
+                        default="error", help="Full-dataset truncation policy.")
+    parser.add_argument("--truncate-max-tokens", type=int, default=None,
+                        help="Pre-chat token limit for official-middle (e.g. upstream's 120000).")
+    selection.add_argument(
         "--token-buckets-json",
-        required=True,
         help="JSON list of name/min_prompt_tokens/max_prompt_tokens/samples objects.",
     )
     return parser.parse_args()
@@ -217,10 +229,23 @@ def main() -> int:
     _write_json(output_dir / "run_status.json", {"status": "running"})
     phase = "input"
     try:
+        if args.all_samples and args.official_length:
+            raise ValueError("--all-samples cannot be combined with --official-length.")
+        if args.all_samples and args.overflow_policy != "official-middle":
+            raise ValueError("--all-samples requires --overflow-policy official-middle.")
+        if not args.all_samples and args.overflow_policy != "error":
+            raise ValueError("Truncating overflow policies require --all-samples.")
+        if args.overflow_policy == "official-middle":
+            if args.truncate_max_tokens is None or args.truncate_max_tokens <= 0:
+                raise ValueError("official-middle requires a positive --truncate-max-tokens.")
+        elif args.truncate_max_tokens is not None:
+            raise ValueError("--truncate-max-tokens requires --overflow-policy official-middle.")
         if args.engine == "sparsevllm" and (args.engine_kwargs or args.server_url):
             raise ValueError("Native quality does not accept external engine/server options.")
         if args.engine != "sparsevllm" and args.hyper_param_json:
             raise ValueError("External quality does not accept native --hyper-param-json.")
+        infer_config = _build_infer_config(args)
+        engine_kwargs = _load_json_object(args.engine_kwargs)
         if not args.data_path:
             raise FileNotFoundError(
                 "LongBench v2 data is not configured. Pass --data-path or set "
@@ -233,7 +258,7 @@ def main() -> int:
         max_prompt_tokens = args.max_model_len - args.max_new_tokens
         if max_prompt_tokens <= 0:
             raise ValueError("max-new-tokens leaves no LongBench v2 prompt budget.")
-        buckets = parse_token_buckets(args.token_buckets_json)
+        buckets = () if args.all_samples else parse_token_buckets(args.token_buckets_json)
         oversized = [
             bucket.name
             for bucket in buckets
@@ -268,8 +293,7 @@ def main() -> int:
             tokenizer_path, trust_remote_code=True
         )
 
-        def prepare_prompt(sample: dict[str, Any]) -> tuple[str, list[int]]:
-            prompt = render_prompt(template, sample)
+        def prepare_chat(prompt: str) -> tuple[str, list[int]]:
             prompt = build_chat(
                 tokenizer,
                 prompt,
@@ -288,10 +312,11 @@ def main() -> int:
                 )
             ]
             if not token_ids:
-                raise ValueError(
-                    f"LongBench v2 sample {sample['_id']!r} tokenized to zero tokens."
-                )
+                raise ValueError("LongBench v2 prompt tokenized to zero tokens.")
             return prompt, token_ids
+
+        def prepare_prompt(sample: dict[str, Any]) -> tuple[str, list[int]]:
+            return prepare_chat(render_prompt(template, sample))
 
         phase = "selection"
         if args.prepared_samples:
@@ -302,6 +327,10 @@ def main() -> int:
                         "seed": args.seed, "no_chat_template": args.no_chat_template,
                         "official_length": args.official_length,
                         "token_buckets": [bucket.__dict__ for bucket in buckets]}
+            if args.all_samples:
+                expected.update(all_samples=True, overflow_policy=args.overflow_policy,
+                                max_prompt_tokens=max_prompt_tokens,
+                                truncate_max_tokens=args.truncate_max_tokens)
             prepared_identity = dict(prepared["identity"])
             prepared_identity["tokenizer_path"] = str(Path(prepared_identity["tokenizer_path"]).resolve())
             if prepared_identity != expected:
@@ -311,23 +340,35 @@ def main() -> int:
             if any(len(item["prompt_token_ids"]) != item["prompt_tokens"] or
                    not 0 < item["prompt_tokens"] <= max_prompt_tokens for item in selected):
                 raise ValueError("Prepared samples have invalid or oversized token sequences.")
+        elif args.overflow_policy == "official-middle":
+            selected = prepare_official_samples(
+                source_rows, template=template, tokenizer=tokenizer, prepare_chat=prepare_chat,
+                truncate_max_tokens=args.truncate_max_tokens, max_prompt_tokens=max_prompt_tokens,
+            )
         else:
             selected = select_samples(
                 source_rows, buckets=buckets, seed=args.seed,
                 prepare_prompt=prepare_prompt, max_prompt_tokens=max_prompt_tokens,
             )
+        if args.all_samples and [item["sample"] for item in selected] != source_rows:
+            raise ValueError("Full-dataset samples must match every source row in source order.")
         identities = [_identity(item) for item in selected]
         _write_jsonl(output_dir / "dataset.jsonl", identities)
 
-        infer_config = _build_infer_config(args)
         resolved_config = {
             "benchmark": "longbench_v2",
-            "protocol": "official_0shot_direct_untruncated_token_stratified",
+            "protocol": ("official_0shot_direct_all_pre_chat_middle"
+                         if args.all_samples else "official_0shot_direct_untruncated_token_stratified"),
+            "all_samples": args.all_samples,
+            "overflow_policy": args.overflow_policy,
+            "max_prompt_tokens": max_prompt_tokens,
+            "truncate_max_tokens": args.truncate_max_tokens,
+            "truncated_samples": sum(item.get("truncated", False) for item in selected),
             "model_path": str(Path(args.model_path).resolve()),
             "tokenizer_path": str(Path(tokenizer_path).resolve()),
             "sparse_method": args.sparse_method,
             "engine": args.engine,
-            "engine_kwargs": _load_json_object(args.engine_kwargs),
+            "engine_kwargs": engine_kwargs,
             "server_url": args.server_url,
             "official_length": args.official_length,
             "prepared_samples_sha256": file_sha256(args.prepared_samples) if args.prepared_samples else None,
@@ -352,10 +393,13 @@ def main() -> int:
         }
         _write_json(output_dir / "resolved_config.json", resolved_config)
         if args.prepare_only:
+            identity_keys = ["data_sha256", "prompt_template_sha256", "tokenizer_path", "seed",
+                             "no_chat_template", "official_length", "token_buckets"]
+            if args.all_samples:
+                identity_keys.extend(["all_samples", "overflow_policy", "max_prompt_tokens",
+                                      "truncate_max_tokens"])
             _write_json(output_dir / "prepared_samples.json", {
-                "identity": {key: resolved_config[key] for key in (
-                    "data_sha256", "prompt_template_sha256", "tokenizer_path", "seed",
-                    "no_chat_template", "official_length", "token_buckets")},
+                "identity": {key: resolved_config[key] for key in identity_keys},
                 "samples": selected,
             })
             _write_json(output_dir / "run_status.json", {"status": "prepared", "samples": len(selected)})

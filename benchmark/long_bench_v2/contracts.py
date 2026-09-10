@@ -244,6 +244,50 @@ def select_samples(
     return selected
 
 
+def prepare_official_samples(
+    rows: list[dict[str, Any]],
+    *,
+    template: str,
+    tokenizer: Any,
+    prepare_chat: Callable[[str], tuple[str, list[int]]],
+    truncate_max_tokens: int,
+    max_prompt_tokens: int,
+) -> list[dict[str, Any]]:
+    """Match upstream query_llm's Hugging Face middle truncation before chat."""
+    if truncate_max_tokens <= 0 or max_prompt_tokens <= 0:
+        raise ValueError("Truncation and runtime prompt budgets must be positive.")
+    selected = []
+    for index, row in enumerate(rows):
+        original = render_prompt(template, row)
+        input_ids = tokenizer.encode(original)
+        truncated = len(input_ids) > truncate_max_tokens
+        content = original
+        if truncated:
+            # Preserve upstream's encode -> slice -> decode round trip, including BOS handling.
+            kept = input_ids[:truncate_max_tokens // 2] + input_ids[-truncate_max_tokens // 2:]
+            content = tokenizer.decode(kept, skip_special_tokens=True)
+        prompt, token_ids = prepare_chat(content)
+        if not 0 < len(token_ids) <= max_prompt_tokens:
+            raise ValueError(
+                f"Sample {row['_id']!r} has {len(token_ids)} post-chat tokens; "
+                f"runtime prompt budget is {max_prompt_tokens}. Lower --truncate-max-tokens "
+                "or increase --max-model-len; official mode does not truncate again."
+            )
+        selected.append({
+            "index": index,
+            "source_index": index,
+            "sample": row,
+            "prompt": prompt,
+            "prompt_token_ids": token_ids,
+            "prompt_tokens": len(token_ids),
+            "original_prompt_tokens": len(input_ids),
+            "original_prompt_sha256": hashlib.sha256(original.encode("utf-8")).hexdigest(),
+            "truncated": truncated,
+            "token_bucket": "all",
+        })
+    return selected
+
+
 def aggregate_results(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if not rows:
         raise ValueError("LongBench v2 aggregate requires at least one sample.")
