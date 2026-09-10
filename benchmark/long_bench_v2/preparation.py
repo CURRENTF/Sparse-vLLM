@@ -7,6 +7,7 @@ import os
 from typing import Any
 
 from transformers import AutoTokenizer
+from tqdm import tqdm
 
 from benchmark.long_bench.pred import build_chat
 from benchmark.long_bench_v2.contracts import prepare_official_samples
@@ -59,12 +60,14 @@ def prepare_official_samples_parallel(
     workers = min(workers, len(rows))
     selected = [None] * len(rows)
     indices = iter(range(len(rows)))
-    completed = 0
     with ProcessPoolExecutor(
         max_workers=workers, mp_context=multiprocessing.get_context("spawn"),
         initializer=_initialize_worker,
         initargs=(tokenizer_path, template, no_chat_template, truncate_max_tokens, max_prompt_tokens),
-    ) as pool:
+    ) as pool, tqdm(
+        total=len(rows), desc="LongBench v2 preparation", unit="it",
+        dynamic_ncols=True, disable=None,
+    ) as progress:
         # Bound queued source texts and returned token arrays instead of submitting all 503 rows.
         pending = {}
         for _ in range(min(2 * workers, len(rows))):
@@ -78,8 +81,7 @@ def prepare_official_samples_parallel(
                     result = future.result()
                     result.update(index=index, source_index=index, sample=rows[index])
                     selected[index] = result
-                    completed += 1
-                    print(f"LongBench v2 preparation: {completed}/{len(rows)}", flush=True)
+                    progress.update(1)
                     next_index = next(indices, None)
                     if next_index is not None:
                         pending[pool.submit(_prepare_row, rows[next_index])] = next_index
