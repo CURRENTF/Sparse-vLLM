@@ -62,3 +62,47 @@ def test_indexed_host_copy_replay(shape):
             torch.testing.assert_close(actual[batch, :n], expected, rtol=0, atol=0)
         torch.testing.assert_close(actual[0, 3], source[0].cpu(), rtol=0, atol=0)
         torch.testing.assert_close(host[7], source[0].cpu(), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_current_token_follows_selection_when_recent_budget_is_zero():
+    # Top-K is unsorted and may exclude the newest token entirely. The old
+    # last-position append corrupted the selected history in both situations.
+    host = torch.randn(11, 1, 64, dtype=torch.bfloat16).pin_memory()
+    pointers = torch.tensor([host.data_ptr()], dtype=torch.uint64, device="cuda")
+    table = torch.tensor([[2, 5, 8], [6, 1, 9]], dtype=torch.int32, device="cuda")
+    rows = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([3, 3], dtype=torch.int32, device="cuda")
+    write_slots = torch.tensor([5, 7], dtype=torch.int32, device="cuda")
+    current = torch.randn(2, 1, 64, dtype=torch.bfloat16, device="cuda")
+    output = torch.empty(6, 1, 64, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        gather_rows(
+            pointers,
+            output,
+            table,
+            rows,
+            lengths,
+            capacity=3,
+            component=0,
+            exclude_slots=write_slots,
+        )
+        append_rows(current, output, lengths, write_slots, 3, table=table, rows=rows)
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for selected in ([[2, 5, 8], [6, 1, 9]], [[8, 2, 9], [7, 1, 6]]):
+        table.copy_(torch.tensor(selected, dtype=torch.int32, device="cuda"))
+        current.add_(1)
+        graph.replay()
+        actual = output.cpu().view(2, 3, 1, 64)
+        for batch, slots in enumerate(selected):
+            reference = host[slots].clone()
+            for index, slot in enumerate(slots):
+                if slot == int(write_slots[batch]):
+                    reference[index] = current[batch].cpu()
+            torch.testing.assert_close(actual[batch], reference, rtol=0, atol=0)

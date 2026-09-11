@@ -38,6 +38,7 @@ def _gather(
     ROWS,
     LENGTHS,
     SLOT_MAP,
+    EXCLUDE_SLOTS,
     TABLE_STRIDE: tl.constexpr,
     WIDTH: tl.constexpr,
     CAPACITY: tl.constexpr,
@@ -58,6 +59,8 @@ def _gather(
         d = offset % WIDTH
         valid = (token < length - SKIP_LAST) & (token < CAPACITY)
         slot = tl.load(TABLE + row * TABLE_STRIDE + token, valid, 0)
+        if EXCLUDE_SLOTS is not None:
+            valid = valid & (slot != tl.load(EXCLUDE_SLOTS + batch))
         source_slot = slot
         if SLOT_MAP is not None:
             source_slot = tl.load(SLOT_MAP + slot, valid, 0)
@@ -72,6 +75,10 @@ def _append(
     DST,
     LENGTHS,
     WRITE_SLOTS,
+    TABLE,
+    ROWS,
+    TABLE_STRIDE: tl.constexpr,
+    SEEK_BLOCK: tl.constexpr,
     WIDTH: tl.constexpr,
     SRC_STRIDE: tl.constexpr,
     CAPACITY: tl.constexpr,
@@ -81,6 +88,16 @@ def _append(
     d = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     length = tl.load(LENGTHS + row)
     slot = tl.load(WRITE_SLOTS + row)
+    if TABLE is not None:
+        token = tl.arange(0, SEEK_BLOCK)
+        table_row = tl.load(ROWS + row)
+        selected = tl.load(
+            TABLE + table_row * TABLE_STRIDE + token,
+            (token < length) & (token < CAPACITY),
+            -1,
+        )
+        position = tl.max(tl.where((selected == slot) & (token < length), token, -1), 0)
+        length = position + 1
     valid = (slot >= 0) & (length > 0) & (length <= CAPACITY) & (d < WIDTH)
     x = tl.load(SRC + row * SRC_STRIDE + d, valid, 0)
     tl.store(DST + (row * CAPACITY + length - 1).to(tl.int64) * WIDTH + d, x, valid)
@@ -120,6 +137,7 @@ def gather_rows(
     scatter: bool = False,
     slot_map=None,
     max_blocks: int = 0,
+    exclude_slots=None,
 ) -> None:
     width = destination.shape[-2] * destination.shape[-1]
     blocks = triton.cdiv(capacity * width, 4096)
@@ -132,6 +150,7 @@ def gather_rows(
         rows,
         lengths,
         slot_map,
+        exclude_slots,
         table.stride(0),
         width,
         capacity,
@@ -148,6 +167,9 @@ def append_rows(
     lengths: torch.Tensor,
     write_slots: torch.Tensor,
     capacity: int,
+    *,
+    table=None,
+    rows=None,
 ) -> None:
     width = source.shape[-2] * source.shape[-1]
     _append[(source.shape[0], triton.cdiv(width, 256))](
@@ -155,6 +177,10 @@ def append_rows(
         destination,
         lengths,
         write_slots,
+        table,
+        rows,
+        0 if table is None else table.stride(0),
+        triton.next_power_of_2(capacity),
         width,
         source.stride(0),
         capacity,

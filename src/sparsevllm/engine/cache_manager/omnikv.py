@@ -35,6 +35,9 @@ class OmniKVCacheManager(StandardCacheManager):
         if original.dtype not in (torch.float16, torch.bfloat16):
             raise ValueError("OmniKV offload supports FP16/BF16 cache storage.")
         full = [self.kv_layer_index(i) for i in self.config.full_attention_layers]
+        # Before the first observer, GPU-only OmniKV also consumes full history.
+        if full:
+            full = sorted(set(full) | set(range(min(full))))
         sparse = self.num_kv_layers - len(full)
         if not full or sparse <= 0:
             raise ValueError(
@@ -268,7 +271,10 @@ class OmniKVCacheManager(StandardCacheManager):
                 lengths,
                 capacity=self.selected_capacity,
                 component=component,
-                skip_last=True,
+                skip_last=self.config.recent_keep_tokens > 0,
+                exclude_slots=self.layer_batch_state.slot_mapping
+                if self.config.recent_keep_tokens == 0
+                else None,
                 max_blocks=32,
                 slot_map=self.attention_cache_storage.host_slot_map,
             )
@@ -324,6 +330,8 @@ class OmniKVCacheManager(StandardCacheManager):
                 context_lens,
                 self.layer_batch_state.slot_mapping,
                 self.selected_capacity,
+                table=active_slots if self.config.recent_keep_tokens == 0 else None,
+                rows=req_indices if self.config.recent_keep_tokens == 0 else None,
             )
         batch = req_indices.numel()
         return (
