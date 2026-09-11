@@ -50,6 +50,10 @@ class OmniKVCacheManager(StandardCacheManager):
             + self.config.decode_keep_tokens
             + self.config.recent_keep_tokens,
         )
+        if self.selected_capacity == 0:
+            raise ValueError(
+                "OmniKV offload requires a positive total selected-token budget."
+            )
         staging_slots = self.max_buffer_rows * self.selected_capacity
         fixed_bytes = sparse * staging_slots * per_layer + staging_slots * 4
         metadata_bytes = self.max_buffer_rows * self.max_model_len * 4
@@ -275,7 +279,8 @@ class OmniKVCacheManager(StandardCacheManager):
                 exclude_slots=self.layer_batch_state.slot_mapping
                 if self.config.recent_keep_tokens == 0
                 else None,
-                max_blocks=32,
+                # Bound the whole batch footprint to leave SMs for model work.
+                max_blocks=max(1, 32 // rows.numel()),
                 slot_map=self.attention_cache_storage.host_slot_map,
             )
 
