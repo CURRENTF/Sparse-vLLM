@@ -33,6 +33,10 @@ pinned CPU 内存，GPU 保留有界的、按请求独立的 LRU 缓存池。
 Top-K 选择保持精确：命中项直接复用，只回读未命中的历史；搬运按稀疏层逐层提前执行。
 MLA 保持压缩表示。沿用模型已有 TP、EP、TP+EP 语义，各 rank 独立保存 backing。
 
+历史 KV 预分配以 `max_model_len × max_num_seqs_in_gpu` 为上限，
+开启 prefix caching 也不扩大该上限；GPU 和主机内存预算可能进一步降低容量。
+独立的 prefix offload 存储也计入主机预算，并考虑 pinned 分配的大小取整。
+
 可用 `omnikv_offload_cache_tokens` 设置每个稀疏层、每个请求的 GPU 缓存容量。
 默认 `None` 将 sink/keep/recent 总预算向上取整到 2 的幂，并以 `max_model_len`
 为上限。显式正数必须覆盖选择预算；设为 `0` 则关闭 LRU，每步完整回读 selected

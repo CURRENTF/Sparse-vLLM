@@ -39,6 +39,11 @@ are reused and only missing history is fetched. Transfers advance one sparse
 layer ahead. MLA stays compressed. Existing model TP, EP and TP+EP semantics
 apply, with independent backing per rank.
 
+History preallocation is capped at `max_model_len × max_num_seqs_in_gpu`,
+including when prefix caching is enabled, and may be reduced by GPU and host
+memory budgets. Separate prefix-offload backing also counts toward the host
+budget, including pinned-allocation size rounding.
+
 `omnikv_offload_cache_tokens` optionally sets each sparse layer's per-request
 GPU pool capacity. The default `None` rounds the total sink/keep/recent budget
 up to a power of two, capped by `max_model_len`. An explicit positive capacity

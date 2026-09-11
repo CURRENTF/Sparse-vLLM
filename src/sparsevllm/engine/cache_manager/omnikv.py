@@ -70,12 +70,7 @@ class OmniKVCacheManager(StandardCacheManager):
         self.prefix_host_blocks = prefix_bytes // (
             self.num_kv_layers * per_layer * self.config.prefix_cache_block_size
         )
-        slots = min(
-            slots,
-            self.max_model_len
-            * self.max_buffer_rows
-            * (2 if self.config.enable_prefix_caching else 1),
-        )
+        slots = min(slots, self.max_model_len * self.max_buffer_rows)
         slots = fit_omnikv_host_slots(
             slots,
             host_budget,
