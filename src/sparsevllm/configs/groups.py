@@ -37,6 +37,7 @@ class SparseMethodConfig:
 
     sparse_method: str = ""
     enable_omnikv_offload: bool = False
+    omnikv_offload_cache_tokens: int = 0
     # Physical cache/runtime ownership can also come from a prefill method.
     # This derived field is normalized before cache and prefix-cache setup.
     resolved_cache_sparse_method: str = field(default="", init=False)

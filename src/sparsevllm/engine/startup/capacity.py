@@ -245,6 +245,16 @@ def profiling_kv_budget_bytes(config, num_slots: int) -> int:
         config.sparse_method,
         prefill_sparse_method=getattr(config, "prefill_sparse_method", None),
     )
+    if method == "omnikv" and getattr(config, "enable_omnikv_offload", False):
+        from sparsevllm.engine.cache_manager.omnikv_capacity import plan_omnikv_pools
+
+        plan = plan_omnikv_pools(
+            config,
+            [layout.kv_layer_index(i) for i in config.full_attention_layers],
+            int(layout.num_kv_layers), int(config.max_num_seqs_in_gpu),
+            bytes_per_slot // int(layout.num_kv_layers),
+        )
+        return plan.budget(num_slots)
     if method != "quest":
         if method in {"snapkv", "h2o"}:
             # SnapKV and H2O share an allocator with one KV payload,

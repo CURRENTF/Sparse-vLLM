@@ -39,6 +39,8 @@ def _gather(
     LENGTHS,
     SLOT_MAP,
     EXCLUDE_SLOTS,
+    CACHE,
+    PLAN,
     TABLE_STRIDE: tl.constexpr,
     WIDTH: tl.constexpr,
     CAPACITY: tl.constexpr,
@@ -69,7 +71,16 @@ def _gather(
         source_slot = slot
         if SLOT_MAP is not None:
             source_slot = tl.load(SLOT_MAP + slot, valid, 0)
-        x = tl.load(src + source_slot.to(tl.int64) * WIDTH + d, valid, 0)
+        host_read = valid
+        if PLAN is not None:
+            entry = tl.load(PLAN + batch * CAPACITY + token, valid, 0)
+            cache_slot = tl.where(entry < 0, -entry - 1, entry).to(tl.int64)
+            host_read = valid & (entry < 0)
+        x = tl.load(src + source_slot.to(tl.int64) * WIDTH + d, host_read, 0)
+        if PLAN is not None:
+            cached = tl.load(CACHE + cache_slot * WIDTH + d, valid & ~host_read, 0)
+            tl.store(CACHE + cache_slot * WIDTH + d, x, host_read)
+            x = tl.where(host_read, x, cached)
         target = slot if SCATTER else batch * CAPACITY + token
         # Padded rows have replicated lengths but no write slot. Do not read
         # their host KV, and leave finite zeros for their private attention view.
@@ -85,6 +96,8 @@ def _append(
     WRITE_SLOTS,
     TABLE,
     ROWS,
+    CACHE,
+    PLAN,
     TABLE_STRIDE: tl.constexpr,
     SEEK_BLOCK: tl.constexpr,
     WIDTH: tl.constexpr,
@@ -109,6 +122,14 @@ def _append(
     valid = (slot >= 0) & (length > 0) & (length <= CAPACITY) & (d < WIDTH)
     x = tl.load(SRC + row * SRC_STRIDE + d, valid, 0)
     tl.store(DST + (row * CAPACITY + length - 1).to(tl.int64) * WIDTH + d, x, valid)
+    if PLAN is not None:
+        entry = tl.load(
+            PLAN + row * CAPACITY + length - 1,
+            (slot >= 0) & (length > 0) & (length <= CAPACITY),
+            0,
+        )
+        cache_slot = tl.where(entry < 0, -entry - 1, entry).to(tl.int64)
+        tl.store(CACHE + cache_slot * WIDTH + d, x, valid)
 
 
 def store_rows(
@@ -146,6 +167,8 @@ def gather_rows(
     slot_map=None,
     max_blocks: int = 0,
     exclude_slots=None,
+    cache=None,
+    plan=None,
 ) -> None:
     width = destination.shape[-2] * destination.shape[-1]
     blocks = triton.cdiv(capacity * width, 4096)
@@ -159,6 +182,8 @@ def gather_rows(
         lengths,
         slot_map,
         exclude_slots,
+        cache,
+        plan,
         table.stride(0),
         width,
         capacity,
@@ -178,6 +203,8 @@ def append_rows(
     *,
     table=None,
     rows=None,
+    cache=None,
+    plan=None,
 ) -> None:
     width = source.shape[-2] * source.shape[-1]
     _append[(source.shape[0], triton.cdiv(width, 256))](
@@ -187,6 +214,8 @@ def append_rows(
         write_slots,
         table,
         rows,
+        cache,
+        plan,
         0 if table is None else table.stride(0),
         triton.next_power_of_2(capacity),
         width,

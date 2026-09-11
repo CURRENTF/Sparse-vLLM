@@ -9,6 +9,8 @@ import torch
 from sparsevllm.kernels.triton.indexed_host_copy import append_rows, gather_rows
 from sparsevllm.utils.context import get_context
 
+from .omnikv_capacity import plan_omnikv_pools
+from .omnikv_lru import OmniKVLRU
 from .omnikv_storage import OmniKVStorage, payload_tensors
 from .standard import StandardCacheManager
 from .storage import HeterogeneousExplicitKVStorage
@@ -20,6 +22,7 @@ class OmniKVCacheManager(StandardCacheManager):
         self._prefetched = set()
         self._pending_prefetch = deque()
         self._current_writes = {}
+        self.lru = None
         super().__init__(
             config, parallel_context, allocation_budget_bytes=allocation_budget_bytes
         )
@@ -36,32 +39,21 @@ class OmniKVCacheManager(StandardCacheManager):
             )
         if original.dtype not in (torch.float16, torch.bfloat16):
             raise ValueError("OmniKV offload supports FP16/BF16 cache storage.")
-        full = [self.kv_layer_index(i) for i in self.config.full_attention_layers]
-        # Before the first observer, GPU-only OmniKV also consumes full history.
-        if full:
-            full = sorted(set(full) | set(range(min(full))))
-        sparse = self.num_kv_layers - len(full)
-        if not full or sparse <= 0:
-            raise ValueError(
-                "OmniKV offload requires both full and sparse attention layers."
-            )
         available, per_layer = self._get_available_slots_info()
-        self.selected_capacity = min(
-            self.max_model_len,
-            self.config.sink_keep_tokens
-            + self.config.decode_keep_tokens
-            + self.config.recent_keep_tokens,
+        plan = plan_omnikv_pools(
+            self.config,
+            [self.kv_layer_index(i) for i in self.config.full_attention_layers],
+            self.num_kv_layers,
+            self.max_buffer_rows,
+            per_layer,
         )
-        if self.selected_capacity == 0:
-            raise ValueError(
-                "OmniKV offload requires a positive total selected-token budget."
-            )
+        full = plan.full_layers
+        sparse = self.num_kv_layers - len(full)
+        self.selected_capacity = plan.selected_capacity
+        cache_capacity = plan.cache_capacity
+        layer_groups = plan.layer_groups
         staging_slots = self.max_buffer_rows * self.selected_capacity
-        metadata_bytes = self.max_buffer_rows * self.max_model_len * 4
-        fixed_bytes = sparse * staging_slots * per_layer + metadata_bytes
-        # One shared full-context prefill buffer, plus the full-attention layers.
-        slot_bytes = (len(full) + 1) * per_layer + 8
-        slots = (available - fixed_bytes - metadata_bytes) // slot_bytes
+        slots = (available - plan.fixed_bytes) // plan.slot_bytes
         # Host backing is bounded across worker processes, not once per GPU.
         meminfo = dict(
             line.split(":", 1)
@@ -141,6 +133,15 @@ class OmniKVCacheManager(StandardCacheManager):
                 self.max_buffer_rows, self.selected_capacity
             )
         )
+        if cache_capacity:
+            self.lru = OmniKVLRU(
+                storage,
+                layer_groups,
+                self.max_buffer_rows,
+                cache_capacity,
+                self.selected_capacity,
+                self.device,
+            )
         self.selected_rows = torch.arange(
             self.max_buffer_rows, dtype=torch.int32, device=self.device
         )
@@ -181,6 +182,9 @@ class OmniKVCacheManager(StandardCacheManager):
 
     def _iter_accounting_tensors(self):
         yield from super()._iter_accounting_tensors()
+        if self.lru is not None:
+            for i, tensor in enumerate(self.lru.tensors()):
+                yield f"omnikv_lru.{i}", tensor
         if self.offload_enabled and self.prefix_offload_controller is not None:
             pool = self.prefix_offload_controller.host_pool
             for layer, parts in enumerate(pool.layers):
@@ -236,6 +240,10 @@ class OmniKVCacheManager(StandardCacheManager):
                 staging_rows=self.max_buffer_rows,
                 full_layers=len(self.attention_cache_storage.full_layers),
             )
+            if self.lru is not None:
+                result["omnikv_offload"]["lru"] = self.lru.stats(
+                    self.attention_cache_storage.bytes_per_slot_per_layer()
+                )
             if self.prefix_offload_controller is not None:
                 result["omnikv_offload"]["prefix_transfer"] = (
                     self.prefix_offload_controller.stats()
@@ -247,6 +255,13 @@ class OmniKVCacheManager(StandardCacheManager):
         self._pending_prefetch.clear()
         self._current_writes.clear()
         self._selection_pending = False
+        if self.lru is not None:
+            self.lru.planned.clear()
+
+    def free_seq(self, seq_id):
+        if self.lru is not None:
+            self.lru.invalidate(self.seq_id_to_row[seq_id])
+        return super().free_seq(seq_id)
 
     def _prepare_prefill(self, seqs):
         self.begin_selection_step()
@@ -285,6 +300,16 @@ class OmniKVCacheManager(StandardCacheManager):
         self._prefetched.add(kv_idx)
 
     def _gather_decode(self, kv_idx, slots, rows, lengths):
+        plan = None
+        if self.lru is not None:
+            plan = self.lru.prepare(
+                kv_idx,
+                slots,
+                rows,
+                self.layer_batch_state.req_indices,
+                lengths,
+                self.layer_batch_state.slot_mapping,
+            )
         for component, destination in enumerate(self.selected_staging[kv_idx]):
             gather_rows(
                 self.attention_cache_storage.pointers[kv_idx],
@@ -294,6 +319,8 @@ class OmniKVCacheManager(StandardCacheManager):
                 lengths,
                 capacity=self.selected_capacity,
                 component=component,
+                cache=None if self.lru is None else self.lru.parts[kv_idx][component],
+                plan=plan,
                 skip_last=self.config.recent_keep_tokens > 0,
                 exclude_slots=self.layer_batch_state.slot_mapping,
                 # Bound the whole batch footprint to leave SMs for model work.
@@ -347,8 +374,8 @@ class OmniKVCacheManager(StandardCacheManager):
         else:
             self._gather_decode(kv_idx, active_slots, req_indices, context_lens)
         parts = self.selected_staging[kv_idx]
-        for source, destination in zip(
-            payload_tensors(self._current_writes.pop(layer_idx)), parts
+        for component, (source, destination) in enumerate(
+            zip(payload_tensors(self._current_writes.pop(layer_idx)), parts)
         ):
             append_rows(
                 source,
@@ -356,6 +383,8 @@ class OmniKVCacheManager(StandardCacheManager):
                 context_lens,
                 self.layer_batch_state.slot_mapping,
                 self.selected_capacity,
+                cache=None if self.lru is None else self.lru.parts[kv_idx][component],
+                plan=None if self.lru is None else self.lru.plan(kv_idx),
                 table=active_slots if self.config.recent_keep_tokens == 0 else None,
                 rows=req_indices if self.config.recent_keep_tokens == 0 else None,
             )
@@ -422,6 +451,8 @@ class OmniKVCacheManager(StandardCacheManager):
             result.extend(self.prefill_staging)
             result.extend(x for parts in self.selected_staging.values() for x in parts)
             result.extend((self.selected_slots, self.selected_rows))
+            if self.lru is not None:
+                result.extend(self.lru.tensors())
         return result
 
     def on_forward_end(self, seqs, is_prefill):
