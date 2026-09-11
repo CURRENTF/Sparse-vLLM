@@ -15,7 +15,7 @@ Date/retry suffixes in arm IDs identify existing results, not required retries.
 
 Common code stays shared: `../run_queue.py` and `../gpu_guard.py` own guarded
 execution; `benchmark/long_bench_v2/` owns scoring; `benchmark/microbench.py`
-owns stage timing. `../../decode_capacity_128k2k/` owns the 128K sweep and
+owns stage timing. `../../sparse_decode_efficiency/` owns the 128K sweep and
 validator; `../prepare_runs.py` owns the original boundary-window experiment.
 Historical H2O fusion/MLA diagnostics and retry scripts remain only in their
 run archives; reproducing those debugging stages uses archived code/configs.

@@ -8,6 +8,7 @@ This repository includes repo-local Codex skills.
 - `code-review`: Review Sparse-vLLM diffs for correctness, sparse-runtime and operator architecture, scheduling semantics, reproducibility, performance, and tests. Use when reviewing PRs, git diffs, sparse method integrations, operator/provider or kernel changes, cache-manager or scheduler changes, benchmark/evaluation scripts, OpenAI serving changes, or when the user asks for a code review. File: `.agents/skills/code-review/SKILL.md`
 - `review-operator-organization`: Review operator/provider boundaries, device capability selection, kernel ownership, dependency compatibility, weight layouts, fallback semantics, and validation. Use for changes under `operators/`, `platforms/`, Triton kernels, external kernel integrations, or model-to-operator call sites. File: `.agents/skills/review-operator-organization/SKILL.md`
 - `optimize-sparsevllm-kernel`: Find, implement, tune, profile, and integrate Sparse-vLLM GPU kernels across Triton, TileLang, CUDA/CuTe, and external SGL providers. Use for kernel hotspots, fusion, correctness baselines, microbenchmarks, Nsight Compute analysis, provider integration, or matched end-to-end performance validation. File: `.agents/skills/optimize-sparsevllm-kernel/SKILL.md`
+- `paper-efficiency`: Standardize paper efficiency comparisons and capacity sweeps using shared entrypoints, explicit defaults, and boundary-only decode timing. Use for paper benchmarks and deciding whether results can share a figure, not figure-only styling. File: `.agents/skills/paper-efficiency/SKILL.md`
 
 ## How to use
 
@@ -17,6 +18,7 @@ This repository includes repo-local Codex skills.
   `$code-review` loads it automatically for relevant diffs.
 - Invoke the end-to-end kernel workflow as `$optimize-sparsevllm-kernel`; it
   loads only the selected DSL and profiling references.
+- Invoke `$paper-efficiency` for paper-level engine efficiency comparisons.
 - Keep method-specific runtime state in `src/sparsevllm/engine/cache_manager/`.
 - Keep `src/sparsevllm/layers/attention.py` generic and hook new methods through shared cache-manager interfaces when possible.
 
@@ -39,6 +41,10 @@ use the documented Nsight diagnostic for kernel-timeline attribution.
 
 ## Benchmark Entrypoints and Shared Statistics
 
+- For paper comparisons, use the defaults and acceptance contract in
+  [.agents/skills/paper-efficiency/SKILL.md](.agents/skills/paper-efficiency/SKILL.md).
+  Main decode results use continuous windows with boundary-only synchronization,
+  preserving supported async/overlap execution. Step-synchronized runs are diagnostics.
 - Use `scripts/benchmarks/run_efficiency_probe.sh` (idle-GPU checks and sweeps)
   or `benchmark/efficiency/bench_probe.py` (explicit engine/TP configuration)
   for request TTFT/TPOT and end-to-end throughput. Do not create another runner
@@ -66,9 +72,13 @@ use the documented Nsight diagnostic for kernel-timeline attribution.
   sampling, scoring, eviction/compaction and cleanup. Exclude prefix hits from
   computed prefill tokens and prefill-produced tokens from decode token work.
   A selected decode window must report its admission/warmup/truncation scope.
-- Probe first-token/decode event windows are diagnostic window rates, not
-  execution-stage rates, even in fixed-batch mode. Pure stages are not measured
-  by that runner. Its old `prefill_token_throughput_tps` and
+- Default probe first-token/decode event windows are diagnostic window rates,
+  not execution-stage rates, even in fixed-batch mode. Explicit `--decode-only-steps`
+  instead measures a validated continuous full-residency decode window with
+  boundary-only synchronization. The fixed-batch adapter supports native per-rank
+  boundaries, vLLM/Tangram async queues, and HiSparse QuEST TP1 overlap queues;
+  validate each model/topology/version with a smoke before a paper sweep.
+  The default probe's old `prefill_token_throughput_tps` and
   `decode_token_throughput_tps` fields are compatibility aliases only; prefer
   `first_token_window_throughput_tps` and `batch_decode_token_throughput_tps`.
   Microbench's legacy `ttft`/`itl` fields are batch observations/proxies, not

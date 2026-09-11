@@ -5,6 +5,8 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 *example.png
+*.png
+*.svg
 wandb/
 /tmp/
 /scripts/tmp/
@@ -16,3 +18,5 @@ wandb/
 /dev_docs/
 docs/dev-notes/
 /scratch
+# Measurements live outside the source checkout; ignore local compatibility links too.
+/scripts/official_experiments/sparse_decode_efficiency/data

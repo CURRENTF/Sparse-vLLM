@@ -18,7 +18,7 @@ src_path = str(REPO_ROOT / "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
-from benchmark.efficiency.metrics import stage_throughput
+from benchmark.efficiency.metrics import PipelinedDecodeWindow, decode_window_fields, stage_throughput
 from sparsevllm.method_registry import (
     CANONICAL_SPARSE_METHODS,
     PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
@@ -304,6 +304,8 @@ def _write_output_dir(args, rows: list[dict[str, Any]]) -> None:
         "lengths": [int(part) for part in args.lengths.split(",") if part.strip()],
         "batch_sizes": [int(part) for part in args.batch_sizes.split(",") if part.strip()],
         "output_len": int(args.output_len),
+        "decode_window_steps": int(getattr(args, "decode_window_steps", 0)),
+        "decode_warmup_steps_after_full": int(getattr(args, "decode_warmup_steps_after_full", 0)),
         "temperature": float(args.temperature),
         "top_p": float(args.top_p),
         "synchronize_step_timing": bool(
@@ -340,7 +342,9 @@ def _write_output_dir(args, rows: list[dict[str, Any]]) -> None:
         f"- Batch sizes: `{args.batch_sizes}`",
         f"- Output length: `{args.output_len}`",
         "",
-        "| Method | Prompt tokens | Batch | Status | First observed token s | Prefill step tok/s | Decode step tok/s | Peak GB | Decode speedup |",
+        "| Method | Prompt tokens | Batch | Status | First observed token s | Prefill step tok/s | Decode "
+        + ("window" if getattr(args, "decode_window_steps", 0) else "step")
+        + " tok/s | Peak GB | Decode speedup |",
         "| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for record in records:
@@ -352,10 +356,10 @@ def _write_output_dir(args, rows: list[dict[str, Any]]) -> None:
                 prompt=record.get("prompt_tokens", ""),
                 batch=record.get("batch_size", ""),
                 status=record["status"],
-                ttft=f"{record.get('ttft_s', 0.0):.3f}" if ok else "",
-                prefill=f"{record.get('prefill_tok_s', 0.0):.1f}" if ok else "",
-                decode=f"{record.get('decode_tok_s', 0.0):.1f}" if ok else "",
-                mem=f"{record.get('peak_memory_gb', 0.0):.2f}" if ok else "",
+                ttft=_format_metric(record.get('ttft_s'), 3) if ok else "",
+                prefill=_format_metric(record.get('prefill_tok_s'), 1) if ok else "",
+                decode=_format_metric(record.get('decode_tok_s'), 1) if ok else "",
+                mem=_format_metric(record.get('peak_memory_gb'), 2) if ok else "",
                 speedup=("n/a" if speedup is None else f"{float(speedup):.2f}") if ok else "",
             )
         )
@@ -365,6 +369,10 @@ def _write_output_dir(args, rows: list[dict[str, Any]]) -> None:
     _write_jsonl_rows(output_dir / "per_sample_results.jsonl", records)
     _write_json(output_dir / "aggregate_metrics.json", aggregate)
     (output_dir / "report.md").write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+
+
+def _format_metric(value, precision):
+    return "n/a" if value is None else f"{value:.{precision}f}"
 
 
 def _decode_cuda_graph_status(llm) -> dict[str, Any]:
@@ -487,7 +495,7 @@ def _completed_output_records(outputs, output_len):
 
 
 def benchmark_task(method, length, bs, args, results_dict):
-    if getattr(args, "engine", "sparsevllm") == "hisparse":
+    if getattr(args, "engine", "sparsevllm") in ("hisparse", "vortex"):
         from benchmark.hisparse_microbench import benchmark_decode_stage
         benchmark_decode_stage(method, length, bs, args, results_dict)
         return
@@ -543,6 +551,7 @@ def benchmark_task(method, length, bs, args, results_dict):
     completed_outputs = []
     completed_requests = 0
     actual_decode_peak = 0
+    window = None
     try:
         m_len = length + args.output_len + (0 if getattr(args, "require_full_decode_batch", False) else 100)
         if args.max_model_len_override is not None:
@@ -636,6 +645,20 @@ def benchmark_task(method, length, bs, args, results_dict):
 
         add_wave(admission_wave_size if staged_admission else bs)
 
+        window = None
+        window_graphs = []
+        if getattr(args, "decode_window_steps", 0):
+            def window_sync():
+                window_graphs[:] = [
+                    {"capture_count": r["decode_graph"]["capture_count"],
+                     "replay_count": r["decode_graph"]["replay_count"],
+                     "eager_decode_count": r["decode_graph"]["eager_static_count"]
+                                           + r["decode_graph"]["force_eager_count"]}
+                    for r in llm.debug_sparse_state_summaries(synchronize=True)]
+            window = PipelinedDecodeWindow(bs, args.decode_window_steps,
+                decode_warmup_steps_after_full, synchronize=window_sync,
+                clock=perf_counter, graph_stats=lambda: [dict(r) for r in window_graphs])
+
         has_queued = False
         zero_steps = 0
         while next_request_idx < bs or not llm.is_finished():
@@ -653,18 +676,31 @@ def benchmark_task(method, length, bs, args, results_dict):
             ):
                 add_wave(admission_wave_size)
 
+            if window is not None:
+                window.boundary()
+                window_seqs = list(llm.scheduler.decoding)
+                window_ids = [seq.seq_id for seq in window_seqs]
+                window_contexts = [len(seq) for seq in window_seqs]
+                window_admitted = next_request_idx == bs and not llm.scheduler.waiting
             step_start = perf_counter()
             finished_outputs, num_tokens = llm.step()
             if synchronize_step_timing:
                 torch.cuda.synchronize()
             step_dt = perf_counter() - step_start
+            if strict_batch and int(getattr(llm.scheduler, "total_preemptions", 0)):
+                raise RuntimeError("Full decode batch capacity exceeded: scheduler preemption")
+            if window is not None:
+                ticket = window.submit(is_decode=num_tokens < 0, request_ids=window_ids,
+                    tokens=abs(num_tokens), admission_complete=window_admitted,
+                    context_lengths=window_contexts,
+                    preemptions=int(getattr(llm.scheduler, "total_preemptions", 0)))
+                actual_tokens = sum(len(tokens) for _, tokens in llm.last_step_token_outputs) if num_tokens < 0 else None
+                window.complete(ticket, decode_tokens=actual_tokens)
             completed_requests += len(finished_outputs)
             actual_decode_peak = max(actual_decode_peak, -num_tokens)
             if strict_batch:
                 completed_outputs.extend(finished_outputs)
                 step_rows.append({"tokens": num_tokens, "elapsed_s": step_dt, "measured": False})
-                if int(getattr(llm.scheduler, "total_preemptions", 0)):
-                    raise RuntimeError("Full decode batch capacity exceeded: scheduler preemption")
             _observe_prefix_cache_hits(llm, prefix_hits_by_seq_id)
             
             if num_tokens > 0:
@@ -716,9 +752,17 @@ def benchmark_task(method, length, bs, args, results_dict):
             if full_admission_reached and max_decode_steps_after_full > 0 and decode_steps_after_full >= max_decode_steps_after_full:
                 break
 
+        # Admission failure is capacity evidence, not an incomplete timing window.
+        # Check it before require_result() so the capacity sweep can refine its bound.
+        if strict_batch and (not full_admission_reached or actual_decode_peak != bs):
+            raise RuntimeError("Full decode batch capacity exceeded: not all requests entered decode together")
+        if window is not None:
+            window.boundary()
+            window_result = window.require_result()
+            case_path = Path(args.output_dir) / f"{method}-{length}-{bs}"
+            (case_path / "window.json").parent.mkdir(parents=True, exist_ok=True)
+            (case_path / "window.json").write_text(json.dumps(window_result, indent=2) + "\n")
         if strict_batch:
-            if not full_admission_reached or actual_decode_peak != bs:
-                raise RuntimeError("Full decode batch capacity exceeded: not all requests entered decode together")
             if len(completed_outputs) != bs or any(len(row[1]) != args.output_len for row in completed_outputs):
                 raise RuntimeError("Incomplete output: every request must finish the requested output length")
             if args.output_dir:
@@ -791,7 +835,8 @@ def benchmark_task(method, length, bs, args, results_dict):
             if staged_admission
             else ""
         )
-        print(f"[{method.upper()}] First observed token: {ttft:.2f}s | Prefill step: {prefill_tp or 0.0:.2f} tok/s | Decode step: {decode_tp or 0.0:.2f} tok/s | Decode execution proxy: {avg_itl:.2f}ms | AvgBS: {avg_active_bs:.1f} | Mem: {peak_mem:.2f} GB{stage_mode}")
+        if window is None:
+            print(f"[{method.upper()}] First observed token: {ttft:.2f}s | Prefill step: {prefill_tp or 0.0:.2f} tok/s | Decode step: {decode_tp or 0.0:.2f} tok/s | Decode execution proxy: {avg_itl:.2f}ms | AvgBS: {avg_active_bs:.1f} | Mem: {peak_mem:.2f} GB{stage_mode}")
         
         results_dict[(method, length, bs)] = {
             "method": method,
@@ -856,6 +901,11 @@ def benchmark_task(method, length, bs, args, results_dict):
             "resolved_engine_config": resolved_engine_config,
             "status": "SUCCESS"
         }
+        if window is not None:
+            result = dict(results_dict[(method, length, bs)])
+            result.update(decode_window_fields(window_result))
+            results_dict[(method, length, bs)] = result
+            _write_jsonl_rows(case_path / "window_steps.jsonl", window.records)
 
     except Exception as e:
         print(f"Error at {method}/{length}/{bs}: {e}")
@@ -865,6 +915,8 @@ def benchmark_task(method, length, bs, args, results_dict):
             _write_jsonl_rows(case_path / "steps.jsonl", step_rows)
             _write_jsonl_rows(case_path / "raw_outputs.jsonl",
                               _completed_output_records(completed_outputs, args.output_len))
+            if window is not None:
+                _write_jsonl_rows(case_path / "window_steps.jsonl", window.records)
         results_dict[(method, length, bs)] = {
             "method": method,
             "sparse_method": normalized_method,
@@ -886,11 +938,13 @@ def benchmark_task(method, length, bs, args, results_dict):
 def main():
     parser = argparse.ArgumentParser(description="Professional benchmark for sparsevllm.")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the model")
-    parser.add_argument("--engine", choices=("sparsevllm", "vllm", "hisparse"), default="sparsevllm")
+    parser.add_argument("--engine", choices=("sparsevllm", "vllm", "hisparse", "vortex"), default="sparsevllm")
     parser.add_argument("--engine_kwargs", default="{}", help="External-engine constructor options, JSON or @file; workload/timing keys remain protected.")
     parser.add_argument("--backend_label", default=None)
     parser.add_argument("--require_full_decode_batch", action="store_true",
                         help="Measure only pure decode steps with all requested sequences resident; require complete outputs and no preemption.")
+    parser.add_argument("--decode_window_steps", type=int, default=0,
+                        help="Opt-in continuous decode window with boundary-only synchronization; mutually exclusive with synchronized steps.")
     parser.add_argument("--lengths", type=str, default="16000,32000,64000", help="Context lengths to test")
     parser.add_argument("--batch_sizes", type=str, default="4", help="Batch sizes to test")
     parser.add_argument(
@@ -986,9 +1040,13 @@ def main():
     args.engine_kwargs_dict = _load_json_arg(args.engine_kwargs)
     if args.engine == "sparsevllm" and (args.engine_kwargs_dict or args.backend_label):
         parser.error("engine_kwargs/backend_label are for external stage adapters only")
-    if args.engine == "hisparse" and not args.output_dir:
+    if args.engine in ("hisparse", "vortex") and not args.output_dir:
         parser.error("HiSparse stage adapter requires --output_dir for worker-side raw steps")
-    if args.require_full_decode_batch and (not args.synchronize_step_timing or args.max_decode_steps_after_full):
+    if args.decode_window_steps and (args.decode_window_steps < 1 or args.synchronize_step_timing
+            or not args.require_full_decode_batch or not args.output_dir
+            or args.decode_warmup_steps_after_full < 1 or args.max_decode_steps_after_full):
+        parser.error("Decode windows require full batch, positive warmup, output_dir, no step sync and complete outputs")
+    if args.require_full_decode_batch and (not (args.synchronize_step_timing or args.decode_window_steps) or args.max_decode_steps_after_full):
         parser.error("Full decode batch measurement requires synchronized timing and untruncated outputs")
     if args.engine == "vllm" and not args.require_full_decode_batch:
         parser.error("vLLM stage adapter requires --require_full_decode_batch")
@@ -1021,7 +1079,8 @@ def main():
 
     # 打印最终报表
     print(f"\n\n{'='*140}")
-    print(f"{ 'Method':<12} {'Len':<8} {'BS':<4} {'First(s)':<10} {'PreStepTP':<12} {'DecStepTP':<12} {'Proxy(ms)':<10} {'AvgBS':<8} {'Mem(GB)':<10} {'Speedup'}")
+    decode_column = "DecWindowTP" if args.decode_window_steps else "DecStepTP"
+    print(f"{ 'Method':<12} {'Len':<8} {'BS':<4} {'First(s)':<10} {'PreStepTP':<12} {decode_column:<12} {'Proxy(ms)':<10} {'AvgBS':<8} {'Mem(GB)':<10} {'Speedup'}")
     print("-" * 140)
     
     # 获取 Vanilla 作为基准计算加速比 (按 length 和 BS 匹配)
@@ -1062,13 +1121,13 @@ def main():
                 
                 bs_str = f"{bs}*" if has_queued else f"{bs}"
                 
-                speedup = 1.0
+                speedup = None if args.decode_window_steps else 1.0
                 if (length, bs) in vanilla_stats:
                     vanilla_decode_tp = float(vanilla_stats[(length, bs)])
                     speedup = dec_tp / vanilla_decode_tp if vanilla_decode_tp > 0 else None
 
                 speedup_str = "n/a" if speedup is None else f"{speedup:.2f}x"
-                print(f"{method:<12} {length:<8} {bs_str:<4} {ttft:<10.2f} {pre_tp:<12.1f} {dec_tp:<12.1f} {itl:<10.2f} {avg_bs:<8.1f} {mem:<10.2f} {speedup_str}")
+                print(f"{method:<12} {length:<8} {bs_str:<4} {_format_metric(ttft, 2):<10} {_format_metric(pre_tp, 1):<12} {_format_metric(dec_tp, 1):<12} {_format_metric(itl, 2):<10} {_format_metric(avg_bs, 1):<8} {_format_metric(mem, 2):<10} {speedup_str}")
                 row = dict(res)
                 row["speedup_vs_vanilla_decode"] = None if speedup is None else float(speedup)
                 jsonl_rows.append(row)

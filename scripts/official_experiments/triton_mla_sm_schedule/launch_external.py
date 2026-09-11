@@ -44,7 +44,7 @@ commands = []
 for lane, gpu in zip(template["external_lanes"], gpus):
     if lane not in args.lanes.split(","):
         continue
-    command = ["python3", str(repo / "scripts/official_experiments/decode_capacity_128k2k/sweep_decode_capacity.py"),
+    command = ["python3", str(repo / "scripts/official_experiments/sparse_decode_efficiency/sweep_decode_capacity.py"),
                "--repo", str(repo), "--config", str(config_path), "--model", "qwen3-30b-fp8", "--lanes", lane,
                "--gpus", gpu, "--attempt", "initial"]
     session = f"{lane}-{root.name}"

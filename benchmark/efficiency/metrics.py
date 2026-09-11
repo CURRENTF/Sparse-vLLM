@@ -140,9 +140,7 @@ class DecodeOnlyWindow:
             self.synchronize()
             finished = self.clock()
             after = self.graph_stats()
-            delta = {key: after[key] - value for key, value in self.graph_before.items()}
-            if delta["capture_count"] or delta["eager_decode_count"] or delta["replay_count"] != self.steps:
-                raise RuntimeError(f"Decode-only window violated captured graph contract: {delta}")
+            delta = decode_graph_delta(self.graph_before, after, self.steps)
             elapsed = finished - self.started
             self.result = {
                 "status": "success",
@@ -188,6 +186,152 @@ class DecodeOnlyWindow:
         if self.result is None:
             raise RuntimeError("Workload ended without the requested full-residency decode-only window")
         return self.result
+
+
+def decode_graph_delta(before, after, steps):
+    """Validate every participating rank, retaining the legacy single-rank form."""
+    if isinstance(before, list):
+        if not before or not isinstance(after, list) or len(before) != len(after):
+            raise RuntimeError("Decode window lost participating ranks")
+        return [decode_graph_delta(a, b, steps) for a, b in zip(before, after)]
+    keys = ("capture_count", "replay_count", "eager_decode_count")
+    delta = {key: after[key] - before[key] for key in keys}
+    if delta["capture_count"] or delta["eager_decode_count"] or delta["replay_count"] != steps:
+        raise RuntimeError(f"Decode-only window violated captured graph contract: {delta}")
+    return delta
+
+
+class PipelinedDecodeWindow(DecodeOnlyWindow):
+    """Stop submissions only at two edges; drain and account for completed work.
+
+    Adapters submit before/after a forward with CPU-owned shape metadata and
+    complete after normal result processing. An edge must drain all in-flight
+    work before calling boundary(); no timed per-step synchronization is needed.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pending = {}
+        self.records = []
+        self.submitted = 0
+        self.last_measured_contexts = None
+
+    @property
+    def needs_boundary(self):
+        return self.result is None and (
+            (self.started is None and self.warmed == self.warmup_steps)
+            or (self.started is not None and self.steps == self.target_steps))
+
+    def boundary(self):
+        if not self.needs_boundary:
+            return
+        if self.pending:
+            raise RuntimeError("Decode boundary has undrained in-flight work")
+        super().boundary()
+        if self.result is not None:
+            selected = [row for row in self.records if row["measured"]]
+            if len(selected) != self.target_steps or not all(row["completed"] for row in selected):
+                raise RuntimeError("Incomplete decode window work")
+            self.result.update(
+                scope="full_residency_contiguous_decode_only_boundary_sync_v2",
+                context_lengths_start=selected[0]["context_lengths"],
+                context_lengths_end=[n + 1 for n in selected[-1]["context_lengths"]],
+                context_length_semantics="logical attention KV length including current query token; end is next-step length",
+                completed_steps=len(selected),
+            )
+
+    def submit(self, *, is_decode, request_ids, tokens, admission_complete,
+               context_lengths, preemptions=0):
+        if self.result is not None:
+            return None
+        if self.needs_boundary:
+            raise RuntimeError("Submission crossed an undrained measurement edge")
+        if preemptions:
+            raise RuntimeError("Full decode batch capacity exceeded: scheduler preemption")
+        if len(context_lengths) != len(request_ids) or any(n < 0 for n in context_lengths):
+            raise ValueError("Missing request context lengths")
+        measured = self.started is not None
+        super().observe(is_decode=is_decode, request_ids=request_ids, tokens=tokens,
+                        admission_complete=admission_complete)
+        pairs = sorted(zip(request_ids, context_lengths))
+        ordered_contexts = [p[1] for p in pairs]
+        if measured and self.last_measured_contexts is not None:
+            if ordered_contexts != [n + 1 for n in self.last_measured_contexts]:
+                raise RuntimeError("Decode context lengths did not advance by one token")
+        if measured:
+            self.last_measured_contexts = ordered_contexts
+        ticket = self.submitted
+        self.submitted += 1
+        row = dict(ticket=ticket, pure_decode=bool(is_decode),
+                   request_ids=[p[0] for p in pairs], context_lengths=ordered_contexts,
+                   tokens=tokens, measured=measured, completed=False)
+        self.pending[ticket] = row
+        self.records.append(row)
+        return ticket
+
+    def complete(self, ticket, *, decode_tokens=None):
+        if ticket is None:
+            return
+        if ticket not in self.pending:
+            raise RuntimeError("Unknown or duplicate completed decode work")
+        row = self.pending.pop(ticket)
+        if row["pure_decode"] and decode_tokens != row["tokens"]:
+            raise RuntimeError("Completed decode tokens disagree with submitted work")
+        row["completed_decode_tokens"] = decode_tokens
+        row["completed"] = True
+
+
+def decode_window_fields(result):
+    """Canonical row fields; never relabel unsynchronized per-step durations."""
+    return dict(
+        measurement_scope="full_batch_decode_window", stage_metrics_status="success",
+        stage_timing_scope=result["scope"], synchronize_step_timing=False,
+        decode_window=result, decode_stage_tokens=result["decode_stage_tokens"],
+        decode_stage_elapsed_s=result["decode_stage_elapsed_s"],
+        decode_stage_throughput_tps=result["decode_stage_throughput_tps"],
+        decode_tp=result["decode_stage_throughput_tps"],
+        ttft=None, itl=None, prefill_tp=None,
+        ttft_timing_scope="not_measured", itl_timing_scope="not_measured",
+        measured_decode_steps_after_full=result["decode_steps"],
+        prefill_stage_elapsed_s=None, prefill_stage_throughput_tps=None,
+        request_metrics_status="not_measured",
+    )
+
+
+def aggregate_decode_windows(rows):
+    if not rows:
+        raise ValueError("No decode repetitions")
+    identity = ("engine", "method", "length", "output_len", "batch_size",
+                "stage_timing_scope", "decode_warmup_steps_after_full",
+                "measured_decode_steps_after_full")
+    for row in rows:
+        if (row.get("status") != "success" or row.get("synchronize_step_timing") is not False
+                or row.get("measurement_scope") != "full_batch_decode_window"
+                or any(row[k] != rows[0][k] for k in identity)):
+            raise ValueError("Inconsistent or failed decode-window repetitions")
+        for key in ("resolved_parallel_topology", "actual_async_scheduling", "actual_overlap_scheduling",
+                    "admission_wave_size", "wave_decode_gap_steps"):
+            if row.get(key) != rows[0].get(key):
+                raise ValueError(f"Inconsistent repetition contract: {key}")
+        window = row["decode_window"]
+        if (row["decode_stage_tokens"] != row["batch_size"] * row["measured_decode_steps_after_full"]
+                or window["decode_stage_tokens"] != row["decode_stage_tokens"]
+                or window["decode_stage_elapsed_s"] != row["decode_stage_elapsed_s"]
+                or not math.isclose(stage_throughput(row["decode_stage_tokens"], row["decode_stage_elapsed_s"]),
+                                    row["decode_stage_throughput_tps"], rel_tol=1e-10)):
+            raise ValueError("Inconsistent repetition token/time accounting")
+    tokens = sum(row["decode_stage_tokens"] for row in rows)
+    elapsed = sum(row["decode_stage_elapsed_s"] for row in rows)
+    result = dict(rows[0])
+    result.pop("decode_window", None)
+    result.pop("artifact", None)
+    result.pop("repetition", None)
+    result.update(repetitions=rows, decode_stage_tokens=tokens, decode_stage_elapsed_s=elapsed,
+                  repetition_throughput_stdev_tps=statistics.stdev(r["decode_stage_throughput_tps"] for r in rows) if len(rows) > 1 else None,
+                  decode_stage_throughput_tps=stage_throughput(tokens, elapsed),
+                  decode_tp=stage_throughput(tokens, elapsed),
+                  measured_decode_steps_after_full=sum(r["measured_decode_steps_after_full"] for r in rows))
+    return result
 
 
 def request_timeline_metrics(

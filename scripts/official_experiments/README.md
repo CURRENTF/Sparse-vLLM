@@ -6,7 +6,7 @@ canonical benchmark entrypoints; they do not implement a separate timing engine.
 Supply machine-specific model, environment, checkout, and output paths at runtime.
 Large logs, token outputs, checkpoints, and source archives remain outside Git.
 
-- [128K input / 2K output decode capacity](decode_capacity_128k2k/README.md):
+- [128K input / 2K output decode capacity](sparse_decode_efficiency/README.md):
   two models, five methods, exact concurrency boundaries, linear/log-y figures.
 - [Sparse-vLLM vs Vortex](sparsevllm_vs_vortex/README.md): guarded single-card
   QuEST and H2O-like comparisons, full-residency decode timing, configs,

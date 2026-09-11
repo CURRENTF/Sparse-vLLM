@@ -1707,10 +1707,12 @@ class ModelRunner:
             }
         return result
 
-    def debug_sparse_state_summaries(self) -> list[dict[str, object]] | None:
+    def debug_sparse_state_summaries(self, synchronize: bool = False) -> list[dict[str, object]] | None:
         local_error: BaseException | None = None
         local_summary = None
         try:
+            if synchronize:
+                self.platform.synchronize()
             local_summary = self.debug_sparse_state_summary()
             local_summary["replica_consistency"] = self.debug_replica_consistency()
         except BaseException as exc:

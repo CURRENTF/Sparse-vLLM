@@ -34,7 +34,7 @@ def main():
 
     try:
         with (args.output / "guard.log").open("x") as guard_log:
-            guard = subprocess.Popen([sys.executable, str(script.parent.parent / "decode_capacity_128k2k/decode_capacity_guard.py"),
+            guard = subprocess.Popen([sys.executable, str(script.parent.parent / "sparse_decode_efficiency/decode_capacity_guard.py"),
                 "--parent", str(os.getpid()), "--ready", str(ready), "--max-seconds", "21600"],
                 stdout=guard_log, stderr=subprocess.STDOUT, start_new_session=True)
             children.append(guard)

@@ -32,7 +32,7 @@ def main():
     args = parser.parse_args()
     summary_dir = args.summary_dir or args.root / 'summary'
     repo = Path(__file__).resolve().parents[4]
-    capacity = module(repo / 'scripts/official_experiments/decode_capacity_128k2k/plot_decode_capacity.py', 'capacity')
+    capacity = module(repo / 'scripts/official_experiments/sparse_decode_efficiency/plot_decode_capacity.py', 'capacity')
     old_plot = module(repo / 'scripts/official_experiments/sparsevllm_vs_vortex/plot.py', 'old_plot')
     sources = {}
 
@@ -88,7 +88,7 @@ def main():
     sns.set_theme(style='whitegrid', context='paper', font='DejaVu Sans', font_scale=1.15,
                   rc={'axes.spines.top': False, 'axes.spines.right': False, 'grid.alpha': .3,
                       'pdf.fonttype': 42, 'svg.fonttype': 'none'})
-    palette = read(repo / 'scripts/official_experiments/decode_capacity_128k2k/palettes/fresh_modern.json')['colors']
+    palette = read(repo / 'scripts/official_experiments/sparse_decode_efficiency/palettes/fresh_modern.json')['colors']
     lanes = {**capacity.LANES, **capacity.EXTERNAL_LANES}
     names = {k: (('Ours (' + v[0] + ')') if k.startswith('svllm') else v[0]) for k, v in lanes.items()}
     names['hisparse-quest'] += ' †'

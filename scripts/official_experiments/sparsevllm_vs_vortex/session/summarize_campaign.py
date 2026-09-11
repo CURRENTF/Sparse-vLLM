@@ -7,7 +7,7 @@ import sys
 import time
 
 REPO=Path(__file__).resolve().parents[4]
-sys.path[:0]=[str(REPO),str(REPO/'scripts/official_experiments/decode_capacity_128k2k')]
+sys.path[:0]=[str(REPO),str(REPO/'scripts/official_experiments/sparse_decode_efficiency')]
 from benchmark.long_bench_v2.contracts import aggregate_results
 from plot_decode_capacity import validate_measurement
 

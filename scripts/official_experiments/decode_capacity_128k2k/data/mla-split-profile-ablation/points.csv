@@ -1,9 +1,0 @@
-name,variant,concurrency,decode_throughput_tps,decode_tokens,decode_elapsed_s,measured_steps,artifact
-bs4-1-profile,profile,4,337.28873487490415,8060,23.89643995370716,2015,bs4-1-profile/performance.jsonl
-bs4-2-fixed32,fixed32,4,337.29447838758654,8060,23.89603304071352,2015,bs4-2-fixed32/performance.jsonl
-bs4-3-fixed32,fixed32,4,335.09641500805793,8060,24.0527789585758,2015,bs4-3-fixed32/performance.jsonl
-bs4-4-profile,profile,4,355.54621306996575,8060,22.669345653848723,2015,bs4-4-profile/performance.jsonl
-bs5-1-profile,profile,5,319.19556173897263,10075,31.563722080318257,2015,bs5-1-profile/performance.jsonl
-bs5-2-fixed32,fixed32,5,396.07389104167197,10075,25.43717277981341,2015,bs5-2-fixed32/performance.jsonl
-bs5-3-fixed32,fixed32,5,375.9406175556826,10075,26.799445256823674,2015,bs5-3-fixed32/performance.jsonl
-bs5-4-profile,profile,5,306.736212614134,10075,32.845812087645754,2015,bs5-4-profile/performance.jsonl

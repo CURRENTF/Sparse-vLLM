@@ -1266,8 +1266,8 @@ class LLMEngine:
             job.finished_at = time.time()
         return True
 
-    def debug_sparse_state_summaries(self) -> list[dict[str, object]]:
-        summaries = self.model_runner.call("debug_sparse_state_summaries")
+    def debug_sparse_state_summaries(self, synchronize: bool = False) -> list[dict[str, object]]:
+        summaries = self.model_runner.call("debug_sparse_state_summaries", synchronize)
         if not isinstance(summaries, list) or len(summaries) != self.config.world_size:
             raise RuntimeError(
                 "Sparse-state summary did not return one record per world rank: "

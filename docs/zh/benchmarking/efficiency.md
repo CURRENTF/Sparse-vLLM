@@ -2,383 +2,192 @@
 
 [English](../../en/benchmarking/efficiency.md) | 简体中文
 
-## 用途
+本手册维护测量定义、入口及支持限制。具体实验的参数、扫描和重绘说明放在
+[scripts/official_experiments/](../../../scripts/official_experiments/)；
+历史结果不随默认协议变化而改写。
 
-效率套件使用匹配的 synthetic request trace，对比 Sparse-vLLM 方法与 vLLM
-全注意力基线。覆盖的维度包括 prompt length、并发度、固定 batch、超额请求
-churn、tensor parallelism、请求延迟、吞吐、GPU 活动率和峰值显存。
+## 入口与最小示例
 
-Synthetic workload 使用确定性的随机 token ID。相同 seed 和 case 下，不同系统
-收到完全相同的 trace；每个实测 iteration 使用新的 trace；当并发度大于 1 时，
-batch 内 prompt 长度不完全相同；prefix caching 固定关闭。churn 场景提交的请求数
-大于最大并发数，因此会包含序列替换和 scheduler 行为。
+| 目的 | 入口 |
+| --- | --- |
+| 请求 TTFT/TPOT、E2E、fixed/churn 对照 | `benchmark/efficiency/bench_probe.py`；可用 `scripts/benchmarks/run_efficiency_probe.sh` 编排 |
+| 论文主图的连续 decode 吞吐 | 同一 probe，显式开启 `--decode-only-steps` |
+| 逐步同步的阶段诊断 | `benchmark/microbench.py --synchronize_step_timing`，不混入主图 |
+| 共享统计及逐请求离线重聚合 | `benchmark/efficiency/metrics.py` |
 
-先用 synthetic suite 定位可疑 setting；只有发现可疑 case 后，才使用单独的
-Nsight 诊断。
+从仓库根目录运行。先激活正确环境（conda 用 activate 或 conda run），确认模型、
+依赖和输出盘可用，并用 `nvidia-smi` 检查所有参与 GPU 空闲。Wrapper 有空卡检查，
+独立 Python CLI 需要手动检查。每次运行使用新的持久输出目录。
 
-## 前置条件
-
-所有命令都从仓库根目录运行。开始前确认：
-
-- 当前 Python 环境已经安装 Sparse-vLLM 和 benchmark 依赖。
-- 请求 `vllm-vanilla` 时，同一个 `PYTHON_BIN` 能够导入 `vllm`。
-- `nvidia-smi` 可用，所选物理 GPU 全部空闲。
-- 模型路径或 Hugging Face model ID 可访问。
-- 输出盘有足够空间保存 JSONL trace 和硬件 timeline。
-- 如需直接使用下文的 JSON 验证命令，环境中需要有 `jq`。
-
-建议先检查：
+以下是请求模式的功能 smoke，不是论文测量点：
 
 ```bash
-cd "<SPARSE_VLLM_REPO>"
-
-PYTHON_BIN=python3
-"${PYTHON_BIN}" -c 'import sparsevllm'
-"${PYTHON_BIN}" -c 'import vllm'  # 仅运行 vLLM baseline 时需要。
-nvidia-smi
-```
-
-Shell wrapper 会拒绝已有计算进程的 GPU。独立 Python CLI 不执行空卡预检，
-使用它之前必须手动检查设备。
-
-## 快速 Smoke Test
-
-下面的小型 fixed-batch run 用 Qwen3-30B、TP=2 验证模型加载、推理、硬件采样
-和 artifact 生成。它不是有代表性的吞吐结果。
-
-```bash
-cd "<SPARSE_VLLM_REPO>"
-
-PROMPT_LENS=4096 \
-OUTPUT_LENS=32 \
-BATCH_SIZES=1 \
-BENCH_SCENARIO=fixed \
-NUM_WARMUPS=0 \
-NUM_ITERS=1 \
-SPARSEVLLM_OUTPUT_DIR="<OUTPUT_ROOT>" \
-bash scripts/benchmarks/run_efficiency_probe.sh \
-  "svllm-vanilla" \
-  "qwen3_30b" \
-  "0,1"
-```
-
-Wrapper 会在 `<OUTPUT_ROOT>` 下创建带时间戳的目录。成功的 run 包含
-`svllm-vanilla/run_status.json`，其中 `status` 为 `success`。
-
-## 跨系统匹配 Sweep
-
-下面的命令在不同 prompt length 和并发度下对比 H2O、SnapKV、Sparse-vLLM
-全注意力和 vLLM 全注意力。`BENCH_SCENARIO=all` 同时运行 fixed batch 和
-oversubscribed churn。
-
-```bash
-cd "<SPARSE_VLLM_REPO>"
-
-PROMPT_LENS="8192,16384,32768" \
-OUTPUT_LENS=512 \
-BATCH_SIZES="1,4,8" \
-BENCH_SCENARIO=all \
-BENCH_SEED=42 \
-NUM_WARMUPS=1 \
-NUM_ITERS=3 \
-MAX_NUM_BATCHED_TOKENS=8192 \
-SPARSE_PREFILL_SCORE_MODE=probability \
-SPARSEVLLM_OUTPUT_DIR="<OUTPUT_ROOT>" \
-bash scripts/benchmarks/run_efficiency_probe.sh \
-  "svllm-h2o,svllm-snapkv,svllm-vanilla,vllm-vanilla" \
-  "qwen3_30b" \
-  "0,1"
-```
-
-这是一次较重的运行：每个系统都会执行所有 prompt length、output length、
-并发度、场景、warmup 和实测 iteration 的组合。先运行 smoke test 或单个 prompt
-length，再启动完整矩阵。512-token output 更适合有代表性的 decode 指标；更短的
-output 只适合功能验证或受时间限制的探索。
-
-Wrapper 支持以下系统名：
-
-| 名称 | Engine | 方法 |
-| --- | --- | --- |
-| `svllm-vanilla` | Sparse-vLLM | `vanilla` |
-| `svllm-h2o` | Sparse-vLLM | `h2o` |
-| `svllm-snapkv` | Sparse-vLLM | `snapkv` |
-| `svllm-omnikv` | Sparse-vLLM | `omnikv` |
-| `svllm-deltakv` | Sparse-vLLM | `deltakv` |
-| `vllm-vanilla` 或 `vllm` | vLLM | `vanilla` |
-
-Probe wrapper 支持以下模型别名：
-
-| 别名 | 默认模型 | Tensor parallel size |
-| --- | --- | --- |
-| `qwen3_30b` | `Qwen/Qwen3-30B-A3B-Instruct-2507` | 2 |
-| `qwen3_8b` | `Qwen/Qwen3-8B` | 1 |
-| `qwen25_7b` | `Qwen/Qwen2.5-7B-Instruct-1M` | 1 |
-
-稀疏方法参数统一从 `benchmark/sparsevllm_regression/manifest.json` 解析，
-其中包括 OmniKV 的模型专用 full-attention 层。若模型没有经过校准的
-manifest 配置，OmniKV 会在加载模型前直接失败。已校准的自定义模型可通过
-`BENCH_MANIFEST_MODEL_ID` 指定 manifest 条目；一次性的外部校准结果可通过
-`OMNIKV_FULL_ATTENTION_LAYERS` 显式传入。单层 OmniKV 配置默认会被拒绝，
-只有 standalone Python runner 的显式消融开关可以放行。
-
-可以用 `MODEL_PATH` 覆盖别名对应的 model ID。当前 probe wrapper 按别名固定
-TP，并对任意自定义模型路径使用 TP=2。需要显式测试不同 TP 时，使用独立 CLI。
-
-## Tensor-Parallel Sweep
-
-对每个系统和 TP setting 分别调用一次 `benchmark/efficiency/bench_probe.py`。
-不同系统必须保持 seed、prompt/output length、并发度、scheduler token budget、
-jitter、warmup 和 iteration 完全相同。每个 run 使用独立输出目录。
-
-TP=1 Sparse-vLLM H2O 示例：
-
-```bash
-cd "<SPARSE_VLLM_REPO>"
-
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD:$PWD/src" python3 \
   benchmark/efficiency/bench_probe.py \
-  --engine sparsevllm \
-  --sparse-method h2o \
-  --model-path "<MODEL_PATH>" \
-  --prompt-lens 8192,16384 \
-  --output-lens 512 \
-  --batch-sizes 1,4,8 \
-  --scenario all \
-  --seed 42 \
-  --tensor-parallel-size 1 \
-  --max-num-batched-tokens 8192 \
-  --monitor-gpus 0 \
-  --output-dir "<OUTPUT_ROOT>/tp1-svllm-h2o"
+  --engine sparsevllm --sparse-method vanilla --model-path "<MODEL_PATH>" \
+  --tensor-parallel-size 1 --monitor-gpus 0 \
+  --scenario fixed --prompt-lens 4096 --output-lens 32 --batch-sizes 1 \
+  --num-warmups 0 --num-iters 1 --output-dir "<NEW_RUN_DIR>"
 ```
 
-TP=2 vLLM baseline 示例：
+完整参数用 `python3 benchmark/efficiency/bench_probe.py --help` 查询。
+`--monitor-gpus` 是物理 GPU ID，须与 `CUDA_VISIBLE_DEVICES` 对齐。
+跨系统运行时对齐模型、权重/KV dtype、trace、GPU/TP/DP/EP、预算、Graph、
+seed、长度、jitter、warmup 和重复次数；不同方法的预算需分别说明
+sink/recent/selected/full layers，同名预算不保证相同工作量或质量。
 
-```bash
-cd "<SPARSE_VLLM_REPO>"
+连续窗口必须显式指定 `--scenario fixed --prompt-length-jitter 0
+--output-length-jitter 0 --decode-only-steps 256 --decode-only-warmup-steps 32`。
+这组窗口参数不是普通请求模式的默认值。正式容量扫描及其 smoke 使用
+[稀疏 decode 效率实验入口](../../../scripts/official_experiments/sparse_decode_efficiency/README.md#boundary-sync-rerun)，
+不要复制计时 runner。窗口须覆盖方法的周期评分/驱逐，必要时统一加长所有对照。
 
-CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH="$PWD:$PWD/src" python3 \
-  benchmark/efficiency/bench_probe.py \
-  --engine vllm \
-  --sparse-method vanilla \
-  --model-path "<MODEL_PATH>" \
-  --prompt-lens 8192,16384 \
-  --output-lens 512 \
-  --batch-sizes 1,4,8 \
-  --scenario all \
-  --seed 42 \
-  --tensor-parallel-size 2 \
-  --max-num-batched-tokens 8192 \
-  --monitor-gpus 0,1 \
-  --output-dir "<OUTPUT_ROOT>/tp2-vllm-vanilla"
-```
+其他入口按需使用：
 
-`--monitor-gpus` 使用物理 GPU ID。选择非零物理设备时，必须与
-`CUDA_VISIBLE_DEVICES` 对齐；例如同时使用 `CUDA_VISIBLE_DEVICES=6,7` 和
-`--monitor-gpus 6,7`。
+- [Probe wrapper](../../../scripts/benchmarks/run_efficiency_probe.sh)：
+  `SYSTEMS MODEL_NAME_OR_PATH PHYSICAL_GPU_IDS`；变量及模型别名以脚本为准。
+  别名固定 TP，自定义路径默认 TP2；显式拓扑用 Python CLI。
+  稀疏参数来自 [regression manifest](../../../benchmark/sparsevllm_regression/manifest.json)；
+  OmniKV 无校准条目会失败，可显式提供 `BENCH_MANIFEST_MODEL_ID` 或
+  `OMNIKV_FULL_ATTENTION_LAYERS`，单层配置需要显式消融开关。
+- [Unified suite](../../../scripts/benchmarks/run_unified_efficiency_suite.sh)：
+  参数顺序是 `GPUS SYSTEMS MODEL_NAME`，运行 synthetic 与 LongBench；
+  数据目录用 `SPARSEVLLM_LONGBENCH_DATA_DIR`，最终检查 `suite_status.json`。
+- [Nsight 诊断](../../../scripts/benchmarks/run_efficiency_profile.sh)：
+  标准测试发现可疑 case 后使用，参数为 `SYSTEM MODEL_PATH GPUS`。
+  当前 wrapper 支持 vanilla/SnapKV/vLLM vanilla、默认 TP2；
+  需要 `nsys` 与 performance-counter 权限，输出 `timeline.nsys-rep`。
 
-完整 CLI 参见 `python3 benchmark/efficiency/bench_probe.py --help`。
+<a id="measurement-contract"></a>
 
-兼容 vLLM 的 fork 可在固定 batch 模式下通过 `--engine-kwargs @config.json`
-传入专用构造参数，并通过 `--backend-label` 明确标注结果。`--sparse-method`
-应填写配置实际启用的算法。专用参数不能覆盖 probe 控制的模型、工作负载容量、
-随机种子、prefix-cache 策略及计时统计设置。还需单独保存 fork 的准确源码版本和
-最终配置；算法同名不代表 token 选择语义相同。
+## 指标与计时契约
 
-## Unified Synthetic 与 LongBench 套件
+### 连续 decode：论文主结果
 
-`run_unified_efficiency_suite.sh` 先运行匹配的 synthetic suite，再运行匹配的
-LongBench lifecycle workload。它会验证 stage 状态、synthetic trace 一致性、
-prefix-cache policy、逐请求状态、硬件采样、LongBench 样本数量，以及各系统间
-source ID coverage。
+吞吐 = 窗口实际完成的 decode tokens / 协调端完整窗口秒数。
 
-LongBench 数据默认位于 `data/LongBench`。其他路径通过
-`SPARSEVLLM_LONGBENCH_DATA_DIR` 指定。
+- Prefill、wave admission 和满批 warmup 在窗口之前完成。窗口内保持同一组请求，
+  不允许 prefill、抢占、换请求、掉批、Graph capture、意外 eager 或窗口不足。
+- 只在窗口两端等待所有参与 rank/设备完成相关工作，并处理异步队列中的在途工作。
+  保留引擎兼容的 async/overlap 和算法必需同步，不添加逐步 CUDA sync 或同步 RPC。
+  按实际完成而非提交次数计 token，分子与分母覆盖同一窗口，逐 rank 校验 Graph 状态。
+- 包含调度、驱动、采样、评分、驱逐和通信，不是孤立 kernel 时间。
+  保存首尾每请求上下文长度、admission、warmup 和实测步数；
+  wave 入场可能使各请求起始上下文不同。
+- 请求仍须完成指定输出并验证 token 数。不能以缩短窗口、降低该点 BS 或截断掩盖失败；
+  改变输入/输出或截断需要明确批准，并按新协议重新测量相关对照。
+- 当前每个 workload 重建引擎；舍弃的 workload 预热持久编译缓存，
+  每次实测另外舍弃满批 warmup 步数，不代表跨 workload 复用热引擎。
+- 窗口边界扰动请求延迟，此模式不报告 TTFT/TPOT。整体服务效率另测请求/E2E，
+  不用排除了 admission 的窗口结果替代。逐步同步与边界同步结果不得混图或混合汇总。
 
-```bash
-cd "<SPARSE_VLLM_REPO>"
+满批窗口不足时，先区分请求过早结束与真实 KV 容量不足。经允许，可在独立试点中
+减少 input、等量增加 output；不缩短 warmup/测量窗口、不关闭 async。
+保存原/新长度、调整原因和窗口内实际上下文；总长度相同不代表 decode 工作量相同。
+调整后的曲线须重测并明确标注，不与原设置混点，也不代表原设置的最大容量。
 
-SPARSEVLLM_LONGBENCH_DATA_DIR="<LONGBENCH_ROOT>" \
-LONGBENCH_SAMPLES=10 \
-PROMPT_LENS="8192,16384,32768" \
-OUTPUT_LENS=512 \
-BATCH_SIZES="1,4,8" \
-SPARSEVLLM_OUTPUT_DIR="<OUTPUT_ROOT>" \
-bash scripts/benchmarks/run_unified_efficiency_suite.sh \
-  "0,1" \
-  "svllm-h2o,svllm-snapkv,svllm-vanilla,vllm-vanilla" \
-  "qwen3_30b"
-```
+### 请求模式：TTFT/TPOT 与 E2E
 
-注意它与 `run_efficiency_probe.sh` 的位置参数顺序不同：unified runner 依次接收
-`GPUS`、`SYSTEMS`、`MODEL_NAME`。最终 validator 在带时间戳的 run root 写入
-`suite_status.json`；验证失败时进程返回非零退出码。
+默认 synthetic probe 使用确定性的随机 token trace，各 iteration 更新 trace，
+同 seed/case 的系统匹配；默认有长度 jitter，churn 包含超额请求及替换。
+连续 decode 入口使用其 manifest 记录的固定 trace，不能与默认 probe 假定同源。
 
-## 主 Wrapper 参数
-
-`run_efficiency_probe.sh` 接收三个位置参数：
-
-```text
-run_efficiency_probe.sh SYSTEMS MODEL_NAME_OR_PATH PHYSICAL_GPU_IDS
-```
-
-主要环境变量如下：
-
-| 变量 | 默认值 | 含义 |
-| --- | --- | --- |
-| `PYTHON_BIN` | `python3` | 所有被测系统共用的 Python executable。 |
-| `MODEL_PATH` | 由别名决定 | 覆盖已知别名解析出的模型。 |
-| `SPARSEVLLM_OUTPUT_DIR` | `outputs` | 输出根目录；wrapper 会增加带时间戳的 run 目录。 |
-| `PROMPT_LENS` | `8192,16384,32768` | 请求的最大 prompt length。 |
-| `OUTPUT_LENS` | `512` | 请求的生成 token 数。 |
-| `BATCH_SIZES` | `1,4,8` | Fixed-batch size 和 churn 最大并发度阶梯。 |
-| `BENCH_SCENARIO` | `all` | `fixed`、`churn` 或 `all`。 |
-| `BENCH_SEED` | `42` | 各 engine 共用的 base seed。 |
-| `PROMPT_LENGTH_JITTER` | `0.10` | 从每个 prompt 上限向下生成变长序列的比例。 |
-| `OUTPUT_LENGTH_JITTER` | `0.25` | churn output length 向下抖动的比例。 |
-| `CHURN_REQUEST_MULTIPLIER` | `4` | Churn request count 与最大并发度的倍数。 |
-| `MAX_NUM_BATCHED_TOKENS` | `8192` | 两个 engine 匹配的 scheduler token budget。 |
-| `NUM_WARMUPS` | `1` | 每个 synthetic case 的 warmup iteration。 |
-| `NUM_ITERS` | `3` | 每个 synthetic case 的实测 iteration。 |
-| `SPARSE_PREFILL_SCORE_MODE` | `probability` | SnapKV prefill score mode：`probability` 或 `logits`。 |
-| `CUDA_HOME` | `/usr/local/cuda-13.0` | Probe wrapper 使用的 CUDA toolkit 根目录。 |
-
-该套件始终关闭 prefix caching；这个入口不提供 prefix-caching benchmark 模式。
-
-## 指标与解释
-
-统计统一由 `benchmark/efficiency/metrics.py` 实现。Probe 的 fixed-batch 与
-churn 均合并实测逐请求样本，报告 TTFT、TPOT 的 mean/P50/P95/P99。
-旧的每批最大 TTFT 均值单独命名为 `batch_max_ttft_ms_mean`。
-请求统计契约为 `per_request_distribution_v3`，不能与旧聚合结果直接比较。
-
-- TTFT 从请求到达观测点计到首 token；TPOT 对输出多于一个 token 的请求计算
-  `(完成时间 - 首 token 时间) / (生成 token 数 - 1)`。不扣除调度等待或其他
-  请求的 prefill 阻塞。单 token 请求的 TPOT 为 null。
-- Sparse-vLLM 记录请求提交与 step 返回可见 token 的事件，不额外逐 step CUDA
-  同步。timing_source 为 `sparsevllm_step_token_publication_no_extra_sync_v1`，
-  不应与旧的逐 step 同步观测混比。vLLM 使用内部
-  metrics，其 legacy finished_time 与 V1 last_token_ts 边界分别记录在
-  timing_source 中。这些是引擎观测指标，不包含 HTTP 客户端网络链路。
-- Probe 默认不采集独立阶段时间，`stage_metrics_status=not_measured`。
-  `first_token_window_throughput_tps` 是输入 token / 首 token 事件窗口；
-  `batch_decode_token_throughput_tps` 是后续输出 token / 最早首 token 至最后
-  完成的窗口。窗口可重叠，不能称为纯 prefill/decode 阶段吞吐。
-  旧字段 `prefill_token_throughput_tps`、`decode_token_throughput_tps`
-  仅保留为兼容别名。
-- 原生 TP1 fixed-batch 可显式开启 CUDA Graph，并传入
-  `--decode-only-steps 256 --decode-only-warmup-steps 8`，诊断满并发的纯 decode
-  窗口。每个 raw iteration 的 `decode_only_window` 使用实际 decode token 数 /
-  连续窗口耗时，仅在两端同步 CUDA。prefill 和 wave 入场在窗口之前；窗口内保留
-  调度、采样、评分、淘汰以及 step 之间的驱动开销。混入 prefill、并发下降、请求
-  替换、Graph capture/eager 执行或窗口不足均报错。这是引擎吞吐，不是孤立 GPU
-  kernel 时间；该诊断的请求延迟受两端同步扰动，使用独立 timing_source，不替代
-  默认请求测量。原有事件窗口字段的含义不变。
-- `output_token_throughput_tps` 使用全部输出 token / 完整实测 workload 时间；
-  跨 iteration 汇总按总 token / 总时间计算。它是 E2E 输出吞吐。
-  `tpot_concurrency_proxy_tps` 是 concurrency × 1000 / mean request TPOT，
-  仅为代数代理，不是观测吞吐。
-- 独立阶段诊断使用 `benchmark/microbench.py --synchronize_step_timing`。
-  逐 step 同步必须显式开启，不用于请求延迟测量；未开启时阶段吞吐为 null，
-  stage_metrics_status 为 not_measured。开启后，
-  `prefill_stage_throughput_tps` 与 `decode_stage_throughput_tps` 分别使用
-  对应实际 token 工作量 / 对应累计 step 时间，包含完整 llm.step 的工作。
-  查看 logical_input_tokens 与 prefill_computed_tokens 区分逻辑输入和计算量；
-  decode_stage_tokens 排除 prefill 产生的首 token。阶段时间不含 step 之间的
-  测试驱动代码。分批 admission、warmup 舍弃、截断的窗口设置随结果保存。
-  旧 ttft 是批次首次观测，旧 itl 是执行时间代理，不能作为请求指标。
-- 固定并发的纯 decode 测量可在同步 microbench 中添加
-  `--require_full_decode_batch --decode_warmup_steps_after_full N`。
-  所有请求必须无抢占地生成完整输出；只统计 warmup 后的满批 decode 步骤，
-  排除批次缩小时的尾部，拒绝截断。指定 `--output_dir` 后保存原始输出与逐步记录。
-  `--engine vllm --methods vanilla` 选择同步 vLLM V1 阶段适配器
-  （验证版本 v0.26.0；需设 `VLLM_ENABLE_V1_MULTIPROCESSING=0`）。
-  step 时间包含所有 worker 的 CUDA 同步 RPC 开销。此模式要求 DP1、EP1 或 EP=TP，
-  禁用 prefix cache 和 admission wave；若提供 `engine_prefill_chunk_size`，
-  它必须等于 `max_num_batched_tokens`。无法映射的参数会明确失败。
-- GPU compute activity 和 memory I/O activity 来自 nvidia-smi 采样，不是
-  理论 MFU/MBU。Coarse active duty 也不能用于归因 CPU/launch 开销。
-
-可在仓库根目录对已有逐请求 artifact 重新统计，无需 GPU：
-
-```bash
-python3 benchmark/efficiency/metrics.py "<RUN_DIR>/request_samples.jsonl"
-```
-
-命令向 stdout 输出 JSON，按 engine、方法、场景、长度、并发度与 timing_source
-分组，并跨 iteration 合并请求。输入缺字段、失败样本或无效指标会明确报错；
-不会覆盖原 artifact。旧 churn artifact 若缺少 timing_source，需要先核实其
-观测边界，不能静默猜测。仅保留 batch 聚合的旧结果无法恢复请求分位数。
-
-Matched comparison 必须匹配 checkpoint、trace、metric contract、engine config、
-TP、seed、长度、scheduler budget、warmup 和 iteration count。成功的 vLLM
-baseline 应保存为不可变 artifact；上述契约或硬件、graph/backend policy 变化时
-生成新 baseline，不要覆盖旧数据。
-
-## Artifact 与验证
-
-每个独立 CLI 或 wrapper 的逐系统输出包含：
-
-| Artifact | 含义 |
+| 指标 | 定义与边界 |
 | --- | --- |
-| `run_manifest.json` | 命令、Git 状态、参数、package/GPU 环境、模型元数据、workload contract 和最终状态。 |
-| `run_status.json` | 终态成功或失败状态。 |
-| `raw_samples.jsonl` | 每个实测 synthetic iteration 一条记录。 |
-| `request_samples.jsonl` | 逐请求 trace 元数据和状态。 |
-| `summary.json` | 聚合结果和终态状态。 |
-| `comparison_report.md` | 便于阅读的指标表。 |
-| `case_hardware/*.json` | 每个 case 的 GPU 采样 timeline 和 summary。 |
-| `operator_runtime_stats.json` | Sparse fixed-batch 的 Provider 绑定、拒绝原因与实际 kernel path。 |
+| TTFT | 请求到达至首 token |
+| TPOT | `(完成时间 - 首 token 时间) / (输出 tokens - 1)`；单 token 为 null，保留调度等待和 prefill 干扰 |
+| `output_token_throughput_tps` | 全部输出 tokens / 完整 workload 时间，即 E2E |
+| `first_token_window_throughput_tps` | 输入 tokens / 首 token 事件窗口 |
+| `batch_decode_token_throughput_tps` | 后续输出 tokens / 最早首 token 至最后完成的窗口 |
 
-不能只根据终端输出声明 run 完成。至少检查：
+后两项是可能重叠的事件窗口，不是执行阶段吞吐。默认
+`stage_metrics_status=not_measured`；旧 `prefill_token_throughput_tps` /
+`decode_token_throughput_tps` 仅是兼容别名。`tpot_concurrency_proxy_tps`
+是 concurrency × 1000 / mean TPOT，不是观测吞吐。
 
-```bash
-jq -e '.status == "success"' "<RUN_DIR>/run_status.json"
-jq -e '.status == "success"' "<RUN_DIR>/summary.json"
-jq -e '.status == "success"' "<RUN_DIR>/run_manifest.json"
-test -s "<RUN_DIR>/raw_samples.jsonl"
-test -s "<RUN_DIR>/request_samples.jsonl"
-```
+请求统计契约 `per_request_distribution_v3` 合并各 iteration 的逐请求样本，
+报告 mean/P50/P95/P99；旧批次最大 TTFT 均值为 `batch_max_ttft_ms_mean`。
+Sparse-vLLM 在 step 返回观测 token，不额外逐步同步，标记
+`sparsevllm_step_token_publication_no_extra_sync_v1`；vLLM 的
+legacy finished_time / V1 last_token_ts 按 `timing_source` 区分。
+它们是引擎事件，不是 HTTP 客户端延迟；观测边界不一致时不能直接比较。
 
-Unified run 还必须检查：
+### 逐步同步：阶段诊断
 
-```bash
-jq -e '.status == "success"' "<UNIFIED_RUN_ROOT>/suite_status.json"
-```
+`--synchronize_step_timing` 测实际计算 tokens / 累计完整同步 step 时间，
+包含 step 内工作，但不包含 step 之间的驱动开销。Prefill 排除 prefix hits，
+decode 排除 prefill 产生的 token；逻辑输入不等于实际计算量。
+既不开同步、也不选连续窗口时，阶段吞吐为 null。旧 `ttft/itl` 是批次观测或代理，
+不是请求分布。
 
-Probe 拒绝向已经包含 benchmark artifact 的目录写入。请选择新的输出目录，不要
-混合或覆盖不同 run。
+固定满批诊断可加 `--require_full_decode_batch --decode_warmup_steps_after_full N`：
+保留完整输出，无抢占；排除 warmup 与掉批尾部，拒绝截断。
+记录 admission、warmup 和截断策略。GPU activity 来自 `nvidia-smi` 采样，
+不是理论 MFU/MBU，也不能据此归因 CPU/launch 开销。
 
-## Nsight 诊断
+<a id="support"></a>
 
-只有标准 sweep 定位到可疑 case 后才使用 profiling wrapper。当前支持
-`svllm-vanilla`、`svllm-snapkv` 和 `vllm-vanilla`，并使用 probe CLI 默认的
-TP=2。
+## 支持范围与验证状态
 
-```bash
-cd "<SPARSE_VLLM_REPO>"
+下表描述适配路径，不保证任意模型/拓扑/依赖版本均已通过 GPU 验证。
+新增能力时同步更新本节；每个目标组合先验证计时边界、完整输出、实际 Graph
+及 async/overlap 状态，再做正式测量，不能仅以“代码已实现”声称性能已验证。
 
-PROMPT_LEN=16384 \
-OUTPUT_LEN=512 \
-CONCURRENCY=8 \
-SPARSEVLLM_OUTPUT_DIR="<OUTPUT_ROOT>" \
-bash scripts/benchmarks/run_efficiency_profile.sh \
-  svllm-vanilla \
-  "<MODEL_PATH>" \
-  "0,1"
-```
-
-该命令要求安装 Nsight Systems（`nsys`）并具有 NVIDIA performance counter
-权限。counter 不可用时会直接失败，不会用估算硬件指标替代。主要输出为
-`timeline.nsys-rep`。
-
-## 故障排查
-
-| 现象 | 检查方法 |
+| 模式 | 当前范围与限制 |
 | --- | --- |
-| Wrapper 报告 GPU busy | 等待列出的 PID 结束，或选择其他空闲物理 GPU ID。 |
-| `sparsevllm` 或 `vllm` 出现 `ModuleNotFoundError` | 将 `PYTHON_BIN` 指向能导入所有被测 engine 的环境；source checkout 可设置 `PYTHONPATH="$PWD:$PWD/src"`。 |
-| 无法加载模型配置 | 检查 `<MODEL_PATH>/config.json`，或确认 Hugging Face model ID 可访问。 |
-| 长 context 或高并发 OOM | 减小 `BATCH_SIZES` 或 `PROMPT_LENS`；记录修改后的矩阵，不要静默删除失败行。 |
-| 输出目录冲突 | 使用新的 `--output-dir` 或 output root，不要追加到旧 run。 |
-| Hardware metric 状态为 `metric_failed` | 检查逐 case hardware JSON 是否存在缺失或失败的 `nvidia-smi` sample。 |
-| Nsight 报告权限不足 | 在 host 开启 NVIDIA performance counter，或跳过诊断；不能把 coarse activity 重新解释为 hardware-counter 数据。 |
+| 默认请求 probe | Sparse-vLLM / vLLM，fixed/churn，显式 TP；模型能力另行约束 |
+| 原生连续 decode | 已实现逐 rank 边界同步，不以 TP1 为永久限制；当前编排 DP1，TP/EP 受模型和引擎能力约束 |
+| vLLM / Tangram 连续 decode | 已实现 async 队列边界排空；外部版本和模型须逐组合 smoke；无 wave admission |
+| HiSparse QuEST 连续 decode | 已实现 TP1 overlap 队列边界排空；不是 MLA 适配，无 wave admission |
+| Vortex QuEST 连续 decode | 复用 SGLang overlap 完成计数，DP1、EP1 或 EP=TP；已实现 TP 组边界同步和逐 rank Graph/工作量校验，模型及拓扑须分别 smoke 验证；无 wave admission |
+| 同步 vLLM 阶段诊断 | 既有验证版本 v0.26.0；设 `VLLM_ENABLE_V1_MULTIPROCESSING=0`；DP1，EP1 或 EP=TP，无 prefix cache/wave；chunk 如指定须等于 scheduler token budget |
+
+连续入口当前要求 fixed、零 jitter、seed 42，开启 Graph、关闭 prefix cache。
+原生支持 wave admission；无法满足契约时报告不支持/测量失败，不关闭 async、
+回退 step-sync 或减少测量工作量来获取“成功”结果。
+
+vLLM-compatible fork 用 `--engine-kwargs @config.json` 和 `--backend-label`。
+参数不能覆盖入口控制的模型、容量、seed、prefix-cache 和计时设置；
+`--sparse-method` 写实际算法，保存 fork 的精确版本与最终配置。
+
+<a id="artifacts"></a>
+
+## 验收、留存与排错
+
+先检查终态与原始证据，不仅看终端吞吐：
+
+| 模式 | 必查产物 |
+| --- | --- |
+| 默认请求 probe | `run_status.json`、`run_manifest.json`、`summary.json` 均为 `success`；`raw_samples.jsonl` 与 `request_samples.jsonl` 完整有效 |
+| 连续 decode | `run_status.json` 为 `completed`，`performance.jsonl` 每行 `success`；校验 `repetitions[].decode_window`、逐步完成记录及完整输出，不套用请求模式文件清单 |
+| Unified suite | 另需 `suite_status.json` 为 `success`，匹配 source ID coverage 和样本数量 |
+
+请求模式另保存 `comparison_report.md`、`case_hardware/*.json` 及适用时的
+`operator_runtime_stats.json`。后者用于 Provider 绑定和实际路径核查。
+离线重聚合：`python3 benchmark/efficiency/metrics.py <RUN_DIR>/request_samples.jsonl`，
+无需 CUDA，JSON 输出到 stdout，不覆盖原文件；缺字段/失败样本会报错。
+缺 `timing_source` 须先核实边界；仅有批次聚合无法恢复请求分位数。
+
+记录命令、配置、Git commit 和 dirty 状态、依赖、模型、trace hash、GPU/拓扑和失败。
+不生成或强制校验逐文件源码指纹；源码变化是否需要重测由实验者判断。
+dirty 状态只表示存在未提交修改，不保证仅凭 commit 可以精确重建源码。
+原始输出、逐次测量与聚合分开保存；吞吐按总 tokens / 总时间聚合，保留离散程度。
+最大并发须验证整数边界及 max+1；普通崩溃不是容量不足证据。
+多方法队列中，方法的 smoke/测量失败应保留证据、跳过该方法并继续其他方法，
+最终仍报告失败；GPU 冲突、资源失效、存储错误或用户停止中止整组。
+契约、硬件或 Graph/backend 政策变化须重测 baseline，不覆盖旧数据。
+
+脚本、可复用配置和绘图代码留在 `scripts/official_experiments/<experiment>/`。
+每次重复数据、可重绘 JSON/CSV、resolved config 和原始数据校验和单独存入
+Research-Vault 的项目数据目录并纳入版本控制，通过显式路径参数交给运行和绘图入口。
+repo 代码配合该数据包应能重绘。大体积日志/原始输出保存在持久数据盘，
+数据包及 Vault 记录保留其索引；不放 tmp、不覆盖旧实验。
+
+| 现象 | 处理 |
+| --- | --- |
+| GPU busy | 等待或选择其他空卡，不终止他人进程 |
+| 依赖/模型不可用 | 检查激活环境、导入、模型 config 及访问权限 |
+| OOM | 保存失败；固定矩阵不要静默降 BS/长度，容量扫描按明确策略定位边界 |
+| 输出目录冲突 | 换新目录，不覆盖历史 run |
+| 窗口/Graph/异步验证失败 | 保留日志，排查适配；不能回退同步协议冒充成功 |
+| 硬件采样失败或 Nsight 权限不足 | 检查采样 JSON、工具和权限；不能用粗粒度 activity 替代 counter 数据 |

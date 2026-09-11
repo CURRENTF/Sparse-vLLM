@@ -36,7 +36,7 @@ limit. The formula scales with hardware but is not a claim of optimal tuning on
 every GPU. Historical context-aware experiments remain frozen in
 `scripts/official_experiments/tilelang_mla_split_profiles`; they do not measure
 this context-independent rule. The capacity rerun recipe is in
-`scripts/official_experiments/decode_capacity_128k2k`.
+`scripts/official_experiments/sparse_decode_efficiency`.
 
 The provider passes SM count from `DeviceCaps` at binding. Context capacity
 remains a storage/validation bound only. Plans are indexed only by batch;

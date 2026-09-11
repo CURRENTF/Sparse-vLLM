@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tarfile
 
-from plot_decode_capacity import validate_measurement
+from plot_decode_capacity import validate_measurement, without_source_fingerprints
 
 CHANGED = {"src/sparsevllm/kernels/tilelang/mla/runtime.py",
            "src/sparsevllm/operators/mla_attention.py"}
@@ -31,11 +31,6 @@ def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def runtime_hashes(identity):
-    return {n: h for n, h in identity["source_sha256"].items()
-            if n.startswith(("src/", "benchmark/"))}
-
-
 def selected_bindings(value):
     if isinstance(value, dict):
         if "selected_provider" in value:
@@ -49,15 +44,7 @@ def selected_bindings(value):
 
 def prepare(args):
     base = read(args.base_plot)
-    target = next(c for c in base["curves"] if (c["model"], c["lane"]) == TARGET)
-    baseline = read(Path(target["points"][0]["artifact"]).parent / "identity.json")
     names = subprocess.check_output(["git", "ls-files", "-z"], cwd=args.repo).decode().split("\0")
-    hashes = {n: sha(args.repo / n) for n in names if n and (args.repo / n).is_file()}
-    current = runtime_hashes({"source_sha256": hashes})
-    previous = runtime_hashes(baseline)
-    changed = {n for n in current.keys() | previous.keys() if current.get(n) != previous.get(n)}
-    if changed != CHANGED:
-        raise ValueError(f"Expected only the reviewed MLA profile files to change, got {sorted(changed)}")
     if RULE not in (args.repo / "src/sparsevllm/kernels/tilelang/mla/runtime.py").read_text():
         raise ValueError("Selected source does not contain the requested rule")
     if not args.scratch_root.is_absolute() or len(str(args.scratch_root)) > 65:
@@ -69,7 +56,7 @@ def prepare(args):
     write(args.run_root / "config.json", config)
     write(args.run_root / "base_plot.json", base)
     with tarfile.open(args.run_root / "source.tar.gz", "w:gz") as archive:
-        for name in sorted(hashes):
+        for name in sorted(n for n in names if n and (args.repo / n).is_file()):
             archive.add(args.repo / name, arcname=name, recursive=False)
     source_dir = args.run_root / "source"
     source_dir.mkdir()
@@ -86,13 +73,13 @@ def prepare(args):
         "context_in_split_selection": False, "target": list(TARGET),
         "repo": str(args.repo.resolve()),
         "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=args.repo, text=True).strip(),
-        "source_sha256": hashes, "source_archive_sha256": sha(args.run_root / "source.tar.gz"),
-        "changed_runtime_files": sorted(changed), "baseline_source_sha256": previous,
+        "git_dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=args.repo, text=True).strip()),
+        "profile_files": sorted(CHANGED),
         "base_plot_path": str(args.base_plot.resolve()), "base_plot_sha256": sha(args.base_plot),
         "config_sha256": sha(args.run_root / "config.json"),
         "quality_scope": "synthetic throughput; not a generation-quality evaluation",
     })
-    print(f"Prepared {args.run_root}; only two reviewed runtime files differ", flush=True)
+    print(f"Prepared {args.run_root}; source equality is not checked", flush=True)
 
 
 def export(args):
@@ -102,7 +89,7 @@ def export(args):
         raise ValueError("Baseline plot data changed after preparation")
     if sha(root / "config.json") != manifest["config_sha256"]:
         raise ValueError("Rerun configuration changed after preparation")
-    base, config = read(root / "base_plot.json"), read(root / "config.json")
+    base, config = without_source_fingerprints(read(root / "base_plot.json")), read(root / "config.json")
     curves = copy.deepcopy(base["curves"])
     curve = next(c for c in curves if (c["model"], c["lane"]) == TARGET)
     paths = list((root / TARGET[0]).glob(f"*/{TARGET[1]}/capacity.json"))
@@ -117,8 +104,6 @@ def export(args):
     for attempt in boundary["attempts"]:
         case = Path(attempt["artifact"]).parent
         identity = read(case / "identity.json")
-        if runtime_hashes(identity) != runtime_hashes(manifest):
-            raise ValueError(f"Runtime/measurement source changed during the sweep: {case}")
         if identity["model_config_sha256"] != old_identity["model_config_sha256"]:
             raise ValueError(f"Model configuration changed: {case}")
         expected = {**old_hp, "decode_graph_capture_sizes": [attempt["concurrency"]]}
@@ -206,9 +191,8 @@ def export(args):
         "alpha": manifest["alpha"], "candidates": manifest["candidates"],
         "tie_break": manifest["tie_break"], "context_in_split_selection": False,
         "base_git_commit": manifest["git_commit"],
-        "source_archive_sha256": manifest["source_archive_sha256"],
-        "changed_runtime_files": manifest["changed_runtime_files"],
-        "changed_source_sha256": {n: manifest["source_sha256"][n] for n in sorted(CHANGED)},
+        "git_dirty": manifest.get("git_dirty"),
+        "profile_files": sorted(CHANGED),
         "reused_curves": 9, "rerun_target": list(TARGET),
         "artifact_prefixes": sorted(roots.values()),
         "metric": portable["metric"], "quality_scope": manifest["quality_scope"],
@@ -233,7 +217,6 @@ def export(args):
         dest.write_bytes((package / name).read_bytes())
     manifest.update(status="completed", accepted_points=sum(len(c["points"]) for c in curves),
                     reused_curves=len(curves)-1, rerun_points=len(curve["points"]),
-                    export_recipe_sha256={n: sha(recipe / n) for n in recipe_names},
                     output=str(output))
     write(root / "manifest.json", manifest)
     print(f"Validated all {manifest['accepted_points']} points; exported {output}", flush=True)

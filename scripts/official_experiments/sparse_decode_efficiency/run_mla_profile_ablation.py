@@ -1,6 +1,5 @@
 """Guarded ABBA comparison using the canonical full-batch decode microbench."""
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -101,12 +100,9 @@ def main():
             time.sleep(1)
         else:
             raise RuntimeError("GPU guard readiness timeout")
-        names = subprocess.check_output(["git", "ls-files", "-z"], cwd=repo, text=True).split("\0")
         save(root / "identity.json", {"git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
-            "source_sha256": {name: hashlib.sha256((repo / name).read_bytes()).hexdigest() for name in names if name and (repo / name).is_file()},
-            "gpus": env["CUDA_VISIBLE_DEVICES"], "flag": FLAG,
-            "orchestrator_sha256": {name: hashlib.sha256((PACKAGE / name).read_bytes()).hexdigest() for name in
-                ("run_mla_profile_ablation.py", "validate_mla_profile_ablation.py", "decode_capacity_guard.py", "plot_decode_capacity.py")}})
+            "git_dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=repo, text=True).strip()),
+            "gpus": env["CUDA_VISIBLE_DEVICES"], "flag": FLAG})
         status("resource", "reserved", gpus=env["CUDA_VISIBLE_DEVICES"])
         for variant in ("profile", "fixed32"):
             case_env = dict(env, **{FLAG: "0" if variant == "profile" else "1"})

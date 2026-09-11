@@ -20,6 +20,87 @@ def test_partial_output_artifact_does_not_label_short_generation_success():
     assert [(row["request_id"], row["token_ids"]) for row in rows] == outputs
 
 
+@pytest.mark.parametrize("admitted,preempt", [(3, False), (4, False), (4, True)])
+def test_native_loop_distinguishes_unadmitted_requests_from_short_window(monkeypatch, tmp_path, admitted, preempt):
+    """BS4 admission at B3 must reach capacity search, not abort as bad timing.
+
+    Exercise the actual loop; collector tests cannot catch post-loop error order.
+    A fully admitted but too-short output must still be a window error.
+    """
+    import sparsevllm
+    from benchmark import microbench
+
+    class Sequence:
+        def __init__(self, seq_id):
+            self.seq_id, self.length = seq_id, 3
+
+        def __len__(self):
+            return self.length
+
+    class Engine:
+        def __init__(self, *args, **kwargs):
+            self.scheduler = SimpleNamespace(waiting=[], decoding=[], total_preemptions=0)
+            self.iteration = 0
+            self.last_step_token_outputs = []
+            self.exited = False
+
+        def add_request(self, *args):
+            seq_id = len(self.scheduler.waiting)
+            self.scheduler.waiting.append(Sequence(seq_id))
+            return seq_id
+
+        def is_finished(self):
+            return self.iteration == 3
+
+        def step(self):
+            self.iteration += 1
+            if self.iteration == 1:
+                self.scheduler.decoding = self.scheduler.waiting[:admitted]
+                self.scheduler.waiting = self.scheduler.waiting[admitted:]
+                return [], 2 * admitted
+            self.last_step_token_outputs = [(s.seq_id, [7]) for s in self.scheduler.decoding]
+            for seq in self.scheduler.decoding:
+                seq.length += 1
+            outputs = []
+            if self.iteration == 3:
+                if preempt:
+                    self.scheduler.total_preemptions += 1
+                    return [], -(admitted - 1)
+                outputs = [(s.seq_id, [7] * 3) for s in self.scheduler.decoding]
+                self.scheduler.decoding = []
+            return outputs, -admitted
+
+        def debug_sparse_state_summaries(self, **kwargs):
+            return [dict(decode_graph=dict(capture_count=1, replay_count=self.iteration - 1,
+                                           eager_static_count=0, force_eager_count=0))]
+
+        def exit(self):
+            self.exited = True
+
+    engine = Engine()
+    monkeypatch.setitem(sparsevllm.__dict__, "LLM", lambda *a, **kw: engine)
+    for name in ("reset_peak_memory_stats", "empty_cache", "synchronize"):
+        monkeypatch.setattr(microbench.torch.cuda, name, lambda: None)
+    args = SimpleNamespace(hyper_params_dict={}, output_len=3,
+        max_model_len_override=None, model_path="fixture", temperature=0.0, top_p=1.0,
+        output_dir=str(tmp_path), require_full_decode_batch=True,
+        decode_window_steps=4, decode_warmup_steps_after_full=1)
+    results = {}
+    microbench.benchmark_task("vanilla", 2, 4, args, results)
+    row = results[("vanilla", 2, 4)]
+    expected = "Full decode batch capacity exceeded" if admitted < 4 or preempt else "without the requested full-residency"
+    assert expected in row["error"]
+    assert row["actual_decode_peak"] == admitted
+    assert row["completed_requests"] == (0 if preempt else admitted)
+    assert engine.exited
+    from scripts.official_experiments.sparse_decode_efficiency.sweep_decode_capacity import capacity_failure
+    log = tmp_path / "run.log"
+    log.write_text(row["error"])
+    assert capacity_failure(row["error"], log) is (admitted < 4 or preempt)
+    raw = [json.loads(line) for line in (tmp_path / "vanilla-2-4/raw_outputs.jsonl").read_text().splitlines()]
+    assert len(raw) == (0 if preempt else admitted) and all(len(r["token_ids"]) == 3 for r in raw)
+
+
 def test_decode_cuda_graph_status_records_execution_counters():
     graph = object()
     runner = SimpleNamespace(

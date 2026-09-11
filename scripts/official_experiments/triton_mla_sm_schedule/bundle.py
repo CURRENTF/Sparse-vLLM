@@ -84,7 +84,7 @@ for fork, name in (("tangram", "config/compression.py"), ("hisparse", "srt/arg_g
     if sha(path) != forks[fork]["imported_files_sha256"][name]:
         raise ValueError("Unsupported-contract evidence changed after capture")
     add(path, Path("validation/unsupported") / fork / name)
-for name in ("scripts/official_experiments/triton_mla_sm_schedule", "scripts/official_experiments/decode_capacity_128k2k"):
+for name in ("scripts/official_experiments/triton_mla_sm_schedule", "scripts/official_experiments/sparse_decode_efficiency"):
     # Recipes and portable data only; no local/private path configs or old plots.
     for path in (args.repo / name).rglob("*"):
         if path.is_file() and path.suffix in {".py", ".sh", ".md", ".json", ".csv"} and not any(x in path.parts for x in ("__pycache__", "plots")) and ".local." not in path.name:

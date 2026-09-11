@@ -9,7 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-PACKAGE = Path(__file__).resolve().parents[1] / "decode_capacity_128k2k"
+PACKAGE = Path(__file__).resolve().parents[1] / "sparse_decode_efficiency"
 sys.path.insert(0, str(PACKAGE))
 from plot_decode_capacity import validate_measurement
 

@@ -46,6 +46,128 @@ def _worker_peak_memory(worker) -> float:
     return torch.cuda.max_memory_allocated() / 1024**3
 
 
+def _install_window_graph_observer(worker):
+    """Worker-local CPU counters; no synchronization in the forward hook."""
+    from vllm.v1.worker import gpu_model_runner
+    if hasattr(worker, "_paper_window_graphs"):
+        raise RuntimeError("Window observer already installed")
+    worker._paper_window_graphs = {"replay_count": 0, "eager_decode_count": 0}
+    original = gpu_model_runner.set_forward_context
+
+    def context(*args, **kwargs):
+        mode = kwargs["cudagraph_runtime_mode"]
+        key = "eager_decode_count" if mode.name == "NONE" else "replay_count"
+        worker._paper_window_graphs[key] += 1
+        return original(*args, **kwargs)
+
+    gpu_model_runner.set_forward_context = context
+
+
+def _window_worker_boundary(worker):
+    import torch
+    from vllm.compilation.counter import compilation_counter
+    torch.cuda.synchronize()
+    return {**worker._paper_window_graphs,
+            "capture_count": compilation_counter.num_cudagraph_captured}
+
+
+def _run_decode_window(engine, core, bs, length, args, row, raw_outputs, steps, case_dir):
+    """Drain via the existing engine loop, without disabling its async scheduler."""
+    from benchmark.efficiency.metrics import PipelinedDecodeWindow, decode_window_fields
+    scheduler = core.scheduler
+    original_schedule = scheduler.schedule
+    original_update = scheduler.update_from_output
+    original_has_requests = scheduler.has_requests
+    graph_stats = []
+    tickets = {}
+    draining = False
+    peak = 0
+    preemptions = 0
+    # Recent vLLM assigns private internal IDs; Tangram's pinned older V1 uses
+    # the caller ID directly. Persist the actual mapping, never strip suffixes.
+    request_id_map = {getattr(state, "external_req_id", internal): internal
+                      for internal, state in engine.output_processor.request_states.items()}
+    if len(request_id_map) != bs:
+        raise RuntimeError("Missing or duplicate external-to-internal request mapping")
+    row["request_id_map"] = request_id_map
+    core.model_executor.collective_rpc(_install_window_graph_observer)
+
+    def synchronize():
+        graph_stats[:] = core.model_executor.collective_rpc(_window_worker_boundary)
+        if len(graph_stats) != row["resolved_parallel_topology"]["tensor_parallel_size"]:
+            raise RuntimeError("Window boundary did not cover every TP/EP worker")
+
+    window = PipelinedDecodeWindow(bs, args.decode_window_steps,
+        args.decode_warmup_steps_after_full, synchronize=synchronize,
+        clock=perf_counter, graph_stats=lambda: [dict(r) for r in graph_stats])
+
+    def schedule(*a, **kw):
+        nonlocal peak, preemptions
+        before = {k: (r.num_computed_tokens, r.num_prompt_tokens)
+                  for k, r in scheduler.requests.items()}
+        out = original_schedule(*a, **kw)
+        counts = out.num_scheduled_tokens
+        preemptions += len(out.preempted_req_ids or ())
+        if preemptions:
+            raise RuntimeError("Full decode batch capacity exceeded: scheduler preemption")
+        pure = bool(counts) and all(before[k][0] >= before[k][1] for k in counts)
+        if pure:
+            peak = max(peak, len(counts))
+        ticket = window.submit(is_decode=pure, request_ids=list(counts),
+            tokens=sum(counts.values()), admission_complete=len(counts) == bs and pure,
+            context_lengths=[before[k][0] + counts[k] for k in counts])
+        tickets[id(out)] = (ticket, pure, list(counts))
+        return out
+
+    def update(out, result, *a, **kw):
+        ticket, pure, ids = tickets.pop(id(out))
+        if pure and ticket is not None:
+            actual = sum(len(result.sampled_token_ids[result.req_id_to_index[k]]) for k in ids)
+        else:
+            actual = None
+        ret = original_update(out, result, *a, **kw)
+        window.complete(ticket, decode_tokens=actual)
+        return ret
+
+    scheduler.schedule = schedule
+    scheduler.update_from_output = update
+    scheduler.has_requests = lambda: False if draining else original_has_requests()
+    try:
+        while engine.has_unfinished_requests() or core.batch_queue:
+            draining = window.needs_boundary
+            if draining and not core.batch_queue:
+                window.boundary()
+                draining = False
+            outputs = engine.step()
+            for output in outputs:
+                if output.finished:
+                    tokens = list(output.outputs[0].token_ids)
+                    raw_outputs.append(dict(request_id=request_id_map[output.request_id],
+                        external_request_id=output.request_id, token_ids=tokens,
+                        status="success" if len(tokens) == args.output_len else "model_failed"))
+        window.boundary()
+        if peak != bs:
+            raise RuntimeError("Full decode batch capacity exceeded: incomplete full residency")
+        result = window.require_result()
+        if len(raw_outputs) != bs or any(r["status"] != "success" for r in raw_outputs):
+            raise RuntimeError("Incomplete output: every request must finish the requested output length")
+        row.update(status="SUCCESS", require_full_decode_batch=True,
+            actual_decode_peak=peak, completed_requests=len(raw_outputs),
+            scheduler_preemptions=preemptions, full_admission_reached=peak == bs,
+            decode_warmup_steps_after_full=args.decode_warmup_steps_after_full,
+            avg_bs=bs,
+            mem=max(core.model_executor.collective_rpc(_worker_peak_memory)),
+            actual_async_scheduling=bool(core.async_scheduling),
+            **decode_window_fields(result))
+        _write_json(case_dir / "window.json", result)
+    finally:
+        steps.extend(window.records)
+        _write_jsonl(case_dir / "window_steps.jsonl", window.records)
+        scheduler.schedule = original_schedule
+        scheduler.update_from_output = original_update
+        scheduler.has_requests = original_has_requests
+
+
 def benchmark_decode_stage(method, length, bs, args, results_dict):
     """Synchronized V1 step diagnostic, called by the canonical microbench CLI.
 
@@ -61,6 +183,7 @@ def benchmark_decode_stage(method, length, bs, args, results_dict):
     llm = None
     case_dir = Path(args.output_dir) / f"{method}-{length}-{bs}" if args.output_dir else None
     try:
+        window_mode = bool(getattr(args, "decode_window_steps", 0))
         extra = dict(getattr(args, "engine_kwargs_dict", {}))
         label = getattr(args, "backend_label", None)
         if method != "vanilla" and not (
@@ -69,8 +192,11 @@ def benchmark_decode_stage(method, length, bs, args, results_dict):
             and extra.get("compression_budget_tokens", 0) > 0
         ):
             raise ValueError("Non-vanilla vLLM stage requires explicit Tangram SnapKV configuration and label")
-        if not args.synchronize_step_timing or not args.require_full_decode_batch:
+        if not (args.synchronize_step_timing or window_mode) or not args.require_full_decode_batch:
             raise ValueError("vLLM stage baseline requires synchronized full-batch timing")
+        if window_mode and (args.synchronize_step_timing or case_dir is None
+                            or args.decode_warmup_steps_after_full < 1):
+            raise ValueError("Window timing requires positive warmup, artifacts and no per-step sync")
         if args.max_decode_steps_after_full or args.decode_warmup_steps_after_full < 0:
             raise ValueError("Stage baseline requires untruncated outputs and non-negative warmup")
         if args.admission_wave_size or args.wave_decode_gap_steps or args.require_prefix_cache_hit:
@@ -104,7 +230,7 @@ def benchmark_decode_stage(method, length, bs, args, results_dict):
                       max_model_len=args.max_model_len_override or length + args.output_len,
                       max_num_seqs=bs, max_num_batched_tokens=hp.get("max_num_batched_tokens", 8192),
                       enable_prefix_caching=False, enable_chunked_prefill=True,
-                      async_scheduling=False, enforce_eager=not hp.get("decode_graph", True),
+                      async_scheduling=window_mode, enforce_eager=not hp.get("decode_graph", True),
                       seed=42, disable_log_stats=True,
                       compilation_config={"cudagraph_capture_sizes": [bs], "max_cudagraph_capture_size": bs})
         allowed_extra = {"dtype", "compression_scorer", "compression_budget_scope",
@@ -129,10 +255,13 @@ def benchmark_decode_stage(method, length, bs, args, results_dict):
         }
         row["vllm_version"] = vllm.__version__
         row["package_source"] = str(Path(vllm.__file__).resolve())
+        if window_mode:
+            from benchmark.efficiency.paper import record_package_source
+            row["package_identity"] = record_package_source(vllm, case_dir)
         llm = LLM(**config)
         engine = llm.llm_engine
         core = engine.engine_core.engine_core
-        if core.batch_queue is not None or core.async_scheduling:
+        if not window_mode and (core.batch_queue is not None or core.async_scheduling):
             raise RuntimeError("Stage diagnostic requires synchronous, non-pipelined EngineCore.step")
         scheduler = core.scheduler
         original_schedule = scheduler.schedule
@@ -159,6 +288,10 @@ def benchmark_decode_stage(method, length, bs, args, results_dict):
                                 ignore_eos=True, max_tokens=args.output_len, detokenize=False)
         for index in range(bs):
             engine.add_request(str(index), {"prompt_token_ids": [100] * length}, params)
+        if window_mode:
+            scheduler.schedule = original_schedule
+            _run_decode_window(engine, core, bs, length, args, row, raw_outputs, steps, case_dir)
+            return
         core.model_executor.collective_rpc(_synchronize_worker)
         full_steps = peak = preemptions = 0
         started = perf_counter()

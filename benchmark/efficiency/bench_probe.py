@@ -27,7 +27,6 @@ if src_path not in sys.path:
 from benchmark.efficiency.hardware_monitor import GPUHardwareMonitor
 from benchmark.efficiency.metrics_calculator import ModelArchitectureSpecs
 from benchmark.efficiency.metrics import (
-    DecodeOnlyWindow,
     BATCH_DECODE_WINDOW_SCOPE,
     REQUEST_METRIC_CONTRACT,
     REQUEST_TPOT_SCOPE,
@@ -704,17 +703,6 @@ def run_sparsevllm_probe(
                             vary_output_lengths=False,
                         )
                         graph_before = llm.debug_sparse_state_summaries()[0]["decode_graph"]
-                        decode_window = None
-                        if getattr(args, "decode_only_steps", 0):
-                            def window_graph_stats():
-                                stats = llm.debug_sparse_state_summaries()[0]["decode_graph"]
-                                return {"capture_count": stats["capture_count"],
-                                        "replay_count": stats["replay_count"],
-                                        "eager_decode_count": stats["eager_static_count"] + stats["force_eager_count"]}
-                            decode_window = DecodeOnlyWindow(
-                                bs, args.decode_only_steps, args.decode_only_warmup_steps,
-                                synchronize=torch.cuda.synchronize, clock=time.perf_counter,
-                                graph_stats=window_graph_stats)
                         t_start = time.perf_counter()
 
                         seq_to_request: dict[int, Any] = {}
@@ -753,15 +741,7 @@ def run_sparsevllm_probe(
                         admit_wave()
 
                         while not llm.is_finished():
-                            if decode_window is not None:
-                                decode_window.boundary()
-                                window_ids = [seq.seq_id for seq in llm.scheduler.decoding]
-                                window_admitted = next_request == len(trace) and not llm.scheduler.waiting
                             finished_outputs, _num_tokens = llm.step()
-                            if decode_window is not None:
-                                decode_window.observe(
-                                    is_decode=_num_tokens < 0, request_ids=window_ids,
-                                    tokens=-_num_tokens, admission_complete=window_admitted)
                             now = time.perf_counter()
                             for seq_id, token_ids in getattr(
                                 llm, "last_step_token_outputs", []
@@ -786,13 +766,8 @@ def run_sparsevllm_probe(
                                     peak_decode_free_slot_stats = llm.scheduler.memory_oracle.free_slot_stats()
                             if next_request < len(trace) and current_wave <= first_token_times.keys():
                                 admit_wave()
-                        if decode_window is not None:
-                            # The last measured step may also finish the workload,
-                            # leaving no next iteration to close its timing window.
-                            decode_window.boundary()
                         if len(seq_to_request) != len(trace):
                             raise RuntimeError("Wave workload ended before all requests were admitted")
-                        window_result = None if decode_window is None else decode_window.require_result()
 
                         elapsed_s = time.perf_counter() - t_start
                         graph_after = llm.debug_sparse_state_summaries()[0]["decode_graph"]
@@ -829,9 +804,6 @@ def run_sparsevllm_probe(
                                     **timing,
                                     "seq_id": seq_id,
                                     "timing_source": (
-                                        "sparsevllm_wave_step_publication_decode_boundary_sync_diagnostic_v1" if wave_size
-                                        else "sparsevllm_step_publication_decode_boundary_sync_diagnostic_v1"
-                                    ) if decode_window is not None else (
                                         "sparsevllm_wave_workload_arrival_step_publication_v1" if wave_size
                                         else "sparsevllm_step_token_publication_no_extra_sync_v1"),
                                 }
@@ -865,8 +837,6 @@ def run_sparsevllm_probe(
                             "profiler_status": "success" if profiler_snap else "skipped_by_policy",
                             "protocol": protocol,
                             "prefill_wave_events": wave_events,
-                            "decode_only_window": window_result,
-                            "request_timing_boundary_sync_diagnostic": decode_window is not None,
                             "peak_first_token_live_requests": peak_first_token_live_requests,
                             "peak_scheduler_decoding_requests": peak_scheduler_decoding_requests,
                             "peak_decode_free_slot_stats": peak_decode_free_slot_stats,
@@ -1769,7 +1739,7 @@ def run_vllm_churn(
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Standardized Synthetic Length Sweep & Efficiency Probe.")
-    parser.add_argument("--engine", type=str, choices=["sparsevllm", "vllm"], default="sparsevllm")
+    parser.add_argument("--engine", type=str, choices=["sparsevllm", "vllm", "hisparse", "vortex"], default="sparsevllm")
     parser.add_argument("--model-path", type=str, required=True, help="Model path or HF name")
     parser.add_argument("--sparse-method", type=str, default="vanilla",
                         help="Sparse method name; fixed-batch vLLM accepts vanilla or explicitly configured snapkv.")
@@ -1819,7 +1789,9 @@ def parse_args():
                         help="Native fixed H2O only: admit next wave after prior first tokens/final-prefill pruning; retain workload-start arrival timestamps.")
     parser.add_argument("--num-warmups", type=int, default=1)
     parser.add_argument("--decode-only-steps", type=int, default=0,
-                        help="Opt-in TP1 fixed-batch diagnostic: contiguous full-residency decode steps, CUDA sync only at window edges; request metrics are perturbed.")
+                        help="Paper decode window: shared native/vLLM/HiSparse adapters, CUDA sync only at drained window edges.")
+    parser.add_argument("--wave-decode-gap-steps", type=int, default=0,
+                        help="Native paper-window wave admission decode gap; not used by request probes.")
     parser.add_argument("--decode-only-warmup-steps", type=int, default=8)
     parser.add_argument("--num-iters", type=int, default=3)
     parser.add_argument("--output-dir", type=str, required=True)
@@ -1861,6 +1833,12 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.decode_only_steps:
+        from benchmark.efficiency.paper import run_paper_decode
+        run_paper_decode(args)
+        return
+    if args.engine in ("hisparse", "vortex") or args.wave_decode_gap_steps:
+        raise ValueError("HiSparse and wave-decode-gap-steps currently require explicit decode-only mode")
     if args.engine != "vllm" and _parse_json_arg(args.engine_kwargs):
         raise ValueError("--engine-kwargs is supported only by the vLLM adapter")
     if args.engine == "vllm" and args.scenario != "fixed" and _parse_json_arg(args.engine_kwargs):
@@ -1869,9 +1847,6 @@ def main():
         raise ValueError("--backend-label requires fixed-batch vLLM")
     if args.decode_only_steps < 0 or args.decode_only_warmup_steps < 1:
         raise ValueError("Invalid decode-only window length or warmup")
-    if args.decode_only_steps and (args.engine != "sparsevllm" or args.scenario != "fixed"
-                                   or args.tensor_parallel_size != 1):
-        raise ValueError("Decode-only boundary timing currently requires native TP1 fixed batch")
     if args.prefill_wave_size < 0 or (
         args.prefill_wave_size
         and (args.engine != "sparsevllm" or args.sparse_method != "h2o" or args.scenario != "fixed")

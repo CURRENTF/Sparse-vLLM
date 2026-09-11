@@ -20,7 +20,7 @@ cleanup() {
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
-python "$REPO_ROOT/scripts/official_experiments/decode_capacity_128k2k/decode_capacity_guard.py" \
+python "$REPO_ROOT/scripts/official_experiments/sparse_decode_efficiency/decode_capacity_guard.py" \
     --parent "$$" --ready "$RUN_ROOT/guard-ready.json" --max-seconds 3600 > "$RUN_ROOT/guard.log" 2>&1 &
 guard_pid=$!
 for ((attempt=0; attempt<90; attempt++)); do

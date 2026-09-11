@@ -22,7 +22,7 @@ if len({gpu for gpu, _ in pairs}) != len(pairs) or any(gpu < 0 or batch <= 0 for
 commands = []
 for gpu, batch in pairs:
     name = f"probe{batch}-gpu{gpu}"
-    command = ["python3", str(args.orchestrator_repo / "scripts/official_experiments/decode_capacity_128k2k/sweep_decode_capacity.py"),
+    command = ["python3", str(args.orchestrator_repo / "scripts/official_experiments/sparse_decode_efficiency/sweep_decode_capacity.py"),
         "--repo", str(args.repo), "--config", str(args.campaign / "config.json"),
         "--model", "qwen3-30b-fp8", "--lanes", "tangram-snapkv", "--gpus", str(gpu),
         "--attempt", name, "--reuse-smoke-from", str(args.smoke_from),

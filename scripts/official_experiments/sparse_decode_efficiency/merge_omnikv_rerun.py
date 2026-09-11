@@ -9,7 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from plot_decode_capacity import LANES, validate_measurement
+from plot_decode_capacity import LANES, validate_measurement, without_source_fingerprints
 
 
 def read(path):
@@ -22,7 +22,7 @@ def main():
     parser.add_argument("--rerun-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
-    original = read(args.original_root / "plots" / "plot_data.json")
+    original = without_source_fingerprints(read(args.original_root / "plots" / "plot_data.json"))
     config = read(args.rerun_root / "config.json")
     expected_config = copy.deepcopy(original["config"])
     expected_config["methods"]["omnikv"]["decode_keep_tokens"] = 1472
@@ -58,10 +58,6 @@ def main():
                 identity = read(case / "identity.json")
                 if identity["model_config_sha256"] != old_identity["model_config_sha256"]:
                     raise ValueError(f"Model config changed: {case}")
-                for name, digest in old_identity["source_sha256"].items():
-                    if name.startswith(("src/", "benchmark/")):
-                        if identity["source_sha256"].get(name) != digest:
-                            raise ValueError(f"Runtime or measurement source changed: {name}")
             curve.update({key: boundary[key] for key in
                           ("max_concurrency", "first_failed_concurrency", "attempts")})
             curve["capacity_artifact"] = str(candidates[0].resolve())

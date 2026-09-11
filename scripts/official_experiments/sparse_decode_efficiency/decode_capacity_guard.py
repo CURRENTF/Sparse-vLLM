@@ -27,13 +27,34 @@ def main():
     parser.add_argument("--parent", type=int, required=True)
     parser.add_argument("--ready", type=Path, required=True)
     parser.add_argument("--max-seconds", type=int, default=172800)
+    parser.add_argument("--handoff-reservation-pid", type=int)
     args = parser.parse_args()
+    handoff = args.handoff_reservation_pid
+    handoff_start = None
+    if handoff is not None:
+        proc = Path(f"/proc/{handoff}")
+        if proc.stat().st_uid != os.getuid() or b"decode_capacity_guard.py" not in (proc / "cmdline").read_bytes():
+            raise ValueError("Handoff must name this user's existing reservation guard")
+        handoff_start = (proc / "stat").read_text().split(")", 1)[1].split()[19]
+    handoff_deadline = time.monotonic() + 60
 
     def check():
+        nonlocal handoff
+        if handoff is not None:
+            proc = Path(f"/proc/{handoff}")
+            try:
+                current_start = (proc / "stat").read_text().split(")", 1)[1].split()[19]
+            except FileNotFoundError:
+                handoff = None
+            else:
+                if current_start != handoff_start:
+                    raise RuntimeError("Reservation handoff PID was reused")
+                if time.monotonic() > handoff_deadline:
+                    raise RuntimeError("Reservation handoff did not finish within 60 seconds")
         text = subprocess.check_output([
             "nvidia-smi", "-i", os.environ["CUDA_VISIBLE_DEVICES"],
             "--query-compute-apps=pid", "--format=csv,noheader,nounits"], text=True, timeout=15)
-        return [int(pid) for pid in text.split() if not descendants(int(pid), args.parent)]
+        return [int(pid) for pid in text.split() if int(pid) != handoff and not descendants(int(pid), args.parent)]
 
     if check():
         raise RuntimeError("GPU busy before reservation")
