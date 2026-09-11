@@ -17,6 +17,7 @@ def test_compute_view_preserves_attention_planning_capacity(input_capacity):
     # This CPU test checks metadata only; CUDA tests establish copy correctness.
     manager = object.__new__(OmniKVCacheManager)
     manager.offload_enabled = True
+    manager.lru = None
     manager.device = torch.device("cuda")
     manager.kv_layer_index = int
     manager.config = SimpleNamespace(recent_keep_tokens=2)

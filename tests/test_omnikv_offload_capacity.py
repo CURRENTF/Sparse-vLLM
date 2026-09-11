@@ -25,6 +25,7 @@ def test_insufficient_pool_budget_does_not_publish_capacity(gpu_bytes, host_kib)
     manager.max_buffer_rows = 2
     manager.world_size = 1
     manager.config = SimpleNamespace(
+        max_model_len=64,
         full_attention_layers=[0],
         sink_keep_tokens=0,
         decode_keep_tokens=8,
@@ -67,6 +68,7 @@ def _reject_exhausted_peer(rank, init_file):
         manager.world_size = 2
         manager.parallel_context = SimpleNamespace(world_all_reduce=dist.all_reduce)
         manager.config = SimpleNamespace(
+            max_model_len=64,
             full_attention_layers=[0],
             sink_keep_tokens=0,
             decode_keep_tokens=8,

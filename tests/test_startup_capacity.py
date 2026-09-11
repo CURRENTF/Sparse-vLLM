@@ -316,3 +316,28 @@ def test_startup_decode_rejects_request_local_capacity_limit():
     assert not runtime.startup_decode_batch_fits(
         [SimpleNamespace(seq_id=0), SimpleNamespace(seq_id=1)],
     )
+
+
+@pytest.mark.parametrize("cache_tokens", [0, 32])
+def test_omnikv_profiling_budget_can_admit_its_profile_workload(cache_tokens):
+    # Native-KV profiling budgets omitted fixed offload pools, causing startup
+    # to fail before it could measure production capacity when LRU was enabled.
+    from sparsevllm.engine.cache_manager.omnikv_capacity import plan_omnikv_pools
+
+    config = _config(sparse_method="omnikv")
+    config.enable_omnikv_offload = True
+    config.full_attention_layers = [0]
+    config.omnikv_offload_cache_tokens = cache_tokens
+    slots = profiling_kv_slots(config)
+    budget = profiling_kv_budget_bytes(config, slots)
+    plan = plan_omnikv_pools(config, [0], 4, 8, 2 * 4 * 128 * 2)
+    assert (budget - plan.fixed_bytes) // plan.slot_bytes >= slots
+
+
+def test_omnikv_cache_cannot_evict_tokens_selected_in_the_same_step():
+    from sparsevllm.engine.cache_manager.omnikv_capacity import plan_omnikv_pools
+
+    config = _config(sparse_method="omnikv")
+    config.omnikv_offload_cache_tokens = 1
+    with pytest.raises(ValueError, match="cover the full selected-token budget"):
+        plan_omnikv_pools(config, [0], 4, 8, 2048)

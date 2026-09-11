@@ -37,10 +37,14 @@ def test_model_dtype_normalization_accepts_legacy_field():
 
 @pytest.mark.parametrize("mode", [None, "logits", "probability"])
 @pytest.mark.parametrize("window", [0, 64, 128])
-def test_h2o_online_eviction_normalizes_score_units_without_changing_window(mode, window):
+def test_h2o_online_eviction_normalizes_score_units_without_changing_window(
+    mode, window
+):
     config = SparseMethodConfig(
-        sparse_method="h2o", h2o_decode_eviction=True,
-        sparse_prefill_score_mode=mode, h2o_prefill_score_window=window,
+        sparse_method="h2o",
+        h2o_decode_eviction=True,
+        sparse_prefill_score_mode=mode,
+        h2o_prefill_score_window=window,
     )
     config.prefill_sparse_method = "h2o_prefill"
     _normalize_sparse_prefill_score(config)
@@ -53,7 +57,9 @@ def test_h2o_online_eviction_normalizes_score_units_without_changing_window(mode
     ("method", "layout", "error", "message"),
     [("", "explicit_kv", ValueError, "requires sparse_method")],
 )
-def test_h2o_online_eviction_rejects_incompatible_execution_contract(method, layout, error, message):
+def test_h2o_online_eviction_rejects_incompatible_execution_contract(
+    method, layout, error, message
+):
     config = SparseMethodConfig(sparse_method=method, h2o_decode_eviction=True)
     config.prefill_sparse_method = "h2o_prefill"
     config.attention_cache_layout = layout
@@ -63,8 +69,10 @@ def test_h2o_online_eviction_rejects_incompatible_execution_contract(method, lay
 
 def test_h2o_online_eviction_still_validates_probability_window():
     config = SparseMethodConfig(
-        sparse_method="h2o", h2o_decode_eviction=True,
-        sparse_prefill_score_mode="logits", h2o_prefill_score_window=256,
+        sparse_method="h2o",
+        h2o_decode_eviction=True,
+        sparse_prefill_score_mode="logits",
+        h2o_prefill_score_window=256,
     )
     config.prefill_sparse_method = "h2o_prefill"
     _normalize_sparse_prefill_score(config)
@@ -79,18 +87,26 @@ def test_mla_h2o_approximation_warns_once_without_changing_prefill_window(monkey
     messages = []
     sink = log.logger.add(lambda message: messages.append(message.record))
     try:
-        for layout, enabled in [("explicit_kv", True), ("mla_latent", False),
-                                ("mla_latent", True), ("mla_latent", True)]:
+        for layout, enabled in [
+            ("explicit_kv", True),
+            ("mla_latent", False),
+            ("mla_latent", True),
+            ("mla_latent", True),
+        ]:
             config = SparseMethodConfig(
-                sparse_method="h2o", h2o_decode_eviction=enabled,
-                sparse_prefill_score_mode="probability", h2o_prefill_score_window=64,
+                sparse_method="h2o",
+                h2o_decode_eviction=enabled,
+                sparse_prefill_score_mode="probability",
+                h2o_prefill_score_window=64,
             )
             config.prefill_sparse_method = "h2o_prefill"
             config.attention_cache_layout = layout
             _normalize_sparse_prefill_score(config)
             _normalize_h2o(config)
             assert config.h2o_prefill_score_window == 64
-            approximation = [m for m in messages if "TODO(h2o-mla-parity)" in m["message"]]
+            approximation = [
+                m for m in messages if "TODO(h2o-mla-parity)" in m["message"]
+            ]
             assert len(approximation) == int(layout == "mla_latent" and enabled)
         assert approximation[0]["level"].name == "WARNING"
     finally:
@@ -102,4 +118,27 @@ def test_omnikv_offload_rejects_other_methods():
 
     config = SparseMethodConfig(sparse_method="h2o", enable_omnikv_offload=True)
     with pytest.raises(ValueError, match="enable_omnikv_offload requires"):
+        normalize_sparse_method_name(config)
+
+
+@pytest.mark.parametrize("tokens", [-1, True, 1.5])
+def test_omnikv_cache_rejects_invalid_capacity(tokens):
+    from sparsevllm.configs.sparse import normalize_sparse_method_name
+
+    config = SparseMethodConfig(
+        sparse_method="omnikv",
+        enable_omnikv_offload=True,
+        omnikv_offload_cache_tokens=tokens,
+    )
+    with pytest.raises(ValueError, match="non-negative integer"):
+        normalize_sparse_method_name(config)
+
+
+def test_omnikv_cache_requires_host_backing():
+    from sparsevllm.configs.sparse import normalize_sparse_method_name
+
+    config = SparseMethodConfig(
+        sparse_method="omnikv", omnikv_offload_cache_tokens=1024
+    )
+    with pytest.raises(ValueError, match="requires enable_omnikv_offload"):
         normalize_sparse_method_name(config)
