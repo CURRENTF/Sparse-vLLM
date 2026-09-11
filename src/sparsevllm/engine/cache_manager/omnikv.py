@@ -55,8 +55,8 @@ class OmniKVCacheManager(StandardCacheManager):
                 "OmniKV offload requires a positive total selected-token budget."
             )
         staging_slots = self.max_buffer_rows * self.selected_capacity
-        fixed_bytes = sparse * staging_slots * per_layer + staging_slots * 4
         metadata_bytes = self.max_buffer_rows * self.max_model_len * 4
+        fixed_bytes = sparse * staging_slots * per_layer + metadata_bytes
         # One shared full-context prefill buffer, plus the full-attention layers.
         slot_bytes = (len(full) + 1) * per_layer + 8
         slots = (available - fixed_bytes - metadata_bytes) // slot_bytes
@@ -126,9 +126,19 @@ class OmniKVCacheManager(StandardCacheManager):
             for i in range(self.num_kv_layers)
             if i not in storage.full_layers
         }
-        self.selected_slots = torch.arange(
-            staging_slots, dtype=torch.int32, device=self.device
-        ).view(self.max_buffer_rows, self.selected_capacity)
+        # Preserve the input table's capacity for provider planning: FA3 uses
+        # its width to choose splits, even when the effective context is short.
+        self.selected_slots = torch.zeros(
+            self.max_buffer_rows,
+            self.max_model_len,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.selected_slots[:, : self.selected_capacity].copy_(
+            torch.arange(staging_slots, dtype=torch.int32, device=self.device).view(
+                self.max_buffer_rows, self.selected_capacity
+            )
+        )
         self.selected_rows = torch.arange(
             self.max_buffer_rows, dtype=torch.int32, device=self.device
         )
@@ -339,7 +349,7 @@ class OmniKVCacheManager(StandardCacheManager):
         batch = req_indices.numel()
         return (
             storage.make_payload(parts),
-            self.selected_slots[:batch],
+            self.selected_slots[:batch, : active_slots.shape[1]],
             self.selected_rows[:batch],
             context_lens,
         )
