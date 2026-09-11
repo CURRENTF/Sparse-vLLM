@@ -45,12 +45,56 @@ def _lookup(
 
 
 @triton.jit
+def _choose_victims(
+    AGES,
+    CLOCK,
+    PLAN,
+    VICTIMS,
+    OWNERS,
+    LENGTHS,
+    WRITES,
+    CACHE: tl.constexpr,
+    CAP: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    batch = tl.program_id(0)
+    if tl.load(WRITES + batch) >= 0:
+        owner = tl.load(OWNERS + batch)
+        i = tl.arange(0, BLOCK)
+        length = tl.load(LENGTHS + batch)
+        entry = tl.load(PLAN + batch * CAP + i, i < CAP, 0)
+        count = tl.sum(((i < CAP) & (i < length) & (entry < 0)).to(tl.int32), 0)
+        if count > 0:
+            clock = tl.load(CLOCK + owner)
+            age = tl.load(AGES + owner * CACHE + i, i < CACHE, clock + 1)
+            # Find the smallest timestamp containing enough victims. This is
+            # exact step-granularity LRU without sorting the whole cache.
+            low = tl.full((), 0, tl.int64)
+            high = clock
+            while low < high:
+                middle = (low + high) // 2
+                enough = (
+                    tl.sum(((i < CACHE) & (age <= middle)).to(tl.int32), 0) >= count
+                )
+                high = tl.where(enough, middle, high)
+                low = tl.where(enough, low, middle + 1)
+            older = (i < CACHE) & (age < low)
+            tied = (i < CACHE) & (age == low)
+            remaining = count - tl.sum(older.to(tl.int32), 0)
+            tied_rank = tl.cumsum(tied.to(tl.int32), 0)
+            chosen = older | (tied & (tied_rank <= remaining))
+            rank = tl.cumsum(chosen.to(tl.int32), 0) - 1
+            tl.store(VICTIMS + batch * CAP + rank, i, chosen)
+
+
+@triton.jit
 def _admit(
     DIRECTORY,
     KEYS,
     AGES,
     CLOCK,
     PLAN,
+    VICTIMS,
     TABLE,
     ROWS,
     OWNERS,
@@ -71,19 +115,12 @@ def _admit(
         row = tl.load(ROWS + batch)
         clock = tl.load(CLOCK + owner)
         i = tl.arange(0, BLOCK)
-        age = tl.load(AGES + owner * CACHE + i, i < CACHE, 0)
-        # Hits were touched first, so no victim can be a selected hit. Ties
-        # within one decode step are broken by pool position deterministically.
-        order = tl.sort(
-            tl.where(i < CACHE, age * BLOCK + i, 0x7FFFFFFFFFFFFFFF), descending=False
-        )
-        victims = (order % BLOCK).to(tl.int32)
         length = tl.load(LENGTHS + batch)
         valid = (i < length) & (i < CAP)
         old_plan = tl.load(PLAN + batch * CAP + i, i < CAP, -1)
         missing = valid & (old_plan < 0)
         rank = tl.cumsum(missing.to(tl.int32), 0) - 1
-        victim = tl.gather(victims, tl.maximum(rank, 0), 0)
+        victim = tl.load(VICTIMS + batch * CAP + rank, missing, 0)
         previous = tl.load(KEYS + owner * CACHE + victim, missing, -1)
         tl.store(DIRECTORY + owner * SLOTS + previous, -1, missing & (previous >= 0))
         slot = tl.load(TABLE + row * STRIDE + i, valid, 0)
@@ -112,6 +149,7 @@ def plan_lru(
     ages,
     clock,
     plan,
+    victims,
     counters,
     table,
     rows,
@@ -139,12 +177,26 @@ def plan_lru(
         table.stride(0),
     )
     _lookup[(rows.numel(),)](*args, triton.next_power_of_2(capacity))
+    _choose_victims[(rows.numel(),)](
+        ages,
+        clock,
+        plan,
+        victims,
+        owners,
+        lengths,
+        writes,
+        cache,
+        capacity,
+        triton.next_power_of_2(cache),
+        num_warps=8,
+    )
     _admit[(rows.numel(),)](
         directory,
         keys,
         ages,
         clock,
         plan,
+        victims,
         table,
         rows,
         owners,
@@ -157,6 +209,6 @@ def plan_lru(
         cache,
         capacity,
         table.stride(0),
-        triton.next_power_of_2(cache),
+        triton.next_power_of_2(capacity),
         num_warps=8,
     )
