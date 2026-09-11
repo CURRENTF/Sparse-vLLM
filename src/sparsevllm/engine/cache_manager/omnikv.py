@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -17,6 +18,7 @@ class OmniKVCacheManager(StandardCacheManager):
     def __init__(self, config, parallel_context, *, allocation_budget_bytes=None):
         self.offload_enabled = bool(config.enable_omnikv_offload)
         self._prefetched = set()
+        self._pending_prefetch = deque()
         self._current_writes = {}
         super().__init__(
             config, parallel_context, allocation_budget_bytes=allocation_budget_bytes
@@ -242,6 +244,7 @@ class OmniKVCacheManager(StandardCacheManager):
 
     def begin_selection_step(self):
         self._prefetched.clear()
+        self._pending_prefetch.clear()
         self._current_writes.clear()
         self._selection_pending = False
 
@@ -266,14 +269,20 @@ class OmniKVCacheManager(StandardCacheManager):
     def prefetch_selections(self, selections):
         self.selection_done.record(self.prefetch_stream)
         self._selection_pending = True
-        for layer_idx, selection in selections:
-            kv_idx = self.kv_layer_index(layer_idx)
-            slots = self._default_active_slots_for_selection(layer_idx, selection)
-            self._gather_decode(
-                kv_idx, slots, selection.req_indices, selection.context_lens
-            )
-            self.layer_ready[kv_idx].record(self.prefetch_stream)
-            self._prefetched.add(kv_idx)
+        self._pending_prefetch.extend(selections)
+        self._prefetch_next_layer()
+
+    def _prefetch_next_layer(self):
+        if not self._pending_prefetch:
+            return
+        layer_idx, selection = self._pending_prefetch.popleft()
+        kv_idx = self.kv_layer_index(layer_idx)
+        slots = self._default_active_slots_for_selection(layer_idx, selection)
+        self._gather_decode(
+            kv_idx, slots, selection.req_indices, selection.context_lens
+        )
+        self.layer_ready[kv_idx].record(self.prefetch_stream)
+        self._prefetched.add(kv_idx)
 
     def _gather_decode(self, kv_idx, slots, rows, lengths):
         for component, destination in enumerate(self.selected_staging[kv_idx]):
@@ -331,6 +340,10 @@ class OmniKVCacheManager(StandardCacheManager):
             )
         if kv_idx in self._prefetched:
             stream.wait_event(self.layer_ready[kv_idx])
+            # Advance only when the current consumer reaches its KV view. The
+            # next layer's transfer overlaps this layer's attention and MLP.
+            with self.selection_stream():
+                self._prefetch_next_layer()
         else:
             self._gather_decode(kv_idx, active_slots, req_indices, context_lens)
         parts = self.selected_staging[kv_idx]
