@@ -92,6 +92,12 @@ def test_engine_rebuilds_production_runtime_before_final_graph_warmup():
         (2, True),
     ]
     assert [call[0] for call in calls].count("capture_graphs") == 2
+    # Temporary layer-skewed KV pools can reject graph batches too, before
+    # production capacity is known (PyramidKV's final layers are smallest).
+    assert all(
+        call[2].get("respect_runtime_capacity") is True
+        for call in calls if call[0] == "capture_graphs"
+    )
     assert calls.count(("profile_startup_prefill",)) == 1
     assert ("begin_startup_memory_profile", "prefill") not in calls
     assert calls.index(("profile_startup_prefill",)) < calls.index(

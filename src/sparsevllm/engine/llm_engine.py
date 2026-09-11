@@ -592,7 +592,9 @@ class LLMEngine:
 
         logger.info("Startup profile phase=cuda_graph.")
         self.model_runner.call("begin_startup_memory_profile", "cuda_graph")
-        prompt_offset = self._capture_startup_decode_graphs(prompt_offset)
+        prompt_offset = self._capture_startup_decode_graphs(
+            prompt_offset, respect_runtime_capacity=True,
+        )
         self._after_warmup_debug_cleanup()
         graph_records = self.model_runner.call(
             "finish_startup_memory_profile",
