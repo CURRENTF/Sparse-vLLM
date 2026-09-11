@@ -1034,6 +1034,42 @@ def _quantize_fp8_token(inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tenso
     return output, scales
 
 
+@triton.jit
+def _silu_mul_quant_fp8_group128_kernel(
+    inputs, quantized, scales, WIDTH: tl.constexpr, GATE_FIRST: tl.constexpr,
+):
+    row, group = tl.program_id(0), tl.program_id(1)
+    dims = group * 128 + tl.arange(0, 128)
+    first = row * (2 * WIDTH) + dims
+    gate = tl.load(inputs + first + (0 if GATE_FIRST else WIDTH)).to(tl.float32)
+    up = tl.load(inputs + first + (WIDTH if GATE_FIRST else 0))
+    # Match the unfused pipeline's SiLU rounding and rounded product before
+    # computing the per-group quantization scale.
+    activated_gate = (gate / (1 + tl.exp(-gate))).to(inputs.dtype.element_ty)
+    activated = (up * activated_gate).to(inputs.dtype.element_ty).to(tl.float32)
+    scale = tl.maximum(tl.max(tl.abs(activated), 0), 1.0e-10) / 448.0
+    q = tl.minimum(tl.maximum(activated / scale, -448.0), 448.0)
+    tl.store(quantized + row * WIDTH + dims, q)
+    tl.store(scales + row * (WIDTH // 128) + group, scale)
+
+
+def _silu_mul_quant_fp8_group128(
+    inputs: torch.Tensor, *, gate_up_order: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, twice_width = inputs.shape
+    width = twice_width // 2
+    quantized = torch.empty(
+        (rows, width), device=inputs.device, dtype=torch.float8_e4m3fn,
+    )
+    scales = torch.empty(
+        (rows, width // 128), device=inputs.device, dtype=torch.float32,
+    )
+    _silu_mul_quant_fp8_group128_kernel[(rows, width // 128)](
+        inputs, quantized, scales, width, gate_up_order == "gate_up", num_warps=4,
+    )
+    return quantized, scales
+
+
 def _quantize_fp8_group128(inputs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     from sparsevllm.kernels.external.sgl.moe import (
         sgl_per_token_group_quant_8bit,
@@ -1587,17 +1623,17 @@ def fused_moe_fp8(
         config=w13_config,
         tensor_scales=tensor_scales,
     )
-    activated = torch.empty(
-        (num_assignments, intermediate_size),
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
-    )
-    silu_and_mul_fwd(
-        w13_output,
-        gate_up_order=gate_up_order,
-        output=activated,
-    )
-    activated_q, activated_scale = quantize(activated)
+    if tensor_scales:
+        activated = torch.empty(
+            (num_assignments, intermediate_size),
+            dtype=hidden_states.dtype, device=hidden_states.device,
+        )
+        silu_and_mul_fwd(w13_output, gate_up_order=gate_up_order, output=activated)
+        activated_q, activated_scale = quantize(activated)
+    else:
+        activated_q, activated_scale = _silu_mul_quant_fp8_group128(
+            w13_output, gate_up_order=gate_up_order,
+        )
     w2_output = torch.empty(
         (num_assignments, hidden_size),
         dtype=hidden_states.dtype,

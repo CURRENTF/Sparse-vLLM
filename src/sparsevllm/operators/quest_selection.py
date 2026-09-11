@@ -153,7 +153,7 @@ class FlashInferQuestPageSelectionProvider(QuestPageSelectionProvider):
             return SupportResult.unsupported(f"requires CUDA, got {caps.platform.name}")
         if spec.cuda_graph and not caps.supports_graph_capture:
             return SupportResult.unsupported("device does not support CUDA Graph capture")
-        supported, reason = flashinfer_top_k_page_table_transform_support()
+        supported, reason = flashinfer_top_k_page_table_transform_support(caps.device_index)
         return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
 
     def binding_metadata(self) -> dict[str, object]:
@@ -190,13 +190,15 @@ class TorchQuestPageSelectionProvider(QuestPageSelectionProvider):
         caps: DeviceCaps,
     ) -> SupportResult:
         del spec, caps
-        return SupportResult.yes("Torch top-k/gather baseline")
+        return SupportResult.yes("Torch stable sort/gather baseline")
 
     def binding_metadata(self) -> dict[str, object]:
         return {
             "implementation_kind": "atomic_provider",
             "implementation_source": "torch",
-            "kernel_path": "torch.topk+torch.gather",
+            "kernel_path": "torch.argsort(stable=True)+torch.gather",
+            "deterministic": True,
+            "tie_break": "small",
         }
 
     def select(self, scores, page_table, lengths, k):
@@ -207,11 +209,11 @@ class TorchQuestPageSelectionProvider(QuestPageSelectionProvider):
             device=scores.device,
         )
         valid = columns[None, :] < lengths[:, None]
-        top_indices = scores.masked_fill(~valid, -float("inf")).topk(
-            k,
-            dim=-1,
-            sorted=False,
-        ).indices
+        # Preserve the upstream contract on devices without enough shared
+        # memory: ties prefer smaller columns, then emit in column order.
+        top_indices = scores.masked_fill(~valid, -float("inf")).argsort(
+            dim=-1, descending=True, stable=True,
+        )[:, :k].sort(dim=-1).values
         selected = page_table.gather(1, top_indices)
         return selected.masked_fill(
             top_indices >= lengths[:, None].to(torch.long),

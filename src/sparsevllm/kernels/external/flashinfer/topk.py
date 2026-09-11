@@ -62,8 +62,16 @@ def _top_k_page_table_transform():
     return callable_, reason
 
 
-def flashinfer_top_k_page_table_transform_support() -> tuple[bool, str]:
+def flashinfer_top_k_page_table_transform_support(
+    device_index: int | None = None,
+) -> tuple[bool, str]:
     _, reason = _top_k_page_table_transform()
+    # FlashInfer's stable tie-break uses FilteredTopK, whose two 16K int32
+    # buffers require 128 KiB per SM (CanImplementFilteredTopK in topk.cuh).
+    # Check the resource contract, not a GPU model or performance profile.
+    props = torch.cuda.get_device_properties(device_index)
+    if props.shared_memory_per_multiprocessor < 128 * 1024:
+        return False, "stable FlashInfer Top-K requires 128 KiB shared memory per SM"
     return True, reason
 
 

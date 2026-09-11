@@ -33,6 +33,7 @@ from sparsevllm.kernels.triton.store_kvcache import (
 from sparsevllm.operators.quest_selection import (
     FlashInferQuestPageSelectionProvider,
     QuestPageSelectionOpSpec,
+    TorchQuestPageSelectionProvider,
 )
 
 
@@ -197,13 +198,10 @@ def _stable_small_index_topk(
     rows = []
     for row in range(int(scores.shape[0])):
         length = int(lengths[row].item())
-        indices = torch.argsort(
-            scores[row, :length].float().cpu(),
-            descending=True,
-            stable=True,
-        )[:k]
-        indices = indices.sort().values
-        rows.append(page_table[row].cpu().index_select(0, indices))
+        values = scores[row, :length].float().cpu().tolist()
+        indices = sorted(sorted(range(length), key=lambda i: (-values[i], i))[:k])
+        selected = page_table[row].cpu()[indices]
+        rows.append(torch.cat((selected, torch.full((k - len(indices),), -1, dtype=torch.int32))))
     return torch.stack(rows).to(scores.device)
 
 
@@ -333,10 +331,14 @@ def test_quest_decode_graph_metadata_matches_table_oracle_and_graph() -> None:
 
 
 @CUDA_REQUIRED
-def test_flashinfer_quest_page_selection_matches_stable_oracle_and_graph() -> None:
-    supported, reason = flashinfer_top_k_page_table_transform_support()
-    if not supported:
-        pytest.skip(reason)
+@pytest.mark.parametrize("provider_type", [FlashInferQuestPageSelectionProvider, TorchQuestPageSelectionProvider])
+@pytest.mark.parametrize("length_values", [(67, 53, 31), (67, 5, 0)])
+def test_quest_page_selection_matches_stable_oracle_and_graph(provider_type, length_values) -> None:
+    """Catch tie-order drift in the portable path used on small-shared-memory GPUs."""
+    if provider_type is FlashInferQuestPageSelectionProvider:
+        supported, reason = flashinfer_top_k_page_table_transform_support()
+        if not supported:
+            pytest.skip(reason)
     torch.manual_seed(20260827)
     batch_size, width, k = 3, 67, 7
     scores = torch.randn(
@@ -352,8 +354,8 @@ def test_flashinfer_quest_page_selection_matches_stable_oracle_and_graph() -> No
         device="cuda",
         dtype=torch.int32,
     ).view(batch_size, width)
-    lengths = torch.tensor([67, 53, 31], device="cuda", dtype=torch.int32)
-    provider = FlashInferQuestPageSelectionProvider(
+    lengths = torch.tensor(length_values, device="cuda", dtype=torch.int32)
+    provider = provider_type(
         op_spec=QuestPageSelectionOpSpec(
             score_dtype=torch.bfloat16,
             cuda_graph=True,
@@ -558,6 +560,68 @@ def test_fused_quest_page_score_matches_tensor_oracle(
         )
     graph.replay()
     torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+
+
+@CUDA_REQUIRED
+@pytest.mark.parametrize(
+    ("batch", "pages", "heads", "kv_heads"),
+    [(2, 37, 6, 2), (1, 2060, 32, 4), (1, 8320, 32, 4)],
+)
+def test_tensorcore_quest_scores_match_matmul_oracle_and_graph(batch, pages, heads, kv_heads):
+    """Catch wrong GQA grouping, padded tile reads, or changed Graph inputs.
+
+    The scalar scoring test does not exercise tensor-core padding or the
+    second pass that merges scores into the original shared-head page set.
+    """
+    from sparsevllm.kernels.triton.quest_page_score import score_quest_pages_tensorcore
+
+    if torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("BF16 tensor cores require SM80+")
+    torch.manual_seed(42)
+    query = torch.randn(batch, heads, 128, device="cuda", dtype=torch.bfloat16)
+    high = torch.randn(pages, kv_heads, 128, device="cuda", dtype=torch.bfloat16).abs()
+    low = -torch.randn_like(high).abs()
+    slots = torch.stack([torch.randperm(pages, device="cuda", dtype=torch.int32) for _ in range(batch)])
+    slots[:, -1] = -1
+
+    def oracle():
+        rows = []
+        for row in range(batch):
+            scores = []
+            indices = slots[row].long().clamp_min(0)
+            group = heads // kv_heads
+            for head in range(kv_heads):
+                q = query[row, head * group:(head + 1) * group]
+                positive = q.clamp_min(0) @ high[indices, head].T
+                negative = q.clamp_max(0) @ low[indices, head].T
+                scores.append((positive + negative).amax(dim=0))
+            rows.append(torch.stack(scores).amax(dim=0))
+        return torch.stack(rows)
+
+    score_quest_pages_tensorcore(query, high, low, slots)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = score_quest_pages_tensorcore(query, high, low, slots)
+    for iteration in range(10):
+        query.normal_()
+        high.normal_().abs_()
+        low.normal_().abs_().neg_()
+        if iteration == 0:
+            query.zero_()
+        elif iteration == 1:
+            query.fill_(-1)
+            high.fill_(2)
+            low.fill_(1)
+        slots.copy_(slots.flip(1))
+        graph.replay()
+        expected = oracle()
+        # Different FP32 accumulation trees may straddle one BF16 rounding
+        # boundary. Check both the score tolerance and the consumed page set.
+        torch.testing.assert_close(actual, expected, rtol=0.008, atol=0)
+        k = min(127, pages)
+        selected = actual.argsort(dim=1, descending=True, stable=True)[:, :k].sort(dim=1).values
+        reference = expected.argsort(dim=1, descending=True, stable=True)[:, :k].sort(dim=1).values
+        torch.testing.assert_close(selected, reference, rtol=0, atol=0)
 
 
 @CUDA_REQUIRED
@@ -994,3 +1058,116 @@ def test_mla_store_updates_fused_quest_bounds_incrementally() -> None:
         )
     torch.testing.assert_close(latent_cache[:page_size], latent)
     torch.testing.assert_close(rope_cache[:page_size], rope)
+
+
+@CUDA_REQUIRED
+@pytest.mark.parametrize(
+    "batch,pages,heads,kv_heads,dim,dtype",
+    [
+        (1, 2060, 1, 1, 576, torch.bfloat16),
+        (4, 257, 1, 1, 576, torch.bfloat16),
+        (2, 259, 34, 1, 129, torch.bfloat16),
+        (1, 37, 6, 2, 65, torch.float16),
+        (2, 37, 8, 2, 96, torch.float32),
+    ],
+)
+def test_general_page_scores_preserve_dimension_tails_and_head_tiles(
+    batch, pages, heads, kv_heads, dim, dtype,
+):
+    """Catch early K-tile rounding, omitted MLA tails, and dropped head tiles.
+
+    The D128 test cannot observe K-loop accumulation or heads beyond one MMA
+    tile. A float64 oracle here independently specifies the reduction formula.
+    """
+    from sparsevllm.kernels.triton.quest_page_score import (
+        score_quest_pages_tensorcore,
+        score_quest_pages_vector,
+    )
+
+    if torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("Paired matrix-product validation requires SM80+")
+    torch.manual_seed(47)
+    q = torch.randn(batch, heads, dim, device="cuda", dtype=dtype)
+    center = torch.randn(pages, kv_heads, dim, device="cuda", dtype=dtype)
+    high = center + torch.rand_like(center)
+    low = center - torch.rand_like(center)
+    slots = torch.stack([
+        torch.randperm(pages, device="cuda", dtype=torch.int32) for _ in range(batch)
+    ])
+    slots[:, -1] = -1
+    functions = [score_quest_pages_vector]
+    if dtype != torch.float32:
+        functions.append(score_quest_pages_tensorcore)
+    captured = []
+    for fn in functions:
+        fn(q, high, low, slots)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = fn(q, high, low, slots)
+        captured.append((graph, output))
+    for iteration in range(3):
+        q.normal_()
+        if iteration == 1:
+            # Only the final, incomplete K tile contributes to the score.
+            q[..., :-1] = 0
+        if iteration == 2:
+            # With multiple query tiles, only the last head contributes.
+            q[:, :-1] = 0
+        slots.copy_(slots.flip(1))
+        expected = []
+        group = heads // kv_heads
+        for row in range(batch):
+            bounds = []
+            for head in range(kv_heads):
+                query = q[row, head * group:(head + 1) * group].double()
+                indices = slots[row].long().clamp_min(0)
+                pos = (query.clamp_min(0) @ high[indices, head].double().T).to(dtype)
+                neg = (query.clamp_max(0) @ low[indices, head].double().T).to(dtype)
+                bounds.append((pos + neg).amax(0))
+            expected.append(torch.stack(bounds).amax(0))
+        expected = torch.stack(expected)
+        for graph, output in captured:
+            graph.replay()
+            rtol, atol = (2e-5, 1e-4) if dtype == torch.float32 else (0.008, 0.02)
+            torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("dtype,heads,kv_heads,dim,pages", [
+    (torch.bfloat16, 32, 4, 128, 2053),
+    (torch.bfloat16, 34, 1, 129, 37),
+    (torch.float16, 4, 1, 65, 513),
+])
+def test_matrix_score_rounding_repair_preserves_scalar_selection(
+    dtype, heads, kv_heads, dim, pages,
+):
+    """Catch rounding-induced page changes and repair masks crossing head tiles.
+
+    A BF16 ULP passed the numerical oracle yet changed a real Qasper answer.
+    The broad numerical test above protects the formula; this regression also
+    requires compatibility with the original scalar reduction on changed graphs.
+    """
+    from sparsevllm.kernels.triton.quest_decode_view import score_quest_pages
+    from sparsevllm.kernels.triton.quest_page_score import score_quest_pages_tensorcore
+
+    if torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("Matrix-product rounding repair requires SM80+")
+    torch.manual_seed(42)
+    q = torch.randn(2, heads, dim, device="cuda", dtype=dtype)
+    hi = torch.randn(pages, kv_heads, dim, device="cuda", dtype=dtype)
+    lo = torch.randn_like(hi)
+    slots = torch.stack([
+        torch.randperm(pages, device="cuda", dtype=torch.int32) for _ in range(2)
+    ])
+    score_quest_pages_tensorcore(q, hi, lo, slots)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = score_quest_pages_tensorcore(q, hi, lo, slots)
+    for _ in range(10):
+        q.normal_()
+        center = torch.randn_like(hi)
+        hi.copy_(center + torch.rand_like(hi))
+        lo.copy_(center - torch.rand_like(lo))
+        slots.copy_(slots.flip(1))
+        expected = score_quest_pages(q, hi, lo, slots)
+        graph.replay()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

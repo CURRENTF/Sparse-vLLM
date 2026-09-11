@@ -447,12 +447,12 @@ def _score_quest_pages_kernel(
     tl.store(output + row * output_stride + logical_page, best_score)
 
 
-def score_quest_pages(
+def _validate_quest_page_score_inputs(
     query: torch.Tensor,
     page_max: torch.Tensor,
     page_min: torch.Tensor,
     row_page_slots: torch.Tensor,
-) -> torch.Tensor:
+) -> tuple[int, int, int, int]:
     """Score logical pages directly from physical QuEST metadata."""
 
     if query.ndim != 3 or not query.is_contiguous():
@@ -463,6 +463,8 @@ def score_quest_pages(
         raise ValueError("QuEST page metadata must be contiguous")
     batch_size, num_query_heads, head_dim = map(int, query.shape)
     _, num_metadata_heads, metadata_head_dim = map(int, page_max.shape)
+    if min(num_query_heads, num_metadata_heads, head_dim) <= 0:
+        raise ValueError("QuEST scoring requires positive head counts and head dimension")
     if metadata_head_dim != head_dim or num_query_heads % num_metadata_heads:
         raise ValueError(
             "QuEST query heads/dim must be divisible by metadata heads and "
@@ -491,6 +493,19 @@ def score_quest_pages(
     if head_dim > 65536:
         raise ValueError(f"QuEST metadata head_dim is too large: {head_dim}")
 
+    return batch_size, num_query_heads, head_dim, num_metadata_heads
+
+
+def score_quest_pages(
+    query: torch.Tensor,
+    page_max: torch.Tensor,
+    page_min: torch.Tensor,
+    row_page_slots: torch.Tensor,
+) -> torch.Tensor:
+    """Score logical pages directly from physical QuEST metadata."""
+    batch_size, num_query_heads, head_dim, num_metadata_heads = _validate_quest_page_score_inputs(
+        query, page_max, page_min, row_page_slots,
+    )
     num_logical_pages = int(row_page_slots.shape[1])
     output = torch.empty(
         (batch_size, num_logical_pages),

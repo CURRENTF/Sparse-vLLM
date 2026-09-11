@@ -27,7 +27,10 @@ from sparsevllm.kernels.triton.quest_decode_view import (
     finalize_quest_decode_view,
     prepare_quest_decode_graph_metadata,
     prepare_quest_decode_geometry,
-    score_quest_pages,
+)
+from sparsevllm.operators.quest_scoring import (
+    QuestPageScoreSpec,
+    resolve_quest_page_score_provider,
 )
 from sparsevllm.operators.quest_selection import (
     QuestPageSelectionOpSpec,
@@ -130,6 +133,20 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             ),
             device_index=self.device.index or 0,
         )
+        if self.platform.is_cuda_alike():
+            self.quest_page_scorer = resolve_quest_page_score_provider(
+                QuestPageScoreSpec(
+                    dtype=self.hf_config.dtype,
+                    query_heads=(
+                        1 if isinstance(self.attention_cache_storage, MlaLatentStorage)
+                        else int(self.hf_config.num_attention_heads) // self.tp_size
+                    ),
+                    kv_heads=self.metadata_num_heads,
+                    head_dim=self.metadata_head_dim,
+                    cuda_graph=bool(config.decode_graph),
+                ),
+                device_index=self.device.index or 0,
+            )
 
         self.allocate_kv_cache()
 
@@ -2679,7 +2696,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             row_page_slots = row_page_slots[:, :max_pages]
         kv_idx = self.kv_layer_index(layer_idx)
         if self.platform.is_cuda_alike():
-            page_scores = score_quest_pages(
+            page_scores = self.quest_page_scorer.score(
                 score_query.contiguous(),
                 self.metadata_cache[0, kv_idx],
                 self.metadata_cache[1, kv_idx],

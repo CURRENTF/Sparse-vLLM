@@ -276,7 +276,8 @@ def _reference_moe(
 
 
 @pytest.mark.parametrize("gate_up_order", ["gate_up", "up_gate"])
-def test_fp8_moe_matches_reference(gate_up_order):
+@pytest.mark.parametrize("activation_dtype", [torch.bfloat16, torch.float16])
+def test_fp8_moe_matches_reference(gate_up_order, activation_dtype):
     torch.manual_seed(17)
     device = torch.device("cuda")
     tokens, experts, top_k = 5, 4, 2
@@ -285,7 +286,7 @@ def test_fp8_moe_matches_reference(gate_up_order):
         tokens,
         hidden,
         device=device,
-        dtype=torch.bfloat16,
+        dtype=activation_dtype,
     )
     w13_weight = _fp8_weight((experts, 2 * intermediate, hidden), device)
     w2_weight = _fp8_weight((experts, hidden, intermediate), device)
@@ -336,6 +337,68 @@ def test_fp8_moe_matches_reference(gate_up_order):
     )
 
     _assert_fp8_pipeline_close(actual, expected)
+
+
+@pytest.mark.parametrize("tokens", [1, 2, 8])
+def test_qwen_fp8_decode_routes_preserve_packed_weights_across_graph_replays(tokens):
+    """Catch wrong gate/up packing or stale per-request routing during graph replay.
+
+    The small generic MoE oracle does not cover the Qwen expert dimensions,
+    shared layout between providers, or changing routes in a captured graph.
+    """
+    from sparsevllm.operators.moe import (
+        FlashInferCutlassFp8MoeProvider,
+        MoeOpSpec,
+        TritonUpGateFp8MoeProvider,
+    )
+
+    providers = [TritonUpGateFp8MoeProvider()]
+    if torch.cuda.get_device_capability() == (9, 0):
+        providers.append(FlashInferCutlassFp8MoeProvider())
+    torch.manual_seed(42)
+    experts, hidden, intermediate, top_k = 128, 2048, 768, 8
+    device = torch.device("cuda", torch.cuda.current_device())
+    x = torch.randn(tokens, hidden, device=device, dtype=torch.bfloat16)
+    w13 = _fp8_weight((experts, 2 * intermediate, hidden), device)
+    w2 = _fp8_weight((experts, hidden, intermediate), device)
+    s13 = torch.rand(experts, 2 * intermediate // 128, hidden // 128, device=device) * 0.02 + 0.01
+    s2 = torch.rand(experts, hidden // 128, intermediate // 128, device=device) * 0.02 + 0.01
+    ids = torch.stack([torch.randperm(experts, device=device)[:top_k] for _ in range(tokens)]).int()
+    weights = torch.softmax(torch.randn(tokens, top_k, device=device), dim=-1)
+    spec = MoeOpSpec(
+        experts, experts, hidden, intermediate, top_k,
+        torch.bfloat16, torch.float8_e4m3fn, (128, 128), 1, True,
+        scale_dtype=torch.float32,
+    )
+    graphs = []
+    for provider in providers:
+        provider.prepare(spec, device=device, tp_rank=0, ep_rank=0)
+
+        def run():
+            return provider.run(
+                spec, x, ids, weights, w13, w2, s13, s2,
+                local_expert_start=0, tp_rank=0, ep_rank=0,
+            )
+
+        for _ in range(3):
+            run()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = run()
+        graphs.append((graph, output, provider))
+    for _ in range(3):
+        x.normal_()
+        ids.copy_(torch.stack([torch.randperm(experts, device=device)[:top_k] for _ in range(tokens)]))
+        weights.copy_(torch.softmax(torch.randn_like(weights), dim=-1))
+        expected = _reference_moe(x, w13, w2, s13, s2, ids, weights, "up_gate")
+        for graph, output, _provider in graphs:
+            graph.replay()
+            assert torch.isfinite(output).all()
+            relative_l2 = torch.linalg.vector_norm(output.float() - expected.float())
+            relative_l2 /= torch.linalg.vector_norm(expected.float())
+            assert relative_l2 < 0.05
+            assert F.cosine_similarity(output.float(), expected.float()).min() > 0.995
 
 
 @pytest.mark.parametrize(

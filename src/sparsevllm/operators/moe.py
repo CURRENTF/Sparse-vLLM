@@ -1551,8 +1551,21 @@ class Qwen3Fp8MoeDispatchPlan(MoeDispatchPlan):
         return ProfileMatch.yes("matched Qwen3 FP8 token dispatch profile")
 
     def _build_routes(self, spec: MoeOpSpec) -> tuple[MoeDispatchRoute, ...]:
+        from importlib.metadata import version
+
         triton = TritonUpGateFp8MoeProvider()
-        if spec.tp_size != 1:
+        # Keep the existing profile's toolchain and graph domain. Within it,
+        # use one packed-weight route for both single- and multi-request work.
+        profiled_graph = (
+            spec.tp_size == 1
+            and spec.cuda_graph
+            and spec.activation_dtype == torch.bfloat16
+            and spec.scale_dtype == torch.float32
+            and torch.__version__ == "2.11.0+cu130"
+            and version("triton") == "3.6.0"
+            and version("flashinfer-python") == "0.6.17"
+        )
+        if spec.tp_size != 1 or profiled_graph:
             return (
                 MoeDispatchRoute(
                     min_tokens=0,
