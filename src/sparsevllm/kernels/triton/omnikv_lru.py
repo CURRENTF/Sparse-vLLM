@@ -10,7 +10,6 @@ def _lookup(
     AGES,
     CLOCK,
     PLAN,
-    COUNTERS,
     MISS_COUNTS,
     TABLE,
     ROWS,
@@ -39,11 +38,7 @@ def _lookup(
         tl.store(CLOCK + owner, clock)
         tl.store(AGES + owner * CACHE + position, clock, hit)
         tl.store(PLAN + batch * CAP + token, tl.where(hit, position, -1), token < CAP)
-        hits = tl.sum((hit & (slot != current)).to(tl.int64), 0)
-        misses = tl.sum((valid & ~hit & (slot != current)).to(tl.int64), 0)
         tl.store(MISS_COUNTS + batch, tl.sum((valid & ~hit).to(tl.int32), 0))
-        tl.atomic_add(COUNTERS, hits, sem="relaxed")
-        tl.atomic_add(COUNTERS + 1, misses, sem="relaxed")
     else:
         tl.store(MISS_COUNTS + batch, 0)
 
@@ -139,13 +134,12 @@ def _admit(
         tl.store(
             PLAN + batch * CAP + i, tl.where(missing, -position - 1, position), valid
         )
-        if VIEW is not None:
-            tl.store(
-                VIEW + batch * VIEW_STRIDE + i,
-                tl.where(valid, position, PADDING_SLOT),
-                i < CAP,
-            )
-    elif VIEW is not None:
+        tl.store(
+            VIEW + batch * VIEW_STRIDE + i,
+            tl.where(valid, position, PADDING_SLOT),
+            i < CAP,
+        )
+    else:
         i = tl.arange(0, BLOCK)
         tl.store(VIEW + batch * VIEW_STRIDE + i, PADDING_SLOT, i < CAP)
 
@@ -158,13 +152,12 @@ def plan_lru(
     plan,
     victims,
     miss_counts,
-    counters,
     table,
     rows,
     owners,
     lengths,
     writes,
-    view=None,
+    view,
 ):
     capacity = plan.shape[1]
     cache = keys.shape[1]
@@ -173,7 +166,6 @@ def plan_lru(
         ages,
         clock,
         plan,
-        counters,
         miss_counts,
         table,
         rows,
@@ -212,7 +204,7 @@ def plan_lru(
         lengths,
         writes,
         view,
-        0 if view is None else view.stride(0),
+        view.stride(0),
         keys.numel(),
         directory.shape[1],
         cache,

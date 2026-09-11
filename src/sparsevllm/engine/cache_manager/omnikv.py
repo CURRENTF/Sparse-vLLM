@@ -223,35 +223,6 @@ class OmniKVCacheManager(StandardCacheManager):
             )
         return result
 
-    def debug_state_summary(self):
-        result = super().debug_state_summary()
-        if self.offload_enabled:
-            accounting = self.memory_accounting()
-            result["omnikv_offload"] = {
-                name: accounting[name]
-                for name in (
-                    "allocated_device_tensor_bytes",
-                    "allocated_host_tensor_bytes",
-                    "omnikv_gpu_only_kv_bytes",
-                    "observed_savings",
-                )
-            }
-            result["omnikv_offload"].update(
-                slots=self.config.num_kvcache_slots,
-                selected_capacity=self.selected_capacity,
-                staging_rows=self.max_buffer_rows,
-                full_layers=len(self.attention_cache_storage.full_layers),
-            )
-            if self.lru is not None:
-                result["omnikv_offload"]["lru"] = self.lru.stats(
-                    self.attention_cache_storage.bytes_per_slot_per_layer()
-                )
-            if self.prefix_offload_controller is not None:
-                result["omnikv_offload"]["prefix_transfer"] = (
-                    self.prefix_offload_controller.stats()
-                )
-        return result
-
     def begin_selection_step(self):
         self._prefetched.clear()
         self._pending_prefetch.clear()
@@ -325,7 +296,6 @@ class OmniKVCacheManager(StandardCacheManager):
                 component=component,
                 cache=None if self.lru is None else self.lru.parts[kv_idx][component],
                 plan=plan,
-                direct=self.lru is not None,
                 miss_tokens=miss_tokens,
                 miss_counts=miss_counts,
                 skip_last=self.config.recent_keep_tokens > 0,
@@ -392,7 +362,6 @@ class OmniKVCacheManager(StandardCacheManager):
                 self.selected_capacity,
                 cache=None if self.lru is None else self.lru.parts[kv_idx][component],
                 plan=None if self.lru is None else self.lru.plan(kv_idx),
-                direct=self.lru is not None,
                 table=active_slots if self.config.recent_keep_tokens == 0 else None,
                 rows=req_indices if self.config.recent_keep_tokens == 0 else None,
             )

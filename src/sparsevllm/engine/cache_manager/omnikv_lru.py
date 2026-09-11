@@ -8,14 +8,9 @@ from sparsevllm.kernels.triton.omnikv_lru import plan_lru
 class OmniKVLRU:
     @staticmethod
     def metadata_bytes(rows, slots, capacity, selected, groups):
-        return (
-            groups * rows * (slots * 4 + capacity * 12 + selected * 8 + 12)
-            + groups * 16
-        )
+        return groups * rows * (slots * 4 + capacity * 12 + selected * 8 + 12)
 
-    def __init__(
-        self, storage, layer_groups, rows, capacity, selected, device, view=None
-    ):
+    def __init__(self, storage, layer_groups, rows, capacity, selected, device, view):
         self.view = view
         self.layer_groups = layer_groups
         self.capacity = capacity
@@ -23,7 +18,7 @@ class OmniKVLRU:
         self.parts = {
             layer: tuple(
                 torch.empty(
-                    rows * capacity + (view is not None),
+                    rows * capacity + 1,
                     *shape,
                     dtype=storage.dtype,
                     device=device,
@@ -32,10 +27,9 @@ class OmniKVLRU:
             )
             for layer in layer_groups
         }
-        if view is not None:
-            for parts in self.parts.values():
-                for part in parts:
-                    part[-1].zero_()
+        for parts in self.parts.values():
+            for part in parts:
+                part[-1].zero_()
         self.metadata = {}
         for group in set(layer_groups.values()):
             self.metadata[group] = (
@@ -48,7 +42,6 @@ class OmniKVLRU:
                 torch.empty((rows, selected), dtype=torch.int32, device=device),
                 torch.empty((rows, selected), dtype=torch.int32, device=device),
                 torch.zeros(rows, dtype=torch.int32, device=device),
-                torch.zeros(2, dtype=torch.int64, device=device),
             )
 
     def prepare(self, layer, table, rows, owners, lengths, writes):
@@ -77,18 +70,3 @@ class OmniKVLRU:
         return [x for parts in self.parts.values() for x in parts] + [
             x for data in self.metadata.values() for x in data
         ]
-
-    def stats(self, bytes_per_token):
-        hits = misses = 0
-        for group, data in self.metadata.items():
-            count = sum(g == group for g in self.layer_groups.values())
-            h, m = data[-1].tolist()
-            hits += h * count
-            misses += m * count
-        return {
-            "cache_tokens_per_request": self.capacity,
-            "historical_gpu_hit_tokens": hits,
-            "historical_host_miss_tokens": misses,
-            "historical_host_read_bytes": misses * bytes_per_token,
-            "historical_hit_rate": hits / (hits + misses) if hits + misses else None,
-        }

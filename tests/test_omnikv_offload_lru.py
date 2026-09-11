@@ -14,13 +14,12 @@ from sparsevllm.kernels.triton.indexed_host_copy import append_rows, gather_rows
     "shape,dtype",
     [((8, 128), torch.float16), ((1, 512), torch.bfloat16), ((1, 64), torch.bfloat16)],
 )
-@pytest.mark.parametrize("direct", [False, True])
-def test_lru_exact_replay_eviction_and_request_turnover(shape, dtype, direct):
+def test_lru_exact_replay_eviction_and_request_turnover(shape, dtype):
     # The plain-copy tests cannot catch stale hits or eviction of still-selected
     # KV: replay changes selected order, request row, and physical slot contents.
     torch.manual_seed(42)
     storage = SimpleNamespace(num_slots=32, shapes=[shape], dtype=dtype)
-    view = torch.empty(2, 8, dtype=torch.int32, device="cuda") if direct else None
+    view = torch.empty(2, 8, dtype=torch.int32, device="cuda")
     lru = OmniKVLRU(storage, {1: 0, 2: 0}, 2, 6, 4, "cuda", view=view)
     hosts = [torch.randn(32, *shape, dtype=dtype).pin_memory() for _ in range(2)]
     pointers = [
@@ -50,9 +49,8 @@ def test_lru_exact_replay_eviction_and_request_turnover(shape, dtype, direct):
                 exclude_slots=writes,
                 cache=lru.parts[layer][0],
                 plan=plan,
-                direct=direct,
-                miss_tokens=lru.misses(layer)[0] if direct else None,
-                miss_counts=lru.misses(layer)[1] if direct else None,
+                miss_tokens=lru.misses(layer)[0],
+                miss_counts=lru.misses(layer)[1],
             )
             append_rows(
                 source,
@@ -64,7 +62,6 @@ def test_lru_exact_replay_eviction_and_request_turnover(shape, dtype, direct):
                 rows=rows,
                 cache=lru.parts[layer][0],
                 plan=plan,
-                direct=direct,
             )
 
     run()
@@ -92,24 +89,17 @@ def test_lru_exact_replay_eviction_and_request_turnover(shape, dtype, direct):
         writes.copy_(torch.tensor(current, device="cuda", dtype=torch.int32))
         old_keys = lru.metadata[0][1].cpu().tolist()
         old_ages = lru.metadata[0][2].cpu().tolist()
-        old_counts = lru.metadata[0][-1].cpu().clone()
         old_clock = lru.metadata[0][3].cpu().tolist()
         graph.replay()
         torch.cuda.synchronize()
-        if direct:
-            for layer, output in zip((1, 2), outputs):
-                output.copy_(lru.parts[layer][0][view[:, :4].reshape(-1).long()])
-        expected_misses = expected_hits = 0
+        for layer, output in zip((1, 2), outputs):
+            output.copy_(lru.parts[layer][0][view[:, :4].reshape(-1).long()])
         for batch, owner in enumerate(request_rows):
             if current[batch] < 0:
                 for output in outputs:
                     assert torch.count_nonzero(output.view(2, 4, *shape)[batch]) == 0
                 assert lru.metadata[0][3][1].item() == old_clock[1]
                 continue
-            for slot in selected[batch]:
-                if slot != current[batch]:
-                    expected_hits += slot in old_keys[owner]
-                    expected_misses += slot not in old_keys[owner]
             # Independently check LRU victims: no selected item is evicted,
             # and any evicted unselected item is no newer than any retained one.
             keys = lru.metadata[0][1][owner].cpu().tolist()
@@ -138,7 +128,3 @@ def test_lru_exact_replay_eviction_and_request_turnover(shape, dtype, direct):
                 )
                 # Model write-through makes this new token valid history next step.
                 host[current[batch]].copy_(source[batch].cpu())
-        assert (lru.metadata[0][-1].cpu() - old_counts).tolist() == [
-            expected_hits,
-            expected_misses,
-        ]

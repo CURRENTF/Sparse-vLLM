@@ -85,7 +85,9 @@ physical-slot reuse, and CUDA Graph replay. CPU tests protect configuration,
 startup admission and attention-view metadata.
 
 The microbenchmark script is
-`scripts/validation/benchmark_omnikv_offload_copy.py`. Each timed graph replay
+the archived `benchmark_omnikv_offload_copy.py` in the original experiment bundle
+(`archived-development/`). This development-only probe and its runtime hit counters
+were removed from the production tree after validation. Each timed graph replay
 starts from the same seeded cache. Cache reseeding and output verification are
 outside the event-timed region; lookup, eviction planning and both history
 components are inside it. It excludes attention and current-token write-through.
