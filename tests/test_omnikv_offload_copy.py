@@ -11,10 +11,18 @@ from sparsevllm.kernels.triton.indexed_host_copy import (
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("shape", [(4, 128), (1, 512), (1, 64)])
-def test_indexed_host_copy_replay(shape):
+@pytest.mark.parametrize(
+    "shape,dtype",
+    [
+        ((4, 128), torch.bfloat16),
+        ((4, 128), torch.float16),
+        ((1, 512), torch.bfloat16),
+        ((1, 64), torch.bfloat16),
+    ],
+)
+def test_indexed_host_copy_replay(shape, dtype):
     torch.manual_seed(17)
-    host = torch.randn(23, *shape, dtype=torch.bfloat16).pin_memory()
+    host = torch.randn(23, *shape, dtype=dtype).pin_memory()
     ptr = torch.tensor([host.data_ptr()], dtype=torch.uint64, device="cuda")
     table = torch.tensor(
         [[8, 2, 19, 4], [10, 3, 5, 7]], dtype=torch.int32, device="cuda"
@@ -22,8 +30,8 @@ def test_indexed_host_copy_replay(shape):
     rows = torch.tensor([1, 0], dtype=torch.int32, device="cuda")
     lengths = torch.tensor([4, 3], dtype=torch.int32, device="cuda")
     slots = torch.tensor([7, -1], dtype=torch.int32, device="cuda")
-    source = torch.randn(2, *shape, dtype=torch.bfloat16, device="cuda")
-    output = torch.zeros(8, *shape, dtype=torch.bfloat16, device="cuda")
+    source = torch.randn(2, *shape, dtype=dtype, device="cuda")
+    output = torch.zeros(8, *shape, dtype=dtype, device="cuda")
 
     def run():
         store_rows(source, ptr, slots, 0)

@@ -16,7 +16,7 @@ from sparsevllm.kernels.triton.indexed_host_copy import gather_rows
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("mla", [False, True])
-def test_split_prefix_restore_after_slot_reuse(mla):
+def test_split_prefix_restore_after_slot_reuse(mla, monkeypatch):
     original = (
         MlaLatentStorage(kv_lora_rank=512, rope_dim=64, dtype=torch.bfloat16)
         if mla
@@ -67,6 +67,16 @@ def test_split_prefix_restore_after_slot_reuse(mla):
             x[:12].zero_()
     new_slots = torch.tensor([2, 9], dtype=torch.int32, device="cuda")
     block.payload.token_slots = new_slots
+    from sparsevllm.engine.cache_manager import omnikv_prefix
+
+    transfer = omnikv_prefix.transfer_rows
+
+    def delayed_second_component(*args, **kwargs):
+        if kwargs["component"] == 1:
+            torch.cuda._sleep(1_000_000)
+        transfer(*args, **kwargs)
+
+    monkeypatch.setattr(omnikv_prefix, "transfer_rows", delayed_second_component)
     operation = controller.submit_h2d([block])
     rows = torch.zeros(1, dtype=torch.int32, device="cuda")
     lengths = torch.full((1,), 2, dtype=torch.int32, device="cuda")
