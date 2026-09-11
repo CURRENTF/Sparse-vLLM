@@ -1,8 +1,13 @@
 """Pinned-memory copies must follow replay metadata and protect padding rows."""
+
 import pytest
 import torch
 
-from sparsevllm.kernels.triton.indexed_host_copy import append_rows, gather_rows, store_rows
+from sparsevllm.kernels.triton.indexed_host_copy import (
+    append_rows,
+    gather_rows,
+    store_rows,
+)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -11,16 +16,22 @@ def test_indexed_host_copy_replay(shape):
     torch.manual_seed(17)
     host = torch.randn(23, *shape, dtype=torch.bfloat16).pin_memory()
     ptr = torch.tensor([host.data_ptr()], dtype=torch.uint64, device="cuda")
-    table = torch.tensor([[8, 2, 19, 4], [10, 3, 5, 7]], dtype=torch.int32, device="cuda")
+    table = torch.tensor(
+        [[8, 2, 19, 4], [10, 3, 5, 7]], dtype=torch.int32, device="cuda"
+    )
     rows = torch.tensor([1, 0], dtype=torch.int32, device="cuda")
     lengths = torch.tensor([4, 3], dtype=torch.int32, device="cuda")
     slots = torch.tensor([7, -1], dtype=torch.int32, device="cuda")
     source = torch.randn(2, *shape, dtype=torch.bfloat16, device="cuda")
     output = torch.zeros(8, *shape, dtype=torch.bfloat16, device="cuda")
+
     def run():
         store_rows(source, ptr, slots, 0)
-        gather_rows(ptr, output, table, rows, lengths, capacity=4, component=0, skip_last=True)
+        gather_rows(
+            ptr, output, table, rows, lengths, capacity=4, component=0, skip_last=True
+        )
         append_rows(source, output, lengths, slots, 4)
+
     run()
     torch.cuda.synchronize()
     stream = torch.cuda.Stream()

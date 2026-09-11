@@ -281,6 +281,10 @@ class StandardPrefixOffloadController:
             dtype=torch.uint64,
             device=self.device,
         )
+        self._init_transfer_runtime()
+
+    def _init_transfer_runtime(self) -> None:
+        device = self.device
         self.d2h_stream = device_runtime.new_stream(device=device)
         self.h2d_stream = device_runtime.new_stream(device=device)
         if self.d2h_stream is None or self.h2d_stream is None:
@@ -445,7 +449,7 @@ class StandardPrefixOffloadController:
         try:
             layer_events = [
                 self._new_event(self.device, f"H2D layer {layer_index}")
-                for layer_index in range(int(self.kv_cache.shape[1]))
+                for layer_index in range(self.host_pool.num_layers)
             ]
             producer_event = self._new_event(self.device, "H2D producer")
             completion_event = self._new_event(self.device, "H2D completion")
@@ -558,7 +562,7 @@ class StandardPrefixOffloadController:
         )
 
     def _h2d_transfer_schedule(self) -> list[tuple[str, int]]:
-        return [("kv", layer_idx) for layer_idx in range(int(self.kv_cache.shape[1]))]
+        return [("kv", layer_idx) for layer_idx in range(self.host_pool.num_layers)]
 
     def _submit_h2d_auxiliary_layer(
         self,

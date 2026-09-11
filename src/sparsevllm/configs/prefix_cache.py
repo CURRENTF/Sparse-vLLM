@@ -62,7 +62,7 @@ def normalize_prefix_cache(config) -> None:
                 "prefix cache offload currently supports only vanilla, OmniKV, and QuEST; "
                 f"got cache method={cache_method!r}."
             )
-        if int(config.tensor_parallel_size) not in (1, 2):
+        if int(config.tensor_parallel_size) not in (1, 2) and not getattr(config, "enable_omnikv_offload", False):
             raise ValueError(
                 "prefix cache offload currently supports tensor_parallel_size=1 or 2."
             )
