@@ -36,7 +36,10 @@ def plan_omnikv_pools(config, full_layers, num_layers, rows, per_layer):
         raise ValueError(
             "OmniKV offload requires a positive total selected-token budget."
         )
-    cache = min(getattr(config, "omnikv_offload_cache_tokens", 0), config.max_model_len)
+    cache = getattr(config, "omnikv_offload_cache_tokens", None)
+    if cache is None:
+        cache = 1 << (selected - 1).bit_length()
+    cache = min(cache, config.max_model_len)
     if cache and cache < selected:
         raise ValueError(
             "omnikv_offload_cache_tokens must cover the full selected-token budget."
@@ -51,6 +54,7 @@ def plan_omnikv_pools(config, full_layers, num_layers, rows, per_layer):
     # Logical slot table and stable compute-view table; full-layer storage plus
     # one shared full-history prefill pool and the allocator/host-map vectors.
     fixed = sparse * rows * selected * per_layer + 2 * rows * config.max_model_len * 4
+    fixed += rows * 4 + num_layers * 16
     slot_bytes = (len(full) + 1) * per_layer + 8
     if cache:
         fixed += sparse * (rows * (cache - selected) + 1) * per_layer

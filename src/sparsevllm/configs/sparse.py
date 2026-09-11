@@ -27,8 +27,10 @@ def normalize_sparse_method_name(config) -> None:
     if config.enable_omnikv_offload and config.sparse_method != "omnikv":
         raise ValueError("enable_omnikv_offload requires sparse_method='omnikv'.")
     cache_tokens = config.omnikv_offload_cache_tokens
-    if isinstance(cache_tokens, bool) or not isinstance(cache_tokens, int) or cache_tokens < 0:
-        raise ValueError("omnikv_offload_cache_tokens must be a non-negative integer.")
+    if cache_tokens is not None and (
+        isinstance(cache_tokens, bool) or not isinstance(cache_tokens, int) or cache_tokens < 0
+    ):
+        raise ValueError("omnikv_offload_cache_tokens must be a non-negative integer or None.")
     if cache_tokens and not config.enable_omnikv_offload:
         raise ValueError("omnikv_offload_cache_tokens requires enable_omnikv_offload.")
     if config.sparse_method not in SUPPORTED_SPARSE_METHODS:

@@ -34,10 +34,17 @@ and token budgets.
 Offload supports CUDA uniform FP16/BF16 explicit KV and the existing BF16 MLA
 512-dimensional latent plus 64-dimensional RoPE layout. Full-attention layers
 retain complete GPU KV. Sparse layers retain complete pinned-host history and
-bounded, request-private GPU decode buffers. Every step fetches the exact
-selected history, including sink/recent tokens; there is no LRU or historical
-GPU hot cache. MLA stays compressed. Existing model TP, EP and TP+EP semantics
+bounded, request-private GPU LRU pools. Top-K selection remains exact: GPU hits
+are reused and only missing history is fetched. Transfers advance one sparse
+layer ahead. MLA stays compressed. Existing model TP, EP and TP+EP semantics
 apply, with independent backing per rank.
+
+`omnikv_offload_cache_tokens` optionally sets each sparse layer's per-request
+GPU pool capacity. The default `None` rounds the total sink/keep/recent budget
+up to a power of two, capped by `max_model_len`. An explicit positive capacity
+must cover that selected budget; `0` disables LRU and fetches the complete
+selected history every step. Larger pools trade GPU capacity for fewer host
+reads. All pools and lookup metadata count toward cache admission budgets.
 
 Prefix caching and decode CUDA Graph can remain enabled within the model's
 existing compatibility limits. Qwen3-MoE currently rejects OmniKV prefix caching,

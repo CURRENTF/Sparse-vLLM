@@ -19,7 +19,7 @@ def main():
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--ep", type=int, default=1)
     parser.add_argument("--offload", action="store_true")
-    parser.add_argument("--cache-tokens", type=int, default=0)
+    parser.add_argument("--cache-tokens", type=int)
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--extended", action="store_true")
     parser.add_argument("--pressure", action="store_true")

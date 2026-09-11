@@ -29,9 +29,14 @@ Sparse-vLLM 在 public command、`LLM(...)`、runtime config 与内部消费者�
 
 支持 CUDA uniform FP16/BF16 显式 KV，以及已有 BF16 MLA 的 512 维 latent
 与 64 维 RoPE 布局。全注意力层的完整 KV 留在 GPU；稀疏层的完整历史保存到
-pinned CPU 内存，GPU 仅保留有界的、按请求独立的 decode buffer。
-每步精确回读选中的历史（包括 sink/recent），没有 LRU 或额外历史热缓存。
+pinned CPU 内存，GPU 保留有界的、按请求独立的 LRU 缓存池。
+Top-K 选择保持精确：命中项直接复用，只回读未命中的历史；搬运按稀疏层逐层提前执行。
 MLA 保持压缩表示。沿用模型已有 TP、EP、TP+EP 语义，各 rank 独立保存 backing。
+
+可用 `omnikv_offload_cache_tokens` 设置每个稀疏层、每个请求的 GPU 缓存容量。
+默认 `None` 将 sink/keep/recent 总预算向上取整到 2 的幂，并以 `max_model_len`
+为上限。显式正数必须覆盖选择预算；设为 `0` 则关闭 LRU，每步完整回读 selected
+历史。更大的缓存池会用更多显存换取更少的回读；缓存池和索引元数据均计入容量预算。
 
 在模型已有兼容范围内，可以同时开启 prefix caching 和 decode CUDA Graph。
 Qwen3-MoE 当前不支持 OmniKV prefix caching，开启 active offload 也不改变这个限制。
