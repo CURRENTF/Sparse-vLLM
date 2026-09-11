@@ -28,7 +28,15 @@ def test_indexed_host_copy_replay(shape):
     def run():
         store_rows(source, ptr, slots, 0)
         gather_rows(
-            ptr, output, table, rows, lengths, capacity=4, component=0, skip_last=True
+            ptr,
+            output,
+            table,
+            rows,
+            lengths,
+            capacity=4,
+            component=0,
+            skip_last=True,
+            max_blocks=2,
         )
         append_rows(source, output, lengths, slots, 4)
 

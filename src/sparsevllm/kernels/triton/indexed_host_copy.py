@@ -47,20 +47,23 @@ def _gather(
     BLOCK: tl.constexpr,
 ):
     batch = tl.program_id(0)
-    offset = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    token = offset // WIDTH
-    d = offset % WIDTH
     row = tl.load(ROWS + batch)
     length = tl.load(LENGTHS + batch)
-    valid = (token < length - SKIP_LAST) & (token < CAPACITY)
-    slot = tl.load(TABLE + row * TABLE_STRIDE + token, valid, 0)
-    source_slot = slot
-    if SLOT_MAP is not None:
-        source_slot = tl.load(SLOT_MAP + slot, valid, 0)
     src = tl.load(SRC_PTR + COMPONENT).to(tl.pointer_type(DST.dtype.element_ty))
-    x = tl.load(src + source_slot.to(tl.int64) * WIDTH + d, valid & (d < WIDTH), 0)
-    target = slot if SCATTER else batch * CAPACITY + token
-    tl.store(DST + target.to(tl.int64) * WIDTH + d, x, valid & (d < WIDTH))
+    for tile in range(
+        tl.program_id(1), tl.cdiv(CAPACITY * WIDTH, BLOCK), tl.num_programs(1)
+    ):
+        offset = tile * BLOCK + tl.arange(0, BLOCK)
+        token = offset // WIDTH
+        d = offset % WIDTH
+        valid = (token < length - SKIP_LAST) & (token < CAPACITY)
+        slot = tl.load(TABLE + row * TABLE_STRIDE + token, valid, 0)
+        source_slot = slot
+        if SLOT_MAP is not None:
+            source_slot = tl.load(SLOT_MAP + slot, valid, 0)
+        x = tl.load(src + source_slot.to(tl.int64) * WIDTH + d, valid, 0)
+        target = slot if SCATTER else batch * CAPACITY + token
+        tl.store(DST + target.to(tl.int64) * WIDTH + d, x, valid)
 
 
 @triton.jit
@@ -116,9 +119,13 @@ def gather_rows(
     skip_last: bool = False,
     scatter: bool = False,
     slot_map=None,
+    max_blocks: int = 0,
 ) -> None:
     width = destination.shape[-2] * destination.shape[-1]
-    _gather[(rows.numel(), triton.cdiv(capacity * width, 4096))](
+    blocks = triton.cdiv(capacity * width, 4096)
+    if max_blocks:
+        blocks = min(blocks, max_blocks)
+    _gather[(rows.numel(), blocks)](
         source_ptrs,
         destination,
         table,

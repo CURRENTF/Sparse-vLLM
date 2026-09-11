@@ -198,6 +198,31 @@ class OmniKVCacheManager(StandardCacheManager):
             )
         return result
 
+    def debug_state_summary(self):
+        result = super().debug_state_summary()
+        if self.offload_enabled:
+            accounting = self.memory_accounting()
+            result["omnikv_offload"] = {
+                name: accounting[name]
+                for name in (
+                    "allocated_device_tensor_bytes",
+                    "allocated_host_tensor_bytes",
+                    "omnikv_gpu_only_kv_bytes",
+                    "observed_savings",
+                )
+            }
+            result["omnikv_offload"].update(
+                slots=self.config.num_kvcache_slots,
+                selected_capacity=self.selected_capacity,
+                staging_rows=self.max_buffer_rows,
+                full_layers=len(self.attention_cache_storage.full_layers),
+            )
+            if self.prefix_offload_controller is not None:
+                result["omnikv_offload"]["prefix_transfer"] = (
+                    self.prefix_offload_controller.stats()
+                )
+        return result
+
     def begin_selection_step(self):
         self._prefetched.clear()
         self._current_writes.clear()
@@ -241,9 +266,10 @@ class OmniKVCacheManager(StandardCacheManager):
                 slots,
                 rows,
                 lengths,
-                capacity=min(self.selected_capacity, slots.shape[1]),
+                capacity=self.selected_capacity,
                 component=component,
                 skip_last=True,
+                max_blocks=32,
                 slot_map=self.attention_cache_storage.host_slot_map,
             )
 

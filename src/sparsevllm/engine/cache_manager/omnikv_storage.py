@@ -89,13 +89,29 @@ class OmniKVStorage:
             self.validate_slot_mapping(slots)
 
     def store(self, layer_idx, slots, payload):
+        if layer_idx in self.full_layers:
+            first, second = payload_tensors(payload)
+            a_cache, b_cache = self.layers[layer_idx]
+            if self.layout is CacheLayout.EXPLICIT_KV:
+                from sparsevllm.kernels.triton.store_kvcache import store_kvcache
+
+                store_kvcache(first, second, a_cache, b_cache, slots)
+            else:
+                from sparsevllm.kernels.triton.mla.copy_latent import (
+                    copy_latent_to_cache,
+                )
+
+                copy_latent_to_cache(
+                    first, second, slots, a_cache, b_cache, validate_slots=False
+                )
+            return
         for component, source in enumerate(payload_tensors(payload)):
             store_rows(
                 source,
                 self.pointers[layer_idx],
                 slots,
                 component,
-                self.host_slot_map if layer_idx not in self.full_layers else None,
+                self.host_slot_map,
             )
 
     def accounting_tensors(self):
