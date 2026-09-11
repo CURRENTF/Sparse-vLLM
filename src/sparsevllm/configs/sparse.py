@@ -16,7 +16,7 @@ from sparsevllm.method_registry import (
     resolve_prefill_sparse_method,
     resolve_sparse_prefill_score_mode,
 )
-from sparsevllm.utils.log import logger, log_once
+from sparsevllm.utils.log import log_once, logger
 
 
 def normalize_sparse_method_name(config) -> None:
