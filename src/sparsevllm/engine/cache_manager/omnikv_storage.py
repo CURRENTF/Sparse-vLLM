@@ -27,6 +27,12 @@ def payload_tensors(payload):
 
 
 class OmniKVStorage:
+    @staticmethod
+    def payload_shapes(original):
+        if original.layout is CacheLayout.EXPLICIT_KV:
+            return [(original.num_kv_heads, original.head_dim)] * 2
+        return [(1, original.kv_lora_rank), (1, original.rope_dim)]
+
     def __init__(
         self, original, *, num_layers, num_slots, full_layers, device, prefix_slots=0
     ):
@@ -34,10 +40,7 @@ class OmniKVStorage:
         self.dtype = original.dtype
         self.full_layers = frozenset(full_layers)
         self.num_slots = num_slots
-        if self.layout is CacheLayout.EXPLICIT_KV:
-            shapes = [(original.num_kv_heads, original.head_dim)] * 2
-        else:
-            shapes = [(1, original.kv_lora_rank), (1, original.rope_dim)]
+        shapes = self.payload_shapes(original)
         self.shapes = shapes
         self.host_slot_map = torch.arange(num_slots, dtype=torch.int32, device=device)
         self.layers = []

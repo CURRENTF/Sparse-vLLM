@@ -7,6 +7,10 @@ import pytest
 import torch
 
 from sparsevllm.engine.cache_manager.omnikv import OmniKVCacheManager
+from sparsevllm.engine.cache_manager.omnikv_capacity import (
+    fit_omnikv_host_slots,
+    omnikv_host_pool_bytes,
+)
 from sparsevllm.engine.cache_manager.storage import ExplicitKVStorage
 
 
@@ -38,13 +42,57 @@ def test_insufficient_pool_budget_does_not_publish_capacity(gpu_bytes, host_kib)
     manager._get_available_slots_info = lambda: (gpu_bytes, 1024)
     with (
         patch("pathlib.Path.read_text", return_value=f"MemAvailable: {host_kib} kB\n"),
-        patch("sparsevllm.engine.cache_manager.omnikv.OmniKVStorage") as allocate,
+        patch(
+            "sparsevllm.engine.cache_manager.omnikv.OmniKVStorage.__init__"
+        ) as allocate,
     ):
         with pytest.raises(MemoryError, match="pools cannot fit"):
             manager.allocate_kv_cache()
         allocate.assert_not_called()
     assert manager.config.num_kvcache_slots == 0
     assert manager.attention_cache_storage is original
+
+
+@pytest.mark.parametrize("part_bytes", [(2048, 2048), (1024, 128)])
+@pytest.mark.parametrize("prefix_slots", [0, 23])
+def test_host_capacity_covers_allocator_rounding_and_split_prefix(
+    part_bytes, prefix_slots
+):
+    # Logical bytes previously admitted a slot just beyond a pinned allocator
+    # size boundary, nearly doubling real RAM use. GPU-only budgets miss this.
+    limit, sparse, full = 1025, 3, 2
+    budget = sum(part_bytes) * (sparse * limit + (sparse + full) * prefix_slots)
+    slots = fit_omnikv_host_slots(limit, budget, part_bytes, sparse, full, prefix_slots)
+    assert 0 < slots < limit
+    assert (
+        omnikv_host_pool_bytes(slots, part_bytes, sparse, full, prefix_slots) <= budget
+    )
+    assert (
+        omnikv_host_pool_bytes(slots + 1, part_bytes, sparse, full, prefix_slots)
+        > budget
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not hasattr(torch.cuda.memory, "host_memory_stats"),
+    reason="CUDA host allocator statistics required",
+)
+@pytest.mark.parametrize("part_bytes", [(2048, 2048), (1024, 128)])
+def test_host_pool_budget_matches_real_pinned_allocations(part_bytes):
+    # Compare against the allocator, not another copy of the rounding formula.
+    slots, prefix, sparse, full = 1025, 23, 3, 2
+    torch.cuda.synchronize()
+    before = torch.cuda.memory.host_memory_stats()["active_bytes.current"]
+    buffers = [
+        torch.empty(count * width, dtype=torch.uint8, pin_memory=True)
+        for count, layers in ((slots + prefix, sparse), (prefix, full))
+        for _ in range(layers)
+        for width in part_bytes
+    ]
+    actual = torch.cuda.memory.host_memory_stats()["active_bytes.current"] - before
+    assert actual == omnikv_host_pool_bytes(slots, part_bytes, sparse, full, prefix)
+    assert actual > sum(t.numel() for t in buffers)
 
 
 def _reject_exhausted_peer(rank, init_file):
@@ -81,7 +129,9 @@ def _reject_exhausted_peer(rank, init_file):
         manager._get_available_slots_info = lambda: (1 if rank == 0 else 1000000, 1024)
         with (
             patch("pathlib.Path.read_text", return_value="MemAvailable: 100000 kB\n"),
-            patch("sparsevllm.engine.cache_manager.omnikv.OmniKVStorage") as allocate,
+            patch(
+                "sparsevllm.engine.cache_manager.omnikv.OmniKVStorage.__init__"
+            ) as allocate,
         ):
             with pytest.raises(MemoryError, match="pools cannot fit"):
                 manager.allocate_kv_cache()

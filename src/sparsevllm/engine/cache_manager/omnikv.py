@@ -9,7 +9,7 @@ import torch
 from sparsevllm.kernels.triton.indexed_host_copy import append_rows, gather_rows
 from sparsevllm.utils.context import get_context
 
-from .omnikv_capacity import plan_omnikv_pools
+from .omnikv_capacity import fit_omnikv_host_slots, plan_omnikv_pools
 from .omnikv_lru import OmniKVLRU
 from .omnikv_storage import OmniKVStorage, payload_tensors
 from .standard import StandardCacheManager
@@ -70,13 +70,22 @@ class OmniKVCacheManager(StandardCacheManager):
         self.prefix_host_blocks = prefix_bytes // (
             self.num_kv_layers * per_layer * self.config.prefix_cache_block_size
         )
-        host_budget -= prefix_bytes
         slots = min(
             slots,
-            host_budget // (sparse * per_layer),
             self.max_model_len
             * self.max_buffer_rows
             * (2 if self.config.enable_prefix_caching else 1),
+        )
+        slots = fit_omnikv_host_slots(
+            slots,
+            host_budget,
+            [
+                heads * dim * original.dtype.itemsize
+                for heads, dim in OmniKVStorage.payload_shapes(original)
+            ],
+            sparse,
+            len(full),
+            self.prefix_host_blocks * self.config.prefix_cache_block_size,
         )
         if self.world_size > 1:
             capacity = torch.tensor(slots, dtype=torch.int64, device=self.device)

@@ -5,6 +5,40 @@ from dataclasses import dataclass
 from .omnikv_lru import OmniKVLRU
 
 
+def omnikv_host_pool_bytes(
+    slots, part_bytes, sparse_layers, full_layers, prefix_slots=0
+):
+    # PyTorch's caching host allocator rounds each pinned allocation to a power
+    # of two. Sparse prefix backing shares the history allocation; full-layer
+    # prefixes have separate pinned allocations.
+    def rounded_parts(count):
+        return (
+            sum(1 << (count * width - 1).bit_length() for width in part_bytes)
+            if count
+            else 0
+        )
+
+    return sparse_layers * rounded_parts(
+        slots + prefix_slots
+    ) + full_layers * rounded_parts(prefix_slots)
+
+
+def fit_omnikv_host_slots(
+    max_slots, budget, part_bytes, sparse_layers, full_layers, prefix_slots=0
+):
+    low, high = 0, max(0, max_slots)
+    while low < high:
+        middle = (low + high + 1) // 2
+        needed = omnikv_host_pool_bytes(
+            middle, part_bytes, sparse_layers, full_layers, prefix_slots
+        )
+        if needed <= budget:
+            low = middle
+        else:
+            high = middle - 1
+    return low
+
+
 @dataclass(frozen=True)
 class OmniKVPoolPlan:
     full_layers: tuple[int, ...]
