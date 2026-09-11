@@ -16,12 +16,44 @@ Set `sparse_method` to one of the following method names.
 | `snapkv` | Physical eviction | SnapKV-style token selection uses an end-of-prompt observation window to keep a compact set of important prompt KV positions before generation. The current paper-aligned decode path is score-free and appends generated tokens without another SnapKV selection pass. | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
 | `h2o` | Physical eviction | Intermediate prefill chunks can be compacted to `h2o_prefill_budget`; the final prompt is compacted to `h2o_decode_budget`. Decode is score-free by default and grows with generated tokens. Optional `h2o_decode_eviction` accumulates decode probabilities and periodically evicts physical KV. | `h2o_decode_eviction`, `h2o_decode_budget`, `h2o_decode_eviction_interval`, `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window`, `sparse_prefill_score_mode` |
 | `pyramidkv` | Physical eviction | PyramidKV-style layer-dependent KV retention. It allocates sparse budgets across layers and physically stores the selected context tokens. | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
-| `omnikv` | Logical masking | OmniKV keeps the physical cache available but constructs sparse attention views for selected layers. This is useful when the method should avoid rewriting cache storage while still reducing attention work. | `full_attention_layers`, `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens` |
+| `omnikv` | Logical masking with optional offload | Cross-layer token selection; optionally keep sparse-layer history in pinned CPU memory and fetch the exact selected KV for decode. | `full_attention_layers`, `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `enable_omnikv_offload` |
 | `quest` | Query-aware page selection | QuEST selects token pages from persistent min/max page summaries. Prefill stays dense. Explicit-KV models score in key coordinates; GLM-4.7-Flash scores the fused MLA latent/RoPE cache with the matching absorbed decode query while keeping the compute payload latent. | `quest_chunk_size`, `quest_skip_layers`, `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens` |
 | `deltakv` | Hybrid compression | Slim compressor-backed DeltaKV runtime. Legacy `deltakv-less-memory*` names normalize here for older configs, but real benchmark runs still require a matching compressor checkpoint. | `deltakv_checkpoint_path`, `deltakv_latent_dim`, `deltakv_center_ratio`, `deltakv_neighbor_count`, `deltakv_latent_quant_bits`, `full_layer_kv_quant_bits` |
 
 Sparse-vLLM uses `sparse_method` unchanged in public commands, `LLM(...)`, the
 runtime config, and internal consumers.
+
+
+## OmniKV KV offload
+
+Set `sparse_method="omnikv", enable_omnikv_offload=True` in `LLM(...)` or
+its runtime configuration. The boolean defaults to `False`; enabling it for
+another sparse method is an error. Keep the model's existing full-layer profile
+and token budgets.
+
+Offload supports CUDA uniform FP16/BF16 explicit KV and the existing BF16 MLA
+512-dimensional latent plus 64-dimensional RoPE layout. Full-attention layers
+retain complete GPU KV. Sparse layers retain complete pinned-host history and
+bounded, request-private GPU decode buffers. Every step fetches the exact
+selected history, including sink/recent tokens; there is no LRU or historical
+GPU hot cache. MLA stays compressed. Existing model TP, EP and TP+EP semantics
+apply, with independent backing per rank.
+
+Prefix caching and decode CUDA Graph can remain enabled within the model's
+existing compatibility limits. Qwen3-MoE currently rejects OmniKV prefix caching,
+including with active offload. Prefix hits share
+history; suffix prefill sees the complete prefix, and generated suffixes remain
+private. `enable_prefix_cache_offload` is a separate option for backing up and
+demoting idle prefix blocks, including full-attention KV. With active OmniKV
+offload it also supports MLA; configure a positive `prefix_cache_host_size_gb`
+large enough for the configured prefix block capacity.
+
+This is a capacity option, with a substantial PCIe/host-memory bandwidth cost.
+Fixed-batch decode latency can increase. Full-attention KV and one full-history
+prefill buffer still grow with context. Chunked prefill reloads sparse-layer
+history and may increase TTFT. Use matched BenchProbe measurements for the
+intended model, context and concurrency before enabling it in a latency-sensitive
+workload.
 
 Prefill acceleration is selected separately with `prefill_sparse_method`.
 Sparse-vLLM currently supports `h2o_prefill` for intermediate-chunk KV

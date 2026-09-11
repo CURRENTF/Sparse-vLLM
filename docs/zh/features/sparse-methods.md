@@ -14,11 +14,37 @@ Sparse-vLLM 围绕 cache-manager-first sparse runtime 构建。engine 支持 phy
 | `snapkv` | Physical eviction | SnapKV 风格的 token selection 使用 prompt 末尾的 observation window，在生成前选出并保留紧凑的重要 prompt KV。当前与论文对齐的 decode 路径不再评分，也不会再次执行 SnapKV selection，只追加生成 token。 | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
 | `h2o` | Physical eviction | 中间 prefill chunk 可压缩到 `h2o_prefill_budget`，最终 prompt 压缩到 `h2o_decode_budget`。默认 decode 不评分或驱逐，物理 row 随生成 token 增长；开启 `h2o_decode_eviction` 后逐步累计概率分数并周期驱逐。 | `h2o_decode_eviction`, `h2o_decode_budget`, `h2o_decode_eviction_interval`, `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window`, `sparse_prefill_score_mode` |
 | `pyramidkv` | Physical eviction | PyramidKV 风格、依赖 layer 的 KV 保留方式。它在 layer 之间分配 sparse budget，并物理存储选中的 context token。 | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
-| `omnikv` | Logical masking | OmniKV 保留 physical cache，但为选定 layer 构建 sparse attention view。适用于不改写 cache storage、同时降低 attention 计算量的场景。 | `full_attention_layers`, `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens` |
+| `omnikv` | Logical masking，可选 offload | 跨层共享 token 选择；可将稀疏层完整历史保存在 pinned CPU 内存，decode 精确取回当前选择的 KV。 | `full_attention_layers`, `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `enable_omnikv_offload` |
 | `quest` | Query-aware page selection | QuEST 根据持久化的 page min/max summary 选择 token page，prefill 保持 dense。显式 KV 模型在 key 坐标中评分；GLM-4.7-Flash 使用匹配的 absorbed decode query 对融合 MLA latent/RoPE cache 评分，同时 compute payload 继续保持 latent。 | `quest_chunk_size`, `quest_skip_layers`, `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens` |
 | `deltakv` | Hybrid compression | 依赖 compressor 的精简 DeltaKV runtime。旧配置中的 `deltakv-less-memory*` 名称会规范到此方法，但实际 benchmark run 仍需要匹配的 compressor checkpoint。 | `deltakv_checkpoint_path`, `deltakv_latent_dim`, `deltakv_center_ratio`, `deltakv_neighbor_count`, `deltakv_latent_quant_bits`, `full_layer_kv_quant_bits` |
 
 Sparse-vLLM 在 public command、`LLM(...)`、runtime config 与内部消费者中统一使用 `sparse_method`。
+
+
+## OmniKV KV offload
+
+在 `LLM(...)` 或运行配置中设置
+`sparse_method="omnikv", enable_omnikv_offload=True`。开关默认 `False`，
+用于其他 sparse method 会报错。继续使用模型原来的 full-layer profile 和 token 预算。
+
+支持 CUDA uniform FP16/BF16 显式 KV，以及已有 BF16 MLA 的 512 维 latent
+与 64 维 RoPE 布局。全注意力层的完整 KV 留在 GPU；稀疏层的完整历史保存到
+pinned CPU 内存，GPU 仅保留有界的、按请求独立的 decode buffer。
+每步精确回读选中的历史（包括 sink/recent），没有 LRU 或额外历史热缓存。
+MLA 保持压缩表示。沿用模型已有 TP、EP、TP+EP 语义，各 rank 独立保存 backing。
+
+在模型已有兼容范围内，可以同时开启 prefix caching 和 decode CUDA Graph。
+Qwen3-MoE 当前不支持 OmniKV prefix caching，开启 active offload 也不改变这个限制。
+命中请求共享历史，
+suffix prefill 使用完整前缀，新生成的 suffix 保持私有。
+`enable_prefix_cache_offload` 是独立开关，用于备份和降级闲置前缀块，
+包括全注意力层 KV。开启 active OmniKV offload 时该组合也支持 MLA；
+需要设置正数 `prefix_cache_host_size_gb`，并足以容纳配置的前缀块容量。
+
+该选项用于释放 KV 显存容量，但会消耗大量 PCIe/host 内存带宽，固定 batch
+的 decode 延迟可能上升。全注意力层 KV 和一份完整历史 prefill buffer
+仍随上下文增长；chunked prefill 重载稀疏层历史可能增加 TTFT。
+对延迟敏感的部署，应先用 BenchProbe 匹配实际模型、上下文和并发进行测量。
 
 Prefill 加速由 `prefill_sparse_method` 独立选择。当前支持两种方法：
 `h2o_prefill` 用于中间 chunk 的物理 KV 压缩，`flashprefill_v2` 用于稀疏化
