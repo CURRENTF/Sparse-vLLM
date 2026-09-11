@@ -127,6 +127,31 @@ class DynamicSelectionRuntime(SparseMethodRuntime):
 
 
 class OmniKVRuntime(DynamicSelectionRuntime):
+    def on_attention_end(self, event):
+        if not getattr(self.cache_manager, "offload_enabled", False):
+            return
+        if event.forward_context.is_prefill or event.layer_idx not in self.obs_layer_ids:
+            return
+        if event.forward_context.is_long_text is False:
+            return
+        with self.cache_manager.selection_stream():
+            super().on_layer_end(LayerEndEvent(
+                layer_idx=event.layer_idx,
+                layer_context=event.forward_context,
+                forward_context=event.forward_context,
+            ))
+            targets = []
+            for layer in range(event.layer_idx + 1, self.num_layers):
+                if layer in self.full_attention_layers:
+                    break
+                if self._is_kv_layer(layer):
+                    targets.append((layer, self._build_selection(layer)))
+            self.cache_manager.prefetch_selections(targets)
+
+    def on_layer_end(self, event):
+        if not getattr(self.cache_manager, "offload_enabled", False):
+            super().on_layer_end(event)
+
     def __init__(self, config, cache_manager):
         super().__init__(config, cache_manager)
         self._omnikv_decode_attn_score_buffer: torch.Tensor | None = None
@@ -156,6 +181,8 @@ class OmniKVRuntime(DynamicSelectionRuntime):
     def _begin_prepare_step(self, step: SparseStepContext) -> None:
         del step
         self._pending_decode_score_specs = []
+        if getattr(self.cache_manager, "offload_enabled", False):
+            self.cache_manager.begin_selection_step()
 
     def _prepare_decode_attention_score(
         self,
