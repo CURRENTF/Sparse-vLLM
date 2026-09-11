@@ -11,7 +11,8 @@ from sparsevllm.engine.cache_manager.omnikv_capacity import (
     fit_omnikv_host_slots,
     omnikv_host_pool_bytes,
 )
-from sparsevllm.engine.cache_manager.storage import ExplicitKVStorage
+from sparsevllm.engine.cache_manager.omnikv_storage import OmniKVStorage
+from sparsevllm.engine.cache_manager.storage import ExplicitKVStorage, MlaLatentStorage
 
 
 @pytest.mark.parametrize("gpu_bytes,host_kib", [(1, 100000), (1000000, 0)])
@@ -123,20 +124,41 @@ def test_host_capacity_covers_allocator_rounding_and_split_prefix(
     reason="CUDA host allocator statistics required",
 )
 @pytest.mark.parametrize("part_bytes", [(2048, 2048), (1024, 128)])
-def test_host_pool_budget_matches_real_pinned_allocations(part_bytes):
+@pytest.mark.parametrize("slots,prefix", [(1024, 0), (1025, 23)])
+def test_host_pool_budget_matches_real_pinned_allocations(part_bytes, slots, prefix):
     # Compare against the allocator, not another copy of the rounding formula.
-    slots, prefix, sparse, full = 1025, 23, 3, 2
+    sparse, full = 3, 2
+    original = (
+        ExplicitKVStorage(num_kv_heads=1, head_dim=1024, dtype=torch.bfloat16)
+        if part_bytes[0] == part_bytes[1]
+        else MlaLatentStorage(kv_lora_rank=512, rope_dim=64, dtype=torch.bfloat16)
+    )
     torch.cuda.synchronize()
     before = torch.cuda.memory.host_memory_stats()["active_bytes.current"]
+    # Model construction installs a CUDA default device; pinned history must
+    # still allocate on CPU, including the profiling cache runtime.
+    with torch.device("cuda"):
+        storage = OmniKVStorage(
+            original, num_layers=sparse + full, num_slots=slots,
+            prefix_slots=prefix, full_layers=range(full), device="cuda",
+        )
+    # Full-layer prefix backing belongs to the prefix pool, not history storage.
     buffers = [
-        torch.empty(count * width, dtype=torch.uint8, pin_memory=True)
-        for count, layers in ((slots + prefix, sparse), (prefix, full))
-        for _ in range(layers)
+        torch.empty(prefix * width, dtype=torch.uint8, pin_memory=True)
+        for _ in range(full)
         for width in part_bytes
     ]
+    torch.cuda.synchronize()
     actual = torch.cuda.memory.host_memory_stats()["active_bytes.current"] - before
     assert actual == omnikv_host_pool_bytes(slots, part_bytes, sparse, full, prefix)
-    assert actual > sum(t.numel() for t in buffers)
+    history = [part for parts in storage.layers[full:] for part in parts]
+    assert all(part.is_pinned() and part.is_contiguous() for part in history)
+    logical = sum(t.numel() * t.element_size() for t in history + buffers)
+    assert actual >= logical
+    # Independent physical ranges catch accidental overlap between slab views.
+    ranges = sorted((t.data_ptr(), t.data_ptr() + t.numel() * t.element_size())
+                    for t in history)
+    assert all(a[1] <= b[0] for a, b in zip(ranges, ranges[1:]))
 
 
 def _reject_exhausted_peer(rank, init_file):

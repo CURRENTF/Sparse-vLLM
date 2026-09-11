@@ -5,6 +5,17 @@ from dataclasses import dataclass
 from .omnikv_lru import OmniKVLRU
 
 
+def omnikv_history_allocation(slots, part_bytes, sparse_layers):
+    """Choose the smaller rounded allocation without changing logical views."""
+    if not slots or not sparse_layers:
+        return 0, False
+    separate = sparse_layers * sum(
+        1 << (slots * width - 1).bit_length() for width in part_bytes
+    )
+    packed = 1 << (slots * sum(part_bytes) * sparse_layers - 1).bit_length()
+    return (packed, True) if packed < separate else (separate, False)
+
+
 def omnikv_host_pool_bytes(
     slots, part_bytes, sparse_layers, full_layers, prefix_slots=0
 ):
@@ -18,9 +29,10 @@ def omnikv_host_pool_bytes(
             else 0
         )
 
-    return sparse_layers * rounded_parts(
-        slots + prefix_slots
-    ) + full_layers * rounded_parts(prefix_slots)
+    history_bytes, _ = omnikv_history_allocation(
+        slots + prefix_slots, part_bytes, sparse_layers
+    )
+    return history_bytes + full_layers * rounded_parts(prefix_slots)
 
 
 def fit_omnikv_host_slots(

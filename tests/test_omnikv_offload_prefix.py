@@ -11,12 +11,12 @@ from sparsevllm.engine.cache_manager.omnikv_storage import OmniKVStorage
 from sparsevllm.engine.cache_manager.standard import StandardPrefixBlockPayload
 from sparsevllm.engine.cache_manager.storage import ExplicitKVStorage, MlaLatentStorage
 from sparsevllm.engine.prefix_cache import PrefixCacheBlock, RadixPrefixIndex
-from sparsevllm.kernels.triton.indexed_host_copy import gather_rows
+from sparsevllm.operators.indexed_host_copy import gather_rows
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("mla", [False, True])
-def test_split_prefix_restore_after_slot_reuse(mla, monkeypatch):
+@pytest.mark.parametrize("mla,num_layers", [(False, 3), (True, 3), (False, 4), (True, 5)])
+def test_split_prefix_restore_after_slot_reuse(mla, num_layers, monkeypatch):
     original = (
         MlaLatentStorage(kv_lora_rank=512, rope_dim=64, dtype=torch.bfloat16)
         if mla
@@ -24,7 +24,7 @@ def test_split_prefix_restore_after_slot_reuse(mla, monkeypatch):
     )
     storage = OmniKVStorage(
         original,
-        num_layers=3,
+        num_layers=num_layers,
         num_slots=12,
         full_layers=[0],
         prefix_slots=8,

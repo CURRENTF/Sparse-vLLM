@@ -62,10 +62,13 @@ large enough for the configured prefix block capacity.
 
 This is a capacity option, with a substantial PCIe/host-memory bandwidth cost.
 Fixed-batch decode latency can increase. Full-attention KV and one full-history
-prefill buffer still grow with context. Chunked prefill reloads sparse-layer
-history and may increase TTFT. Use matched BenchProbe measurements for the
-intended model, context and concurrency before enabling it in a latency-sensitive
-workload.
+prefill buffer still grow with context. Chunked prefill reloads earlier
+sparse-layer history while using the current chunk directly from GPU; the
+current chunk is still written through to host. Historical reloads may increase
+TTFT. On multi-socket hosts, keep pinned memory local to each GPU where possible;
+remote memory and competing host-memory traffic can reduce transfer throughput.
+Use matched BenchProbe measurements for the intended model, context and
+concurrency before enabling it in a latency-sensitive workload.
 
 Prefill acceleration is selected separately with `prefill_sparse_method`.
 Sparse-vLLM currently supports `h2o_prefill` for intermediate-chunk KV

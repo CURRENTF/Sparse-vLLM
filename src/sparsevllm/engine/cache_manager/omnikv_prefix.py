@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from sparsevllm.kernels.triton.indexed_host_copy import transfer_rows
+from sparsevllm.operators.indexed_host_copy import transfer_rows
 
 from .prefix_offload import PinnedPrefixKVPool, StandardPrefixOffloadController
 

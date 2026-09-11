@@ -6,7 +6,11 @@ from pathlib import Path
 
 import torch
 
-from sparsevllm.kernels.triton.indexed_host_copy import append_rows, gather_rows
+from sparsevllm.operators.indexed_host_copy import (
+    append_rows,
+    gather_prefill_rows,
+    gather_rows,
+)
 from sparsevllm.utils.context import get_context
 
 from .omnikv_capacity import fit_omnikv_host_slots, plan_omnikv_pools
@@ -305,7 +309,7 @@ class OmniKVCacheManager(StandardCacheManager):
                 skip_last=self.config.recent_keep_tokens > 0,
                 exclude_slots=self.layer_batch_state.slot_mapping,
                 # Bound the whole batch footprint to leave SMs for model work.
-                max_blocks=max(1, 32 // rows.numel()),
+                block_budget=32,
                 slot_map=self.attention_cache_storage.host_slot_map,
             )
 
@@ -406,17 +410,20 @@ class OmniKVCacheManager(StandardCacheManager):
                 req_indices,
                 context_lens,
             )
-        for component, destination in enumerate(self.prefill_staging):
-            gather_rows(
+        for component, (current, destination) in enumerate(
+            zip((k_current, v_current), self.prefill_staging)
+        ):
+            gather_prefill_rows(
                 storage.pointers[kv_idx],
+                current,
                 destination,
                 active_slots,
                 req_indices,
                 context_lens,
+                get_context().cu_seqlens_q,
+                storage.host_slot_map,
                 capacity=int(selection.max_context_len),
                 component=component,
-                scatter=True,
-                slot_map=storage.host_slot_map,
             )
         return (
             storage.make_payload(self.prefill_staging),

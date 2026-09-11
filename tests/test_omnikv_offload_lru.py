@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from sparsevllm.engine.cache_manager.omnikv_lru import OmniKVLRU
-from sparsevllm.kernels.triton.indexed_host_copy import append_rows, gather_rows
+from sparsevllm.operators.indexed_host_copy import append_rows, gather_rows
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

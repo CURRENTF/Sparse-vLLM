@@ -52,7 +52,10 @@ suffix prefill 使用完整前缀，新生成的 suffix 保持私有。
 
 该选项用于释放 KV 显存容量，但会消耗大量 PCIe/host 内存带宽，固定 batch
 的 decode 延迟可能上升。全注意力层 KV 和一份完整历史 prefill buffer
-仍随上下文增长；chunked prefill 重载稀疏层历史可能增加 TTFT。
+仍随上下文增长。Chunked prefill 从主机恢复此前的稀疏层历史，当前 chunk
+直接使用 GPU 上的 KV，同时保留向主机写穿；历史重载仍可能增加 TTFT。
+多路 CPU 主机应尽量让 pinned 内存位于对应 GPU 的本地 NUMA 节点，
+远端内存和其他任务的主机内存流量可能降低搬运吞吐。
 对延迟敏感的部署，应先用 BenchProbe 匹配实际模型、上下文和并发进行测量。
 
 Prefill 加速由 `prefill_sparse_method` 独立选择。当前支持两种方法：

@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from sparsevllm.kernels.triton.indexed_host_copy import (
+from sparsevllm.operators.indexed_host_copy import (
     append_rows,
     gather_rows,
     store_rows,
@@ -44,7 +44,7 @@ def test_indexed_host_copy_replay(shape, dtype):
             capacity=4,
             component=0,
             skip_last=True,
-            max_blocks=2,
+            block_budget=4,
             exclude_slots=slots,
         )
         append_rows(source, output, lengths, slots, 4)
@@ -119,3 +119,90 @@ def test_current_token_follows_selection_when_recent_budget_is_zero():
                 if slot == int(write_slots[batch]):
                     reference[index] = current[batch].cpu()
             torch.testing.assert_close(actual[batch], reference, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "batch,shape,dtype",
+    [
+        (3, (8, 128), torch.bfloat16),
+        (5, (1, 512), torch.bfloat16),
+        (3, (1, 64), torch.float16),
+    ],
+)
+def test_cached_gather_rebalances_dynamic_compacted_misses(batch, shape, dtype):
+    # Per-request copy tests miss errors in the global tile-to-request mapping,
+    # particularly empty requests and partial tiles in non-power-of-two batches.
+    torch.manual_seed(19)
+    capacity, slots = 9, 32
+    host = torch.randn(slots, *shape, dtype=dtype).pin_memory()
+    pointers = torch.tensor([host.data_ptr()], dtype=torch.uint64, device="cuda")
+    table_cpu = torch.stack(
+        [torch.randperm(slots)[: capacity + 2] for _ in range(batch)]
+    ).int()
+    rows_cpu = torch.randperm(batch).int()
+    slot_map_cpu = torch.randperm(slots).int()
+    lengths_cpu = torch.full((batch,), capacity, dtype=torch.int32)
+    lengths_cpu[-1] = capacity - 2
+    writes_cpu = table_cpu[rows_cpu.long(), capacity - 1].clone()
+    positions = torch.randperm(batch * capacity).reshape(batch, capacity).int()
+    plan_cpu = -positions - 1
+    plan_cpu[:, ::3] = positions[:, ::3]
+    misses_cpu = torch.stack(
+        [torch.randperm(capacity) for _ in range(batch)]
+    ).int()
+    table, rows, slot_map, lengths, writes, plan, misses = [
+        tensor.cuda()
+        for tensor in (
+            table_cpu, rows_cpu, slot_map_cpu, lengths_cpu,
+            writes_cpu, plan_cpu, misses_cpu,
+        )
+    ]
+    counts = torch.zeros(batch, dtype=torch.int32, device="cuda")
+    cache = torch.full((batch * capacity, *shape), -17, dtype=dtype, device="cuda")
+
+    def run():
+        gather_rows(
+            pointers,
+            cache,
+            table,
+            rows,
+            lengths,
+            capacity=capacity,
+            component=0,
+            block_budget=2,
+            slot_map=slot_map,
+            exclude_slots=writes,
+            cache=cache,
+            plan=plan,
+            miss_tokens=misses,
+            miss_counts=counts,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for values in (
+        [0] * batch,
+        [0, 1, capacity, 3, capacity - 1][:batch],
+        [capacity] * batch,
+    ):
+        counts.copy_(torch.tensor(values, dtype=torch.int32, device="cuda"))
+        misses_cpu = misses_cpu.flip(1)
+        misses.copy_(misses_cpu)
+        cache.fill_(-17)
+        graph.replay()
+        expected = torch.full_like(cache.cpu(), -17)
+        for request, count in enumerate(values):
+            for token in misses_cpu[request, :count].tolist():
+                slot = int(table_cpu[rows_cpu[request], token])
+                entry = int(plan_cpu[request, token])
+                if (
+                    token < lengths_cpu[request]
+                    and slot != writes_cpu[request]
+                    and entry < 0
+                ):
+                    expected[-entry - 1] = host[slot_map_cpu[slot]]
+        torch.testing.assert_close(cache.cpu(), expected, rtol=0, atol=0)

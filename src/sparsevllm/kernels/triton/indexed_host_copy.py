@@ -1,8 +1,5 @@
 """GPU-indexed copies between CUDA and UVA-mapped pinned host pools."""
 
-from __future__ import annotations
-
-import torch
 import triton
 import triton.language as tl
 
@@ -39,35 +36,24 @@ def _gather(
     LENGTHS,
     SLOT_MAP,
     EXCLUDE_SLOTS,
-    CACHE,
-    PLAN,
-    MISS_TOKENS,
-    MISS_COUNTS,
     TABLE_STRIDE: tl.constexpr,
     WIDTH: tl.constexpr,
     CAPACITY: tl.constexpr,
     COMPONENT: tl.constexpr,
     SKIP_LAST: tl.constexpr,
-    SCATTER: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     batch = tl.program_id(0)
     row = tl.load(ROWS + batch)
     length = tl.load(LENGTHS + batch)
     src = tl.load(SRC_PTR + COMPONENT).to(tl.pointer_type(DST.dtype.element_ty))
-    count = CAPACITY
-    if MISS_COUNTS is not None:
-        count = tl.load(MISS_COUNTS + batch)
     for tile in range(
-        tl.program_id(1), tl.cdiv(count * WIDTH, BLOCK), tl.num_programs(1)
+        tl.program_id(1), tl.cdiv(CAPACITY * WIDTH, BLOCK), tl.num_programs(1)
     ):
         offset = tile * BLOCK + tl.arange(0, BLOCK)
-        item = offset // WIDTH
-        token = item
-        if MISS_TOKENS is not None:
-            token = tl.load(MISS_TOKENS + batch * CAPACITY + item, item < count, 0)
+        token = offset // WIDTH
         d = offset % WIDTH
-        valid = (item < count) & (token < length - SKIP_LAST) & (token < CAPACITY)
+        valid = (token < length - SKIP_LAST) & (token < CAPACITY)
         active = True
         if EXCLUDE_SLOTS is not None:
             current_slot = tl.load(EXCLUDE_SLOTS + batch)
@@ -79,20 +65,113 @@ def _gather(
         source_slot = slot
         if SLOT_MAP is not None:
             source_slot = tl.load(SLOT_MAP + slot, valid, 0)
-        host_read = valid
-        if PLAN is not None:
-            entry = tl.load(PLAN + batch * CAPACITY + token, valid, 0)
-            cache_slot = tl.where(entry < 0, -entry - 1, entry).to(tl.int64)
-            host_read = valid & (entry < 0)
-        x = tl.load(src + source_slot.to(tl.int64) * WIDTH + d, host_read, 0)
-        if PLAN is not None:
-            tl.store(CACHE + cache_slot * WIDTH + d, x, host_read)
-        target = slot if SCATTER else batch * CAPACITY + token
+        x = tl.load(src + source_slot.to(tl.int64) * WIDTH + d, valid, 0)
+        target = batch * CAPACITY + token
         # Padded rows have replicated lengths but no write slot. Do not read
         # their host KV, and leave finite zeros for their private attention view.
         store_mask = valid | ((not active) & (token < CAPACITY))
-        if PLAN is None:
-            tl.store(DST + target.to(tl.int64) * WIDTH + d, x, store_mask)
+        tl.store(DST + target.to(tl.int64) * WIDTH + d, x, store_mask)
+
+
+@triton.jit
+def _gather_cached(
+    SRC_PTR,
+    CACHE,
+    TABLE,
+    ROWS,
+    LENGTHS,
+    SLOT_MAP,
+    EXCLUDE_SLOTS,
+    PLAN,
+    MISS_TOKENS,
+    MISS_COUNTS,
+    TABLE_STRIDE: tl.constexpr,
+    WIDTH: tl.constexpr,
+    CAPACITY: tl.constexpr,
+    COMPONENT: tl.constexpr,
+    SKIP_LAST: tl.constexpr,
+    BATCH: tl.constexpr,
+    BATCH_BLOCK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    requests = tl.arange(0, BATCH_BLOCK)
+    counts = tl.load(MISS_COUNTS + requests, requests < BATCH, 0)
+    tiles = tl.cdiv(counts * WIDTH, BLOCK)
+    ends = tl.cumsum(tiles, 0)
+    total = tl.sum(tiles, 0)
+    source = tl.load(SRC_PTR + COMPONENT).to(tl.pointer_type(CACHE.dtype.element_ty))
+    # Share the fixed CTA budget across misses: per-request quotas leave the
+    # transfer waiting for whichever request has the most newly selected KV.
+    for tile in range(tl.program_id(0), total, tl.num_programs(0)):
+        batch = tl.sum((tile >= ends).to(tl.int32), 0)
+        begin = tl.sum(tl.where(requests < batch, tiles, 0), 0)
+        offsets = (tile - begin) * BLOCK + tl.arange(0, BLOCK)
+        item = offsets // WIDTH
+        count = tl.load(MISS_COUNTS + batch)
+        token = tl.load(MISS_TOKENS + batch * CAPACITY + item, item < count, 0)
+        length = tl.load(LENGTHS + batch)
+        row = tl.load(ROWS + batch)
+        valid = (item < count) & (token < length - SKIP_LAST) & (token < CAPACITY)
+        if EXCLUDE_SLOTS is not None:
+            current = tl.load(EXCLUDE_SLOTS + batch)
+            valid = valid & (current >= 0)
+        slot = tl.load(TABLE + row * TABLE_STRIDE + token, valid, 0)
+        if EXCLUDE_SLOTS is not None:
+            valid = valid & (slot != current)
+        source_slot = slot
+        if SLOT_MAP is not None:
+            source_slot = tl.load(SLOT_MAP + slot, valid, 0)
+        entry = tl.load(PLAN + batch * CAPACITY + token, valid, 0)
+        valid = valid & (entry < 0)
+        position = (-entry - 1).to(tl.int64)
+        value = tl.load(
+            source + source_slot.to(tl.int64) * WIDTH + offsets % WIDTH, valid, 0
+        )
+        tl.store(CACHE + position * WIDTH + offsets % WIDTH, value, valid)
+
+
+@triton.jit
+def _gather_prefill(
+    SRC_PTR,
+    CURRENT,
+    DST,
+    TABLE,
+    ROWS,
+    LENGTHS,
+    CU_QUERY,
+    SLOT_MAP,
+    TABLE_STRIDE: tl.constexpr,
+    CURRENT_STRIDE: tl.constexpr,
+    WIDTH: tl.constexpr,
+    CAPACITY: tl.constexpr,
+    COMPONENT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    batch = tl.program_id(0)
+    row = tl.load(ROWS + batch)
+    length = tl.load(LENGTHS + batch)
+    query_begin = tl.load(CU_QUERY + batch)
+    query_end = tl.load(CU_QUERY + batch + 1)
+    history = length - (query_end - query_begin)
+    offsets = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    token = offsets // WIDTH
+    feature = offsets % WIDTH
+    valid = (token < length) & (token < CAPACITY)
+    slot = tl.load(TABLE + row * TABLE_STRIDE + token, valid, 0)
+    # CPU write-through has already preserved the chunk. Avoid reading it back
+    # over the host link; only earlier chunks and shared prefix KV need that.
+    from_host = valid & (token < history)
+    host_slot = tl.load(SLOT_MAP + slot, from_host, 0)
+    source = tl.load(SRC_PTR + COMPONENT).to(tl.pointer_type(DST.dtype.element_ty))
+    old = tl.load(source + host_slot.to(tl.int64) * WIDTH + feature, from_host, 0)
+    current = tl.load(
+        CURRENT + (query_begin + token - history).to(tl.int64) * CURRENT_STRIDE + feature,
+        valid & (token >= history), 0,
+    )
+    tl.store(
+        DST + slot.to(tl.int64) * WIDTH + feature,
+        tl.where(token < history, old, current), valid,
+    )
 
 
 @triton.jit
@@ -140,103 +219,6 @@ def _append(
         tl.store(CACHE + cache_slot * WIDTH + d, x, valid)
 
 
-def store_rows(
-    source: torch.Tensor,
-    destination_ptrs: torch.Tensor,
-    slots: torch.Tensor,
-    component: int,
-    slot_map=None,
-) -> None:
-    width = source.shape[-2] * source.shape[-1]
-    _copy_rows[(source.shape[0], triton.cdiv(width, 256))](
-        source,
-        destination_ptrs,
-        slots,
-        slot_map,
-        source.shape[0],
-        width,
-        source.stride(0),
-        component,
-        256,
-    )
-
-
-def gather_rows(
-    source_ptrs: torch.Tensor,
-    destination: torch.Tensor,
-    table: torch.Tensor,
-    rows: torch.Tensor,
-    lengths: torch.Tensor,
-    *,
-    capacity: int,
-    component: int,
-    skip_last: bool = False,
-    scatter: bool = False,
-    slot_map=None,
-    max_blocks: int = 0,
-    exclude_slots=None,
-    cache=None,
-    plan=None,
-    miss_tokens=None,
-    miss_counts=None,
-) -> None:
-    width = destination.shape[-2] * destination.shape[-1]
-    blocks = triton.cdiv(capacity * width, 4096)
-    if max_blocks:
-        blocks = min(blocks, max_blocks)
-    _gather[(rows.numel(), blocks)](
-        source_ptrs,
-        destination,
-        table,
-        rows,
-        lengths,
-        slot_map,
-        exclude_slots,
-        cache,
-        plan,
-        miss_tokens,
-        miss_counts,
-        table.stride(0),
-        width,
-        capacity,
-        component,
-        skip_last,
-        scatter,
-        4096,
-    )
-
-
-def append_rows(
-    source: torch.Tensor,
-    destination: torch.Tensor,
-    lengths: torch.Tensor,
-    write_slots: torch.Tensor,
-    capacity: int,
-    *,
-    table=None,
-    rows=None,
-    cache=None,
-    plan=None,
-) -> None:
-    width = source.shape[-2] * source.shape[-1]
-    _append[(source.shape[0], triton.cdiv(width, 256))](
-        source,
-        destination,
-        lengths,
-        write_slots,
-        table,
-        rows,
-        cache,
-        plan,
-        0 if table is None else table.stride(0),
-        triton.next_power_of_2(capacity),
-        width,
-        source.stride(0),
-        capacity,
-        256,
-    )
-
-
 @triton.jit
 def _transfer(
     SRC_PTR,
@@ -259,28 +241,3 @@ def _transfer(
     dst = tl.load(DST_PTR + COMPONENT).to(tl.pointer_type(DTYPE))
     x = tl.load(src + source.to(tl.int64) * WIDTH + d, d < WIDTH, 0)
     tl.store(dst + target.to(tl.int64) * WIDTH + d, x, d < WIDTH)
-
-
-def transfer_rows(
-    source_ptrs,
-    destination_ptrs,
-    source_slots,
-    destination_slots,
-    *,
-    width,
-    dtype,
-    component,
-    slot_map=None,
-):
-    if source_slots.numel():
-        _transfer[(source_slots.numel(), triton.cdiv(width, 256))](
-            source_ptrs,
-            destination_ptrs,
-            source_slots,
-            destination_slots,
-            slot_map,
-            width,
-            component,
-            tl.bfloat16 if dtype == torch.bfloat16 else tl.float16,
-            256,
-        )
