@@ -1,5 +1,9 @@
 # OmniKV offload implementation and validation
 
+This is the historical first-stage report at `2b767763`, before GPU LRU reuse.
+See [the LRU follow-up](omnikv-offload-lru-validation.md) for current defaults,
+additional optimizations, and their validation.
+
 Date: 2026-09-11. Base: `4cec18b4`. Branch: `feat/omnikv-offload`.
 
 The active offload implementation is opt-in through
