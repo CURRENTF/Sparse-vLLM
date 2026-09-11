@@ -53,7 +53,7 @@ def plan_omnikv_pools(config, full_layers, num_layers, rows, per_layer):
     fixed = sparse * rows * selected * per_layer + 2 * rows * config.max_model_len * 4
     slot_bytes = (len(full) + 1) * per_layer + 8
     if cache:
-        fixed += sparse * rows * cache * per_layer
+        fixed += sparse * (rows * (cache - selected) + 1) * per_layer
         fixed += OmniKVLRU.metadata_bytes(rows, 0, cache, selected, groups)
         slot_bytes += groups * rows * 4
     return OmniKVPoolPlan(

@@ -118,7 +118,7 @@ class OmniKVCacheManager(StandardCacheManager):
         self.selected_staging = {
             i: allocate(staging_slots)
             for i in range(self.num_kv_layers)
-            if i not in storage.full_layers
+            if i not in storage.full_layers and not cache_capacity
         }
         # Preserve the input table's capacity for provider planning: FA3 uses
         # its width to choose splits, even when the effective context is short.
@@ -141,7 +141,9 @@ class OmniKVCacheManager(StandardCacheManager):
                 cache_capacity,
                 self.selected_capacity,
                 self.device,
+                view=self.selected_slots,
             )
+            self.selected_staging = self.lru.parts
         self.selected_rows = torch.arange(
             self.max_buffer_rows, dtype=torch.int32, device=self.device
         )
@@ -321,6 +323,7 @@ class OmniKVCacheManager(StandardCacheManager):
                 component=component,
                 cache=None if self.lru is None else self.lru.parts[kv_idx][component],
                 plan=plan,
+                direct=self.lru is not None,
                 skip_last=self.config.recent_keep_tokens > 0,
                 exclude_slots=self.layer_batch_state.slot_mapping,
                 # Bound the whole batch footprint to leave SMs for model work.
@@ -385,6 +388,7 @@ class OmniKVCacheManager(StandardCacheManager):
                 self.selected_capacity,
                 cache=None if self.lru is None else self.lru.parts[kv_idx][component],
                 plan=None if self.lru is None else self.lru.plan(kv_idx),
+                direct=self.lru is not None,
                 table=active_slots if self.config.recent_keep_tokens == 0 else None,
                 rows=req_indices if self.config.recent_keep_tokens == 0 else None,
             )

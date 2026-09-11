@@ -56,6 +56,9 @@ def _admit(
     OWNERS,
     LENGTHS,
     WRITES,
+    VIEW,
+    VIEW_STRIDE: tl.constexpr,
+    PADDING_SLOT: tl.constexpr,
     SLOTS: tl.constexpr,
     CACHE: tl.constexpr,
     CAP: tl.constexpr,
@@ -92,10 +95,30 @@ def _admit(
         tl.store(
             PLAN + batch * CAP + i, tl.where(missing, -position - 1, position), valid
         )
+        if VIEW is not None:
+            tl.store(
+                VIEW + batch * VIEW_STRIDE + i,
+                tl.where(valid, position, PADDING_SLOT),
+                i < CAP,
+            )
+    elif VIEW is not None:
+        i = tl.arange(0, BLOCK)
+        tl.store(VIEW + batch * VIEW_STRIDE + i, PADDING_SLOT, i < CAP)
 
 
 def plan_lru(
-    directory, keys, ages, clock, plan, counters, table, rows, owners, lengths, writes
+    directory,
+    keys,
+    ages,
+    clock,
+    plan,
+    counters,
+    table,
+    rows,
+    owners,
+    lengths,
+    writes,
+    view=None,
 ):
     capacity = plan.shape[1]
     cache = keys.shape[1]
@@ -127,6 +150,9 @@ def plan_lru(
         owners,
         lengths,
         writes,
+        view,
+        0 if view is None else view.stride(0),
+        keys.numel(),
         directory.shape[1],
         cache,
         capacity,

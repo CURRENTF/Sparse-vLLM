@@ -41,6 +41,7 @@ def _gather(
     EXCLUDE_SLOTS,
     CACHE,
     PLAN,
+    DIRECT: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
     WIDTH: tl.constexpr,
     CAPACITY: tl.constexpr,
@@ -78,14 +79,16 @@ def _gather(
             host_read = valid & (entry < 0)
         x = tl.load(src + source_slot.to(tl.int64) * WIDTH + d, host_read, 0)
         if PLAN is not None:
-            cached = tl.load(CACHE + cache_slot * WIDTH + d, valid & ~host_read, 0)
             tl.store(CACHE + cache_slot * WIDTH + d, x, host_read)
-            x = tl.where(host_read, x, cached)
+            if not DIRECT:
+                cached = tl.load(CACHE + cache_slot * WIDTH + d, valid & ~host_read, 0)
+                x = tl.where(host_read, x, cached)
         target = slot if SCATTER else batch * CAPACITY + token
         # Padded rows have replicated lengths but no write slot. Do not read
         # their host KV, and leave finite zeros for their private attention view.
         store_mask = valid | ((not active) & (token < CAPACITY))
-        tl.store(DST + target.to(tl.int64) * WIDTH + d, x, store_mask)
+        if not DIRECT:
+            tl.store(DST + target.to(tl.int64) * WIDTH + d, x, store_mask)
 
 
 @triton.jit
@@ -98,6 +101,7 @@ def _append(
     ROWS,
     CACHE,
     PLAN,
+    DIRECT: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
     SEEK_BLOCK: tl.constexpr,
     WIDTH: tl.constexpr,
@@ -121,7 +125,8 @@ def _append(
         length = position + 1
     valid = (slot >= 0) & (length > 0) & (length <= CAPACITY) & (d < WIDTH)
     x = tl.load(SRC + row * SRC_STRIDE + d, valid, 0)
-    tl.store(DST + (row * CAPACITY + length - 1).to(tl.int64) * WIDTH + d, x, valid)
+    if not DIRECT:
+        tl.store(DST + (row * CAPACITY + length - 1).to(tl.int64) * WIDTH + d, x, valid)
     if PLAN is not None:
         entry = tl.load(
             PLAN + row * CAPACITY + length - 1,
@@ -169,6 +174,7 @@ def gather_rows(
     exclude_slots=None,
     cache=None,
     plan=None,
+    direct=False,
 ) -> None:
     width = destination.shape[-2] * destination.shape[-1]
     blocks = triton.cdiv(capacity * width, 4096)
@@ -184,6 +190,7 @@ def gather_rows(
         exclude_slots,
         cache,
         plan,
+        direct,
         table.stride(0),
         width,
         capacity,
@@ -205,6 +212,7 @@ def append_rows(
     rows=None,
     cache=None,
     plan=None,
+    direct=False,
 ) -> None:
     width = source.shape[-2] * source.shape[-1]
     _append[(source.shape[0], triton.cdiv(width, 256))](
@@ -216,6 +224,7 @@ def append_rows(
         rows,
         cache,
         plan,
+        direct,
         0 if table is None else table.stride(0),
         triton.next_power_of_2(capacity),
         width,

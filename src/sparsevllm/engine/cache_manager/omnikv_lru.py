@@ -12,17 +12,29 @@ class OmniKVLRU:
             groups * rows * (slots * 4 + capacity * 12 + selected * 4 + 8) + groups * 16
         )
 
-    def __init__(self, storage, layer_groups, rows, capacity, selected, device):
+    def __init__(
+        self, storage, layer_groups, rows, capacity, selected, device, view=None
+    ):
+        self.view = view
         self.layer_groups = layer_groups
         self.capacity = capacity
         self.planned = set()
         self.parts = {
             layer: tuple(
-                torch.empty(rows * capacity, *shape, dtype=storage.dtype, device=device)
+                torch.empty(
+                    rows * capacity + (view is not None),
+                    *shape,
+                    dtype=storage.dtype,
+                    device=device,
+                )
                 for shape in storage.shapes
             )
             for layer in layer_groups
         }
+        if view is not None:
+            for parts in self.parts.values():
+                for part in parts:
+                    part[-1].zero_()
         self.metadata = {}
         for group in set(layer_groups.values()):
             self.metadata[group] = (
@@ -40,7 +52,7 @@ class OmniKVLRU:
         group = self.layer_groups[layer]
         data = self.metadata[group]
         if group not in self.planned:
-            plan_lru(*data, table, rows, owners, lengths, writes)
+            plan_lru(*data, table, rows, owners, lengths, writes, self.view)
             self.planned.add(group)
         return data[4]
 
