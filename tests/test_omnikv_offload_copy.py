@@ -45,6 +45,7 @@ def test_indexed_host_copy_replay(shape, dtype):
             component=0,
             skip_last=True,
             max_blocks=2,
+            exclude_slots=slots,
         )
         append_rows(source, output, lengths, slots, 4)
 
@@ -66,7 +67,11 @@ def test_indexed_host_copy_replay(shape, dtype):
         actual = output.cpu().view(2, 4, *shape)
         for batch, row in enumerate(order):
             n = int(lengths[batch]) - 1
-            expected = host[table[row, :n].cpu().long()]
+            expected = (
+                host[table[row, :n].cpu().long()]
+                if batch == 0
+                else torch.zeros_like(actual[batch, :n])
+            )
             torch.testing.assert_close(actual[batch, :n], expected, rtol=0, atol=0)
         torch.testing.assert_close(actual[0, 3], source[0].cpu(), rtol=0, atol=0)
         torch.testing.assert_close(host[7], source[0].cpu(), rtol=0, atol=0)

@@ -276,9 +276,7 @@ class OmniKVCacheManager(StandardCacheManager):
                 capacity=self.selected_capacity,
                 component=component,
                 skip_last=self.config.recent_keep_tokens > 0,
-                exclude_slots=self.layer_batch_state.slot_mapping
-                if self.config.recent_keep_tokens == 0
-                else None,
+                exclude_slots=self.layer_batch_state.slot_mapping,
                 # Bound the whole batch footprint to leave SMs for model work.
                 max_blocks=max(1, 32 // rows.numel()),
                 slot_map=self.attention_cache_storage.host_slot_map,

@@ -58,15 +58,23 @@ def _gather(
         token = offset // WIDTH
         d = offset % WIDTH
         valid = (token < length - SKIP_LAST) & (token < CAPACITY)
+        active = True
+        if EXCLUDE_SLOTS is not None:
+            current_slot = tl.load(EXCLUDE_SLOTS + batch)
+            active = current_slot >= 0
+            valid = valid & active
         slot = tl.load(TABLE + row * TABLE_STRIDE + token, valid, 0)
         if EXCLUDE_SLOTS is not None:
-            valid = valid & (slot != tl.load(EXCLUDE_SLOTS + batch))
+            valid = valid & (slot != current_slot)
         source_slot = slot
         if SLOT_MAP is not None:
             source_slot = tl.load(SLOT_MAP + slot, valid, 0)
         x = tl.load(src + source_slot.to(tl.int64) * WIDTH + d, valid, 0)
         target = slot if SCATTER else batch * CAPACITY + token
-        tl.store(DST + target.to(tl.int64) * WIDTH + d, x, valid)
+        # Padded rows have replicated lengths but no write slot. Do not read
+        # their host KV, and leave finite zeros for their private attention view.
+        store_mask = valid | ((not active) & (token < CAPACITY))
+        tl.store(DST + target.to(tl.int64) * WIDTH + d, x, store_mask)
 
 
 @triton.jit
