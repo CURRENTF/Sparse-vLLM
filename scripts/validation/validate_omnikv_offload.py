@@ -23,6 +23,7 @@ def main():
     parser.add_argument("--extended", action="store_true")
     parser.add_argument("--pressure", action="store_true")
     parser.add_argument("--no-prefix", action="store_true")
+    parser.add_argument("--cancel", action="store_true")
     parser.add_argument("--prefix-offload", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--reference", type=Path)
@@ -67,6 +68,7 @@ def main():
         ),
         "extended": args.extended,
         "pressure": args.pressure,
+        "cancel": args.cancel,
         "samples": [],
     }
     llm = None
@@ -110,6 +112,42 @@ def main():
                     "outputs": outputs,
                     "input_token_ids": prompts,
                     "max_tokens": [p.max_tokens for p in sampling],
+                }
+            )
+        if args.cancel:
+            prompts = [prefix + [81, 82], prefix + [91, 92]]
+            request_ids = [llm.add_request(prompt, params) for prompt in prompts]
+            for _ in range(64):
+                llm.step()
+                running = list(llm.scheduler.decoding)
+                if len(running) == 2 and all(
+                    seq.num_completion_tokens >= 3 for seq in running
+                ):
+                    break
+            else:
+                raise AssertionError(
+                    "shared-prefix requests never reached concurrent decode"
+                )
+            cancelled = next(seq for seq in running if seq.seq_id == request_ids[0])
+            cancelled_tokens = list(cancelled.completion_token_ids)
+            llm.abort_request(request_ids[0])
+            completed = {}
+            for _ in range(64):
+                if llm.is_finished():
+                    break
+                finished, _ = llm.step()
+                completed.update(
+                    {seq_id: token_ids for seq_id, token_ids, _, _ in finished}
+                )
+            assert llm.is_finished()
+            assert request_ids[1] in completed and request_ids[0] not in completed
+            artifact["samples"].append(
+                {
+                    "case": "cancel_shared_prefix",
+                    "status": "success",
+                    "input_token_ids": prompts,
+                    "cancelled_partial_token_ids": cancelled_tokens,
+                    "outputs": [{"token_ids": completed[request_ids[1]]}],
                 }
             )
         artifact["cold_hit_token_match"] = (
