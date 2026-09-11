@@ -95,3 +95,11 @@ def test_mla_h2o_approximation_warns_once_without_changing_prefill_window(monkey
         assert approximation[0]["level"].name == "WARNING"
     finally:
         log.logger.remove(sink)
+
+
+def test_omnikv_offload_rejects_other_methods():
+    from sparsevllm.configs.sparse import normalize_sparse_method_name
+
+    config = SparseMethodConfig(sparse_method="h2o", enable_omnikv_offload=True)
+    with pytest.raises(ValueError, match="enable_omnikv_offload requires"):
+        normalize_sparse_method_name(config)

@@ -36,6 +36,7 @@ class SparseMethodConfig:
     """Shared and method-specific sparse-attention settings."""
 
     sparse_method: str = ""
+    enable_omnikv_offload: bool = False
     # Physical cache/runtime ownership can also come from a prefill method.
     # This derived field is normalized before cache and prefix-cache setup.
     resolved_cache_sparse_method: str = field(default="", init=False)

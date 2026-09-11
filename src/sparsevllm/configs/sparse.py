@@ -21,6 +21,11 @@ from sparsevllm.utils.log import logger, log_once
 
 def normalize_sparse_method_name(config) -> None:
     config.sparse_method = normalize_sparse_method(config.sparse_method)
+    config.enable_omnikv_offload = _coerce_bool_config(
+        "enable_omnikv_offload", config.enable_omnikv_offload
+    )
+    if config.enable_omnikv_offload and config.sparse_method != "omnikv":
+        raise ValueError("enable_omnikv_offload requires sparse_method='omnikv'.")
     if config.sparse_method not in SUPPORTED_SPARSE_METHODS:
         supported = ", ".join(repr(method) for method in sorted(SUPPORTED_SPARSE_METHODS) if method)
         raise ValueError(
