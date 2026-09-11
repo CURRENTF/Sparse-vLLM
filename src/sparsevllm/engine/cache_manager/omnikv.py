@@ -303,6 +303,7 @@ class OmniKVCacheManager(StandardCacheManager):
 
     def _gather_decode(self, kv_idx, slots, rows, lengths):
         plan = None
+        miss_tokens = miss_counts = None
         if self.lru is not None:
             plan = self.lru.prepare(
                 kv_idx,
@@ -312,6 +313,7 @@ class OmniKVCacheManager(StandardCacheManager):
                 lengths,
                 self.layer_batch_state.slot_mapping,
             )
+            miss_tokens, miss_counts = self.lru.misses(kv_idx)
         for component, destination in enumerate(self.selected_staging[kv_idx]):
             gather_rows(
                 self.attention_cache_storage.pointers[kv_idx],
@@ -324,6 +326,8 @@ class OmniKVCacheManager(StandardCacheManager):
                 cache=None if self.lru is None else self.lru.parts[kv_idx][component],
                 plan=plan,
                 direct=self.lru is not None,
+                miss_tokens=miss_tokens,
+                miss_counts=miss_counts,
                 skip_last=self.config.recent_keep_tokens > 0,
                 exclude_slots=self.layer_batch_state.slot_mapping,
                 # Bound the whole batch footprint to leave SMs for model work.

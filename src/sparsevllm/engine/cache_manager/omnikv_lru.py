@@ -9,7 +9,8 @@ class OmniKVLRU:
     @staticmethod
     def metadata_bytes(rows, slots, capacity, selected, groups):
         return (
-            groups * rows * (slots * 4 + capacity * 12 + selected * 8 + 8) + groups * 16
+            groups * rows * (slots * 4 + capacity * 12 + selected * 8 + 12)
+            + groups * 16
         )
 
     def __init__(
@@ -46,6 +47,7 @@ class OmniKVLRU:
                 torch.zeros(rows, dtype=torch.int64, device=device),
                 torch.empty((rows, selected), dtype=torch.int32, device=device),
                 torch.empty((rows, selected), dtype=torch.int32, device=device),
+                torch.zeros(rows, dtype=torch.int32, device=device),
                 torch.zeros(2, dtype=torch.int64, device=device),
             )
 
@@ -59,6 +61,10 @@ class OmniKVLRU:
 
     def plan(self, layer):
         return self.metadata[self.layer_groups[layer]][4]
+
+    def misses(self, layer):
+        data = self.metadata[self.layer_groups[layer]]
+        return data[5], data[6]
 
     def invalidate(self, row):
         for directory, keys, ages, clock, *_ in self.metadata.values():

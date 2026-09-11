@@ -41,6 +41,8 @@ def _gather(
     EXCLUDE_SLOTS,
     CACHE,
     PLAN,
+    MISS_TOKENS,
+    MISS_COUNTS,
     DIRECT: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
     WIDTH: tl.constexpr,
@@ -54,13 +56,19 @@ def _gather(
     row = tl.load(ROWS + batch)
     length = tl.load(LENGTHS + batch)
     src = tl.load(SRC_PTR + COMPONENT).to(tl.pointer_type(DST.dtype.element_ty))
+    count = CAPACITY
+    if MISS_COUNTS is not None:
+        count = tl.load(MISS_COUNTS + batch)
     for tile in range(
-        tl.program_id(1), tl.cdiv(CAPACITY * WIDTH, BLOCK), tl.num_programs(1)
+        tl.program_id(1), tl.cdiv(count * WIDTH, BLOCK), tl.num_programs(1)
     ):
         offset = tile * BLOCK + tl.arange(0, BLOCK)
-        token = offset // WIDTH
+        item = offset // WIDTH
+        token = item
+        if MISS_TOKENS is not None:
+            token = tl.load(MISS_TOKENS + batch * CAPACITY + item, item < count, 0)
         d = offset % WIDTH
-        valid = (token < length - SKIP_LAST) & (token < CAPACITY)
+        valid = (item < count) & (token < length - SKIP_LAST) & (token < CAPACITY)
         active = True
         if EXCLUDE_SLOTS is not None:
             current_slot = tl.load(EXCLUDE_SLOTS + batch)
@@ -175,6 +183,8 @@ def gather_rows(
     cache=None,
     plan=None,
     direct=False,
+    miss_tokens=None,
+    miss_counts=None,
 ) -> None:
     width = destination.shape[-2] * destination.shape[-1]
     blocks = triton.cdiv(capacity * width, 4096)
@@ -190,6 +200,8 @@ def gather_rows(
         exclude_slots,
         cache,
         plan,
+        miss_tokens,
+        miss_counts,
         direct,
         table.stride(0),
         width,

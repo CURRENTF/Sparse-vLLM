@@ -11,6 +11,7 @@ def _lookup(
     CLOCK,
     PLAN,
     COUNTERS,
+    MISS_COUNTS,
     TABLE,
     ROWS,
     OWNERS,
@@ -40,8 +41,11 @@ def _lookup(
         tl.store(PLAN + batch * CAP + token, tl.where(hit, position, -1), token < CAP)
         hits = tl.sum((hit & (slot != current)).to(tl.int64), 0)
         misses = tl.sum((valid & ~hit & (slot != current)).to(tl.int64), 0)
+        tl.store(MISS_COUNTS + batch, tl.sum((valid & ~hit).to(tl.int32), 0))
         tl.atomic_add(COUNTERS, hits, sem="relaxed")
         tl.atomic_add(COUNTERS + 1, misses, sem="relaxed")
+    else:
+        tl.store(MISS_COUNTS + batch, 0)
 
 
 @triton.jit
@@ -127,6 +131,9 @@ def _admit(
         tl.store(KEYS + owner * CACHE + victim, slot, missing)
         tl.store(AGES + owner * CACHE + victim, clock, missing)
         tl.store(DIRECTORY + owner * SLOTS + slot, victim, missing)
+        # Victim positions are no longer needed after admission. Reuse this
+        # workspace as the compact selected-token list consumed by host copies.
+        tl.store(VICTIMS + batch * CAP + rank, i, missing)
         position = owner * CACHE + tl.where(missing, victim, old_plan)
         # Negative entries encode a host miss; positive entries are GPU hits.
         tl.store(
@@ -150,6 +157,7 @@ def plan_lru(
     clock,
     plan,
     victims,
+    miss_counts,
     counters,
     table,
     rows,
@@ -166,6 +174,7 @@ def plan_lru(
         clock,
         plan,
         counters,
+        miss_counts,
         table,
         rows,
         owners,

@@ -51,6 +51,8 @@ def test_lru_exact_replay_eviction_and_request_turnover(shape, dtype, direct):
                 cache=lru.parts[layer][0],
                 plan=plan,
                 direct=direct,
+                miss_tokens=lru.misses(layer)[0] if direct else None,
+                miss_counts=lru.misses(layer)[1] if direct else None,
             )
             append_rows(
                 source,

@@ -102,6 +102,8 @@ def main():
                     plan=plan,
                     cache=destination if cached else None,
                     direct=cached,
+                    miss_tokens=lru.misses(1)[0] if cached else None,
+                    miss_counts=lru.misses(1)[1] if cached else None,
                 )
 
         summaries = []
