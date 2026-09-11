@@ -88,5 +88,12 @@ def test_split_prefix_restore_after_slot_reuse(mla):
                 output.cpu(), expected[layer][component], rtol=0, atol=0
             )
     controller.synchronize_all()
+    stats = controller.stats()
+    per_layer = source_slots.numel() * storage.bytes_per_slot_per_layer()
+    assert stats["prefix_cache_h2d_bytes"] == per_layer * len(storage.full_layers)
+    assert stats["prefix_cache_d2h_bytes"] == per_layer * len(storage.layers)
+    assert stats["prefix_cache_sparse_rehome_h2d_bytes"] == per_layer * (
+        len(storage.layers) - len(storage.full_layers)
+    )
     controller.free_host_payloads([block])
     assert pool.free_blocks == pool.capacity_blocks

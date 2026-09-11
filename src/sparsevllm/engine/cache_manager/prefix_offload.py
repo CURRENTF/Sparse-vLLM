@@ -488,7 +488,7 @@ class StandardPrefixOffloadController:
                 self.prefix_cache.abort_h2d(block)
             raise
 
-        byte_count = self._transfer_token_byte_count(int(device_slots.numel()))
+        byte_count = self._h2d_token_byte_count(int(device_slots.numel()))
         operation = PrefixH2DOperation(
             blocks=list(blocks),
             host_token_indices=host_token_indices,
@@ -571,6 +571,9 @@ class StandardPrefixOffloadController:
     ) -> None:
         del layer_index, auxiliary_tensors
         raise RuntimeError("This prefix offload controller has no auxiliary layers.")
+
+    def _h2d_token_byte_count(self, token_count: int) -> int:
+        return self._transfer_token_byte_count(token_count)
 
     def _transfer_byte_count(self, block_count: int) -> int:
         return self._transfer_token_byte_count(int(block_count) * self.block_size)

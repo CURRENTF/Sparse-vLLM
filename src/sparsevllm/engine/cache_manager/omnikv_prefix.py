@@ -103,3 +103,22 @@ class OmniKVPrefixOffloadController(StandardPrefixOffloadController):
             * self.host_pool.num_layers
             * self.storage.bytes_per_slot_per_layer()
         )
+
+    def _h2d_token_byte_count(self, token_count):
+        # Sparse prefix restore changes the map; only full layers cross PCIe.
+        return (
+            token_count
+            * len(self.storage.full_layers)
+            * self.storage.bytes_per_slot_per_layer()
+        )
+
+    def stats(self):
+        result = super().stats()
+        # D2H publication also reads sparse backing through the GPU before
+        # writing its permanent host location. Report that read separately.
+        result["prefix_cache_sparse_rehome_h2d_bytes"] = (
+            self.d2h_bytes
+            * (self.host_pool.num_layers - len(self.storage.full_layers))
+            // self.host_pool.num_layers
+        )
+        return result
