@@ -36,8 +36,9 @@ def test_compute_view_preserves_attention_planning_capacity(input_capacity):
     table = torch.zeros(1, input_capacity, dtype=torch.int32)
     rows = torch.zeros(1, dtype=torch.int32)
     lengths = torch.tensor([5], dtype=torch.int32)
-    with patch("torch.cuda.current_stream"), patch(
-        "sparsevllm.engine.cache_manager.omnikv.append_rows"
+    with (
+        patch("torch.cuda.current_stream"),
+        patch("sparsevllm.engine.cache_manager.omnikv.append_rows"),
     ):
         payload, staging_table, _, actual_lengths = manager.get_layer_compute_payload(
             1, table, rows, lengths
