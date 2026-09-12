@@ -15,6 +15,7 @@ def _copy_rows(
     SRC_STRIDE: tl.constexpr,
     COMPONENT: tl.constexpr,
     BLOCK: tl.constexpr,
+    DIRECT: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     d = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -22,7 +23,10 @@ def _copy_rows(
     if SLOT_MAP is not None and COMPONENT == 0:  # noqa: SIM102 (constexpr guard)
         if tl.program_id(1) == 0:
             tl.store(SLOT_MAP + slot, slot, slot >= 0)
-    dst = tl.load(DST_PTR + COMPONENT).to(tl.pointer_type(SRC.dtype.element_ty))
+    if DIRECT:
+        dst = DST_PTR
+    else:
+        dst = tl.load(DST_PTR + COMPONENT).to(tl.pointer_type(SRC.dtype.element_ty))
     x = tl.load(SRC + row * SRC_STRIDE + d, (slot >= 0) & (d < WIDTH), 0)
     tl.store(dst + slot.to(tl.int64) * WIDTH + d, x, (slot >= 0) & (d < WIDTH))
 
@@ -241,3 +245,43 @@ def _transfer(
     dst = tl.load(DST_PTR + COMPONENT).to(tl.pointer_type(DTYPE))
     x = tl.load(src + source.to(tl.int64) * WIDTH + d, d < WIDTH, 0)
     tl.store(dst + target.to(tl.int64) * WIDTH + d, x, d < WIDTH)
+
+
+@triton.jit
+def _gather_prefill_history(
+    SOURCE_PTRS,
+    DEST,
+    TABLE,
+    ROWS,
+    LENGTHS,
+    CU_QUERY,
+    SLOT_MAP,
+    TABLE_STRIDE: tl.constexpr,
+    WIDTH: tl.constexpr,
+    COMPONENT: tl.constexpr,
+    BATCH: tl.constexpr,
+    BATCH_BLOCK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    requests = tl.arange(0, BATCH_BLOCK)
+    lengths = tl.load(LENGTHS + requests, requests < BATCH, 0)
+    begins = tl.load(CU_QUERY + requests, requests < BATCH, 0)
+    ends_q = tl.load(CU_QUERY + requests + 1, requests < BATCH, 0)
+    history = lengths - (ends_q - begins)
+    tiles = tl.cdiv(history * WIDTH, BLOCK)
+    ends = tl.cumsum(tiles, 0)
+    total = tl.sum(tiles, 0)
+    source = tl.load(SOURCE_PTRS + COMPONENT).to(tl.pointer_type(DEST.dtype.element_ty))
+    for tile in range(tl.program_id(0), total, tl.num_programs(0)):
+        batch = tl.sum((tile >= ends).to(tl.int32), 0)
+        begin = tl.sum(tl.where(requests < batch, tiles, 0), 0)
+        offsets = (tile - begin) * BLOCK + tl.arange(0, BLOCK)
+        token, feature = offsets // WIDTH, offsets % WIDTH
+        count = tl.sum(tl.where(requests == batch, history, 0), 0)
+        row = tl.load(ROWS + batch)
+        slot = tl.load(TABLE + row * TABLE_STRIDE + token, token < count, 0)
+        host_slot = tl.load(SLOT_MAP + slot, token < count, 0)
+        value = tl.load(
+            source + host_slot.to(tl.int64) * WIDTH + feature, token < count, 0
+        )
+        tl.store(DEST + slot.to(tl.int64) * WIDTH + feature, value, token < count)

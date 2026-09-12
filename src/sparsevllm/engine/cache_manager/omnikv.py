@@ -9,6 +9,8 @@ import torch
 from sparsevllm.operators.indexed_host_copy import (
     append_rows,
     gather_prefill_rows,
+    gather_prefill_history,
+    scatter_prefill_current,
     gather_rows,
 )
 from sparsevllm.utils.context import get_context
@@ -27,6 +29,8 @@ class OmniKVCacheManager(StandardCacheManager):
         self._pending_prefetch = deque()
         self._current_writes = {}
         self.lru = None
+        self._prefill_next_layer = {}
+        self._prefill_prefetched_layer = None
         super().__init__(
             config, parallel_context, allocation_budget_bytes=allocation_budget_bytes
         )
@@ -159,6 +163,12 @@ class OmniKVCacheManager(StandardCacheManager):
         self.selection_done = torch.cuda.Event()
         self.layer_ready = {i: torch.cuda.Event() for i in self.selected_staging}
         self._selection_pending = False
+        if not self.config.prefill_sparse_method:
+            next_layer = None
+            for layer in reversed(self.kv_transformer_layer_indices()):
+                self._prefill_next_layer[layer] = next_layer
+                if self.kv_layer_index(layer) not in storage.full_layers:
+                    next_layer = layer
 
     def _init_prefix_offload(self):
         if not self.offload_enabled:
@@ -245,6 +255,7 @@ class OmniKVCacheManager(StandardCacheManager):
         return super().free_seq(seq_id)
 
     def _prepare_prefill(self, seqs):
+        self._prefill_prefetched_layer = None
         self.begin_selection_step()
         return super()._prepare_prefill(seqs)
 
@@ -410,9 +421,18 @@ class OmniKVCacheManager(StandardCacheManager):
                 req_indices,
                 context_lens,
             )
+        prefetched = self._prefill_prefetched_layer == layer_idx
+        if prefetched:
+            torch.cuda.current_stream(self.device).wait_event(self.layer_ready[kv_idx])
+            self._prefill_prefetched_layer = None
         for component, (current, destination) in enumerate(
             zip((k_current, v_current), self.prefill_staging)
         ):
+            if prefetched:
+                scatter_prefill_current(
+                    current, destination, self.layer_batch_state.slot_mapping
+                )
+                continue
             gather_prefill_rows(
                 storage.pointers[kv_idx],
                 current,
@@ -431,6 +451,34 @@ class OmniKVCacheManager(StandardCacheManager):
             req_indices,
             context_lens,
         )
+
+    def on_layer_attention_end(self, layer_idx):
+        super().on_layer_attention_end(layer_idx)
+        if not self.offload_enabled or not get_context().is_prefill:
+            return
+        next_layer = self._prefill_next_layer.get(layer_idx)
+        if next_layer is None or self._prefill_prefetched_layer is not None:
+            return
+        # Prefix restoration may remap host slots. Order it before the early
+        # read, and reuse the single staging pool only after attention consumes it.
+        self.before_prefill_layer_attention(next_layer, None)
+        storage = self.attention_cache_storage
+        state = self.layer_batch_state
+        kv_idx = self.kv_layer_index(next_layer)
+        with self.selection_stream():
+            for component, destination in enumerate(self.prefill_staging):
+                gather_prefill_history(
+                    storage.pointers[kv_idx],
+                    destination,
+                    self.buffer_req_to_token_slots,
+                    state.req_indices,
+                    state.context_lens,
+                    get_context().cu_seqlens_q,
+                    storage.host_slot_map,
+                    component=component,
+                )
+            self.layer_ready[kv_idx].record(self.prefetch_stream)
+        self._prefill_prefetched_layer = next_layer
 
     def decode_graph_keepalive_tensors(self):
         result = super().decode_graph_keepalive_tensors()

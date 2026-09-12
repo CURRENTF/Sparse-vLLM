@@ -3,10 +3,13 @@
 import pytest
 import torch
 
-from sparsevllm.operators.indexed_host_copy import gather_prefill_rows
+from sparsevllm.operators.indexed_host_copy import (
+    gather_prefill_rows, gather_prefill_history, scatter_prefill_current,
+)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("prefetch", [False, True])
 @pytest.mark.parametrize(
     "width,dtype,query_lengths,history_lengths,latent",
     [
@@ -14,10 +17,11 @@ from sparsevllm.operators.indexed_host_copy import gather_prefill_rows
         (1024, torch.float16, [0, 1, 64], [0, 32, 1], False),
         (512, torch.bfloat16, [1, 9, 5], [32, 32, 17], True),
         (64, torch.bfloat16, [17, 9, 33], [32, 32, 1], True),
+        (128, torch.bfloat16, [1] * 8, [0, 4097, 1, 0, 7, 11, 2, 0], False),
     ],
 )
 def test_full_prefill_view_uses_gpu_current_chunk(
-    width, dtype, query_lengths, history_lengths, latent
+    width, dtype, query_lengths, history_lengths, latent, prefetch
 ):
     # Existing host-only gather tests cannot catch a current-chunk round trip,
     # incorrect query offsets, or damage to shared prefix/private suffix views.
@@ -67,8 +71,25 @@ def test_full_prefill_view_uses_gpu_current_chunk(
             expected[new_slots] = current_cpu[
                 cu_cpu[request] : cu_cpu[request + 1]
             ].unsqueeze(1)
-        gather_prefill_rows(
-            pointers, current, destination, table, rows, lengths, cu_query, slot_map,
-            capacity=capacity, component=component,
-        )
+        if prefetch:
+            # A remapped shared prefix must be visible to the transfer stream;
+            # the current CPU chunk is poisoned, so it cannot be read early.
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                gather_prefill_history(
+                    pointers, destination, table, rows, lengths, cu_query, slot_map,
+                    component=component,
+                )
+            torch.cuda.current_stream().wait_stream(stream)
+            new_slots = torch.cat([
+                table_cpu[rows_cpu[i], h : h + q]
+                for i, (h, q) in enumerate(zip(history_lengths, query_lengths))
+            ]).cuda()
+            scatter_prefill_current(current, destination, new_slots)
+        else:
+            gather_prefill_rows(
+                pointers, current, destination, table, rows, lengths, cu_query, slot_map,
+                capacity=capacity, component=component,
+            )
         torch.testing.assert_close(destination.cpu(), expected, rtol=0, atol=0)

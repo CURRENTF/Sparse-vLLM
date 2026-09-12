@@ -12,6 +12,7 @@ from sparsevllm.kernels.triton.indexed_host_copy import (
     _gather,
     _gather_cached,
     _gather_prefill,
+    _gather_prefill_history,
     _transfer,
 )
 
@@ -179,3 +180,24 @@ def transfer_rows(
             tl.bfloat16 if dtype == torch.bfloat16 else tl.float16,
             256,
         )
+
+
+def gather_prefill_history(
+    source_ptrs, destination, table, rows, lengths, cu_query, slot_map, *, component
+):
+    """Restore only historical rows, sharing a bounded grid across requests."""
+    width = destination.shape[-2] * destination.shape[-1]
+    _gather_prefill_history[(32,)](
+        source_ptrs, destination, table, rows, lengths, cu_query, slot_map,
+        table.stride(0), width, component, rows.numel(),
+        triton.next_power_of_2(rows.numel()), 4096,
+    )
+
+
+def scatter_prefill_current(source, destination, slots):
+    """Write explicit or MLA current KV into the physical prefill view."""
+    width = destination.shape[-2] * destination.shape[-1]
+    _copy_rows[(source.shape[0], triton.cdiv(width, 256))](
+        source, destination, slots, None, source.shape[0], width,
+        source.stride(0), 0, 256, DIRECT=True,
+    )
