@@ -17,8 +17,8 @@ from sparsevllm.engine.cache_manager.base import (
     MlaLatentPayload,
     PrefillComputeView,
 )
-from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
-from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
+from sparsevllm.engine.cache_manager.methods.h2o import H2OCacheManager
+from sparsevllm.engine.cache_manager.methods.snapkv import SnapKVCacheManager
 from sparsevllm.engine.cache_manager.storage import MlaLatentStorage
 from sparsevllm.engine.decode_graph_contract import (
     DecodeGraphContract,
@@ -510,7 +510,7 @@ def test_h2o_cache_manager_factory_routes_first_class_method():
         hf_config=SimpleNamespace(model_type="qwen2"),
     )
     with patch(
-        "sparsevllm.engine.cache_manager.h2o.H2OCacheManager",
+        "sparsevllm.engine.cache_manager.methods.h2o.H2OCacheManager",
         return_value=expected,
     ) as constructor:
         actual = CacheManager.create(config, SimpleNamespace())
@@ -526,7 +526,7 @@ def test_h2o_cache_manager_factory_routes_prefill_only_method():
         hf_config=SimpleNamespace(model_type="qwen2"),
     )
     with patch(
-        "sparsevllm.engine.cache_manager.h2o.H2OCacheManager",
+        "sparsevllm.engine.cache_manager.methods.h2o.H2OCacheManager",
         return_value=expected,
     ) as constructor:
         actual = CacheManager.create(config, SimpleNamespace())

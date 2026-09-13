@@ -21,7 +21,7 @@ from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger
 from sparsevllm.utils.profiler import profiler
 
-from .base import (
+from ..base import (
     AttentionViewMeta,
     DecodeComputeView,
     ExplicitKVPayload,

@@ -6,7 +6,7 @@ import torch
 
 from sparsevllm.operators.indexed_host_copy import transfer_rows
 
-from .prefix_offload import PinnedPrefixKVPool, StandardPrefixOffloadController
+from ...prefix_offload import PinnedPrefixKVPool, StandardPrefixOffloadController
 
 
 class OmniKVPrefixPool(PinnedPrefixKVPool):

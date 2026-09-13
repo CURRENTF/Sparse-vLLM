@@ -163,7 +163,7 @@ class DeltaKVLessMemoryKernelTest(unittest.TestCase):
         self.assertTrue(torch.equal(got_idx, expected_idx))
 
     def test_streaming_cluster_helper_matches_whole_block_cluster(self):
-        from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager
+        from sparsevllm.engine.cache_manager.methods.deltakv_less_memory import DeltaKVLessMemoryCacheManager
 
         torch.manual_seed(11)
         device = "cuda"
@@ -718,7 +718,7 @@ class DeltaKVLessMemoryKernelTest(unittest.TestCase):
         self.assertTrue(torch.allclose(v_out[out], v_ref.to(dtype), atol=2e-3, rtol=2e-3))
 
     def test_full_layer_kivi_batched_store_matches_reference_pack(self):
-        from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager
+        from sparsevllm.engine.cache_manager.methods.deltakv_less_memory import DeltaKVLessMemoryCacheManager
 
         torch.manual_seed(7)
         device = "cuda"
@@ -773,7 +773,7 @@ class DeltaKVLessMemoryKernelTest(unittest.TestCase):
         self.assertTrue(torch.allclose(manager.full_layer_kivi_value_mins[0, slots], mn_v))
 
     def test_full_prefill_kivi_materialize_chunks_block_store(self):
-        from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager
+        from sparsevllm.engine.cache_manager.methods.deltakv_less_memory import DeltaKVLessMemoryCacheManager
 
         torch.manual_seed(13)
         device = "cuda"

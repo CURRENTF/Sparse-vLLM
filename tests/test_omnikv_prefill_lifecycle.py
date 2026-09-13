@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sparsevllm.engine.cache_manager.omnikv import OmniKVCacheManager
+from sparsevllm.engine.cache_manager.methods.omnikv.manager import OmniKVCacheManager
 from sparsevllm.operators.indexed_host_copy import gather_prefill_history
 from sparsevllm.utils.context import get_context
 

@@ -12,9 +12,9 @@ from sparsevllm.engine.cache_manager.base import (
     LayerBatchStates,
     PrefillComputeView,
 )
-from sparsevllm.engine.cache_manager.rkv import RKVCacheManager
+from sparsevllm.engine.cache_manager.methods.rkv import RKVCacheManager
 from sparsevllm.engine.cache_manager.storage import MlaLatentStorage
-from sparsevllm.engine.cache_manager.skipkv import (
+from sparsevllm.engine.cache_manager.methods.skipkv import (
     SkipKVCacheManager,
     SkipKVSentence,
     SkipKVSequenceState,

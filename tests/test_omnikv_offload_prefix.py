@@ -3,11 +3,11 @@
 import pytest
 import torch
 
-from sparsevllm.engine.cache_manager.omnikv_prefix import (
+from sparsevllm.engine.cache_manager.methods.omnikv.prefix import (
     OmniKVPrefixOffloadController,
     OmniKVPrefixPool,
 )
-from sparsevllm.engine.cache_manager.omnikv_storage import OmniKVStorage
+from sparsevllm.engine.cache_manager.methods.omnikv.storage import OmniKVStorage
 from sparsevllm.engine.cache_manager.standard import StandardPrefixBlockPayload
 from sparsevllm.engine.cache_manager.storage import ExplicitKVStorage, MlaLatentStorage
 from sparsevllm.engine.prefix_cache import PrefixCacheBlock, RadixPrefixIndex
@@ -67,7 +67,7 @@ def test_split_prefix_restore_after_slot_reuse(mla, num_layers, monkeypatch):
             x[:12].zero_()
     new_slots = torch.tensor([2, 9], dtype=torch.int32, device="cuda")
     block.payload.token_slots = new_slots
-    from sparsevllm.engine.cache_manager import omnikv_prefix
+    from sparsevllm.engine.cache_manager.methods.omnikv import prefix as omnikv_prefix
 
     transfer = omnikv_prefix.transfer_rows
 

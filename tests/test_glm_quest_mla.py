@@ -12,7 +12,7 @@ from sparsevllm.engine.cache_manager import (
     MlaLatentWrite,
     SparseSelection,
 )
-from sparsevllm.engine.cache_manager.quest import QuestCacheManager
+from sparsevllm.engine.cache_manager.methods.quest import QuestCacheManager
 from sparsevllm.engine.cache_manager.storage import MlaLatentStorage
 from sparsevllm.operators.quest_selection import (
     QuestPageSelectionOpSpec,

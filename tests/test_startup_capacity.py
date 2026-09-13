@@ -111,7 +111,7 @@ def test_h2o_prefill_only_uses_h2o_physical_cache_budget():
 
     budget = profiling_kv_budget_bytes(config, 10)
 
-    from sparsevllm.engine.cache_manager.snapkv import resolve_snapkv_cache_capacity
+    from sparsevllm.engine.cache_manager.methods.snapkv import resolve_snapkv_cache_capacity
 
     # Regression: a doubled startup budget made high-concurrency H2O OOM
     # before profiling, despite its pruned resident rows fitting in memory.
@@ -259,7 +259,7 @@ def test_startup_batch_feasibility_uses_all_memory_oracle_budgets():
 @pytest.mark.parametrize("free_by_layer,expected", [([4, 4], True), ([4, 3], False)])
 def test_startup_decode_checks_all_h2o_layers_without_allocating(free_by_layer, expected):
     # A later layer can lack the fourth append even when the first layer fits.
-    from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
+    from sparsevllm.engine.cache_manager.methods.h2o import H2OCacheManager
 
     manager = object.__new__(H2OCacheManager)
     manager._num_free_slots = list(free_by_layer)
@@ -322,7 +322,7 @@ def test_startup_decode_rejects_request_local_capacity_limit():
 def test_omnikv_profiling_budget_can_admit_its_profile_workload(cache_tokens):
     # Native-KV profiling budgets omitted fixed offload pools, causing startup
     # to fail before it could measure production capacity when LRU was enabled.
-    from sparsevllm.engine.cache_manager.omnikv_capacity import plan_omnikv_pools
+    from sparsevllm.engine.cache_manager.methods.omnikv.capacity import plan_omnikv_pools
 
     config = _config(sparse_method="omnikv")
     config.enable_omnikv_offload = True
@@ -335,7 +335,7 @@ def test_omnikv_profiling_budget_can_admit_its_profile_workload(cache_tokens):
 
 
 def test_omnikv_cache_cannot_evict_tokens_selected_in_the_same_step():
-    from sparsevllm.engine.cache_manager.omnikv_capacity import plan_omnikv_pools
+    from sparsevllm.engine.cache_manager.methods.omnikv.capacity import plan_omnikv_pools
 
     config = _config(sparse_method="omnikv")
     config.omnikv_offload_cache_tokens = 1

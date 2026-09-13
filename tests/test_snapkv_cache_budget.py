@@ -7,8 +7,8 @@ import torch
 import sparsevllm.platforms as platforms
 from sparsevllm.config import RuntimeLayout
 from sparsevllm.engine.cache_manager.base import CacheManager
-from sparsevllm.engine.cache_manager.rkv import RKVCacheManager
-from sparsevllm.engine.cache_manager.snapkv import (
+from sparsevllm.engine.cache_manager.methods.rkv import RKVCacheManager
+from sparsevllm.engine.cache_manager.methods.snapkv import (
     SnapKVCacheManager,
     resolve_snapkv_cache_capacity,
 )

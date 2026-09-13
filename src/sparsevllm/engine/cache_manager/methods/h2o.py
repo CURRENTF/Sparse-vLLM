@@ -15,9 +15,9 @@ from sparsevllm.method_registry import (
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.profiler import profiler
 
-from .base import ExplicitKVPayload, PrefillComputeView, PrefillScoreRequest
+from ..base import ExplicitKVPayload, PrefillComputeView, PrefillScoreRequest
 from .snapkv import SnapKVCacheManager
-from .storage import ExplicitKVStorage
+from ..storage import ExplicitKVStorage
 
 
 class _H2ORowRef(NamedTuple):

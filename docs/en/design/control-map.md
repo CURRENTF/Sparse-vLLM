@@ -84,10 +84,10 @@ flowchart TD
 | --- | --- | --- | --- |
 | Dense | `vanilla` / `""` | Full KV cache, no sparse selection. | `standard.py`, generic attention path |
 | Streaming window | `streamingllm`, `attention-sink`, `attention_sink` | Physical eviction to sink + recent tokens. | `streamingllm.py`, `standard.py`-style mechanics |
-| SnapKV / PyramidKV | `snapkv`, `pyramidkv` | Physical eviction after score-based keep selection; PyramidKV changes per-layer budgets. | `cache_manager/snapkv.py`, `sparse_methods/snapkv.py` |
-| OmniKV | `omnikv` | Logical masking/view building from observation-layer scores. `full_attention_layers=auto` resolves a model profile that may be shared with DeltaKV; unregistered models should be calibrated with `python -m sparsevllm.utils.select_omnikv_full_layers`. | `cache_manager/omnikv.py`, `sparse_methods/dynamic.py`, `omnikv_fused.py` |
-| QuEST | `quest` | Query-aware decode page/chunk selection; persistent page metadata and native view construction remain cache-manager/provider owned. | `cache_manager/quest.py`, `sparse_methods/passthrough.py` |
-| DeltaKV | `deltakv` | Compressor-backed hybrid cache: sparse full/reference pool plus compressed latent state. Registered models may share OmniKV's `full_attention_layers=auto` profile. | `cache_manager/deltakv*.py`, `sparse_methods/dynamic.py`, `deltakv_kernels.py` |
+| SnapKV / PyramidKV | `snapkv`, `pyramidkv` | Physical eviction after score-based keep selection; PyramidKV changes per-layer budgets. | `cache_manager/methods/snapkv.py`, `sparse_methods/snapkv.py` |
+| OmniKV | `omnikv` | Logical masking/view building from observation-layer scores. `full_attention_layers=auto` resolves a model profile that may be shared with DeltaKV; unregistered models should be calibrated with `python -m sparsevllm.utils.select_omnikv_full_layers`. | `cache_manager/methods/omnikv/manager.py`, `sparse_methods/dynamic.py`, `omnikv_fused.py` |
+| QuEST | `quest` | Query-aware decode page/chunk selection; persistent page metadata and native view construction remain cache-manager/provider owned. | `cache_manager/methods/quest.py`, `sparse_methods/passthrough.py` |
+| DeltaKV | `deltakv` | Compressor-backed hybrid cache: sparse full/reference pool plus compressed latent state. Registered models may share OmniKV's `full_attention_layers=auto` profile. | `cache_manager/methods/deltakv*.py`, `sparse_methods/dynamic.py`, `deltakv_kernels.py` |
 
 ## State Ownership Contracts
 
@@ -112,8 +112,8 @@ flowchart TD
 
 | File | Why it is hard | How to approach it |
 | --- | --- | --- |
-| `src/sparsevllm/engine/cache_manager/deltakv_less_memory.py` | Very large direct-residual/full-layer-KIVI/static-graph implementation. | Treat as several logical regions: allocation, prefill staging, full-layer KIVI, sparse raw/ref views, static decode plan, reconstruction/writeback. Add tests around the region touched. |
-| `src/sparsevllm/engine/cache_manager/deltakv.py` | Compressor-backed V4 path combines clustering, latent storage, full pool, staging, reconstruction, and graph hooks. | Avoid cosmetic edits. Change only with focused native runtime and kernel tests. |
+| `src/sparsevllm/engine/cache_manager/methods/deltakv_less_memory.py` | Very large direct-residual/full-layer-KIVI/static-graph implementation. | Treat as several logical regions: allocation, prefill staging, full-layer KIVI, sparse raw/ref views, static decode plan, reconstruction/writeback. Add tests around the region touched. |
+| `src/sparsevllm/engine/cache_manager/methods/deltakv.py` | Compressor-backed V4 path combines clustering, latent storage, full pool, staging, reconstruction, and graph hooks. | Avoid cosmetic edits. Change only with focused native runtime and kernel tests. |
 | `src/sparsevllm/engine/sparse_methods/dynamic.py` | OmniKV and DeltaKV share observation-layer scoring but differ in logical selection and physical payload semantics. | Preserve the shared score lifecycle; keep pool/reconstruction ownership in each cache manager. |
 | `src/sparsevllm/engine/sparse_methods/snapkv.py` | SnapKV and PyramidKV share scored compaction while using different layer budgets and triggers. | Reuse only the common lifecycle and preserve method-specific boundary behavior. |
 | `src/sparsevllm/layers/attention.py` | Small enough, but high blast radius because every method passes through it. | Keep it method-agnostic. Prefer adding a cache-manager hook over adding a branch here. |

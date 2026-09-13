@@ -11,14 +11,14 @@ import pytest
 import torch
 
 from sparsevllm.config import Config
-from sparsevllm.engine.cache_manager.quest import (
+from sparsevllm.engine.cache_manager.methods.quest import (
     QuestCacheManager,
     QuestDecodeGraphState,
     QuestPrefixBlockPayload,
 )
 from sparsevllm.configs.model import RuntimeLayout
 from sparsevllm.engine.cache_manager import MlaLatentPayload
-from sparsevllm.engine.cache_manager.omnikv import OmniKVCacheManager
+from sparsevllm.engine.cache_manager.methods.omnikv.manager import OmniKVCacheManager
 from sparsevllm.engine.cache_manager.standard import StandardCacheManager, StandardPrefixBlockPayload
 from sparsevllm.engine.cache_manager.storage import MlaLatentStorage
 from sparsevllm.engine.cache_manager.prefix_offload import (

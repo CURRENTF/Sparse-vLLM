@@ -20,13 +20,13 @@ from sparsevllm.models.layout import resolve_attention_qk_head_dim
 from sparsevllm.method_registry import sparse_decode_attention_score_kind
 from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.cache_manager import LayerBatchStates
-from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
-from sparsevllm.engine.cache_manager.omnikv import OmniKVCacheManager
-from sparsevllm.engine.cache_manager.rkv import RKVCacheManager
-from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
+from sparsevllm.engine.cache_manager.methods.h2o import H2OCacheManager
+from sparsevllm.engine.cache_manager.methods.omnikv.manager import OmniKVCacheManager
+from sparsevllm.engine.cache_manager.methods.rkv import RKVCacheManager
+from sparsevllm.engine.cache_manager.methods.snapkv import SnapKVCacheManager
 from sparsevllm.engine.cache_manager.standard import StandardCacheManager
 from sparsevllm.engine.cache_manager.storage import MlaLatentStorage
-from sparsevllm.engine.cache_manager.streamingllm import (
+from sparsevllm.engine.cache_manager.methods.streamingllm import (
     StreamingLLMCacheManager,
 )
 from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphRunner

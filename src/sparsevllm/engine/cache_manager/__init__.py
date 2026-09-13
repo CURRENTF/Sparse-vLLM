@@ -60,47 +60,47 @@ def __getattr__(name: str):
 
         return StandardCacheManager
     if name == "StreamingLLMCacheManager":
-        from .streamingllm import StreamingLLMCacheManager
+        from .methods.streamingllm import StreamingLLMCacheManager
 
         return StreamingLLMCacheManager
     if name == "SnapKVCacheManager":
-        from .snapkv import SnapKVCacheManager
+        from .methods.snapkv import SnapKVCacheManager
 
         return SnapKVCacheManager
     if name == "H2OCacheManager":
-        from .h2o import H2OCacheManager
+        from .methods.h2o import H2OCacheManager
 
         return H2OCacheManager
     if name == "RKVCacheManager":
-        from .rkv import RKVCacheManager
+        from .methods.rkv import RKVCacheManager
 
         return RKVCacheManager
     if name == "SkipKVCacheManager":
-        from .skipkv import SkipKVCacheManager
+        from .methods.skipkv import SkipKVCacheManager
 
         return SkipKVCacheManager
     if name == "QuestCacheManager":
-        from .quest import QuestCacheManager
+        from .methods.quest import QuestCacheManager
 
         return QuestCacheManager
     if name == "OmniKVCacheManager":
-        from .omnikv import OmniKVCacheManager
+        from .methods.omnikv.manager import OmniKVCacheManager
 
         return OmniKVCacheManager
     if name == "DeltaKVCacheManager":
-        from .deltakv_runtime import DeltaKVCacheManager
+        from .methods.deltakv_runtime import DeltaKVCacheManager
 
         return DeltaKVCacheManager
     if name == "DeltaKVCacheTritonManagerV4":
-        from .deltakv_base import DeltaKVCacheTritonManagerV4
+        from .methods.deltakv_base import DeltaKVCacheTritonManagerV4
 
         return DeltaKVCacheTritonManagerV4
     if name == "DeltaKVLessMemoryCacheManager":
-        from .deltakv_less_memory import DeltaKVLessMemoryCacheManager
+        from .methods.deltakv_less_memory import DeltaKVLessMemoryCacheManager
 
         return DeltaKVLessMemoryCacheManager
     if name == "DeltaKVLessMemoryCudaGraphCacheManager":
-        from .deltakv_less_memory_cuda_graph import DeltaKVLessMemoryCudaGraphCacheManager
+        from .methods.deltakv_less_memory_cuda_graph import DeltaKVLessMemoryCudaGraphCacheManager
 
         return DeltaKVLessMemoryCudaGraphCacheManager
 

@@ -6,9 +6,9 @@ import torch
 
 from sparsevllm.operators.indexed_host_copy import store_rows
 
-from .base import ExplicitKVPayload, ExplicitKVWrite, MlaLatentPayload, MlaLatentWrite
-from .omnikv_capacity import omnikv_history_allocation
-from .storage.base import CacheLayout
+from ...base import ExplicitKVPayload, ExplicitKVWrite, MlaLatentPayload, MlaLatentWrite
+from .capacity import omnikv_history_allocation
+from ...storage.base import CacheLayout
 
 
 def payload_tensors(payload):

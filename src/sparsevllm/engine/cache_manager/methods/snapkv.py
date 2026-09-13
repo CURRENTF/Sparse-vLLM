@@ -25,7 +25,7 @@ from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger, log_level
 from sparsevllm.utils.profiler import profiler
 
-from .base import (
+from ..base import (
     AttentionCacheWrite,
     CacheManager,
     ExplicitKVPayload,
@@ -34,8 +34,8 @@ from .base import (
     PrefillScoreRequest,
     SparseSelection,
 )
-from .raw_kv_offload import RawKVOffloadBuffer
-from .storage import ExplicitKVStorage, create_attention_cache_storage
+from ..raw_kv_offload import RawKVOffloadBuffer
+from ..storage import ExplicitKVStorage, create_attention_cache_storage
 
 
 _INT32_BYTES = 4

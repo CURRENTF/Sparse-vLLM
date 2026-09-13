@@ -10,11 +10,11 @@ from transformers import Glm4MoeLiteConfig
 
 from sparsevllm.config import RuntimeLayout
 from sparsevllm.engine.cache_manager import LayerBatchStates
-from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
-from sparsevllm.engine.cache_manager.rkv import RKVCacheManager
+from sparsevllm.engine.cache_manager.methods.snapkv import SnapKVCacheManager
+from sparsevllm.engine.cache_manager.methods.rkv import RKVCacheManager
 from sparsevllm.engine.cache_manager.standard import StandardCacheManager
 from sparsevllm.engine.cache_manager.storage import MlaLatentStorage
-from sparsevllm.engine.cache_manager.streamingllm import (
+from sparsevllm.engine.cache_manager.methods.streamingllm import (
     StreamingLLMCacheManager,
 )
 from sparsevllm.engine.sequence import Sequence
@@ -92,7 +92,7 @@ def test_glm_rkv_query_cache_allocates_and_records_full_qk_head_width():
             return_value=cpu_platform,
         ),
         patch(
-            "sparsevllm.engine.cache_manager.snapkv.create_attention_cache_storage",
+            "sparsevllm.engine.cache_manager.methods.snapkv.create_attention_cache_storage",
             return_value=SimpleNamespace(),
         ),
         patch.object(SnapKVCacheManager, "allocate_kv_cache", autospec=True),

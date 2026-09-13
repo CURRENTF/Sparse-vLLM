@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sparsevllm.engine.cache_manager.omnikv_lru import OmniKVLRU
+from sparsevllm.engine.cache_manager.methods.omnikv.lru import OmniKVLRU
 from sparsevllm.operators.indexed_host_copy import append_rows, gather_rows
 
 

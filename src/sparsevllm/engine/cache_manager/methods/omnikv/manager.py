@@ -15,11 +15,11 @@ from sparsevllm.operators.indexed_host_copy import (
 )
 from sparsevllm.utils.context import get_context
 
-from .omnikv_capacity import fit_omnikv_host_slots, plan_omnikv_pools
-from .omnikv_lru import OmniKVLRU
-from .omnikv_storage import OmniKVStorage, payload_tensors
-from .standard import StandardCacheManager
-from .storage import HeterogeneousExplicitKVStorage
+from .capacity import fit_omnikv_host_slots, plan_omnikv_pools
+from .lru import OmniKVLRU
+from .storage import OmniKVStorage, payload_tensors
+from ...standard import StandardCacheManager
+from ...storage import HeterogeneousExplicitKVStorage
 
 
 class OmniKVCacheManager(StandardCacheManager):
@@ -173,7 +173,7 @@ class OmniKVCacheManager(StandardCacheManager):
     def _init_prefix_offload(self):
         if not self.offload_enabled:
             return super()._init_prefix_offload()
-        from .omnikv_prefix import OmniKVPrefixOffloadController, OmniKVPrefixPool
+        from .prefix import OmniKVPrefixOffloadController, OmniKVPrefixPool
 
         if self.prefix_host_blocks <= 0:
             raise ValueError(

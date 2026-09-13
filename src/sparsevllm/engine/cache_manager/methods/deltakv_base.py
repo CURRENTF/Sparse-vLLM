@@ -24,7 +24,7 @@ from sparsevllm.utils.profiler import profiler
 from sparsevllm.layers.rotary_embedding import get_rope, apply_rotary_emb
 from sparsevllm.platforms import device_runtime
 
-from .base import (
+from ..base import (
     AttentionViewMeta,
     CacheManager,
     DecodeComputeView,
@@ -33,7 +33,7 @@ from .base import (
     PrefillComputeView,
     SparseSelection,
 )
-from .raw_kv_offload import RawKVOffloadBuffer
+from ..raw_kv_offload import RawKVOffloadBuffer
 
 
 @dataclass(frozen=True)

@@ -9,14 +9,14 @@ import torch
 
 from sparsevllm.config import RuntimeLayout
 from sparsevllm.configs.groups import SparseMethodConfig
-from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
-from sparsevllm.engine.cache_manager.rkv import RKVCacheManager
-from sparsevllm.engine.cache_manager.skipkv import (
+from sparsevllm.engine.cache_manager.methods.h2o import H2OCacheManager
+from sparsevllm.engine.cache_manager.methods.rkv import RKVCacheManager
+from sparsevllm.engine.cache_manager.methods.skipkv import (
     SkipKVCacheManager,
     SkipKVSentence,
     SkipKVSequenceState,
 )
-from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
+from sparsevllm.engine.cache_manager.methods.snapkv import SnapKVCacheManager
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.sparse_controller import SparseController
 

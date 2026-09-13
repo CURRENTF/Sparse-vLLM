@@ -12,9 +12,9 @@ from sparsevllm.engine.cache_manager import (
     LayerBatchStates,
     PrefillComputeView,
 )
-from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
-from sparsevllm.engine.cache_manager.rkv import RKVCacheManager
-from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
+from sparsevllm.engine.cache_manager.methods.h2o import H2OCacheManager
+from sparsevllm.engine.cache_manager.methods.rkv import RKVCacheManager
+from sparsevllm.engine.cache_manager.methods.snapkv import SnapKVCacheManager
 from sparsevllm.engine.cache_manager.storage import MlaLatentStorage
 from sparsevllm.engine.chain_cache import ChainCacheCoordinator
 from sparsevllm.engine.sequence import Sequence

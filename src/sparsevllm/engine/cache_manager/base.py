@@ -464,35 +464,35 @@ class CacheManager(ABC):
 
             return create_manager(QuantizedCacheManager)
         if sparse_method == "deltakv":
-            from .deltakv_runtime import DeltaKVCacheManager
+            from .methods.deltakv_runtime import DeltaKVCacheManager
 
             return create_manager(DeltaKVCacheManager)
         if sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
-            from .streamingllm import StreamingLLMCacheManager
+            from .methods.streamingllm import StreamingLLMCacheManager
 
             return create_manager(StreamingLLMCacheManager)
         if sparse_method in ("snapkv", "pyramidkv"):
-            from .snapkv import SnapKVCacheManager
+            from .methods.snapkv import SnapKVCacheManager
 
             return create_manager(SnapKVCacheManager)
         if sparse_method == "h2o":
-            from .h2o import H2OCacheManager
+            from .methods.h2o import H2OCacheManager
 
             return create_manager(H2OCacheManager)
         if sparse_method == "rkv":
-            from .rkv import RKVCacheManager
+            from .methods.rkv import RKVCacheManager
 
             return create_manager(RKVCacheManager)
         if sparse_method == "skipkv":
-            from .skipkv import SkipKVCacheManager
+            from .methods.skipkv import SkipKVCacheManager
 
             return create_manager(SkipKVCacheManager)
         if sparse_method == "quest":
-            from .quest import QuestCacheManager
+            from .methods.quest import QuestCacheManager
 
             return create_manager(QuestCacheManager)
         if sparse_method == "omnikv":
-            from .omnikv import OmniKVCacheManager
+            from .methods.omnikv.manager import OmniKVCacheManager
 
             return create_manager(OmniKVCacheManager)
 

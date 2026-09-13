@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from .omnikv_lru import OmniKVLRU
+from .lru import OmniKVLRU
 
 
 def omnikv_history_allocation(slots, part_bytes, sparse_layers):

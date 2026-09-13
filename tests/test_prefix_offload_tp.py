@@ -16,7 +16,7 @@ from sparsevllm.engine.cache_manager.prefix_offload import (
     QuestPrefixOffloadController,
     StandardPrefixOffloadController,
 )
-from sparsevllm.engine.cache_manager.quest import QuestPrefixBlockPayload
+from sparsevllm.engine.cache_manager.methods.quest import QuestPrefixBlockPayload
 from sparsevllm.engine.cache_manager.standard import StandardPrefixBlockPayload
 from sparsevllm.engine.mixed_prefix_offload import (
     MixedPrefixOffloadController,

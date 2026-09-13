@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import pytest
 
 from sparsevllm.configs.sparse import _normalize_h2o
-from sparsevllm.engine.cache_manager.h2o import H2OCacheManager
-from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
+from sparsevllm.engine.cache_manager.methods.h2o import H2OCacheManager
+from sparsevllm.engine.cache_manager.methods.snapkv import SnapKVCacheManager
 from sparsevllm.engine.chain_cache import (
     ChainAdmissionPlan,
     ChainBusyError,

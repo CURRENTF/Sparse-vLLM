@@ -246,7 +246,7 @@ def profiling_kv_budget_bytes(config, num_slots: int) -> int:
         prefill_sparse_method=getattr(config, "prefill_sparse_method", None),
     )
     if method == "omnikv" and getattr(config, "enable_omnikv_offload", False):
-        from sparsevllm.engine.cache_manager.omnikv_capacity import plan_omnikv_pools
+        from sparsevllm.engine.cache_manager.methods.omnikv.capacity import plan_omnikv_pools
 
         plan = plan_omnikv_pools(
             config,

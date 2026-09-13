@@ -40,7 +40,7 @@ from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.profiler import profiler
 
-from .base import (
+from ..base import (
     AttentionCacheWrite,
     AttentionPayload,
     CacheManager,
@@ -50,13 +50,13 @@ from .base import (
     PagedDecodeViewMeta,
     SparseSelection,
 )
-from .prefix_cache_mixin import PrefixCacheMixin
-from .prefix_offload import (
+from ..prefix_cache_mixin import PrefixCacheMixin
+from ..prefix_offload import (
     PinnedQuestPrefixPool,
     PrefixH2DOperation,
     QuestPrefixOffloadController,
 )
-from .storage import ExplicitKVStorage, MlaLatentStorage, create_attention_cache_storage
+from ..storage import ExplicitKVStorage, MlaLatentStorage, create_attention_cache_storage
 
 
 @dataclass

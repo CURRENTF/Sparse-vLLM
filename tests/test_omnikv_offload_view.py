@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from sparsevllm.engine.cache_manager.base import MlaLatentPayload, MlaLatentWrite
-from sparsevllm.engine.cache_manager.omnikv import OmniKVCacheManager
+from sparsevllm.engine.cache_manager.methods.omnikv.manager import OmniKVCacheManager
 
 
 @pytest.mark.parametrize("input_capacity", [8, 32])
@@ -39,7 +39,7 @@ def test_compute_view_preserves_attention_planning_capacity(input_capacity):
     lengths = torch.tensor([5], dtype=torch.int32)
     with (
         patch("torch.cuda.current_stream"),
-        patch("sparsevllm.engine.cache_manager.omnikv.append_rows"),
+        patch("sparsevllm.engine.cache_manager.methods.omnikv.manager.append_rows"),
     ):
         payload, staging_table, _, actual_lengths = manager.get_layer_compute_payload(
             1, table, rows, lengths

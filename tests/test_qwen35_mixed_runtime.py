@@ -15,8 +15,8 @@ from sparsevllm.engine.cache_manager.base import (
     LayerBatchStates,
     resolve_joint_prefix_capacity,
 )
-from sparsevllm.engine.cache_manager.quest import QuestCacheManager, QuestPrefixBlockPayload
-from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
+from sparsevllm.engine.cache_manager.methods.quest import QuestCacheManager, QuestPrefixBlockPayload
+from sparsevllm.engine.cache_manager.methods.snapkv import SnapKVCacheManager
 from sparsevllm.engine.cache_manager.standard import (
     StandardCacheManager,
     StandardPrefixBlockPayload,

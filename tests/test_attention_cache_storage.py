@@ -15,7 +15,7 @@ from sparsevllm.engine.cache_manager import (
     MlaLatentPayload,
     MlaLatentWrite,
 )
-from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
+from sparsevllm.engine.cache_manager.methods.snapkv import SnapKVCacheManager
 from sparsevllm.engine.cache_manager.standard import StandardCacheManager
 from sparsevllm.engine.cache_manager.storage import (
     CacheLayout,
