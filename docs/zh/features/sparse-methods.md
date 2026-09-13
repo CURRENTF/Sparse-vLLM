@@ -23,40 +23,15 @@ Sparse-vLLM 在 public command、`LLM(...)`、runtime config 与内部消费者�
 
 ## OmniKV KV offload
 
-在 `LLM(...)` 或运行配置中设置
-`sparse_method="omnikv", enable_omnikv_offload=True`。开关默认 `False`，
-用于其他 sparse method 会报错。继续使用模型原来的 full-layer profile 和 token 预算。
+OmniKV offload 将全注意力层 KV 保留在 GPU，稀疏层历史保存在 CPU，
+按精确选择的索引取回 attention 所需 KV，并复用 GPU 缓存中的 KV。
+建议在显存受限时开启。当并发超过 GPU KV 容量时，可减少请求等待，明显降低 TTFT；
+但搬运开销可能使 decode TPS 回退，尤其是在全部请求本来就能装入显存时。
 
-支持 CUDA uniform FP16/BF16 显式 KV，以及已有 BF16 MLA 的 512 维 latent
-与 64 维 RoPE 布局。全注意力层的完整 KV 留在 GPU；稀疏层的完整历史保存到
-pinned CPU 内存，GPU 保留有界的、按请求独立的 LRU 缓存池。
-Top-K 选择保持精确：命中项直接复用，只回读未命中的历史；搬运按稀疏层逐层提前执行。
-MLA 保持压缩表示。沿用模型已有 TP、EP、TP+EP 语义，各 rank 独立保存 backing。
-
-历史 KV 预分配以 `max_model_len × max_num_seqs_in_gpu` 为上限，
-开启 prefix caching 也不扩大该上限；GPU 和主机内存预算可能进一步降低容量。
-独立的 prefix offload 存储也计入主机预算，并考虑 pinned 分配的大小取整。
-
-可用 `omnikv_offload_cache_tokens` 设置每个稀疏层、每个请求的 GPU 缓存容量。
-默认 `None` 将 sink/keep/recent 总预算向上取整到 2 的幂，并以 `max_model_len`
-为上限。显式正数必须覆盖选择预算；设为 `0` 则关闭 LRU，每步完整回读 selected
-历史。更大的缓存池会用更多显存换取更少的回读；缓存池和索引元数据均计入容量预算。
-
-在模型已有兼容范围内，可以同时开启 prefix caching 和 decode CUDA Graph。
-Qwen3-MoE 当前不支持 OmniKV prefix caching，开启 active offload 也不改变这个限制。
-命中请求共享历史，
-suffix prefill 使用完整前缀，新生成的 suffix 保持私有。
-`enable_prefix_cache_offload` 是独立开关，用于备份和降级闲置前缀块，
-包括全注意力层 KV。开启 active OmniKV offload 时该组合也支持 MLA；
-需要设置正数 `prefix_cache_host_size_gb`，并足以容纳配置的前缀块容量。
-
-该选项用于释放 KV 显存容量，但会消耗大量 PCIe/host 内存带宽，固定 batch
-的 decode 延迟可能上升。全注意力层 KV 和一份完整历史 prefill buffer
-仍随上下文增长。Chunked prefill 从主机恢复此前的稀疏层历史，当前 chunk
-直接使用 GPU 上的 KV，同时保留向主机写穿；历史重载仍可能增加 TTFT。
-多路 CPU 主机应尽量让 pinned 内存位于对应 GPU 的本地 NUMA 节点，
-远端内存和其他任务的主机内存流量可能降低搬运吞吐。
-对延迟敏感的部署，应先用 BenchProbe 匹配实际模型、上下文和并发进行测量。
+| 参数 | 说明 |
+|---|---|
+| `enable_omnikv_offload` | 默认 `False`。在 `sparse_method="omnikv"` 时设为 `True` 开启。 |
+| `omnikv_offload_cache_tokens` | 每个稀疏层、每个请求的 GPU 缓存 token 数。默认 `None` 自动设置；`0` 关闭 LRU 缓存；正数必须覆盖所选 token 预算。增大缓存可减少搬运，但会占用更多显存。 |
 
 Prefill 加速由 `prefill_sparse_method` 独立选择。当前支持两种方法：
 `h2o_prefill` 用于中间 chunk 的物理 KV 压缩，`flashprefill_v2` 用于稀疏化

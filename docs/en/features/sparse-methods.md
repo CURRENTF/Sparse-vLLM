@@ -26,49 +26,16 @@ runtime config, and internal consumers.
 
 ## OmniKV KV offload
 
-Set `sparse_method="omnikv", enable_omnikv_offload=True` in `LLM(...)` or
-its runtime configuration. The boolean defaults to `False`; enabling it for
-another sparse method is an error. Keep the model's existing full-layer profile
-and token budgets.
+OmniKV offload keeps full-attention KV on GPU and sparse-layer history in CPU
+memory, fetching the exact selected KV for attention and reusing GPU-cached KV.
+Enable it when GPU memory is limited. When concurrency exceeds GPU-resident KV
+capacity, it can substantially reduce TTFT by reducing request waiting. Transfers
+can lower decode TPS, especially when all requests already fit on GPU.
 
-Offload supports CUDA uniform FP16/BF16 explicit KV and the existing BF16 MLA
-512-dimensional latent plus 64-dimensional RoPE layout. Full-attention layers
-retain complete GPU KV. Sparse layers retain complete pinned-host history and
-bounded, request-private GPU LRU pools. Top-K selection remains exact: GPU hits
-are reused and only missing history is fetched. Transfers advance one sparse
-layer ahead. MLA stays compressed. Existing model TP, EP and TP+EP semantics
-apply, with independent backing per rank.
-
-History preallocation is capped at `max_model_len × max_num_seqs_in_gpu`,
-including when prefix caching is enabled, and may be reduced by GPU and host
-memory budgets. Separate prefix-offload backing also counts toward the host
-budget, including pinned-allocation size rounding.
-
-`omnikv_offload_cache_tokens` optionally sets each sparse layer's per-request
-GPU pool capacity. The default `None` rounds the total sink/keep/recent budget
-up to a power of two, capped by `max_model_len`. An explicit positive capacity
-must cover that selected budget; `0` disables LRU and fetches the complete
-selected history every step. Larger pools trade GPU capacity for fewer host
-reads. All pools and lookup metadata count toward cache admission budgets.
-
-Prefix caching and decode CUDA Graph can remain enabled within the model's
-existing compatibility limits. Qwen3-MoE currently rejects OmniKV prefix caching,
-including with active offload. Prefix hits share
-history; suffix prefill sees the complete prefix, and generated suffixes remain
-private. `enable_prefix_cache_offload` is a separate option for backing up and
-demoting idle prefix blocks, including full-attention KV. With active OmniKV
-offload it also supports MLA; configure a positive `prefix_cache_host_size_gb`
-large enough for the configured prefix block capacity.
-
-This is a capacity option, with a substantial PCIe/host-memory bandwidth cost.
-Fixed-batch decode latency can increase. Full-attention KV and one full-history
-prefill buffer still grow with context. Chunked prefill reloads earlier
-sparse-layer history while using the current chunk directly from GPU; the
-current chunk is still written through to host. Historical reloads may increase
-TTFT. On multi-socket hosts, keep pinned memory local to each GPU where possible;
-remote memory and competing host-memory traffic can reduce transfer throughput.
-Use matched BenchProbe measurements for the intended model, context and
-concurrency before enabling it in a latency-sensitive workload.
+| Parameter | Description |
+|---|---|
+| `enable_omnikv_offload` | Default `False`. Set to `True` with `sparse_method="omnikv"` to enable offload. |
+| `omnikv_offload_cache_tokens` | GPU cache capacity in tokens per request per sparse layer. Default `None` sizes it automatically; `0` disables LRU caching. A positive value must cover the selected-token budget. Larger caches use more GPU memory to reduce transfers. |
 
 Prefill acceleration is selected separately with `prefill_sparse_method`.
 Sparse-vLLM currently supports `h2o_prefill` for intermediate-chunk KV
