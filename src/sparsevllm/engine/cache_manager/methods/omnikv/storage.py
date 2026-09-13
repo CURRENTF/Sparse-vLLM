@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import torch
 
-from sparsevllm.operators.indexed_host_copy import store_rows
+from sparsevllm.operators.indexed_host_copy import make_pointer_table, store_rows
 
 from ...base import ExplicitKVPayload, ExplicitKVWrite, MlaLatentPayload, MlaLatentWrite
-from .capacity import omnikv_history_allocation
+from ...offload.host_pool import HostTensorPool
 from ...storage.base import CacheLayout
 
 
@@ -48,52 +48,26 @@ class OmniKVStorage:
         self.pointers = []
         host_slots = num_slots + prefix_slots
         sparse_layers = num_layers - len(self.full_layers)
-        _, packed = omnikv_history_allocation(
-            host_slots,
-            [h * d * self.dtype.itemsize for h, d in shapes],
-            sparse_layers,
+        self.host_allocation = HostTensorPool(
+            [(host_slots, *shape) for shape in shapes] * sparse_layers,
+            dtype=self.dtype,
+            allow_packing=True,
         )
-        self.host_pool = (
-            torch.empty(
-                sparse_layers * host_slots * sum(h * d for h, d in shapes),
-                dtype=self.dtype,
-                device="cpu",
-                pin_memory=True,
-            )
-            if packed
-            else None
-        )
-        host_offset = 0
+        self.host_pool = self.host_allocation.backing
+        host_parts = iter(self.host_allocation.tensors)
         for layer in range(num_layers):
-            on_host = layer not in self.full_layers
-            if on_host and packed:
-                views = []
-                for shape in shapes:
-                    size = host_slots * shape[0] * shape[1]
-                    views.append(
-                        self.host_pool[host_offset : host_offset + size].view(
-                            host_slots, *shape
-                        )
-                    )
-                    host_offset += size
-                parts = tuple(views)
+            if layer not in self.full_layers:
+                parts = tuple(next(host_parts) for _ in shapes)
             else:
                 parts = tuple(
                     torch.empty(
-                        host_slots if on_host else num_slots,
-                        *shape,
-                        dtype=self.dtype,
-                        device="cpu" if on_host else device,
-                        pin_memory=on_host,
+                        num_slots, *shape, dtype=self.dtype, device=device,
+                        pin_memory=False,
                     )
                     for shape in shapes
                 )
             self.layers.append(parts)
-            self.pointers.append(
-                torch.tensor(
-                    [x.data_ptr() for x in parts], dtype=torch.uint64, device=device
-                )
-            )
+            self.pointers.append(make_pointer_table(parts, device=device))
 
     def make_payload(self, parts):
         return (

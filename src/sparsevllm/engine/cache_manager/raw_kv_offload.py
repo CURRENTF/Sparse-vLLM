@@ -8,6 +8,8 @@ import torch
 
 from sparsevllm.platforms import device_runtime
 
+from .offload.host_pool import HostTensorPool
+
 
 @dataclass
 class _RawKVEntry:
@@ -81,19 +83,13 @@ class RawKVOffloadBuffer:
                 producer_events={},
             )
         else:
+            k, v = HostTensorPool(
+                ((total_len, *k_shape_tail), (total_len, *v_shape_tail)),
+                dtype=dtype, pin_memory=self.pin_memory,
+            ).tensors
             self._entries[key] = _RawKVEntry(
-                k=torch.empty(
-                    (total_len, *k_shape_tail),
-                    dtype=dtype,
-                    device="cpu",
-                    pin_memory=self.pin_memory,
-                ),
-                v=torch.empty(
-                    (total_len, *v_shape_tail),
-                    dtype=dtype,
-                    device="cpu",
-                    pin_memory=self.pin_memory,
-                ),
+                k=k,
+                v=v,
                 capacity=total_len,
                 k_shape_tail=tuple(k_shape_tail),
                 v_shape_tail=tuple(v_shape_tail),
@@ -186,8 +182,9 @@ class RawKVOffloadBuffer:
                     "RawKVOffloadBuffer chunked put_range cannot leave a gap: "
                     f"key={key} start={start} filled_until={int(entry.filled_until)}."
                 )
-            k_cpu = torch.empty(tuple(k.shape), dtype=entry.dtype, device="cpu", pin_memory=self.pin_memory)
-            v_cpu = torch.empty(tuple(v.shape), dtype=entry.dtype, device="cpu", pin_memory=self.pin_memory)
+            k_cpu, v_cpu = HostTensorPool(
+                (k.shape, v.shape), dtype=entry.dtype, pin_memory=self.pin_memory,
+            ).tensors
             k_cpu.copy_(k.detach().to(dtype=entry.dtype), non_blocking=True)
             v_cpu.copy_(v.detach().to(dtype=entry.dtype), non_blocking=True)
             entry.chunks[start] = (k_cpu, v_cpu)

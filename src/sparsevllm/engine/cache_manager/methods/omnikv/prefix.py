@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import torch
+from sparsevllm.operators.indexed_host_copy import make_pointer_table, transfer_rows
 
-from sparsevllm.operators.indexed_host_copy import transfer_rows
-
+from ...offload.host_pool import HostTensorPool
 from ...prefix_offload import PinnedPrefixKVPool, StandardPrefixOffloadController
 
 
@@ -21,25 +20,15 @@ class OmniKVPrefixPool(PinnedPrefixKVPool):
         self.pointers = []
         for layer, parts in enumerate(storage.layers):
             if layer in storage.full_layers:
-                parts = tuple(
-                    torch.empty(
-                        count,
-                        *shape,
-                        dtype=storage.dtype,
-                        device="cpu",
-                        pin_memory=True,
-                    )
-                    for shape in storage.shapes
-                )
+                parts = HostTensorPool(
+                    [(count, *shape) for shape in storage.shapes],
+                    dtype=storage.dtype,
+                ).tensors
             else:
                 # This region becomes the sole valid sparse prefix backing.
                 parts = tuple(x[storage.num_slots :] for x in parts)
             self.layers.append(parts)
-            self.pointers.append(
-                torch.tensor(
-                    [x.data_ptr() for x in parts], dtype=torch.uint64, device=device
-                )
-            )
+            self.pointers.append(make_pointer_table(parts, device=device))
 
 
 class OmniKVPrefixOffloadController(StandardPrefixOffloadController):

@@ -2,37 +2,21 @@
 
 from dataclasses import dataclass
 
+from ...offload.allocation import plan_host_allocation
 from .lru import OmniKVLRU
-
-
-def omnikv_history_allocation(slots, part_bytes, sparse_layers):
-    """Choose the smaller rounded allocation without changing logical views."""
-    if not slots or not sparse_layers:
-        return 0, False
-    separate = sparse_layers * sum(
-        1 << (slots * width - 1).bit_length() for width in part_bytes
-    )
-    packed = 1 << (slots * sum(part_bytes) * sparse_layers - 1).bit_length()
-    return (packed, True) if packed < separate else (separate, False)
 
 
 def omnikv_host_pool_bytes(
     slots, part_bytes, sparse_layers, full_layers, prefix_slots=0
 ):
-    # PyTorch's caching host allocator rounds each pinned allocation to a power
-    # of two. Sparse prefix backing shares the history allocation; full-layer
-    # prefixes have separate pinned allocations.
-    def rounded_parts(count):
-        return (
-            sum(1 << (count * width - 1).bit_length() for width in part_bytes)
-            if count
-            else 0
-        )
-
-    history_bytes, _ = omnikv_history_allocation(
-        slots + prefix_slots, part_bytes, sparse_layers
+    history = plan_host_allocation(
+        [(slots + prefix_slots) * width for width in part_bytes] * sparse_layers,
+        allow_packing=True,
     )
-    return history_bytes + full_layers * rounded_parts(prefix_slots)
+    prefix = plan_host_allocation(
+        [prefix_slots * width for width in part_bytes] * full_layers
+    )
+    return history.estimated_bytes + prefix.estimated_bytes
 
 
 def fit_omnikv_host_slots(

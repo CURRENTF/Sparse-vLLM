@@ -17,6 +17,36 @@ from sparsevllm.kernels.triton.indexed_host_copy import (
 )
 
 
+def make_pointer_table(tensors, *, device) -> torch.Tensor:
+    """Bind contiguous FP16/BF16 components for GPU-indexed host transfers.
+
+    Call during storage preparation, outside graph capture. The storage owner
+    must retain every tensor while a transfer or captured graph can use the
+    table. Component widths may differ (for example MLA latent and RoPE).
+    """
+    tensors = tuple(tensors)
+    if not tensors or tensors[0].dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("Indexed host transfers require FP16/BF16 components.")
+    device = torch.device(device)
+    if device.type != "cuda":
+        raise ValueError("Indexed host pointer tables require a CUDA device.")
+    for tensor in tensors:
+        if tensor.dtype != tensors[0].dtype or not tensor.is_contiguous():
+            raise ValueError(
+                "Indexed transfer components must be contiguous and share a dtype."
+            )
+        if tensor.device.type not in ("cpu", "cuda"):
+            raise ValueError("Indexed transfer components must be on CPU or CUDA.")
+        if tensor.device.type == "cpu" and not tensor.is_pinned():
+            raise ValueError("GPU-indexed host transfers require pinned CPU components.")
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    if any(tensor.is_cuda and tensor.device.index != device_index for tensor in tensors):
+        raise ValueError("Indexed transfer components must belong to the target CUDA device.")
+    return torch.tensor(
+        [tensor.data_ptr() for tensor in tensors], dtype=torch.uint64, device=device
+    )
+
+
 def store_rows(
     source: torch.Tensor,
     destination_ptrs: torch.Tensor,
@@ -24,6 +54,12 @@ def store_rows(
     component: int,
     slot_map=None,
 ) -> None:
+    """Scatter current rows; negative slots are inactive.
+
+    If supplied, slot_map is reset to identity at written slots by component
+    zero. This fused mapping update is opt-in, not a generic copy side effect.
+    The caller orders publication after all component writes before any reader.
+    """
     width = source.shape[-2] * source.shape[-1]
     _copy_rows[(source.shape[0], triton.cdiv(width, 256))](
         source,
@@ -58,6 +94,10 @@ def gather_rows(
 
     Zero leaves the grid unbounded. Plain gathers retain at least one block
     per request; cached gathers share the budget across all request misses.
+    A cached plan encodes a miss destination as -slot-1 and a hit as slot;
+    miss_tokens/miss_counts describe compact selected-token indices per row.
+    The caller owns selection and replacement policy. All dynamic metadata
+    stays in fixed-address GPU tensors for replay. No allocation occurs here.
     """
     width = destination.shape[-2] * destination.shape[-1]
     blocks = triton.cdiv(capacity * width, 4096)
@@ -135,6 +175,11 @@ def append_rows(
     rows=None,
     plan=None,
 ) -> None:
+    """Write current GPU rows into a contiguous view or encoded cache plan.
+
+    A supplied table locates current tokens when they are not necessarily the
+    last selected entry. Negative write slots denote inactive graph padding.
+    """
     width = source.shape[-2] * source.shape[-1]
     _append[(source.shape[0], triton.cdiv(width, 256))](
         source,
