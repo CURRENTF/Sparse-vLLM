@@ -313,7 +313,6 @@ class OmniKVCacheManager(StandardCacheManager):
                 lengths,
                 capacity=self.selected_capacity,
                 component=component,
-                cache=None if self.lru is None else self.lru.parts[kv_idx][component],
                 plan=plan,
                 miss_tokens=miss_tokens,
                 miss_counts=miss_counts,
@@ -370,8 +369,8 @@ class OmniKVCacheManager(StandardCacheManager):
         else:
             self._gather_decode(kv_idx, active_slots, req_indices, context_lens)
         parts = self.selected_staging[kv_idx]
-        for component, (source, destination) in enumerate(
-            zip(payload_tensors(self._current_writes.pop(layer_idx)), parts)
+        for source, destination in zip(
+            payload_tensors(self._current_writes.pop(layer_idx)), parts
         ):
             append_rows(
                 source,
@@ -379,7 +378,6 @@ class OmniKVCacheManager(StandardCacheManager):
                 context_lens,
                 self.layer_batch_state.slot_mapping,
                 self.selected_capacity,
-                cache=None if self.lru is None else self.lru.parts[kv_idx][component],
                 plan=None if self.lru is None else self.lru.plan(kv_idx),
                 table=active_slots if self.config.recent_keep_tokens == 0 else None,
                 rows=req_indices if self.config.recent_keep_tokens == 0 else None,

@@ -106,10 +106,7 @@ class OmniKVStorage:
         return self.make_payload(self.layers[layer_idx])
 
     def bytes_per_slot_per_layer(self):
-        return (
-            sum(h * d for h, d in self.shapes)
-            * torch.tensor([], dtype=self.dtype).element_size()
-        )
+        return sum(h * d for h, d in self.shapes) * self.dtype.itemsize
 
     def slot_capacity(self):
         return self.num_slots

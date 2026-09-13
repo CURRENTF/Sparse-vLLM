@@ -13,7 +13,6 @@ class OmniKVLRU:
     def __init__(self, storage, layer_groups, rows, capacity, selected, device, view):
         self.view = view
         self.layer_groups = layer_groups
-        self.capacity = capacity
         self.planned = set()
         self.parts = {
             layer: tuple(

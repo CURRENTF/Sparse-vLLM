@@ -30,7 +30,6 @@ def store_rows(
         destination_ptrs,
         slots,
         slot_map,
-        source.shape[0],
         width,
         source.stride(0),
         component,
@@ -51,7 +50,6 @@ def gather_rows(
     slot_map=None,
     block_budget: int = 0,
     exclude_slots=None,
-    cache=None,
     plan=None,
     miss_tokens=None,
     miss_counts=None,
@@ -67,7 +65,7 @@ def gather_rows(
     if plan is not None:
         _gather_cached[(block_budget or batch * blocks,)](
             source_ptrs,
-            cache,
+            destination,
             table,
             rows,
             lengths,
@@ -135,7 +133,6 @@ def append_rows(
     *,
     table=None,
     rows=None,
-    cache=None,
     plan=None,
 ) -> None:
     width = source.shape[-2] * source.shape[-1]
@@ -146,7 +143,6 @@ def append_rows(
         write_slots,
         table,
         rows,
-        cache,
         plan,
         0 if table is None else table.stride(0),
         triton.next_power_of_2(capacity),
@@ -198,6 +194,6 @@ def scatter_prefill_current(source, destination, slots):
     """Write explicit or MLA current KV into the physical prefill view."""
     width = destination.shape[-2] * destination.shape[-1]
     _copy_rows[(source.shape[0], triton.cdiv(width, 256))](
-        source, destination, slots, None, source.shape[0], width,
+        source, destination, slots, None, width,
         source.stride(0), 0, 256, DIRECT=True,
     )

@@ -31,36 +31,33 @@ def test_lru_exact_replay_eviction_and_request_turnover(shape, dtype):
     lengths = torch.full((2,), 4, dtype=torch.int32, device="cuda")
     writes = torch.full((2,), 31, dtype=torch.int32, device="cuda")
     sources = [torch.randn(2, *shape, dtype=dtype, device="cuda") for _ in hosts]
-    outputs = [torch.zeros(8, *shape, dtype=dtype, device="cuda") for _ in hosts]
     table.copy_(torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], device="cuda"))
 
     def run():
         lru.planned.clear()
-        for layer, ptr, out, source in zip((1, 2), pointers, outputs, sources):
+        for layer, ptr, source in zip((1, 2), pointers, sources):
             plan = lru.prepare(layer, table, rows, owners, lengths, writes)
             gather_rows(
                 ptr,
-                out,
+                lru.parts[layer][0],
                 table,
                 rows,
                 lengths,
                 capacity=4,
                 component=0,
                 exclude_slots=writes,
-                cache=lru.parts[layer][0],
                 plan=plan,
                 miss_tokens=lru.misses(layer)[0],
                 miss_counts=lru.misses(layer)[1],
             )
             append_rows(
                 source,
-                out,
+                lru.parts[layer][0],
                 lengths,
                 writes,
                 4,
                 table=table,
                 rows=rows,
-                cache=lru.parts[layer][0],
                 plan=plan,
             )
 
@@ -92,8 +89,10 @@ def test_lru_exact_replay_eviction_and_request_turnover(shape, dtype):
         old_clock = lru.metadata[0][3].cpu().tolist()
         graph.replay()
         torch.cuda.synchronize()
-        for layer, output in zip((1, 2), outputs):
-            output.copy_(lru.parts[layer][0][view[:, :4].reshape(-1).long()])
+        outputs = [
+            lru.parts[layer][0][view[:, :4].reshape(-1).long()]
+            for layer in (1, 2)
+        ]
         for batch, owner in enumerate(request_rows):
             if current[batch] < 0:
                 for output in outputs:

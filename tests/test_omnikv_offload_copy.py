@@ -173,7 +173,6 @@ def test_cached_gather_rebalances_dynamic_compacted_misses(batch, shape, dtype):
             block_budget=2,
             slot_map=slot_map,
             exclude_slots=writes,
-            cache=cache,
             plan=plan,
             miss_tokens=misses,
             miss_counts=counts,

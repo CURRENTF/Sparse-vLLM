@@ -10,7 +10,6 @@ def _copy_rows(
     DST_PTR,
     SLOTS,
     SLOT_MAP,
-    N: tl.constexpr,
     WIDTH: tl.constexpr,
     SRC_STRIDE: tl.constexpr,
     COMPONENT: tl.constexpr,
@@ -186,7 +185,6 @@ def _append(
     WRITE_SLOTS,
     TABLE,
     ROWS,
-    CACHE,
     PLAN,
     TABLE_STRIDE: tl.constexpr,
     SEEK_BLOCK: tl.constexpr,
@@ -220,7 +218,7 @@ def _append(
             0,
         )
         cache_slot = tl.where(entry < 0, -entry - 1, entry).to(tl.int64)
-        tl.store(CACHE + cache_slot * WIDTH + d, x, valid)
+        tl.store(DST + cache_slot * WIDTH + d, x, valid)
 
 
 @triton.jit
