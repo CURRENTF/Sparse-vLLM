@@ -26,9 +26,9 @@ from sparsevllm.engine.prefix_cache import (
 from sparsevllm.engine.prefix_prune import PrefixPruneRecord
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
-from sparsevllm.utils.log import logger, log_level
-from sparsevllm.utils.profiler import profiler
 from sparsevllm.platforms import device_runtime
+from sparsevllm.utils.log import log_level, logger
+from sparsevllm.utils.profiler import profiler
 
 from .base import (
     AttentionCacheWrite,
@@ -40,10 +40,17 @@ from .base import (
     PrefillScoreRequest,
     SparseSelection,
 )
+from .offload.prefix_components import (
+    ComponentPrefixOffloadController,
+    ComponentPrefixPool,
+    prefix_block_bytes,
+    storage_prefix_components,
+)
 from .prefix_cache_mixin import PrefixCacheMixin
 from .prefix_offload import (
     PinnedPrefixKVPool,
     PrefixH2DOperation,
+    PrefixOffloadController,
     StandardPrefixOffloadController,
 )
 from .storage import (
@@ -146,7 +153,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         self._scheduler_freeable_block_ids: frozenset[bytes] | None = None
         self._scheduler_reclaimable_slots: int | None = None
         self._init_prefix_cache_runtime()
-        self.prefix_offload_controller: StandardPrefixOffloadController | None = None
+        self.prefix_offload_controller: PrefixOffloadController | None = None
         self._prefix_offload_step_h2d_operations: list[PrefixH2DOperation] = []
         self._prefix_write_through_candidates: dict[bytes, PrefixCacheBlock] = {}
         self._prefix_prune_scoring: dict[str, object] | None = None
@@ -168,13 +175,9 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         host_size_gb = getattr(self.config, "prefix_cache_host_size_gb", None)
         if host_size_gb is None:
             raise RuntimeError("Prefix cache offload requires prefix_cache_host_size_gb.")
-        storage = self._require_uniform_explicit_storage("Prefix cache offload")
-        kv_cache = storage.cache
-        bytes_per_block = int(
-            self.prefix_cache_block_size
-            * self.num_kv_layers
-            * storage.bytes_per_slot_per_layer()
-        )
+        storage = self.attention_cache_storage
+        components = storage_prefix_components(storage, self.num_kv_layers)
+        bytes_per_block = prefix_block_bytes(components, self.prefix_cache_block_size)
         host_bytes = int(float(host_size_gb) * (1024**3))
         host_capacity_blocks = host_bytes // bytes_per_block
         gpu_capacity_blocks = int(self.config.num_kvcache_slots) // self.prefix_cache_block_size
@@ -187,6 +190,20 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                 f"host_blocks={host_capacity_blocks} required_blocks={required_blocks} "
                 f"bytes_per_block={bytes_per_block} host_size_gb={host_size_gb}."
             )
+        if not isinstance(storage, ExplicitKVStorage):
+            host_pool = ComponentPrefixPool(
+                components=components,
+                capacity_blocks=host_capacity_blocks,
+                block_size=self.prefix_cache_block_size,
+            )
+            self.prefix_offload_controller = ComponentPrefixOffloadController(
+                components=components,
+                prefix_cache=self.prefix_cache,
+                host_pool=host_pool,
+                block_size=self.prefix_cache_block_size,
+                device=self.device,
+            )
+            return
         host_pool = PinnedPrefixKVPool(
             capacity_blocks=host_capacity_blocks,
             num_layers=self.num_kv_layers,
@@ -197,7 +214,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         )
         self.prefix_offload_controller = StandardPrefixOffloadController(
             prefix_cache=self.prefix_cache,
-            kv_cache=kv_cache,
+            kv_cache=storage.cache,
             host_pool=host_pool,
             block_size=self.prefix_cache_block_size,
             device=self.device,
@@ -241,7 +258,11 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                 "KV cache capacity is smaller than max_model_len after reserving runtime metadata: "
                 f"capacity={self.config.num_kvcache_slots} max_model_len={self.max_model_len}."
             )
-        if getattr(self.config, "prefix_cache_max_blocks", None) is not None:
+        # Host-resident prefixes remain live after their GPU slots are reclaimed.
+        if (
+            getattr(self.config, "prefix_cache_max_blocks", None) is not None
+            and not getattr(self.config, "enable_prefix_cache_offload", False)
+        ):
             self.config.prefix_cache_max_blocks = min(
                 self.config.prefix_cache_max_blocks,
                 self.config.num_kvcache_slots // getattr(self.config, "prefix_cache_block_size", 16),

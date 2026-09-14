@@ -106,12 +106,6 @@ def normalize_prefix_cache(config) -> None:
     config.prefix_cache_salt = str(config.prefix_cache_salt or "")
 
 def finalize_prefix_cache(config) -> None:
-    if (
-        config.enable_prefix_cache_offload
-        and config.sparse_method == "quest"
-        and config.attention_cache_layout == "mla_latent"
-    ):
-        raise ValueError("MLA QuEST prefix cache CPU offload is not supported.")
     block_multiple = config.model_spec.prefix_cache_block_size_multiple
     if (
         block_multiple is not None

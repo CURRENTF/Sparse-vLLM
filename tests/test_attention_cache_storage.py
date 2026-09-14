@@ -740,3 +740,28 @@ def test_mla_storage_store_skips_padding_and_overwrites_reused_slot():
     )
     assert torch.equal(storage.latent_cache[0, 1], replacement.latent[0])
     assert torch.equal(storage.rope_cache[0, 1], replacement.rope[0])
+
+
+@pytest.mark.parametrize("offload", [False, True])
+def test_prefix_logical_capacity_preserves_host_resident_blocks(offload):
+    """GPU pressure must not erase host-backed prefixes by shrinking the tree cap."""
+    manager = object.__new__(StandardCacheManager)
+    manager.device = torch.device("cpu")
+    manager.num_kv_layers = 2
+    manager.attention_cache_storage = MlaLatentStorage(
+        kv_lora_rank=512, rope_dim=64, dtype=torch.bfloat16
+    )
+    manager.config = SimpleNamespace(
+        prefix_cache_max_blocks=8,
+        prefix_cache_block_size=16,
+        enable_prefix_cache_offload=offload,
+    )
+    slot_bytes = manager.attention_cache_storage.bytes_per_slot_per_layer()
+    manager._get_available_slots_info = lambda: (32 * 2 * slot_bytes, slot_bytes)
+    manager.allocate_kv_cache()
+    gpu_blocks = manager.config.num_kvcache_slots // 16
+    if offload:
+        assert manager.config.prefix_cache_max_blocks == 8
+        assert manager.config.prefix_cache_max_blocks > gpu_blocks
+    else:
+        assert manager.config.prefix_cache_max_blocks == gpu_blocks

@@ -70,8 +70,9 @@ GLM 逐张量 FP8 加载支持 E4M3 权重以及每个量化投影对应的 BF16
 ⁴ H2O 的 tensor-parallel 执行可能产生与 TP=1 不同的稀疏选择。各模型原有的
 TP、EP、DP 限制仍然适用。
 
-⁵ GLM QuEST 支持设备驻留的 radix Prefix Cache 与 decode CUDA Graph。
-打分使用 TP rank 本地 heads，不保证与 TP=1 等价；Prefix CPU offload 暂不支持。
+⁵ GLM QuEST 支持 radix Prefix Cache（含 CPU offload）与 decode CUDA Graph。
+打分使用 TP rank 本地 heads，不保证与 TP=1 等价；CPU offload 支持 attention
+TP=1 或 TP=2。
 
 ⁶ 带共享 KV 层的 Gemma 4 checkpoint 不支持逐层 StreamingLLM eviction；
 Vanilla 和 OmniKV 仍受支持。

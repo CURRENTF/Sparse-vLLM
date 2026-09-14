@@ -55,15 +55,17 @@ def test_glm_latent_quest_accepts_prefix_cache_with_graph(tp, dp):
     assert config.decode_graph is True
 
 
-def test_glm_latent_quest_keeps_cpu_prefix_offload_unsupported():
-    # Enabling device prefix reuse must not enter the explicit-KV host pool.
-    with pytest.raises(ValueError, match="MLA QuEST.*CPU offload"):
-        _glm_config(
-            sparse_method="quest",
-            enable_prefix_caching=True,
-            enable_prefix_cache_offload=True,
-            prefix_cache_host_size_gb=1,
-        )
+def test_glm_latent_quest_prefix_offload_accepts_graph():
+    config = _glm_config(
+        sparse_method="quest",
+        enable_prefix_caching=True,
+        enable_prefix_cache_offload=True,
+        prefix_cache_host_size_gb=1,
+        decode_graph=True,
+    )
+    assert config.enable_prefix_cache_offload
+    assert config.resolved_prefix_cache_mode == "radix"
+    assert config.decode_graph
 
 
 @pytest.mark.parametrize("expert_parallel_size", [2, 4])

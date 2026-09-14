@@ -117,10 +117,11 @@ compressed or quantized row metadata.
 `prefix_cache_mode=auto` chooses radix for vanilla/OmniKV/QuEST and a linear
 chain for SnapKV/H2O/PyramidKV/R-KV/SkipKV. `radix` and `chain` can be
 requested explicitly, but incompatible method/mode pairs fail fast.
-GLM-4.7-Flash latent QuEST supports device-resident radix prefix caching with
-decode CUDA Graph. Prefix blocks must match `quest_chunk_size`. Page selection
+GLM-4.7-Flash latent QuEST supports radix prefix caching (including CPU offload)
+with decode CUDA Graph. Prefix blocks must match `quest_chunk_size`. Page selection
 uses each TP rank's local query heads, so TP and single-rank results need not
-be equivalent. Prefix CPU offload remains unsupported.
+be equivalent. Offload restores latent/RoPE cache and page summaries together;
+the existing attention TP=1 or TP=2 offload restriction still applies.
 Existing vanilla/OmniKV radix trees can be physically compacted with the
 SnapKV- or KVzip-scored maintenance API described in
 [Prefix cache pruning](prefix-cache-pruning.md); QuEST trees reject pruning.

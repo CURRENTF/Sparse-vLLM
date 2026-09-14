@@ -81,9 +81,9 @@ by the mixed-attention runtime.
 ⁴ H2O tensor-parallel execution may produce different sparse selections from
 TP=1. Model-specific TP, EP, and DP restrictions still apply.
 
-⁵ GLM QuEST supports device-resident radix prefix caching and decode CUDA Graph.
-Selection uses TP-local heads; equivalence with TP=1 is not guaranteed. Prefix
-CPU offload remains unsupported.
+⁵ GLM QuEST supports radix prefix caching (including CPU offload) and decode
+CUDA Graph. Selection uses TP-local heads; equivalence with TP=1 is not
+guaranteed. CPU offload supports attention TP=1 or TP=2.
 
 ⁶ Gemma 4 checkpoints with shared KV layers reject per-layer StreamingLLM
 eviction. Vanilla and OmniKV remain supported.

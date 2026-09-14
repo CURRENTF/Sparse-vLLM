@@ -4,12 +4,13 @@ import torch
 
 from sparsevllm.kernels.triton.store_kvcache import (
     store_kvcache,
-    store_prefill_kvcache_with_quest_metadata,
     store_kvcache_with_quest_metadata,
+    store_prefill_kvcache_with_quest_metadata,
 )
 
 from ..base import AttentionCacheWrite, ExplicitKVPayload, ExplicitKVWrite
 from .base import CacheLayout
+from .components import CacheComponentSpec
 
 
 class ExplicitKVStorage:
@@ -66,6 +67,16 @@ class ExplicitKVStorage:
     @property
     def cache(self) -> torch.Tensor:
         return self._require_cache()
+
+    def component_specs(self, layer_idx: int) -> tuple[CacheComponentSpec, ...]:
+        return tuple(
+            CacheComponentSpec(name, (self.num_kv_heads, self.head_dim), self.dtype)
+            for name in ("key", "value")
+        )
+
+    def component_tensors(self, layer_idx: int) -> tuple[torch.Tensor, ...]:
+        payload = self.layer_payload(layer_idx)
+        return payload.k_cache, payload.v_cache
 
     def layer_payload(self, layer_idx: int) -> ExplicitKVPayload:
         cache = self._require_cache()

@@ -214,6 +214,8 @@ def test_quest_prefix_offload_round_trips_kv_and_metadata_per_layer():
         expected_kv,
     )
     assert torch.equal(host_pool.metadata_cache[:, :, host_blocks], expected_metadata)
+    transferred_bytes = expected_kv.nbytes + expected_metadata.nbytes
+    assert controller.d2h_bytes == transferred_bytes
 
     assert len(prefix_cache.demote_device_until_freeable(2)) == 2
     destination_pages = [0, 3]
@@ -244,6 +246,7 @@ def test_quest_prefix_offload_round_trips_kv_and_metadata_per_layer():
             expected_metadata[:, layer_index],
         )
     controller.synchronize_all()
+    assert controller.h2d_bytes == transferred_bytes
 
 
 def _mixed_state_spec():
