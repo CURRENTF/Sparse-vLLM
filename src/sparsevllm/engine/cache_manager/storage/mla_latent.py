@@ -11,6 +11,7 @@ from sparsevllm.kernels.triton.mla.decode_stage1 import MLA_LATENT_DIM, MLA_ROPE
 
 from ..base import AttentionCacheWrite, MlaLatentPayload, MlaLatentWrite
 from .base import CacheLayout
+from .components import CacheComponentSpec
 
 
 class MlaLatentStorage:
@@ -82,6 +83,16 @@ class MlaLatentStorage:
         if self.latent_cache is None or self.rope_cache is None:
             raise RuntimeError("MLA latent storage has not been allocated.")
         return self.latent_cache, self.rope_cache
+
+    def component_specs(self, layer_idx: int) -> tuple[CacheComponentSpec, ...]:
+        return (
+            CacheComponentSpec("latent", (1, self.kv_lora_rank), self.dtype),
+            CacheComponentSpec("rope", (1, self.rope_dim), self.dtype),
+        )
+
+    def component_tensors(self, layer_idx: int) -> tuple[torch.Tensor, ...]:
+        payload = self.layer_payload(layer_idx)
+        return payload.latent_cache, payload.rope_cache
 
     def layer_payload(self, layer_idx: int) -> MlaLatentPayload:
         latent_cache, rope_cache = self._require_caches()

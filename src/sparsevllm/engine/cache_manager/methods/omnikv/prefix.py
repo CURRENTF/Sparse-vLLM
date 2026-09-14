@@ -5,16 +5,16 @@ from __future__ import annotations
 from sparsevllm.operators.indexed_host_copy import make_pointer_table, transfer_rows
 
 from ...offload.host_pool import HostTensorPool
-from ...prefix_offload import PinnedPrefixKVPool, StandardPrefixOffloadController
+from ...prefix_offload import PinnedPrefixBlockPool, PrefixOffloadController
 
 
-class OmniKVPrefixPool(PinnedPrefixKVPool):
+class OmniKVPrefixPool(PinnedPrefixBlockPool):
     def __init__(self, storage, capacity_blocks, block_size, device):
-        self.capacity_blocks = capacity_blocks
-        self.block_size = block_size
-        self.num_layers = len(storage.layers)
-        self._allocated = set()
-        self._free_indices = list(range(capacity_blocks - 1, -1, -1))
+        super().__init__(
+            capacity_blocks=capacity_blocks,
+            block_size=block_size,
+            num_layers=len(storage.layers),
+        )
         count = capacity_blocks * block_size
         self.layers = []
         self.pointers = []
@@ -31,14 +31,15 @@ class OmniKVPrefixPool(PinnedPrefixKVPool):
             self.pointers.append(make_pointer_table(parts, device=device))
 
 
-class OmniKVPrefixOffloadController(StandardPrefixOffloadController):
+class OmniKVPrefixOffloadController(PrefixOffloadController):
     def __init__(self, *, prefix_cache, storage, host_pool, block_size, device):
-        self.prefix_cache = prefix_cache
         self.storage = storage
-        self.host_pool = host_pool
-        self.block_size = block_size
-        self.device = device
-        self._init_transfer_runtime()
+        super().__init__(
+            prefix_cache=prefix_cache,
+            host_pool=host_pool,
+            block_size=block_size,
+            device=device,
+        )
 
     def _submit_d2h_payload(self, device_slots, host_token_indices, auxiliary_tensors):
         for layer in range(self.host_pool.num_layers):

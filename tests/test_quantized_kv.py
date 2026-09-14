@@ -86,7 +86,7 @@ def test_unsupported_storage_contract_fails_before_allocation(changes, match):
 @pytest.mark.parametrize("method", ["kivi", "turboquant", "fp8_kv"])
 @pytest.mark.parametrize("graph", [False, True])
 def test_parallel_budget_matches_local_attention_heads(tmp_path, method, graph):
-    """TP halves head-owned storage; EP must not divide replicated attention KV."""
+    """TP halves head-owned storage; changing EP must not change attention KV."""
     from transformers import Qwen3MoeConfig
     from sparsevllm.config import Config
     from sparsevllm.engine.startup.capacity import profiling_kv_budget_bytes
@@ -101,11 +101,9 @@ def test_parallel_budget_matches_local_attention_heads(tmp_path, method, graph):
                    max_num_batched_tokens=128, max_num_seqs_in_batch=2,
                    max_decoding_seqs=2, max_num_seqs_in_gpu=2, decode_graph=graph)
     single = Config(**options)
-    ep = Config(**options, expert_parallel_size=2)
     tp = Config(**options, tensor_parallel_size=2)
     hybrid = Config(**options, tensor_parallel_size=2, expert_parallel_size=2)
     budget = lambda config: profiling_kv_budget_bytes(config, 96)
-    assert budget(ep) == budget(single)
     assert budget(hybrid) == budget(tp) < budget(single)
     # Independent shape oracle: a TP=1 model with the same local KV head count.
     hf.num_key_value_heads = 1
@@ -126,7 +124,7 @@ def test_quantization_preserves_model_parallel_validation(tmp_path):
     options = dict(model=str(tmp_path), sparse_method="kivi", max_model_len=160)
     with pytest.raises(ValueError, match="num_key_value_heads"):
         Config(**options, tensor_parallel_size=4)
-    with pytest.raises(ValueError, match="num_experts"):
+    with pytest.raises(ValueError, match="must be divisible by MoE EP"):
         Config(**options, expert_parallel_size=3)
     with pytest.raises(ValueError, match="[Dd]ata|DP"):
         Config(**options, data_parallel_size=2)
@@ -297,7 +295,7 @@ def test_manager_chunk_append_and_free_preserve_history(tmp_path, kernel_device,
     group = ParallelGroup(None, (0,), 0, 1)
     from sparsevllm.engine.startup.capacity import profiling_kv_budget_bytes, profiling_kv_slots
     config.startup_cache_phase = "profiling"
-    manager = CacheManager.create(config, ParallelContext(group, group, group, group),
+    manager = CacheManager.create(config, ParallelContext(world=group, attn_tp=group, moe_ep=group, attn_dp=group, moe_tp=group),
                                   allocation_budget_bytes=profiling_kv_budget_bytes(config, profiling_kv_slots(config)))
     seq = Sequence(list(range(67)))
     torch.manual_seed(15)

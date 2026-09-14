@@ -223,6 +223,30 @@ def transfer_rows(
         )
 
 
+def transfer_components(
+    source_ptrs,
+    destination_ptrs,
+    source_slots,
+    destination_slots,
+    *,
+    width,
+    dtype,
+):
+    """Copy equally shaped components sharing the same row index vectors."""
+    if source_slots.numel():
+        _transfer[(source_slots.numel(), triton.cdiv(width, 256), source_ptrs.numel())](
+            source_ptrs,
+            destination_ptrs,
+            source_slots,
+            destination_slots,
+            None,
+            width,
+            None,
+            tl.bfloat16 if dtype == torch.bfloat16 else tl.float16,
+            256,
+        )
+
+
 def gather_prefill_history(
     source_ptrs, destination, table, rows, lengths, cu_query, slot_map, *, component
 ):

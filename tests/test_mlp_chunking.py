@@ -10,7 +10,7 @@ from sparsevllm.distributed import ParallelContext, ParallelGroup
 
 def _single_process_parallel_context() -> ParallelContext:
     group = ParallelGroup(process_group=None, ranks=(0,), rank=0, size=1)
-    return ParallelContext(world=group, tensor=group, expert=group, data=group)
+    return ParallelContext(world=group, moe_tp=group, attn_tp=group, moe_ep=group, attn_dp=group)
 
 
 class MLPChunkingTest(unittest.TestCase):

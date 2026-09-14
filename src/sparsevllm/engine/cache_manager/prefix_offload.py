@@ -70,44 +70,15 @@ def _payload_device_page(block: PrefixCacheBlock) -> int:
     return int(page)
 
 
-class PinnedPrefixKVPool:
-    """Fixed-capacity pinned host storage, indexed in logical prefix blocks."""
+class PinnedPrefixBlockPool:
+    """Host block indices shared by concrete physical host pools."""
 
-    def __init__(
-        self,
-        *,
-        capacity_blocks: int,
-        num_layers: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_dim: int,
-        dtype: torch.dtype,
-    ) -> None:
+    def __init__(self, *, capacity_blocks, num_layers, block_size):
+        if capacity_blocks <= 0 or num_layers <= 0 or block_size <= 0:
+            raise ValueError("Prefix pool dimensions must be positive.")
         self.capacity_blocks = int(capacity_blocks)
         self.num_layers = int(num_layers)
         self.block_size = int(block_size)
-        if self.capacity_blocks <= 0:
-            raise ValueError(
-                f"Pinned prefix host capacity must be positive, got {capacity_blocks}."
-            )
-        if not device_runtime.supports_pin_memory():
-            raise RuntimeError(
-                "Prefix cache offload requires pinned host memory, but the active platform "
-                "does not support it."
-            )
-        self.cache = torch.empty(
-            (
-                2,
-                self.num_layers,
-                self.capacity_blocks,
-                self.block_size,
-                int(num_kv_heads),
-                int(head_dim),
-            ),
-            dtype=dtype,
-            device="cpu",
-            pin_memory=True,
-        )
         self._free_indices = list(range(self.capacity_blocks - 1, -1, -1))
         self._allocated: set[int] = set()
 
@@ -171,6 +142,46 @@ class PinnedPrefixKVPool:
         self._free_indices = list(range(self.capacity_blocks - 1, -1, -1))
 
 
+class PinnedPrefixKVPool(PinnedPrefixBlockPool):
+    """Fixed-capacity pinned host storage, indexed in logical prefix blocks."""
+
+    def __init__(
+        self,
+        *,
+        capacity_blocks: int,
+        num_layers: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+    ) -> None:
+        if int(capacity_blocks) <= 0:
+            raise ValueError(
+                f"Pinned prefix host capacity must be positive, got {capacity_blocks}."
+            )
+        super().__init__(
+            capacity_blocks=capacity_blocks, num_layers=num_layers, block_size=block_size,
+        )
+        if not device_runtime.supports_pin_memory():
+            raise RuntimeError(
+                "Prefix cache offload requires pinned host memory, but the active platform "
+                "does not support it."
+            )
+        self.cache = torch.empty(
+            (
+                2,
+                self.num_layers,
+                self.capacity_blocks,
+                self.block_size,
+                int(num_kv_heads),
+                int(head_dim),
+            ),
+            dtype=dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+
+
 class PinnedQuestPrefixPool(PinnedPrefixKVPool):
     """Pinned QuEST host tier containing both full-page KV and page summaries."""
 
@@ -216,71 +227,14 @@ class PrefixH2DOperation:
     auxiliary_layer_events: dict[int, Any] | None = None
 
 
-class StandardPrefixOffloadController:
-    """Asynchronous write-through transfers for Standard/OmniKV prefix blocks."""
+class PrefixOffloadController:
+    """Prefix transfer lifecycle, independent of physical payload and copy backend."""
 
-    def __init__(
-        self,
-        *,
-        prefix_cache: RadixPrefixIndex,
-        kv_cache: torch.Tensor,
-        host_pool: PinnedPrefixKVPool,
-        block_size: int,
-        device: torch.device,
-    ) -> None:
-        if not device_runtime.supports_streams(device):
-            raise RuntimeError(
-                "Prefix cache offload requires asynchronous device streams; "
-                f"device={device}."
-            )
+    def __init__(self, *, prefix_cache, host_pool, block_size, device):
         self.prefix_cache = prefix_cache
-        self.kv_cache = kv_cache
         self.host_pool = host_pool
         self.block_size = int(block_size)
         self.device = device
-        self.item_size = int(
-            self.kv_cache.shape[-2]
-            * self.kv_cache.shape[-1]
-            * self.kv_cache.element_size()
-        )
-        if self.item_size <= 0 or self.item_size % 8 != 0:
-            raise RuntimeError(
-                "sgl_kernel prefix transfer item size must be positive and divisible by 8: "
-                f"item_size={self.item_size}."
-            )
-        if not self.kv_cache.is_contiguous() or not self.host_pool.cache.is_contiguous():
-            raise RuntimeError("Prefix transfer requires contiguous layer-first KV pools.")
-        if not self.host_pool.cache.is_pinned():
-            raise RuntimeError("Prefix transfer host KV pool must be pinned.")
-        if (
-            tuple(self.kv_cache.shape[:2]) != (2, self.host_pool.num_layers)
-            or tuple(self.kv_cache.shape[-2:]) != tuple(self.host_pool.cache.shape[-2:])
-        ):
-            raise RuntimeError(
-                "Prefix device and host KV pool shapes are incompatible: "
-                f"device={tuple(self.kv_cache.shape)} host={tuple(self.host_pool.cache.shape)}."
-            )
-        self._transfer_all_layers, self._transfer_per_layer = _load_kvcache_transfer_ops()
-        self.device_k_ptrs = torch.tensor(
-            [self.kv_cache[0, layer].data_ptr() for layer in range(self.host_pool.num_layers)],
-            dtype=torch.uint64,
-            device=self.device,
-        )
-        self.device_v_ptrs = torch.tensor(
-            [self.kv_cache[1, layer].data_ptr() for layer in range(self.host_pool.num_layers)],
-            dtype=torch.uint64,
-            device=self.device,
-        )
-        self.host_k_ptrs = torch.tensor(
-            [self.host_pool.cache[0, layer].data_ptr() for layer in range(self.host_pool.num_layers)],
-            dtype=torch.uint64,
-            device=self.device,
-        )
-        self.host_v_ptrs = torch.tensor(
-            [self.host_pool.cache[1, layer].data_ptr() for layer in range(self.host_pool.num_layers)],
-            dtype=torch.uint64,
-            device=self.device,
-        )
         self._init_transfer_runtime()
 
     def _init_transfer_runtime(self) -> None:
@@ -531,17 +485,7 @@ class StandardPrefixOffloadController:
         host_token_indices: torch.Tensor,
         auxiliary_tensors: tuple[torch.Tensor, ...],
     ) -> None:
-        del auxiliary_tensors
-        self._transfer_all_layers(
-            src_k_layers=self.device_k_ptrs,
-            dst_k_layers=self.host_k_ptrs,
-            src_v_layers=self.device_v_ptrs,
-            dst_v_layers=self.host_v_ptrs,
-            src_indices=device_slots,
-            dst_indices=host_token_indices,
-            item_size=self.item_size,
-            num_layers=self.host_pool.num_layers,
-        )
+        raise NotImplementedError
 
     def _submit_h2d_layer(
         self,
@@ -550,16 +494,7 @@ class StandardPrefixOffloadController:
         device_slots: torch.Tensor,
         auxiliary_tensors: tuple[torch.Tensor, ...],
     ) -> None:
-        del auxiliary_tensors
-        self._transfer_per_layer(
-            src_k=self.host_pool.cache[0, layer_index],
-            dst_k=self.kv_cache[0, layer_index],
-            src_v=self.host_pool.cache[1, layer_index],
-            dst_v=self.kv_cache[1, layer_index],
-            src_indices=host_token_indices,
-            dst_indices=device_slots,
-            item_size=self.item_size,
-        )
+        raise NotImplementedError
 
     def _h2d_transfer_schedule(self) -> list[tuple[str, int]]:
         return [("kv", layer_idx) for layer_idx in range(self.host_pool.num_layers)]
@@ -579,12 +514,7 @@ class StandardPrefixOffloadController:
         return self._transfer_token_byte_count(int(block_count) * self.block_size)
 
     def _transfer_token_byte_count(self, token_count: int) -> int:
-        return int(
-            int(token_count)
-            * self.host_pool.num_layers
-            * 2
-            * self.item_size
-        )
+        raise NotImplementedError
 
     def h2d_operation_for_block(self, block: PrefixCacheBlock) -> PrefixH2DOperation | None:
         return self._h2d_by_block_id.get(block.stable_block_id)
@@ -675,6 +605,118 @@ class StandardPrefixOffloadController:
             "prefix_cache_d2h_inflight_operations": int(len(self.d2h_operations)),
             "prefix_cache_h2d_inflight_operations": int(len(self.h2d_operations)),
         }
+
+
+class StandardPrefixOffloadController(PrefixOffloadController):
+    """Asynchronous write-through transfers for Standard/OmniKV prefix blocks."""
+
+    def __init__(
+        self,
+        *,
+        prefix_cache: RadixPrefixIndex,
+        kv_cache: torch.Tensor,
+        host_pool: PinnedPrefixKVPool,
+        block_size: int,
+        device: torch.device,
+    ) -> None:
+        if not device_runtime.supports_streams(device):
+            raise RuntimeError(
+                "Prefix cache offload requires asynchronous device streams; "
+                f"device={device}."
+            )
+        self.prefix_cache = prefix_cache
+        self.kv_cache = kv_cache
+        self.host_pool = host_pool
+        self.block_size = int(block_size)
+        self.device = device
+        self.item_size = int(
+            self.kv_cache.shape[-2]
+            * self.kv_cache.shape[-1]
+            * self.kv_cache.element_size()
+        )
+        if self.item_size <= 0 or self.item_size % 8 != 0:
+            raise RuntimeError(
+                "sgl_kernel prefix transfer item size must be positive and divisible by 8: "
+                f"item_size={self.item_size}."
+            )
+        if not self.kv_cache.is_contiguous() or not self.host_pool.cache.is_contiguous():
+            raise RuntimeError("Prefix transfer requires contiguous layer-first KV pools.")
+        if not self.host_pool.cache.is_pinned():
+            raise RuntimeError("Prefix transfer host KV pool must be pinned.")
+        if (
+            tuple(self.kv_cache.shape[:2]) != (2, self.host_pool.num_layers)
+            or tuple(self.kv_cache.shape[-2:]) != tuple(self.host_pool.cache.shape[-2:])
+        ):
+            raise RuntimeError(
+                "Prefix device and host KV pool shapes are incompatible: "
+                f"device={tuple(self.kv_cache.shape)} host={tuple(self.host_pool.cache.shape)}."
+            )
+        self._transfer_all_layers, self._transfer_per_layer = _load_kvcache_transfer_ops()
+        self.device_k_ptrs = torch.tensor(
+            [self.kv_cache[0, layer].data_ptr() for layer in range(self.host_pool.num_layers)],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.device_v_ptrs = torch.tensor(
+            [self.kv_cache[1, layer].data_ptr() for layer in range(self.host_pool.num_layers)],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.host_k_ptrs = torch.tensor(
+            [self.host_pool.cache[0, layer].data_ptr() for layer in range(self.host_pool.num_layers)],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.host_v_ptrs = torch.tensor(
+            [self.host_pool.cache[1, layer].data_ptr() for layer in range(self.host_pool.num_layers)],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self._init_transfer_runtime()
+
+    def _submit_d2h_payload(
+        self,
+        device_slots: torch.Tensor,
+        host_token_indices: torch.Tensor,
+        auxiliary_tensors: tuple[torch.Tensor, ...],
+    ) -> None:
+        del auxiliary_tensors
+        self._transfer_all_layers(
+            src_k_layers=self.device_k_ptrs,
+            dst_k_layers=self.host_k_ptrs,
+            src_v_layers=self.device_v_ptrs,
+            dst_v_layers=self.host_v_ptrs,
+            src_indices=device_slots,
+            dst_indices=host_token_indices,
+            item_size=self.item_size,
+            num_layers=self.host_pool.num_layers,
+        )
+
+    def _submit_h2d_layer(
+        self,
+        layer_index: int,
+        host_token_indices: torch.Tensor,
+        device_slots: torch.Tensor,
+        auxiliary_tensors: tuple[torch.Tensor, ...],
+    ) -> None:
+        del auxiliary_tensors
+        self._transfer_per_layer(
+            src_k=self.host_pool.cache[0, layer_index],
+            dst_k=self.kv_cache[0, layer_index],
+            src_v=self.host_pool.cache[1, layer_index],
+            dst_v=self.kv_cache[1, layer_index],
+            src_indices=host_token_indices,
+            dst_indices=device_slots,
+            item_size=self.item_size,
+        )
+
+    def _transfer_token_byte_count(self, token_count: int) -> int:
+        return int(
+            int(token_count)
+            * self.host_pool.num_layers
+            * 2
+            * self.item_size
+        )
 
 
 class QuestPrefixOffloadController(StandardPrefixOffloadController):
@@ -820,12 +862,7 @@ class QuestPrefixOffloadController(StandardPrefixOffloadController):
             item_size=self.item_size,
         )
 
-    def _transfer_byte_count(self, block_count: int) -> int:
-        kv_bytes = super()._transfer_byte_count(block_count)
-        metadata_bytes = int(
-            int(block_count)
-            * self.host_pool.num_layers
-            * 2
-            * self.item_size
+    def _transfer_token_byte_count(self, token_count: int) -> int:
+        return super()._transfer_token_byte_count(token_count) + int(
+            (token_count // self.block_size) * self.host_pool.num_layers * 2 * self.item_size
         )
-        return kv_bytes + metadata_bytes

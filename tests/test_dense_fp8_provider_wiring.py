@@ -18,9 +18,9 @@ from sparsevllm.utils.loader import load_model
 
 def _parallel_context() -> SimpleNamespace:
     return SimpleNamespace(
-        tp_rank=0,
-        tp_size=1,
-        tp_all_reduce=lambda tensor: tensor,
+        attn_tp_rank=0,
+        attn_tp_size=1,
+        attn_tp=SimpleNamespace(all_reduce=lambda tensor: tensor),
     )
 
 
@@ -259,7 +259,7 @@ def test_dense_mha_models_build_and_bind_full_attention_provider(
 ):
     config = _dense_config(model_name)
     context = _parallel_context()
-    context.attention_tp_size = 1
+    context.attn_tp_size = 1
     engine_config = SimpleNamespace(sparse_method="vanilla")
     engine_config.max_decoding_seqs = 64
     engine_config.decode_graph = True

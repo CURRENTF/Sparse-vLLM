@@ -59,7 +59,7 @@ def test_scalar_checkpoint_load_preserves_merged_and_tp_weights(tmp_path, tp_siz
     quantization = _quantization()
     # Round-tripping must not reinterpret the serialized checkpoint as block-wise.
     assert QuantizationConfig.from_hf_config(quantization.to_dict()).checkpoint_scale_layout == "per_tensor"
-    context = SimpleNamespace(tp_size=tp_size, tp_rank=tp_rank)
+    context = SimpleNamespace(attn_tp_size=tp_size, attn_tp_rank=tp_rank)
     with (
         patch("sparsevllm.layers.linear.get_parallel_context", return_value=context),
         patch("sparsevllm.layers.linear.QuantizationRegistry.resolve_linear_provider"),

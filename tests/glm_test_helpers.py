@@ -67,9 +67,10 @@ def _single_rank_parallel_context() -> ParallelContext:
     singleton = ParallelGroup(None, (0,), 0, 1)
     return ParallelContext(
         world=singleton,
-        tensor=singleton,
-        expert=singleton,
-        data=singleton,
+        moe_tp=singleton,
+        attn_tp=singleton,
+        moe_ep=singleton,
+        attn_dp=singleton,
     )
 
 

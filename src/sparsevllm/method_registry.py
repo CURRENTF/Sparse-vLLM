@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum, auto
 
-from sparsevllm.distributed.topology import ParallelMode, ParallelTopology
+from sparsevllm.distributed.topology import ParallelTopology
 from sparsevllm.models.spec import MODEL_SPECS
 from sparsevllm.operators.attention_capabilities import AttentionScoreKind
 
@@ -389,10 +389,8 @@ GLM4_MOE_LITE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
         {"", "streamingllm", "snapkv", "h2o", "omnikv", "quest", "rkv"}
     ),
     prefix_cache_methods=frozenset(
-        {"", "streamingllm", "snapkv", "h2o", "omnikv", "rkv"}
+        {"", "streamingllm", "snapkv", "h2o", "omnikv", "quest", "rkv"}
     ),
-    # TODO: Validate GLM latent QuEST numerical correctness and interleaved
-    # CUDA Graph capture/replay on the supported TP/EP matrix.
     decode_graph_methods=frozenset(
         {"", "streamingllm", "snapkv", "h2o", "omnikv", "quest", "rkv"}
     ),
@@ -406,19 +404,14 @@ GEMMA4_COMPATIBILITY = ModelRuntimeCompatibility(
 
 MODEL_RUNTIME_COMPATIBILITY = {
     **{
-        (model_type, ParallelMode.STANDARD): DENSE_MODEL_COMPATIBILITY
+        model_type: DENSE_MODEL_COMPATIBILITY
         for model_type in ("qwen2", "qwen3", "qwen3_5", "llama")
     },
-    ("qwen3_moe", ParallelMode.STANDARD): QWEN3_MOE_EP_COMPATIBILITY,
-    ("qwen3_moe", ParallelMode.OUTER_TP_MOE): QWEN3_MOE_TP_EP_COMPATIBILITY,
-    ("qwen3_5_moe", ParallelMode.STANDARD): QWEN35_MOE_COMPATIBILITY,
-    ("qwen3_5_moe", ParallelMode.OUTER_TP_MOE): QWEN35_MOE_COMPATIBILITY,
-    ("minimax_m2", ParallelMode.STANDARD): MINIMAX_M2_EP_COMPATIBILITY,
-    ("minimax_m2", ParallelMode.OUTER_TP_MOE): MINIMAX_M2_TP_EP_COMPATIBILITY,
-    ("glm4_moe_lite", ParallelMode.STANDARD): GLM4_MOE_LITE_EP_COMPATIBILITY,
-    ("glm4_moe_lite", ParallelMode.OUTER_TP_MOE): GLM4_MOE_LITE_EP_COMPATIBILITY,
-    ("gemma4", ParallelMode.STANDARD): GEMMA4_COMPATIBILITY,
-    ("gemma4", ParallelMode.OUTER_TP_MOE): GEMMA4_COMPATIBILITY,
+    "qwen3_moe": QWEN3_MOE_EP_COMPATIBILITY,
+    "qwen3_5_moe": QWEN35_MOE_COMPATIBILITY,
+    "minimax_m2": MINIMAX_M2_EP_COMPATIBILITY,
+    "glm4_moe_lite": GLM4_MOE_LITE_EP_COMPATIBILITY,
+    "gemma4": GEMMA4_COMPATIBILITY,
 }
 
 DECODE_CUDA_GRAPH_SUPPORTED_METHODS = set(CANONICAL_SPARSE_METHODS)
@@ -539,11 +532,12 @@ def validate_model_runtime_compatibility(
     decode_method = normalize_sparse_method(
         sparse_method if decode_sparse_method is None else decode_sparse_method
     )
-    compatibility = MODEL_RUNTIME_COMPATIBILITY.get((model_type, topology.mode))
+    compatibility = MODEL_RUNTIME_COMPATIBILITY.get(model_type)
+    if model_type == "qwen3_moe" and topology.attn_tp_size > 1:
+        compatibility = QWEN3_MOE_TP_EP_COMPATIBILITY
     if compatibility is None:
         raise NotImplementedError(
-            f"Unsupported Sparse-vLLM model_type={model_type!r} with "
-            f"parallel mode={topology.mode.value!r}."
+            f"Unsupported Sparse-vLLM model_type={model_type!r}."
         )
 
     if bool(decode_graph) and decode_method not in compatibility.decode_graph_methods:
@@ -561,7 +555,7 @@ def validate_model_runtime_compatibility(
             for item in sorted(compatibility.sparse_methods)
         )
         raise ValueError(
-            f"Unsupported {model_type} {topology.mode.value} sparse method "
+            f"Unsupported {model_type} sparse method "
             f"{method!r}; validated methods: {supported}."
         )
     if bool(enable_prefix_caching) and method not in compatibility.prefix_cache_methods:

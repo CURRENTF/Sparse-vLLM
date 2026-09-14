@@ -193,7 +193,7 @@ def profiling_kv_budget_bytes(config, num_slots: int) -> int:
         from sparsevllm.engine.cache_manager.storage.quantized_kv import QuantizedKVStorage, quantized_kv_reserved_bytes
         g = int(config.kv_quant_page_size)
         # Match CacheManager's attention shard, not the global or MoE TP shape.
-        tp_size = int(config.parallel_topology.attention_tp_size)
+        tp_size = int(config.parallel_topology.attn_tp_size)
         local_shapes = config.runtime_layout.local_kv_shapes(tp_size)
         if local_shapes:
             h, d = local_shapes[0]
@@ -211,7 +211,7 @@ def profiling_kv_budget_bytes(config, num_slots: int) -> int:
                 + pages * (layers * storage.bytes_per_page_per_layer() + g * 4))
     dtype_size = torch.empty((), dtype=config.hf_config.dtype).element_size()
     layout = config.runtime_layout
-    tp_size = int(config.parallel_topology.attention_tp_size)
+    tp_size = int(config.parallel_topology.attn_tp_size)
     configured_layout = config.attention_cache_layout
     cache_layout = (
         configured_layout

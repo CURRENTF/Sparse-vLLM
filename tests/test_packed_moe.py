@@ -12,8 +12,8 @@ def _parallel_context(*, tp_rank=0, tp_size=1, ep_rank=0, ep_size=1):
     return SimpleNamespace(
         moe_tp_rank=tp_rank,
         moe_tp_size=tp_size,
-        ep_rank=ep_rank,
-        ep_size=ep_size,
+        moe_ep_rank=ep_rank,
+        moe_ep_size=ep_size,
     )
 
 

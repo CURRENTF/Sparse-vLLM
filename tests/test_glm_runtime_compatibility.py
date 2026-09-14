@@ -40,27 +40,38 @@ def test_glm_config_rejects_flashprefill_v2_for_mla_latent_storage():
         )
 
 
-def test_glm_config_rejects_latent_quest_prefix_cache():
-    with pytest.raises(ValueError, match="prefix caching is validated only"):
-        _glm_config(
-            sparse_method="quest",
-            enable_prefix_caching=True,
-        )
+@pytest.mark.parametrize("tp,dp", [(1, 1), (2, 1), (2, 2)])
+def test_glm_latent_quest_accepts_prefix_cache_with_graph(tp, dp):
+    config = _glm_config(
+        sparse_method="quest",
+        enable_prefix_caching=True,
+        decode_graph=True,
+        tensor_parallel_size=tp,
+        data_parallel_size=dp,
+        expert_parallel_size=tp * dp,
+    )
+    assert config.resolved_prefix_cache_mode == "radix"
+    assert config.prefix_cache_block_size == config.quest_chunk_size
+    assert config.decode_graph is True
+
+
+def test_glm_latent_quest_prefix_offload_accepts_graph():
+    config = _glm_config(
+        sparse_method="quest",
+        enable_prefix_caching=True,
+        enable_prefix_cache_offload=True,
+        prefix_cache_host_size_gb=1,
+        decode_graph=True,
+    )
+    assert config.enable_prefix_cache_offload
+    assert config.resolved_prefix_cache_mode == "radix"
+    assert config.decode_graph
 
 
 @pytest.mark.parametrize("expert_parallel_size", [2, 4])
-def test_glm_config_accepts_replicated_attention_ep(expert_parallel_size):
-    config = _glm_config(
-        tensor_parallel_size=1,
-        expert_parallel_size=expert_parallel_size,
-        data_parallel_size=1,
-    )
-
-    assert config.world_size == expert_parallel_size
-    assert config.tensor_parallel_size == 1
-    assert config.expert_parallel_size == expert_parallel_size
-    assert config.data_parallel_size == 1
-    assert not config.uses_outer_tp_moe_layout
+def test_glm_config_rejects_ep_that_expands_the_attention_world(expert_parallel_size):
+    with pytest.raises(ValueError, match="must be divisible by MoE EP"):
+        _glm_config(tensor_parallel_size=1, expert_parallel_size=expert_parallel_size)
 
 
 @pytest.mark.parametrize(
@@ -68,7 +79,7 @@ def test_glm_config_accepts_replicated_attention_ep(expert_parallel_size):
         "tensor_parallel_size",
         "expert_parallel_size",
         "world_size",
-        "moe_tensor_parallel_size",
+        "moe_tp_size",
     ),
     [
         (2, 2, 2, 1),
@@ -80,16 +91,15 @@ def test_glm_config_accepts_outer_tp_moe_ep_layout(
     tensor_parallel_size,
     expert_parallel_size,
     world_size,
-    moe_tensor_parallel_size,
+    moe_tp_size,
 ):
     config = _glm_config(
         tensor_parallel_size=tensor_parallel_size,
         expert_parallel_size=expert_parallel_size,
     )
 
-    assert config.uses_outer_tp_moe_layout
     assert config.world_size == world_size
-    assert config.moe_tensor_parallel_size == moe_tensor_parallel_size
+    assert config.moe_tp_size == moe_tp_size
 
 
 def test_glm_hybrid_checks_routed_width_against_moe_tp_not_outer_tp():
@@ -99,7 +109,7 @@ def test_glm_hybrid_checks_routed_width_against_moe_tp_not_outer_tp():
         hf_overrides={"moe_intermediate_size": 6},
     )
 
-    assert config.moe_tensor_parallel_size == 2
+    assert config.moe_tp_size == 2
 
 
 def test_glm_hybrid_rejects_routed_width_not_divisible_by_moe_tp():
@@ -112,12 +122,12 @@ def test_glm_hybrid_rejects_routed_width_not_divisible_by_moe_tp():
 
 
 def test_glm_config_rejects_nondivisible_outer_tp_moe_ep_layout():
-    with pytest.raises(ValueError, match="TP divisible by EP"):
+    with pytest.raises(ValueError, match="must be divisible by MoE EP"):
         _glm_config(tensor_parallel_size=2, expert_parallel_size=4)
 
 
-def test_glm_config_rejects_data_parallelism():
-    with pytest.raises(ValueError, match="does not support data parallelism"):
+def test_glm_config_rejects_dp_without_matching_expert_ranks():
+    with pytest.raises(ValueError, match="EP=world size"):
         _glm_config(data_parallel_size=2)
 
 
@@ -175,3 +185,33 @@ def test_glm_config_rejects_startup_budget_smaller_than_batch_plan():
             decode_graph_startup_capture_limit=4,
             max_decoding_seqs=5,
         )
+
+
+def test_hybrid_attention_rejects_only_unimplemented_moe_tp():
+    ep_size = 2
+    from sparsevllm.distributed import ParallelTopology
+    from sparsevllm.models.spec import resolve_model_spec
+
+    topology = ParallelTopology(attn_tp_size=2, moe_ep_size=ep_size, attn_dp_size=2)
+    with pytest.raises(ValueError, match="engine currently supports DP attention only"):
+        resolve_model_spec("glm4_moe_lite").validate_parallel_execution(topology)
+    with pytest.raises(ValueError, match="engine currently supports DP attention only"):
+        _glm_config(tensor_parallel_size=2, data_parallel_size=2, expert_parallel_size=ep_size)
+
+
+def test_glm_dense_mlp_width_uses_attention_tp_even_with_pure_ep_experts():
+    with pytest.raises(ValueError, match="attention TP.*intermediate_size"):
+        _glm_config(tensor_parallel_size=4, expert_parallel_size=4,
+                    hf_overrides={"intermediate_size": 6})
+
+
+@pytest.mark.parametrize("model_type,dp_size,tp_size", [
+    ("glm4_moe_lite", 2, 2), ("qwen3_moe", 2, 4),
+    ("minimax_m2", 4, 2), ("glm4_moe_lite", 3, 2),
+])
+def test_hybrid_attention_execution_has_no_four_gpu_limit(dp_size, tp_size, model_type):
+    from sparsevllm.distributed import ParallelTopology
+    from sparsevllm.models.spec import resolve_model_spec
+
+    topology = ParallelTopology(tp_size, dp_size * tp_size, dp_size)
+    resolve_model_spec(model_type).validate_parallel_execution(topology)

@@ -59,7 +59,7 @@ from sparsevllm.utils.loader import _target_weight_name_for_model, _validate_all
 
 def _single_process_parallel_context() -> ParallelContext:
     group = ParallelGroup(process_group=None, ranks=(0,), rank=0, size=1)
-    return ParallelContext(world=group, tensor=group, expert=group, data=group)
+    return ParallelContext(world=group, moe_tp=group, attn_tp=group, moe_ep=group, attn_dp=group)
 
 
 def test_qwen35_runtime_passes_h2o_score_contract_to_full_attention_builder():
@@ -71,7 +71,7 @@ def test_qwen35_runtime_passes_h2o_score_contract_to_full_attention_builder():
         max_decoding_seqs=8,
         decode_graph=False,
     )
-    context = SimpleNamespace(attention_tp_size=1)
+    context = SimpleNamespace(attn_tp_size=1)
     full_attention = object()
     gated_delta_rule = object()
     with (
@@ -110,7 +110,7 @@ def test_qwen35_runtime_closes_attention_if_gdn_prepare_fails():
         max_decoding_seqs=8,
         decode_graph=False,
     )
-    context = SimpleNamespace(attention_tp_size=1)
+    context = SimpleNamespace(attn_tp_size=1)
     full_attention = Mock(name="full_attention")
     with (
         patch(
@@ -302,8 +302,8 @@ def test_qwen35_moe_reduces_routed_and_shared_outputs_together():
     block.parallel_context = Mock()
     block.parallel_context.world.size = 2
     block.parallel_context.world.ranks = (0, 1)
-    block.parallel_context.tensor.ranks = (0, 1)
-    block.parallel_context.world_all_reduce.side_effect = lambda outputs: outputs + 1
+    block.parallel_context.attn_tp.ranks = (0, 1)
+    block.parallel_context.world.all_reduce.side_effect = lambda outputs: outputs + 1
 
     with patch(
         "sparsevllm.models.qwen3_5_moe.gated_shared_add",
@@ -311,7 +311,7 @@ def test_qwen35_moe_reduces_routed_and_shared_outputs_together():
     ):
         actual = block._forward_chunk(hidden_states)
 
-    packed = block.parallel_context.world_all_reduce.call_args.args[0]
+    packed = block.parallel_context.world.all_reduce.call_args.args[0]
     torch.testing.assert_close(packed, torch.stack((local_output, shared_output)))
     torch.testing.assert_close(
         actual,
@@ -319,38 +319,6 @@ def test_qwen35_moe_reduces_routed_and_shared_outputs_together():
     )
 
 
-def test_qwen35_moe_does_not_sum_replicated_shared_expert_across_ep():
-    hidden_states = torch.randn(2, 4)
-    local_output = torch.full_like(hidden_states, 2.0)
-    shared_output = torch.full_like(hidden_states, 3.0)
-    gate_logits = torch.zeros(2, 1)
-    block = Qwen35MoeSparseMoeBlock.__new__(Qwen35MoeSparseMoeBlock)
-    torch.nn.Module.__init__(block)
-    block.shared_expert = Mock(return_value=shared_output)
-    block.gate = Mock(
-        return_value=(
-            torch.ones(2, 1),
-            torch.zeros(2, 1, dtype=torch.int32),
-            gate_logits,
-        )
-    )
-    block.experts = Mock(return_value=local_output)
-    block.parallel_context = Mock()
-    block.parallel_context.world.size = 2
-    block.parallel_context.world.ranks = (0, 1)
-    block.parallel_context.tensor.ranks = (0,)
-    block.parallel_context.world_all_reduce.return_value = local_output * 2
-    block.parallel_context.tp_all_reduce.return_value = shared_output
-
-    with patch(
-        "sparsevllm.models.qwen3_5_moe.gated_shared_add",
-        side_effect=lambda routed, shared, gate: routed + shared * gate.sigmoid(),
-    ):
-        actual = block._forward_chunk(hidden_states)
-
-    block.parallel_context.world_all_reduce.assert_called_once_with(local_output)
-    block.parallel_context.tp_all_reduce.assert_called_once_with(shared_output)
-    torch.testing.assert_close(actual, local_output * 2 + shared_output * 0.5)
 
 
 def test_qwen35_moe_skips_single_rank_output_packing():
@@ -375,7 +343,7 @@ def test_qwen35_moe_skips_single_rank_output_packing():
     ):
         actual = block._forward_chunk(hidden_states)
 
-    block.parallel_context.world_all_reduce.assert_not_called()
+    block.parallel_context.world.all_reduce.assert_not_called()
     torch.testing.assert_close(
         actual, hidden_states + 2 + 0.5 * (hidden_states + 1)
     )
@@ -962,11 +930,11 @@ def test_model_runner_resets_inherited_allocator_peak_before_model_construction(
     config = SimpleNamespace(
         enable_profiler=False,
         world_size=1,
+        attn_dp_size=1,
         tensor_parallel_size=1,
         expert_parallel_size=1,
         data_parallel_size=1,
         parallel_topology=ParallelTopology(1, 1, 1),
-        uses_outer_tp_moe_layout=False,
         mlp_chunk_size=16384,
         decode_graph=False,
         decode_graph_capture_sizes=None,

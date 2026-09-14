@@ -6,6 +6,10 @@ from enum import Enum
 import torch
 import torch.distributed as dist
 
+from sparsevllm.distributed.moe_communication import (
+    AllGatherReduceScatterMoeCommunication,
+    MoeCommunication,
+)
 from sparsevllm.distributed.parallel_context import ParallelContext, ParallelGroup
 from sparsevllm.operators.all_reduce import (
     AllReduceGraphBufferMetadata,
@@ -70,7 +74,7 @@ class ParallelAllReduceHandle:
         if binding is None:
             return tensor
         if get_context().is_prefill:
-            return ParallelContext._all_reduce(tensor, self._group)
+            return self._group.all_reduce(tensor)
         if binding.op is None:
             raise RuntimeError("Parallel all-reduce handle is not prepared.")
         return binding.op.run(tensor)
@@ -80,10 +84,11 @@ class ParallelAllReduceHandle:
 class DecodeParallelCollectives:
     attention: ParallelAllReduceHandle
     moe: ParallelAllReduceHandle
+    moe_transport: MoeCommunication | None = None
 
 
 class ParallelCollectiveRuntime:
-    """Own shared all-reduce resources and their CUDA Graph lifecycle."""
+    """Own shared collective resources and their CUDA Graph lifecycle."""
 
     def __init__(
         self,
@@ -98,10 +103,19 @@ class ParallelCollectiveRuntime:
         self.state = ParallelCollectiveState.OPEN
         self._bindings: list[_AllReduceBinding] = []
         self._handles: dict[_AllReduceKey, ParallelAllReduceHandle] = {}
+        self._moe_transport: MoeCommunication | None = None
 
     @property
     def has_graph_collectives(self) -> bool:
         return self.cuda_graph and bool(self._bindings)
+
+    def moe_transport_stats(self):
+        transport = self._moe_transport
+        return {
+            "transport": "allreduce" if transport is None else type(transport).__name__,
+            "provider": None if transport is None else transport.name,
+            "version": getattr(getattr(transport, "op", None), "version", None),
+        }
 
     def _request_all_reduce(
         self,
@@ -162,19 +176,73 @@ class ParallelCollectiveRuntime:
     ) -> DecodeParallelCollectives:
         attention = self._request_all_reduce(
             "attention",
-            self.parallel_context.attention_output_group,
+            self.parallel_context.attn_tp,
             max_rows=attention_max_rows,
             hidden_size=hidden_size,
             dtype=dtype,
         )
         moe = self._request_all_reduce(
             "moe",
-            self.parallel_context.moe_output_group,
+            self.parallel_context.world,
             max_rows=moe_max_rows,
             hidden_size=hidden_size,
             dtype=dtype,
         )
         return DecodeParallelCollectives(attention=attention, moe=moe)
+
+    def request_moe_collectives(
+        self, *, attention_max_rows, moe_max_rows, max_local_tokens,
+        hidden_size, dtype, backend, num_experts, top_k,
+    ):
+        """Prepare transport from token ownership; models supply tensor contracts."""
+        if self.parallel_context.attn_dp_size > 1:
+            return self.request_dp_collectives(
+                max_rows=attention_max_rows,
+                max_local_tokens=max(attention_max_rows, max_local_tokens),
+                hidden_size=hidden_size, dtype=dtype, backend=backend,
+                num_experts=num_experts, top_k=top_k,
+            )
+        return self.request_decode_collectives(
+            attention_max_rows=attention_max_rows, moe_max_rows=moe_max_rows,
+            hidden_size=hidden_size, dtype=dtype,
+        )
+
+    def request_dp_collectives(
+        self, *, max_rows, hidden_size, dtype, backend="agrs",
+        max_local_tokens=None, num_experts=None, top_k=None,
+    ):
+        if self.state is not ParallelCollectiveState.OPEN or self._moe_transport is not None:
+            raise RuntimeError("DP collectives must be requested once before preparation.")
+        if self.parallel_context.attn_dp_size <= 1:
+            raise ValueError("DP collectives require the DP attention topology.")
+        attention = self._request_all_reduce(
+            "attention", self.parallel_context.attn_tp,
+            max_rows=max_rows, hidden_size=hidden_size, dtype=dtype,
+        )
+        moe = self._request_all_reduce(
+            "moe", self.parallel_context.attn_tp,
+            max_rows=max_rows, hidden_size=hidden_size, dtype=dtype,
+        )
+        if backend == "agrs":
+            self._moe_transport = AllGatherReduceScatterMoeCommunication(
+                self.parallel_context,
+                max_rows=max(max_rows, max_local_tokens or max_rows),
+                hidden_size=hidden_size,
+                dtype=dtype,
+                reduce=moe.run,
+            )
+        elif backend == "deepepv1":
+            from sparsevllm.distributed.moe_all2all import AllToAllMoeCommunication
+            from sparsevllm.operators.all2all import AllToAllOpSpec
+
+            spec = AllToAllOpSpec(
+                self.parallel_context.moe_ep_size, hidden_size, num_experts, top_k,
+                max_local_tokens, dtype, self.cuda_graph,
+            )
+            self._moe_transport = AllToAllMoeCommunication(self.parallel_context, spec)
+        else:
+            raise ValueError(f"Unsupported DP MoE transport: {backend}")
+        return DecodeParallelCollectives(attention, moe, self._moe_transport)
 
     def prepare(self) -> None:
         if self.state is not ParallelCollectiveState.OPEN:
@@ -183,6 +251,10 @@ class ParallelCollectiveRuntime:
             )
         prepared: list[PreparedAllReduceOp] = []
         try:
+            if self._moe_transport is not None and self._moe_transport.op is None:
+                self._moe_transport.prepare(
+                    device_index=self.device_index, cuda_graph=self.cuda_graph
+                )
             for binding in self._bindings:
                 binding.op = prepare_parallel_all_reduce(
                     binding.group,
@@ -196,6 +268,8 @@ class ParallelCollectiveRuntime:
         except BaseException:
             for op in reversed(prepared):
                 op.close()
+            if self._moe_transport is not None:
+                self._moe_transport.close()
             self.state = ParallelCollectiveState.CLOSED
             raise
         self.state = ParallelCollectiveState.PREPARED
@@ -379,6 +453,8 @@ class ParallelCollectiveRuntime:
             binding.local_metadata = None
             binding.local_metadata_summary = None
             binding.gathered_metadata = None
+        # AG/RS uses persistent transport workspace, independent of graph input
+        # addresses. Keep it alive when replacing active and idle graphs.
         self.state = ParallelCollectiveState.OPEN
         self.prepare()
 
@@ -389,6 +465,8 @@ class ParallelCollectiveRuntime:
             if binding.op is not None:
                 binding.op.close()
                 binding.op = None
+        if self._moe_transport is not None:
+            self._moe_transport.close()
         self.state = ParallelCollectiveState.CLOSED
 
 

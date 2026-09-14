@@ -239,8 +239,9 @@ def _transfer(
     target = tl.load(TARGET + row)
     if SLOT_MAP is not None:
         source = tl.load(SLOT_MAP + source)
-    src = tl.load(SRC_PTR + COMPONENT).to(tl.pointer_type(DTYPE))
-    dst = tl.load(DST_PTR + COMPONENT).to(tl.pointer_type(DTYPE))
+    component = tl.program_id(2) if COMPONENT is None else COMPONENT
+    src = tl.load(SRC_PTR + component).to(tl.pointer_type(DTYPE))
+    dst = tl.load(DST_PTR + component).to(tl.pointer_type(DTYPE))
     x = tl.load(src + source.to(tl.int64) * WIDTH + d, d < WIDTH, 0)
     tl.store(dst + target.to(tl.int64) * WIDTH + d, x, d < WIDTH)
 

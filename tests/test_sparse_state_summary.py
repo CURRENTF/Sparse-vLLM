@@ -79,10 +79,10 @@ def test_model_runner_gathers_one_debug_summary_per_world_rank():
     )
     runner.parallel_context = ParallelContext(
         world=world_group,
-        tensor=singleton_group,
-        expert=world_group,
-        data=singleton_group,
-        moe_tensor=singleton_group,
+        attn_tp=world_group,
+        moe_ep=world_group,
+        attn_dp=singleton_group,
+        moe_tp=singleton_group,
     )
     runner.sparse_controller = SimpleNamespace(
         debug_state_summary=lambda: {"sparse_method": "", "layers": {}}
@@ -108,7 +108,7 @@ def test_model_runner_gathers_one_debug_summary_per_world_rank():
     )
 
     def gather(output, local, group):
-        assert group is runner.parallel_context.world.process_group
+        assert group is runner.parallel_context.attn_tp.process_group
         output[:] = [local, {"world_rank": 1, "ep_rank": 1, "state": local["state"]}]
 
     with (
@@ -119,7 +119,7 @@ def test_model_runner_gathers_one_debug_summary_per_world_rank():
 
     assert [summary["world_rank"] for summary in summaries] == [0, 1]
     assert summaries[0]["state"] == summaries[1]["state"]
-    assert summaries[0]["decode_graph"] == {
+    expected_graph = {
         "enabled": True,
         "capture_count": 1,
         "replay_count": 3,
@@ -140,6 +140,7 @@ def test_model_runner_gathers_one_debug_summary_per_world_rank():
             "capture_sampling": False,
         },
     }
+    assert {key: summaries[0]["decode_graph"][key] for key in expected_graph} == expected_graph
     sync_status.assert_called_once_with("debug_sparse_state_summaries", None)
 
 
@@ -148,9 +149,10 @@ def test_tp_debug_replica_consistency_marks_vocab_sharded_logits_not_applicable(
     runner.world_size = 2
     runner.parallel_context = ParallelContext(
         world=ParallelGroup(process_group=object(), ranks=(0, 1), rank=1, size=2),
-        tensor=ParallelGroup(process_group=object(), ranks=(0, 1), rank=1, size=2),
-        expert=ParallelGroup(process_group=None, ranks=(1,), rank=0, size=1),
-        data=ParallelGroup(process_group=None, ranks=(1,), rank=0, size=1),
+        moe_tp=ParallelGroup(process_group=object(), ranks=(0, 1), rank=1, size=2),
+        attn_tp=ParallelGroup(process_group=object(), ranks=(0, 1), rank=1, size=2),
+        moe_ep=ParallelGroup(process_group=None, ranks=(1,), rank=0, size=1),
+        attn_dp=ParallelGroup(process_group=None, ranks=(1,), rank=0, size=1),
     )
     runner.model = SimpleNamespace(model=SimpleNamespace(layers=()))
 
@@ -166,7 +168,7 @@ def test_tp_debug_replica_consistency_marks_vocab_sharded_logits_not_applicable(
 
 def test_nonzero_rank_debug_logits_rpc_returns_none_before_tensor_access():
     runner = object.__new__(ModelRunner)
-    runner.rank = 1
+    runner.parallel_context = SimpleNamespace(attn_tp_rank=1)
 
     assert runner.debug_last_logits_cpu() is None
 

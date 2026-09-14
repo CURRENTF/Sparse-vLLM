@@ -279,19 +279,10 @@ class Qwen35MoeSparseMoeBlock(nn.Module):
         topk_weights, topk_ids, shared_gate_logits = self.gate(hidden_states)
         local_output = self.experts(hidden_states, topk_ids, topk_weights)
         if self.parallel_context.world.size > 1:
-            if (
-                self.parallel_context.tensor.ranks
-                == self.parallel_context.world.ranks
-            ):
-                local_output, shared_output = self.parallel_context.world_all_reduce(
-                    torch.stack((local_output, shared_output))
-                )
-            else:
-                # Routed experts are partitioned across the full TP x EP world,
-                # while the shared expert is replicated across EP and sharded
-                # only across its tensor-parallel group.
-                local_output = self.parallel_context.world_all_reduce(local_output)
-                shared_output = self.parallel_context.tp_all_reduce(shared_output)
+            # This model currently requires DP=1: both outputs are world partials.
+            local_output, shared_output = self.parallel_context.world.all_reduce(
+                torch.stack((local_output, shared_output))
+            )
         return gated_shared_add(local_output, shared_output, shared_gate_logits)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -726,12 +717,12 @@ class Qwen35MoeForCausalLM(Qwen35ForCausalLM):
             "fp8" if first_experts.fp8_enabled else "bf16",
             first_experts.provider.name,
             self.model.layers[0].mlp.gate.provider.name,
-            self.parallel_context.attention_tp_rank,
-            self.parallel_context.attention_tp_size,
+            self.parallel_context.attn_tp_rank,
+            self.parallel_context.attn_tp_size,
             self.parallel_context.moe_tp_rank,
             self.parallel_context.moe_tp_size,
-            self.parallel_context.ep_rank,
-            self.parallel_context.ep_size,
+            self.parallel_context.moe_ep_rank,
+            self.parallel_context.moe_ep_size,
             first_experts.local_expert_start,
             first_experts.local_expert_end,
             len(self.model.layers),

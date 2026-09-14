@@ -92,7 +92,7 @@ class OmniKVCacheManager(StandardCacheManager):
         )
         if self.world_size > 1:
             capacity = torch.tensor(slots, dtype=torch.int64, device=self.device)
-            self.parallel_context.world_all_reduce(
+            self.parallel_context.world.all_reduce(
                 capacity, op=torch.distributed.ReduceOp.MIN
             )
             slots = int(capacity.item())

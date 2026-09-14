@@ -276,7 +276,7 @@ def test_gemma4_h20_router_expert_boundary_matches_torch(num_experts):
 
 def _parallel_context() -> ParallelContext:
     group = ParallelGroup(process_group=None, ranks=(0,), rank=0, size=1)
-    return ParallelContext(world=group, tensor=group, expert=group, data=group)
+    return ParallelContext(world=group, moe_tp=group, attn_tp=group, moe_ep=group, attn_dp=group)
 
 
 def _patch_parallel_context():

@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import os
 import re
+from functools import partial
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen3MoeConfig
 
-from sparsevllm.distributed import get_parallel_context
+from sparsevllm.distributed import DecodeParallelCollectives, get_parallel_context
+from sparsevllm.distributed.moe_communication import prepare_moe_communication
 from sparsevllm.layers.embed_head import ParallelLMHead
 from sparsevllm.layers.packed_moe import PackedMoeExperts
 from sparsevllm.models.qwen3 import (
@@ -93,7 +95,10 @@ class Qwen3MoePackedExperts(PackedMoeExperts):
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
-    def __init__(self, config: Qwen3MoeConfig) -> None:
+    def __init__(
+        self, config: Qwen3MoeConfig,
+        parallel_collectives: DecodeParallelCollectives | None = None,
+    ) -> None:
         super().__init__()
         self.parallel_context = get_parallel_context()
         self.mlp_chunk_size = int(getattr(config, "mlp_chunk_size", 16384))
@@ -101,13 +106,25 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             raise ValueError(
                 f"mlp_chunk_size must be > 0, got {self.mlp_chunk_size}."
             )
+        self.moe_communication = prepare_moe_communication(
+            self.parallel_context, parallel_collectives
+        )
         self.gate = Qwen3MoeRouter(config)
         self.experts = Qwen3MoePackedExperts(config)
+
+    def _route(self, hidden_states):
+        _, weights, ids = self.gate(hidden_states)
+        return ids, weights
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.dim() != 2:
             raise ValueError(
                 f"Qwen3MoeSparseMoeBlock expects [tokens, hidden], got {tuple(hidden_states.shape)}."
+            )
+        if self.parallel_context.attn_dp_size > 1:
+            return self.moe_communication.run(
+                hidden_states, route=self._route, experts=self.experts,
+                chunk_size=self.mlp_chunk_size,
             )
         debug_enabled = os.getenv("SPARSEVLLM_DEBUG_MOE", "0") == "1"
         if debug_enabled:
@@ -160,17 +177,20 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 else int(local_hit_count.item())
             )
 
-        output = self.parallel_context.world_all_reduce(local_output)
+        output = self.moe_communication.combine(local_output)
         if debug_enabled:
             self.debug_last_output = output.detach().clone()
         return output
 
 
 class Qwen3MoeDecoderLayer(Qwen3DecoderLayerBase):
-    def __init__(self, config: Qwen3MoeConfig) -> None:
+    def __init__(
+        self, config: Qwen3MoeConfig,
+        parallel_collectives: DecodeParallelCollectives | None = None,
+    ) -> None:
         super().__init__(config)
         self.parallel_context = get_parallel_context()
-        self.mlp = Qwen3MoeSparseMoeBlock(config)
+        self.mlp = Qwen3MoeSparseMoeBlock(config, parallel_collectives)
 
     def forward(
         self,
@@ -184,11 +204,6 @@ class Qwen3MoeDecoderLayer(Qwen3DecoderLayerBase):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)
 
-        if self.parallel_context.tp_size == 1 and self.parallel_context.ep_size > 1:
-            # The incoming residual is already replicated, so syncing attention
-            # output before RMSNorm preserves the old post-norm state with half
-            # the broadcast payload.
-            self.parallel_context.ep_broadcast(hidden_states, src_ep_rank=0)
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
@@ -196,8 +211,13 @@ class Qwen3MoeDecoderLayer(Qwen3DecoderLayerBase):
 
 
 class Qwen3MoeModel(Qwen3ModelBase):
-    def __init__(self, config: Qwen3MoeConfig) -> None:
-        super().__init__(config, Qwen3MoeDecoderLayer)
+    def __init__(
+        self, config: Qwen3MoeConfig,
+        parallel_collectives: DecodeParallelCollectives | None = None,
+    ) -> None:
+        super().__init__(
+            config, partial(Qwen3MoeDecoderLayer, parallel_collectives=parallel_collectives)
+        )
 
 
 class Qwen3MoeForCausalLM(nn.Module):
@@ -215,13 +235,22 @@ class Qwen3MoeForCausalLM(nn.Module):
         engine_config,
         parallel_context,
         device: torch.device,
+        collective_runtime,
+        max_decode_tokens,
         **_,
     ) -> dict:
         return {
+            "parallel_collectives": collective_runtime.request_moe_collectives(
+                attention_max_rows=max_decode_tokens, moe_max_rows=max_decode_tokens,
+                max_local_tokens=engine_config.max_num_batched_tokens,
+                hidden_size=int(config.hidden_size), dtype=model_activation_dtype(config),
+                backend=engine_config.moe_backend, num_experts=int(config.num_experts),
+                top_k=int(config.num_experts_per_tok),
+            ),
             "full_attention_provider": build_mha_full_attention_provider(
                 config,
                 sparse_method=engine_config.sparse_method,
-                attention_tp_size=parallel_context.attention_tp_size,
+                attention_tp_size=parallel_context.attn_tp_size,
                 device=device,
                 max_batch_size=engine_config.max_decoding_seqs,
                 cuda_graph=engine_config.decode_graph,
@@ -233,12 +262,13 @@ class Qwen3MoeForCausalLM(nn.Module):
         self,
         config: Qwen3MoeConfig,
         full_attention_provider: FullAttentionProvider | None = None,
+        parallel_collectives: DecodeParallelCollectives | None = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.parallel_context = get_parallel_context()
         self.full_attention_provider = full_attention_provider
-        self.model = Qwen3MoeModel(config)
+        self.model = Qwen3MoeModel(config, parallel_collectives)
         if full_attention_provider is not None:
             bind_mha_full_attention_provider(self.model, full_attention_provider)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
@@ -488,8 +518,8 @@ class Qwen3MoeForCausalLM(nn.Module):
             "[{}, {}) across {} layers; intentionally skipped {} remote expert tensors.",
             self.parallel_context.world_rank,
             self.model.layers[0].mlp.experts.provider.name,
-            self.parallel_context.tp_rank,
-            self.parallel_context.tp_size,
+            self.parallel_context.attn_tp_rank,
+            self.parallel_context.attn_tp_size,
             self.parallel_context.moe_tp_rank,
             self.parallel_context.moe_tp_size,
             self.model.layers[0].mlp.experts.local_expert_start,
@@ -504,6 +534,10 @@ class Qwen3MoeForCausalLM(nn.Module):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         return self.model(input_ids, positions)
+
+    def forward_idle_experts(self, hidden_states):
+        for layer in self.model.layers:
+            layer.mlp(hidden_states)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)

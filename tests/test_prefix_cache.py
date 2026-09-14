@@ -111,6 +111,7 @@ def _make_standard_manager_for_prefix(block_size=2, method=""):
     fingerprint = build_prefix_cache_fingerprint(cfg, block_size)
     manager_type = OmniKVCacheManager if method == "omnikv" else StandardCacheManager
     manager = object.__new__(manager_type)
+    manager.parallel_context = SimpleNamespace(attn_tp_size=1)
     manager.config = cfg
     manager.device = torch.device("cpu")
     manager.enable_prefix_caching = True
@@ -281,6 +282,7 @@ def test_standard_prefix_prune_rejects_unimplemented_recompression_without_mutat
 
 def test_quest_explicitly_rejects_physical_prefix_pruning():
     manager = object.__new__(QuestCacheManager)
+    manager.parallel_context = SimpleNamespace(attn_tp_size=1)
     with pytest.raises(RuntimeError, match="QuEST.*without pruning"):
         manager.prefix_cache_prune(
             [1, 2, 3, 4],
@@ -376,6 +378,7 @@ def _make_quest_manager_for_prefix(page_size=2):
     cfg = _cfg(method="quest", block_size=page_size)
     fingerprint = build_prefix_cache_fingerprint(cfg, page_size)
     manager = object.__new__(QuestCacheManager)
+    manager.parallel_context = SimpleNamespace(attn_tp_size=1)
     manager.config = cfg
     manager.runtime_layout = SimpleNamespace(kv_layer_index=lambda layer_idx: int(layer_idx))
     manager.device = torch.device("cpu")
@@ -1448,13 +1451,15 @@ def test_prefix_delete_plan_rejects_tp_divergence_before_mutation():
     manager = _make_standard_manager_for_prefix(block_size=2)
     manager.world_size = 2
     manager.parallel_context = SimpleNamespace(
-        world=SimpleNamespace(process_group=None),
+        world=SimpleNamespace(process_group="world"),
+        attn_tp=SimpleNamespace(process_group="replica"),
+        attn_dp_size=2, attn_tp_size=2,
     )
     block_id = _insert_tokens(manager.prefix_cache, [1, 2])
     local_plan = manager.prefix_cache.preview_delete_subtree([1, 2]).to_dict()
 
     def gather(plans, plan, group=None):
-        del group
+        assert group == "replica"
         plans[:] = [
             plan,
             {

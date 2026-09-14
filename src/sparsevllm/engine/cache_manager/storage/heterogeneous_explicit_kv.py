@@ -6,6 +6,7 @@ from sparsevllm.kernels.triton.store_kvcache import store_kvcache
 
 from ..base import AttentionCacheWrite, ExplicitKVPayload, ExplicitKVWrite
 from .base import CacheLayout
+from .components import CacheComponentSpec
 
 
 class HeterogeneousExplicitKVStorage:
@@ -44,6 +45,16 @@ class HeterogeneousExplicitKVStorage:
         if not self.kv_cache:
             raise RuntimeError("Heterogeneous KV storage has not been allocated.")
         return self.kv_cache
+
+    def component_specs(self, layer_idx: int) -> tuple[CacheComponentSpec, ...]:
+        return tuple(
+            CacheComponentSpec(name, self.layer_shapes[layer_idx], self.dtype)
+            for name in ("key", "value")
+        )
+
+    def component_tensors(self, layer_idx: int) -> tuple[torch.Tensor, ...]:
+        payload = self.layer_payload(layer_idx)
+        return payload.k_cache, payload.v_cache
 
     def layer_payload(self, layer_idx: int) -> ExplicitKVPayload:
         cache = self._layer_cache(layer_idx)

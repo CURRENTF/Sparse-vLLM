@@ -10,19 +10,30 @@
 | --- | --- | --- | :---: | :---: | :---: |
 | Qwen2.5 | `qwen2` | BF16 / FP16 / 块级 FP8 | ✅ | 仅支持 1 | 仅支持 1 |
 | Qwen3 Dense | `qwen3` | BF16 / FP16 / 块级 FP8 | ✅（FP8：1/2/4/8） | 仅支持 1 | 仅支持 1 |
-| Qwen3MoE | `qwen3_moe` | BF16 / FP16 / 块级 FP8 | ✅ | 仅支持 1 | ✅ |
+| Qwen3MoE | `qwen3_moe` | BF16 / FP16 / 块级 FP8 | ✅ | ✅ | ✅ |
 | Qwen3.5 / 3.6 / 3.8 | `qwen3_5` | BF16 / 块级 FP8 | ✅ | 仅支持 1 | 仅支持 1 |
 | Qwen3.6 MoE | `qwen3_5_moe` | BF16 / 块级 FP8 | ✅ | 仅支持 1 | ✅ |
-| GLM-4.7-Flash | `glm4_moe_lite` | BF16 / 实验性逐张量 FP8 | ✅ | 仅支持 1 | 1 / 2 / 4 |
+| GLM-4.7-Flash | `glm4_moe_lite` | BF16 / 实验性逐张量 FP8 | ✅ | ✅⁵ | ✅ |
 | Gemma 4 Dense / MoE | `gemma4` | BF16 / FP16 | ✅ | 仅支持 1 | ✅（仅 MoE） |
 | Llama 3 / 3.1 | `llama` | BF16 / FP16 / 块级 FP8 | ✅ | 仅支持 1 | 仅支持 1 |
-| MiniMax M2.7 | `minimax_m2` | 块级 FP8，非量化权重使用 BF16 | ✅ | 仅支持 1 | ✅ |
+| MiniMax M2.7 | `minimax_m2` | 块级 FP8，非量化权重使用 BF16 | ✅ | ✅ | ✅ |
 
 TP 规模限制为 1 到 8，并且 checkpoint 维度（包括 attention head 数和 vocabulary
 大小）必须能被所选 TP 规模整除。
 
-MoE 模型可能在内部组合 tensor parallelism 和 expert parallelism；不合法的 TP/EP
-组合会在配置阶段被拒绝。
+`tensor_parallel_size` 和 `data_parallel_size` 描述 attention 拓扑，总进程数为
+`world_size = DP * TP`。`expert_parallel_size` 描述同一个 world 内的 routed expert
+分布，专家内部 TP 为 `world_size / EP`，因此 EP 必须整除 world size，且不会额外
+增加进程。例如 `TP=4, DP=1, EP=2` 使用四个进程，attention TP=4、专家内部 TP=2。
+
+GLM、Qwen3MoE 和 MiniMax 支持 attention TP×DP，要求 `moe_backend="agrs"`
+且 `EP=world_size`（专家内部 TP=1）。例如 `TP=2, DP=2, EP=4` 使用四张卡；
+更大的合法拓扑也可使用，具体取决于模型维度和硬件约束。Dense MLP 和 shared expert
+在每个 DP 副本内使用 attention TP。每个副本拥有自己的调度器和 prefix cache，
+支持 decode CUDA Graph；原有稀疏方法和 prefix-cache 限制继续适用。
+
+AG/RS 是默认 DP 通信方式。`moe_backend="deepepv1"` 仍要求 attention TP=1
+以及受支持的 NVLink 硬件，不支持的组合会在启动阶段报错。DP=1 的默认后端仍为 `all-reduce`。
 
 块级 FP8 要求使用 E4M3 权重、动态激活量化以及 `128 x 128` 的权重块大小。
 Llama、Qwen2 和 Qwen3 Dense FP8 checkpoint 还要求每个 TP-local dense
@@ -43,7 +54,7 @@ GLM 逐张量 FP8 加载支持 E4M3 权重以及每个量化投影对应的 BF16
 | Qwen3MoE | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
 | Qwen3.5 / 3.6 / 3.8 | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | 匹配的 checkpoint³ |
 | Qwen3.6 MoE | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
-| GLM-4.7-Flash | ✅⁵ | ✅⁵ | ✅⁵ | 实验性⁴⁵ | — | ✅⁵ | 实验性⁵ | ✅⁵ | — | — |
+| GLM-4.7-Flash | ✅ | ✅ | ✅ | 实验性⁴ | — | ✅ | ✅⁵ | ✅ | — | — |
 | Gemma 4 Dense / MoE | ✅ | ✅⁶ | — | — | — | ✅ | — | — | — | — |
 | Llama 3 / 3.1 | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | 指定 checkpoint¹ | 需要 compressor² |
 | MiniMax M2.7 | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
@@ -59,7 +70,9 @@ GLM 逐张量 FP8 加载支持 E4M3 权重以及每个量化投影对应的 BF16
 ⁴ H2O 的 tensor-parallel 执行可能产生与 TP=1 不同的稀疏选择。各模型原有的
 TP、EP、DP 限制仍然适用。
 
-⁵ GLM 要求 `DP=1`。QuEST 支持仍为实验性。
+⁵ GLM QuEST 支持 radix Prefix Cache（含 CPU offload）与 decode CUDA Graph。
+打分使用 TP rank 本地 heads，不保证与 TP=1 等价；CPU offload 支持 attention
+TP=1 或 TP=2。
 
 ⁶ 带共享 KV 层的 Gemma 4 checkpoint 不支持逐层 StreamingLLM eviction；
 Vanilla 和 OmniKV 仍受支持。

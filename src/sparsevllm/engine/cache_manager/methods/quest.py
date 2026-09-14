@@ -13,7 +13,6 @@ from sparsevllm.engine.decode_graph_contract import (
     DecodeGraphContract,
     DecodeGraphInputs,
 )
-from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.prefix_cache import (
     PrefixCacheBlock,
     PrefixTransferKind,
@@ -22,11 +21,12 @@ from sparsevllm.engine.prefix_cache import (
     select_write_through_candidates,
     usable_prefix_cache_tokens,
 )
+from sparsevllm.engine.sequence import Sequence
 from sparsevllm.kernels.triton.quest_decode_view import (
-    fuse_mla_quest_selection_query,
     finalize_quest_decode_view,
-    prepare_quest_decode_graph_metadata,
+    fuse_mla_quest_selection_query,
     prepare_quest_decode_geometry,
+    prepare_quest_decode_graph_metadata,
 )
 from sparsevllm.operators.quest_scoring import (
     QuestPageScoreSpec,
@@ -50,13 +50,25 @@ from ..base import (
     PagedDecodeViewMeta,
     SparseSelection,
 )
+from ..offload.prefix_components import (
+    ComponentPrefixOffloadController,
+    ComponentPrefixPool,
+    prefix_block_bytes,
+    storage_prefix_components,
+)
 from ..prefix_cache_mixin import PrefixCacheMixin
 from ..prefix_offload import (
     PinnedQuestPrefixPool,
     PrefixH2DOperation,
+    PrefixOffloadController,
     QuestPrefixOffloadController,
 )
-from ..storage import ExplicitKVStorage, MlaLatentStorage, create_attention_cache_storage
+from ..storage import (
+    ExplicitKVStorage,
+    MlaLatentStorage,
+    create_attention_cache_storage,
+)
+from ..storage.components import CacheComponentSpec
 
 
 @dataclass
@@ -224,7 +236,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             device=self.device,
         )
         self._init_prefix_cache_runtime()
-        self.prefix_offload_controller: QuestPrefixOffloadController | None = None
+        self.prefix_offload_controller: PrefixOffloadController | None = None
         self._prefix_offload_step_h2d_operations: list[PrefixH2DOperation] = []
         self._prefix_write_through_candidates: dict[bytes, PrefixCacheBlock] = {}
         has_linear_layers = bool(
@@ -248,14 +260,24 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         host_size_gb = getattr(self.config, "prefix_cache_host_size_gb", None)
         if host_size_gb is None:
             raise RuntimeError("Prefix cache offload requires prefix_cache_host_size_gb.")
-        bytes_per_block = int(
-            (self.page_size + 1)
-            * self.num_kv_layers
-            * 2
-            * self.num_kv_heads
-            * self.head_dim
-            * self.kv_cache.element_size()
+        storage = self.attention_cache_storage
+        summary_specs = tuple(
+            CacheComponentSpec(
+                name, (self.metadata_num_heads, self.metadata_head_dim),
+                self.metadata_cache.dtype, "page",
+            )
+            for name in ("page_max", "page_min")
         )
+        components = tuple(
+            layer + tuple(
+                (spec, self.metadata_cache[component, index])
+                for component, spec in enumerate(summary_specs)
+            )
+            for index, layer in enumerate(
+                storage_prefix_components(storage, self.num_kv_layers)
+            )
+        )
+        bytes_per_block = prefix_block_bytes(components, self.page_size)
         host_capacity_blocks = int(float(host_size_gb) * (1024**3)) // bytes_per_block
         required_blocks = int(self.num_pages)
         if self.prefix_cache.max_blocks is not None:
@@ -266,6 +288,20 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                 f"host_blocks={host_capacity_blocks} required_blocks={required_blocks} "
                 f"bytes_per_block={bytes_per_block} host_size_gb={host_size_gb}."
             )
+        if isinstance(storage, MlaLatentStorage):
+            host_pool = ComponentPrefixPool(
+                components=components,
+                capacity_blocks=host_capacity_blocks,
+                block_size=self.page_size,
+            )
+            self.prefix_offload_controller = ComponentPrefixOffloadController(
+                components=components,
+                prefix_cache=self.prefix_cache,
+                host_pool=host_pool,
+                block_size=self.page_size,
+                device=self.device,
+            )
+            return
         host_pool = PinnedQuestPrefixPool(
             capacity_blocks=host_capacity_blocks,
             num_layers=self.num_kv_layers,
@@ -2771,9 +2807,9 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             is_long_text = bool(get_context().is_long_text)
             dense_slots = None
             if not is_long_text:
-                dense_slots = self.buffer_req_to_token_slots.index_select(
+                dense_slots = self.buffer_req_to_token_slots[:, :max_keep].index_select(
                     0, req_indices.to(torch.long)
-                )[:, :max_keep]
+                )
             page_scores, row_page_slots, num_pages, previous_page_counts = (
                 self._score_previous_decode_pages(
                     layer_idx,

@@ -30,9 +30,7 @@ def payload_tensors(payload):
 class OmniKVStorage:
     @staticmethod
     def payload_shapes(original):
-        if original.layout is CacheLayout.EXPLICIT_KV:
-            return [(original.num_kv_heads, original.head_dim)] * 2
-        return [(1, original.kv_lora_rank), (1, original.rope_dim)]
+        return [component.shape for component in original.component_specs(0)]
 
     def __init__(
         self, original, *, num_layers, num_slots, full_layers, device, prefix_slots=0

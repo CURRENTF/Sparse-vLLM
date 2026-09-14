@@ -136,7 +136,7 @@ def test_minimax_config_rejects_unvalidated_parallel_layout(
     tmp_path,
     parallel_kwargs,
 ):
-    with pytest.raises(ValueError, match="MiniMax M2.7|Outer-TP MoE"):
+    with pytest.raises(ValueError, match="MoE TP=1|must be divisible by MoE EP"):
         _make_config(tmp_path, **parallel_kwargs)
 
 

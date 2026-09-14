@@ -8,6 +8,7 @@ from typing import Any
 import torch
 from transformers import AutoConfig
 
+from sparsevllm.distributed.topology import ParallelTopology
 from sparsevllm.method_registry import (
     is_deltakv_method,
     validate_model_runtime_compatibility,
@@ -205,12 +206,12 @@ def load_and_validate_model(config) -> None:
     outer_dtype = _normalize_hf_config_dtype(config.outer_hf_config, torch.bfloat16)
     _normalize_hf_config_dtype(config.hf_config, outer_dtype)
     config.model_spec = model_spec
-    config.parallel_topology = model_spec.topology(
-        config.tensor_parallel_size,
-        config.expert_parallel_size,
-        config.data_parallel_size,
-        config.hf_config,
+    config.parallel_topology = ParallelTopology(
+        attn_tp_size=config.tensor_parallel_size,
+        attn_dp_size=config.data_parallel_size,
+        moe_ep_size=config.expert_parallel_size,
     )
+    model_spec.validate_parallel_execution(config.parallel_topology)
     if config.tiny_random:
         from sparsevllm.debug.tiny_random import apply_tiny_random_overrides
 

@@ -80,7 +80,7 @@ def _validate_dense_fp8(
         )
         * head_dim,
     }
-    alignment = 128 * topology.attention_tp_size
+    alignment = 128 * topology.attn_tp_size
     invalid = {
         name: size
         for name, size in dimensions.items()
@@ -89,7 +89,7 @@ def _validate_dense_fp8(
     if invalid:
         raise ValueError(
             f"{model_name} requires every TP-local dense projection dimension to be "
-            f"128-aligned; TP={topology.attention_tp_size}, invalid={invalid}."
+            f"128-aligned; TP={topology.attn_tp_size}, invalid={invalid}."
         )
 
 
@@ -163,9 +163,9 @@ def _validate_qwen3_moe(
             "Qwen3MoE v1 supports BF16/FP16 checkpoints only, "
             f"got dtype={dtype}."
         )
-    if topology.is_outer_tp_moe and dtype != torch.bfloat16:
+    if topology.attn_tp_size > 1 and dtype != torch.bfloat16:
         raise NotImplementedError(
-            "Qwen3MoE outer TP supports BF16 checkpoints only, "
+            "Qwen3MoE attention TP supports BF16 checkpoints only, "
             f"got dtype={dtype}."
         )
     if quantization.enabled:
@@ -205,7 +205,7 @@ def _validate_qwen35_moe(
             "shared_expert_intermediate_size": int(
                 config_get(config, "shared_expert_intermediate_size", 0) or 0
             )
-            // topology.attention_tp_size,
+            // topology.attn_tp_size,
         }
         invalid = {
             name: size
@@ -215,7 +215,7 @@ def _validate_qwen35_moe(
         if invalid:
             raise ValueError(
                 "Qwen3.6 MoE FP8 local Linear dimensions must be 128-aligned, "
-                f"got TP={topology.attention_tp_size}, invalid={invalid}."
+                f"got TP={topology.attn_tp_size}, invalid={invalid}."
             )
 
 
@@ -321,7 +321,7 @@ def _gemma4_checkpoint(outer, config, _raw, quantization, topology) -> None:
     if quantization.enabled:
         raise NotImplementedError("Gemma 4 currently supports unquantized BF16 checkpoints only.")
     enable_moe = bool(config_get(config, "enable_moe_block", False))
-    if topology.expert_parallel_size > 1 and not enable_moe:
+    if topology.moe_ep_size > 1 and not enable_moe:
         raise ValueError("Gemma 4 dense checkpoints require expert_parallel_size=1.")
     if enable_moe and not int(config_get(config, "num_experts", 0) or 0):
         raise ValueError("Gemma 4 MoE requires a positive num_experts.")

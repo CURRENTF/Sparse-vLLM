@@ -24,8 +24,8 @@ class LinearBase(nn.Module):
         super().__init__()
         self.tp_dim = tp_dim
         self.parallel_context = get_parallel_context()
-        self.tp_rank = self.parallel_context.tp_rank
-        self.tp_size = self.parallel_context.tp_size
+        self.tp_rank = self.parallel_context.attn_tp_rank
+        self.tp_size = self.parallel_context.attn_tp_size
         self.quantization_config = quantization
         self.quantized = bool(getattr(quantization, "enabled", False))
         self._quantized_weight_loaded = not self.quantized
@@ -252,7 +252,7 @@ class ColumnParallelLinear(LinearBase):
         bias: bool = False,
         quantization=None,
     ):
-        tp_size = get_parallel_context().tp_size
+        tp_size = get_parallel_context().attn_tp_size
         super().__init__(input_size, divide(output_size, tp_size), bias, 0, quantization=quantization)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -402,7 +402,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         bias: bool = False,
         quantization=None,
     ):
-        tp_size = get_parallel_context().tp_size
+        tp_size = get_parallel_context().attn_tp_size
         total_num_kv_heads = total_num_kv_heads or total_num_heads
         self.head_size = head_size
         self.num_heads = divide(total_num_heads, tp_size)
@@ -487,7 +487,7 @@ class ReplicatedKVQKVParallelLinear(QKVParallelLinear):
         bias: bool = False,
         quantization=None,
     ):
-        tp_size = get_parallel_context().tp_size
+        tp_size = get_parallel_context().attn_tp_size
         if total_num_kv_heads >= tp_size:
             raise ValueError(
                 "ReplicatedKVQKVParallelLinear requires total_num_kv_heads < TP size, "
@@ -578,7 +578,7 @@ class RowParallelLinear(LinearBase):
         quantization=None,
         reduce_results: bool = True,
     ):
-        tp_size = get_parallel_context().tp_size
+        tp_size = get_parallel_context().attn_tp_size
         super().__init__(divide(input_size, tp_size), output_size, bias, 1, quantization=quantization)
         self.reduce_results = bool(reduce_results)
 
@@ -628,5 +628,5 @@ class RowParallelLinear(LinearBase):
         else:
             y = F.linear(x, self.weight, bias)
         if self.reduce_results:
-            return self.parallel_context.tp_all_reduce(y)
+            return self.parallel_context.attn_tp.all_reduce(y)
         return y

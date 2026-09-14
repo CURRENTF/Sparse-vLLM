@@ -16,8 +16,8 @@ class VocabParallelEmbedding(nn.Module):
     ):
         super().__init__()
         self.parallel_context = get_parallel_context()
-        self.tp_rank = self.parallel_context.tp_rank
-        self.tp_size = self.parallel_context.tp_size
+        self.tp_rank = self.parallel_context.attn_tp_rank
+        self.tp_size = self.parallel_context.attn_tp_size
         assert num_embeddings % self.tp_size == 0
         self.num_embeddings = num_embeddings
         self.reduce_results = bool(reduce_results)
@@ -58,7 +58,7 @@ class VocabParallelEmbedding(nn.Module):
         y = F.embedding(x, self.weight)
         if self.tp_size > 1:
             y = mask.unsqueeze(1) * y
-        return self.parallel_context.tp_all_reduce(y) if self.reduce_results else y
+        return self.parallel_context.attn_tp.all_reduce(y) if self.reduce_results else y
 
 
 class ParallelLMHead(VocabParallelEmbedding):
@@ -79,6 +79,6 @@ class ParallelLMHead(VocabParallelEmbedding):
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
-            all_logits = self.parallel_context.tp_gather(logits)
+            all_logits = self.parallel_context.attn_tp.gather(logits)
             logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
         return logits

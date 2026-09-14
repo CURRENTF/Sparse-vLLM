@@ -8,11 +8,12 @@ from sparsevllm.layers.layernorm import ColumnParallelRMSNorm
 
 class _ReferenceTpContext(SimpleNamespace):
     def __init__(self, rank, remote_square_sums):
-        super().__init__(attention_tp_rank=rank, attention_tp_size=2)
+        super().__init__(attn_tp_rank=rank, attn_tp_size=2)
+        self.attn_tp = SimpleNamespace(all_reduce=self.all_reduce)
         self.remote_square_sums = remote_square_sums
         self.all_reduce_calls = 0
 
-    def attention_tp_all_reduce(self, values):
+    def all_reduce(self, values):
         values.add_(self.remote_square_sums)
         self.all_reduce_calls += 1
         return values

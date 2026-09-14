@@ -175,8 +175,8 @@ class ColumnParallelRMSNorm(RMSNorm):
             parallel_context = get_parallel_context()
         self.parallel_context = parallel_context
         self.global_hidden_size = int(global_hidden_size)
-        self.tp_rank = int(self.parallel_context.attention_tp_rank)
-        self.tp_size = int(self.parallel_context.attention_tp_size)
+        self.tp_rank = int(self.parallel_context.attn_tp_rank)
+        self.tp_size = int(self.parallel_context.attn_tp_size)
         if self.global_hidden_size % self.tp_size:
             raise ValueError(
                 "Column-parallel RMSNorm size must be divisible by attention TP, "
@@ -211,7 +211,7 @@ class ColumnParallelRMSNorm(RMSNorm):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         square_sum = x.float().square().sum(dim=-1)
-        self.parallel_context.attention_tp_all_reduce(square_sum)
+        self.parallel_context.attn_tp.all_reduce(square_sum)
         return self._apply_global_rms(x, square_sum)
 
     def forward_pair(
@@ -229,7 +229,7 @@ class ColumnParallelRMSNorm(RMSNorm):
             )
 
             square_sums = paired_square_sums(x, other)
-            self.parallel_context.attention_tp_all_reduce(square_sums)
+            self.parallel_context.attn_tp.all_reduce(square_sums)
             return paired_rms_apply(
                 x,
                 other,
@@ -248,7 +248,7 @@ class ColumnParallelRMSNorm(RMSNorm):
             ),
             dim=-1,
         )
-        self.parallel_context.attention_tp_all_reduce(square_sums)
+        self.parallel_context.attn_tp.all_reduce(square_sums)
         return (
             self._apply_global_rms(x, square_sums[..., 0]),
             other_norm._apply_global_rms(other, square_sums[..., 1]),
