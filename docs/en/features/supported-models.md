@@ -26,8 +26,15 @@ TP is limited to sizes 1 through 8 and requires the checkpoint dimensions,
 including the attention heads and vocabulary size, to be divisible by the
 selected TP size.
 
-MoE models may combine tensor and expert parallelism internally; invalid TP/EP
-combinations are rejected during configuration.
+`tensor_parallel_size` and `data_parallel_size` describe attention: the total
+process count is `world_size = DP * TP`. `expert_parallel_size` describes routed
+expert placement within that same world; expert TP is `world_size / EP`, so EP
+must divide the world size. EP does not add processes. For example, `TP=4,
+DP=1, EP=2` uses four processes with attention TP=4 and expert TP=2.
+
+Topology validity does not imply engine support. Attention TP×DP execution is
+not yet implemented; the supported DP path requires `TP=1, EP=DP`. A former
+`TP=1, DP=1, EP>1` configuration is rejected rather than expanded automatically.
 
 Block FP8 support requires E4M3 weights, dynamic activation quantization, and
 a `128 x 128` weight block size. Llama, Qwen2, and Qwen3 dense FP8 checkpoints

@@ -86,9 +86,9 @@ class AllGatherReduceScatterMoeCommunication(MoeCommunication):
     def __init__(
         self, parallel_context: ParallelContext, *, max_rows=None, hidden_size=None, dtype=None
     ):
-        if parallel_context.attention_tp_size != 1 or parallel_context.moe_tp_size != 1:
+        if parallel_context.attn_tp_size != 1 or parallel_context.moe_tp_size != 1:
             raise ValueError("AG/RS currently requires attention TP=1 and MoE TP=1.")
-        self.group = parallel_context.expert
+        self.group = parallel_context.moe_ep
         self.max_rows = max_rows
         self.hidden_size = hidden_size
         self.dtype = dtype
@@ -163,12 +163,12 @@ class AllGatherReduceScatterMoeCommunication(MoeCommunication):
 
 
 def prepare_moe_communication(parallel_context: ParallelContext, collectives=None):
-    if parallel_context.uses_dp_attention:
+    if parallel_context.attn_dp_size > 1:
         if collectives is not None:
             return collectives.moe_transport
         return AllGatherReduceScatterMoeCommunication(parallel_context)
     return AllReduceMoeCommunication(
         collectives.moe.run
         if collectives is not None
-        else parallel_context.world_all_reduce
+        else parallel_context.world.all_reduce
     )

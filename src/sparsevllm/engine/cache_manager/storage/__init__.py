@@ -27,7 +27,7 @@ def create_attention_cache_storage(
         runtime_layout = getattr(config, "runtime_layout", None)
         parallel_topology = getattr(config, "parallel_topology", None)
         layer_shapes = (
-            runtime_layout.local_kv_shapes(parallel_topology.attention_tp_size)
+            runtime_layout.local_kv_shapes(parallel_topology.attn_tp_size)
             if runtime_layout is not None and parallel_topology is not None
             else ()
         )

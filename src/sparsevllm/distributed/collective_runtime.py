@@ -74,7 +74,7 @@ class ParallelAllReduceHandle:
         if binding is None:
             return tensor
         if get_context().is_prefill:
-            return ParallelContext._all_reduce(tensor, self._group)
+            return self._group.all_reduce(tensor)
         if binding.op is None:
             raise RuntimeError("Parallel all-reduce handle is not prepared.")
         return binding.op.run(tensor)
@@ -176,14 +176,14 @@ class ParallelCollectiveRuntime:
     ) -> DecodeParallelCollectives:
         attention = self._request_all_reduce(
             "attention",
-            self.parallel_context.attention_output_group,
+            self.parallel_context.attn_tp,
             max_rows=attention_max_rows,
             hidden_size=hidden_size,
             dtype=dtype,
         )
         moe = self._request_all_reduce(
             "moe",
-            self.parallel_context.moe_output_group,
+            self.parallel_context.world,
             max_rows=moe_max_rows,
             hidden_size=hidden_size,
             dtype=dtype,
@@ -195,7 +195,7 @@ class ParallelCollectiveRuntime:
         hidden_size, dtype, backend, num_experts, top_k,
     ):
         """Prepare transport from token ownership; models supply tensor contracts."""
-        if self.parallel_context.uses_dp_attention:
+        if self.parallel_context.attn_dp_size > 1:
             return self.request_dp_collectives(
                 max_rows=attention_max_rows,
                 max_local_tokens=max(attention_max_rows, max_local_tokens),
@@ -215,7 +215,7 @@ class ParallelCollectiveRuntime:
     ):
         if self.state is not ParallelCollectiveState.OPEN or self._moe_transport is not None:
             raise RuntimeError("DP collectives must be requested once before preparation.")
-        if not self.parallel_context.uses_dp_attention:
+        if self.parallel_context.attn_dp_size <= 1:
             raise ValueError("DP collectives require the DP attention topology.")
         if backend == "agrs":
             self._moe_transport = AllGatherReduceScatterMoeCommunication(
@@ -229,13 +229,13 @@ class ParallelCollectiveRuntime:
             from sparsevllm.operators.all2all import AllToAllOpSpec
 
             spec = AllToAllOpSpec(
-                self.parallel_context.ep_size, hidden_size, num_experts, top_k,
+                self.parallel_context.moe_ep_size, hidden_size, num_experts, top_k,
                 max_local_tokens, dtype, self.cuda_graph,
             )
             self._moe_transport = AllToAllMoeCommunication(self.parallel_context, spec)
         else:
             raise ValueError(f"Unsupported DP MoE transport: {backend}")
-        identity = ParallelAllReduceHandle(self.parallel_context.tensor)
+        identity = ParallelAllReduceHandle(self.parallel_context.attn_tp)
         return DecodeParallelCollectives(identity, identity, self._moe_transport)
 
     def prepare(self) -> None:

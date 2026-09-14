@@ -151,9 +151,10 @@ def _ep_context(ep_rank: int, ep_size: int) -> ParallelContext:
     ranks = tuple(range(ep_size))
     return ParallelContext(
         world=ParallelGroup(None, ranks, ep_rank, ep_size),
-        tensor=ParallelGroup(None, (ep_rank,), 0, 1),
-        expert=ParallelGroup(None, ranks, ep_rank, ep_size),
-        data=ParallelGroup(None, (ep_rank,), 0, 1),
+        moe_tp=ParallelGroup(None, (ep_rank,), 0, 1),
+        attn_tp=ParallelGroup(None, (ep_rank,), 0, 1),
+        moe_ep=ParallelGroup(None, ranks, ep_rank, ep_size),
+        attn_dp=ParallelGroup(None, (ep_rank,), 0, 1),
     )
 
 
@@ -161,9 +162,10 @@ def _tp_context(tp_rank: int, tp_size: int) -> ParallelContext:
     ranks = tuple(range(tp_size))
     return ParallelContext(
         world=ParallelGroup(None, ranks, tp_rank, tp_size),
-        tensor=ParallelGroup(None, ranks, tp_rank, tp_size),
-        expert=ParallelGroup(None, (tp_rank,), 0, 1),
-        data=ParallelGroup(None, (tp_rank,), 0, 1),
+        moe_tp=ParallelGroup(None, ranks, tp_rank, tp_size),
+        attn_tp=ParallelGroup(None, ranks, tp_rank, tp_size),
+        moe_ep=ParallelGroup(None, (tp_rank,), 0, 1),
+        attn_dp=ParallelGroup(None, (tp_rank,), 0, 1),
     )
 
 

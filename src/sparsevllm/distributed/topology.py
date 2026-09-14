@@ -1,192 +1,73 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
-
-
-class ParallelMode(str, Enum):
-    STANDARD = "standard"
-    OUTER_TP_MOE = "outer_tp_moe_tp_ep"
-    DP_ATTENTION = "dp_attention"
 
 
 @dataclass(frozen=True)
 class ParallelTopology:
-    tensor_parallel_size: int
-    expert_parallel_size: int
-    data_parallel_size: int
-    mode: ParallelMode = ParallelMode.STANDARD
+    """Two factorizations of one world: attention DP x TP and MoE EP x TP."""
+
+    attn_tp_size: int
+    moe_ep_size: int
+    attn_dp_size: int
 
     def __post_init__(self) -> None:
-        for field in (
-            "tensor_parallel_size",
-            "expert_parallel_size",
-            "data_parallel_size",
+        sizes = (self.attn_tp_size, self.moe_ep_size, self.attn_dp_size)
+        if any(
+            not isinstance(size, int) or isinstance(size, bool) or size <= 0
+            for size in sizes
         ):
-            object.__setattr__(self, field, int(getattr(self, field)))
-        object.__setattr__(self, "mode", ParallelMode(self.mode))
-        sizes = (
-            self.tensor_parallel_size,
-            self.expert_parallel_size,
-            self.data_parallel_size,
-        )
-        if any(size <= 0 for size in sizes):
+            raise ValueError("Parallel sizes must be positive integers.")
+        if self.world_size % self.moe_ep_size:
             raise ValueError(
-                "Parallel sizes must be positive, "
-                f"got TP={sizes[0]}, EP={sizes[1]}, DP={sizes[2]}."
+                f"World size DP*TP={self.world_size} must be divisible by "
+                f"MoE EP={self.moe_ep_size}."
             )
-        if self.mode is ParallelMode.DP_ATTENTION:
-            if self.tensor_parallel_size != 1 or self.expert_parallel_size != self.data_parallel_size:
-                raise ValueError("DP attention requires TP=1 and EP=DP.")
-        if self.mode is ParallelMode.OUTER_TP_MOE:
-            if self.data_parallel_size != 1:
-                raise ValueError(
-                    "Outer-TP MoE parallelism requires DP=1, "
-                    f"got DP={self.data_parallel_size}."
-                )
-            if self.tensor_parallel_size % self.expert_parallel_size:
-                raise ValueError(
-                    "Outer-TP MoE requires TP divisible by EP, "
-                    f"got TP={self.tensor_parallel_size}, EP={self.expert_parallel_size}."
-                )
-
-    @property
-    def is_outer_tp_moe(self) -> bool:
-        return self.mode is ParallelMode.OUTER_TP_MOE
-
-    @property
-    def attention_tp_size(self) -> int:
-        return self.tensor_parallel_size
-
-    @property
-    def moe_tp_size(self) -> int:
-        return (
-            self.tensor_parallel_size // self.expert_parallel_size
-            if self.is_outer_tp_moe
-            else self.tensor_parallel_size
-        )
 
     @property
     def world_size(self) -> int:
-        if self.mode is ParallelMode.DP_ATTENTION:
-            return self.data_parallel_size
-        return (
-            self.tensor_parallel_size
-            if self.is_outer_tp_moe
-            else self.tensor_parallel_size
-            * self.expert_parallel_size
-            * self.data_parallel_size
-        )
+        return self.attn_dp_size * self.attn_tp_size
 
+    @property
+    def moe_tp_size(self) -> int:
+        return self.world_size // self.moe_ep_size
 
-def world_rank_from_parallel_ranks(
-    topology: ParallelTopology,
-    dp_rank: int,
-    ep_rank: int,
-    tp_rank: int,
-) -> int:
-    if topology.is_outer_tp_moe:
-        raise ValueError("Outer-TP MoE does not use standard DP/EP/TP rank mapping.")
-    dp_rank, ep_rank, tp_rank = int(dp_rank), int(ep_rank), int(tp_rank)
-    for name, rank, size in (
-        ("dp_rank", dp_rank, topology.data_parallel_size),
-        ("ep_rank", ep_rank, topology.expert_parallel_size),
-        ("tp_rank", tp_rank, topology.tensor_parallel_size),
-    ):
-        if not 0 <= rank < size:
-            raise ValueError(f"{name} must be in [0, {size}), got {rank}.")
-    if topology.mode is ParallelMode.DP_ATTENTION:
-        if dp_rank != ep_rank:
-            raise ValueError("DP attention shares the data and expert rank axis.")
-        return dp_rank
-    return (
-        (dp_rank * topology.expert_parallel_size + ep_rank)
-        * topology.tensor_parallel_size
-        + tp_rank
-    )
+    def attn_ranks(self, world_rank: int) -> tuple[int, int]:
+        """Return (attention DP rank, attention TP rank)."""
+        self._validate_world_rank(world_rank)
+        return divmod(world_rank, self.attn_tp_size)
 
+    def moe_ranks(self, world_rank: int) -> tuple[int, int]:
+        """Return (MoE EP rank, MoE TP rank)."""
+        self._validate_world_rank(world_rank)
+        return divmod(world_rank, self.moe_tp_size)
 
-def parallel_ranks_from_world_rank(
-    topology: ParallelTopology,
-    world_rank: int,
-) -> tuple[int, int, int]:
-    if topology.is_outer_tp_moe:
-        raise ValueError("Outer-TP MoE does not use standard DP/EP/TP rank mapping.")
-    world_rank = int(world_rank)
-    if not 0 <= world_rank < topology.world_size:
-        raise ValueError(
-            f"world_rank must be in [0, {topology.world_size}), got {world_rank}."
-        )
-    if topology.mode is ParallelMode.DP_ATTENTION:
-        return world_rank, world_rank, 0
-    dp_ep_rank, tp_rank = divmod(world_rank, topology.tensor_parallel_size)
-    dp_rank, ep_rank = divmod(dp_ep_rank, topology.expert_parallel_size)
-    return dp_rank, ep_rank, tp_rank
-
-
-def _standard_group_ranks(
-    topology: ParallelTopology,
-) -> dict[str, tuple[tuple[int, ...], ...]]:
-    tp_size = topology.tensor_parallel_size
-    ep_size = topology.expert_parallel_size
-    dp_size = topology.data_parallel_size
-
-    def world_rank(dp_rank: int, ep_rank: int, tp_rank: int) -> int:
-        return world_rank_from_parallel_ranks(topology, dp_rank, ep_rank, tp_rank)
-
-    tensor_groups = tuple(
-        tuple(world_rank(dp_rank, ep_rank, tp_rank) for tp_rank in range(tp_size))
-        for dp_rank in range(dp_size)
-        for ep_rank in range(ep_size)
-    )
-    return {
-        "tensor": tensor_groups,
-        "expert": tuple(
-            tuple(world_rank(dp_rank, ep_rank, tp_rank) for ep_rank in range(ep_size))
-            for dp_rank in range(dp_size)
-            for tp_rank in range(tp_size)
-        ),
-        "data": tuple(
-            tuple(world_rank(dp_rank, ep_rank, tp_rank) for dp_rank in range(dp_size))
-            for ep_rank in range(ep_size)
-            for tp_rank in range(tp_size)
-        ),
-        "moe_tensor": tensor_groups,
-    }
-
-
-def _outer_tp_moe_group_ranks(
-    topology: ParallelTopology,
-) -> dict[str, tuple[tuple[int, ...], ...]]:
-    outer_tp_size = topology.attention_tp_size
-    moe_ep_size = topology.expert_parallel_size
-    moe_tp_size = topology.moe_tp_size
-    return {
-        "tensor": (tuple(range(outer_tp_size)),),
-        "expert": tuple(
-            tuple(
-                ep_rank * moe_tp_size + moe_tp_rank
-                for ep_rank in range(moe_ep_size)
+    def _validate_world_rank(self, world_rank: int) -> None:
+        if not 0 <= world_rank < self.world_size:
+            raise ValueError(
+                f"world_rank must be in [0, {self.world_size}), got {world_rank}."
             )
-            for moe_tp_rank in range(moe_tp_size)
-        ),
-        "data": tuple((rank,) for rank in range(outer_tp_size)),
-        "moe_tensor": tuple(
-            tuple(range(ep_rank * moe_tp_size, (ep_rank + 1) * moe_tp_size))
-            for ep_rank in range(moe_ep_size)
-        ),
-    }
 
 
 def parallel_group_ranks(
     topology: ParallelTopology,
 ) -> dict[str, tuple[tuple[int, ...], ...]]:
-    if topology.mode is ParallelMode.DP_ATTENTION:
-        singleton = tuple((rank,) for rank in range(topology.world_size))
-        world = (tuple(range(topology.world_size)),)
-        return {"tensor": singleton, "expert": world, "data": world, "moe_tensor": singleton}
-    return (
-        _outer_tp_moe_group_ranks(topology)
-        if topology.is_outer_tp_moe
-        else _standard_group_ranks(topology)
-    )
+    world_size = topology.world_size
+    attn_tp = topology.attn_tp_size
+    moe_tp = topology.moe_tp_size
+    return {
+        "attn_tp": tuple(
+            tuple(range(start, start + attn_tp))
+            for start in range(0, world_size, attn_tp)
+        ),
+        "attn_dp": tuple(
+            tuple(range(offset, world_size, attn_tp)) for offset in range(attn_tp)
+        ),
+        "moe_tp": tuple(
+            tuple(range(start, start + moe_tp))
+            for start in range(0, world_size, moe_tp)
+        ),
+        "moe_ep": tuple(
+            tuple(range(offset, world_size, moe_tp)) for offset in range(moe_tp)
+        ),
+    }

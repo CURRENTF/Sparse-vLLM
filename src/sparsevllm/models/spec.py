@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from sparsevllm.distributed.sharding import validate_model_sharding, validate_top_k
-from sparsevllm.distributed.topology import ParallelMode, ParallelTopology
+from sparsevllm.distributed.topology import ParallelTopology
 from sparsevllm.utils.config import config_get
 
 
@@ -18,8 +18,6 @@ class ModelSpec:
     supports_quantized_tiny_random: bool = False
     tiny_random_requires_standard_head_shape: bool = True
     supports_expert_parallel: bool = False
-    supports_outer_tp_moe: bool = False
-    outer_tp_moe_config_field: str | None = None
     supports_data_parallel: bool = False
     prefix_cache_block_size_multiple: int | None = None
     deltakv_checkpoint_model_types: frozenset[str] = frozenset()
@@ -30,40 +28,27 @@ class ModelSpec:
     moe_tp_fields: tuple[str, ...] = ()
     top_k_field: str | None = None
 
-    def topology(
-        self,
-        tp_size: int,
-        ep_size: int,
-        dp_size: int,
-        hf_config: Any | None = None,
-    ) -> ParallelTopology:
-        use_outer_tp_moe = self.supports_outer_tp_moe and (
-            self.outer_tp_moe_config_field is None
-            or bool(config_get(hf_config, self.outer_tp_moe_config_field, False))
-        )
-        topology = ParallelTopology(
-            int(tp_size),
-            int(ep_size),
-            int(dp_size),
-            (
-                ParallelMode.DP_ATTENTION
-                if self.supports_data_parallel and int(dp_size) > 1
-                else ParallelMode.OUTER_TP_MOE
-                if use_outer_tp_moe and int(tp_size) > 1
-                else ParallelMode.STANDARD
-            ),
-        )
-        if topology.expert_parallel_size > 1 and not self.supports_expert_parallel:
+    def validate_parallel_execution(self, topology: ParallelTopology) -> None:
+        """Reject unimplemented execution paths without changing topology semantics."""
+        if topology.moe_ep_size > 1 and not self.supports_expert_parallel:
             raise ValueError(
                 f"{self.name} does not support expert parallelism, "
-                f"got EP={topology.expert_parallel_size}."
+                f"got EP={topology.moe_ep_size}."
             )
-        if topology.data_parallel_size > 1 and not self.supports_data_parallel:
+        if topology.attn_dp_size > 1 and not self.supports_data_parallel:
             raise ValueError(
                 f"{self.name} does not support data parallelism, "
-                f"got DP={topology.data_parallel_size}."
+                f"got DP={topology.attn_dp_size}."
             )
-        return topology
+        if topology.attn_dp_size > 1 and (
+            topology.attn_tp_size != 1 or topology.moe_tp_size != 1
+        ):
+            raise ValueError(
+                "The engine currently supports DP attention only with "
+                "attention TP=1 and MoE TP=1 (EP=DP); "
+                f"got attention DP={topology.attn_dp_size}, TP={topology.attn_tp_size}, "
+                f"MoE EP={topology.moe_ep_size}, TP={topology.moe_tp_size}."
+            )
 
     def validate_sharding(self, hf_config: Any, topology: ParallelTopology) -> None:
         raw_num_experts = (
@@ -139,7 +124,6 @@ MODEL_SPECS.update(
         "qwen3_moe": ModelSpec(
             "Qwen3MoE",
             supports_expert_parallel=True,
-            supports_outer_tp_moe=True,
             runtime_class_name="Qwen3MoeForCausalLM",
             attention_tp_fields=_MOE_TP_FIELDS,
             num_experts_field="num_experts",
@@ -152,7 +136,6 @@ MODEL_SPECS.update(
             allow_raw_config=True,
             supports_tiny_random=False,
             supports_expert_parallel=True,
-            supports_outer_tp_moe=True,
             prefix_cache_block_size_multiple=4096,
             deltakv_checkpoint_model_types=frozenset({"qwen3_5"}),
             runtime_class_name="Qwen35MoeForCausalLM",
@@ -170,7 +153,6 @@ MODEL_SPECS.update(
             supports_quantized_tiny_random=True,
             tiny_random_requires_standard_head_shape=False,
             supports_expert_parallel=True,
-            supports_outer_tp_moe=True,
             runtime_class_name="MiniMaxM2ForCausalLM",
             attention_tp_fields=_MOE_TP_FIELDS,
             num_experts_field="num_local_experts",
@@ -181,13 +163,12 @@ MODEL_SPECS.update(
             "GLM-4.7-Flash",
             tiny_random_requires_standard_head_shape=False,
             supports_expert_parallel=True,
-            supports_outer_tp_moe=True,
             supports_data_parallel=True,
             runtime_class_name="Glm4MoeLiteForCausalLM",
             attention_cache_layout="mla_latent",
-            attention_tp_fields=("num_attention_heads", "vocab_size"),
+            attention_tp_fields=("num_attention_heads", "vocab_size", "intermediate_size"),
             num_experts_field="n_routed_experts",
-            moe_tp_fields=("intermediate_size", "moe_intermediate_size"),
+            moe_tp_fields=("moe_intermediate_size",),
             top_k_field="num_experts_per_tok",
         ),
         "gemma4": ModelSpec(
@@ -195,8 +176,6 @@ MODEL_SPECS.update(
             allow_raw_config=True,
             supports_tiny_random=False,
             supports_expert_parallel=True,
-            supports_outer_tp_moe=True,
-            outer_tp_moe_config_field="enable_moe_block",
             runtime_class_name="Gemma4ForCausalLM",
             attention_tp_fields=(
                 "num_attention_heads",

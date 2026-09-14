@@ -79,10 +79,10 @@ def test_model_runner_gathers_one_debug_summary_per_world_rank():
     )
     runner.parallel_context = ParallelContext(
         world=world_group,
-        tensor=singleton_group,
-        expert=world_group,
-        data=singleton_group,
-        moe_tensor=singleton_group,
+        attn_tp=singleton_group,
+        moe_ep=world_group,
+        attn_dp=singleton_group,
+        moe_tp=singleton_group,
     )
     runner.sparse_controller = SimpleNamespace(
         debug_state_summary=lambda: {"sparse_method": "", "layers": {}}
@@ -149,9 +149,10 @@ def test_tp_debug_replica_consistency_marks_vocab_sharded_logits_not_applicable(
     runner.world_size = 2
     runner.parallel_context = ParallelContext(
         world=ParallelGroup(process_group=object(), ranks=(0, 1), rank=1, size=2),
-        tensor=ParallelGroup(process_group=object(), ranks=(0, 1), rank=1, size=2),
-        expert=ParallelGroup(process_group=None, ranks=(1,), rank=0, size=1),
-        data=ParallelGroup(process_group=None, ranks=(1,), rank=0, size=1),
+        moe_tp=ParallelGroup(process_group=object(), ranks=(0, 1), rank=1, size=2),
+        attn_tp=ParallelGroup(process_group=object(), ranks=(0, 1), rank=1, size=2),
+        moe_ep=ParallelGroup(process_group=None, ranks=(1,), rank=0, size=1),
+        attn_dp=ParallelGroup(process_group=None, ranks=(1,), rank=0, size=1),
     )
     runner.model = SimpleNamespace(model=SimpleNamespace(layers=()))
 

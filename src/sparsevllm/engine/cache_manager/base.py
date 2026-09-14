@@ -334,12 +334,12 @@ class CacheManager(ABC):
         self.parallel_context = parallel_context
         self.rank = parallel_context.world_rank
         self.world_size = parallel_context.world_size
-        self.tp_rank = parallel_context.tp_rank
-        self.tp_size = parallel_context.tp_size
-        self.ep_rank = parallel_context.ep_rank
-        self.ep_size = parallel_context.ep_size
-        self.dp_rank = parallel_context.dp_rank
-        self.dp_size = parallel_context.dp_size
+        self.tp_rank = parallel_context.attn_tp_rank
+        self.tp_size = parallel_context.attn_tp_size
+        self.ep_rank = parallel_context.moe_ep_rank
+        self.ep_size = parallel_context.moe_ep_size
+        self.dp_rank = parallel_context.attn_dp_rank
+        self.dp_size = parallel_context.attn_dp_size
         self.platform = platforms.current_platform
         self.device = self.platform.get_device(self.rank)
         self.hf_config = config.hf_config
@@ -407,7 +407,7 @@ class CacheManager(ABC):
         local_plan: dict[str, object],
     ) -> None:
         if (int(getattr(self, "world_size", 1)) <= 1
-                or self.parallel_context.uses_dp_attention):
+                or (self.parallel_context.attn_dp_size > 1)):
             return
         plans: list[dict[str, object] | None] = [None] * self.world_size
         dist.all_gather_object(
@@ -1855,7 +1855,7 @@ class CacheManager(ABC):
             attention_tp_size = int(
                 getattr(
                     getattr(self, "parallel_context", None),
-                    "attention_tp_size",
+                    "attn_tp_size",
                     getattr(self, "tp_size", 1),
                 )
             )

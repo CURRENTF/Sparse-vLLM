@@ -98,9 +98,10 @@ def _ep_context(ep_rank: int, ep_size: int) -> ParallelContext:
     ranks = tuple(range(ep_size))
     return ParallelContext(
         world=ParallelGroup(None, ranks, ep_rank, ep_size),
-        tensor=ParallelGroup(None, (ep_rank,), 0, 1),
-        expert=ParallelGroup(None, ranks, ep_rank, ep_size),
-        data=ParallelGroup(None, (ep_rank,), 0, 1),
+        moe_tp=ParallelGroup(None, (ep_rank,), 0, 1),
+        attn_tp=ParallelGroup(None, (ep_rank,), 0, 1),
+        moe_ep=ParallelGroup(None, ranks, ep_rank, ep_size),
+        attn_dp=ParallelGroup(None, (ep_rank,), 0, 1),
     )
 
 
@@ -108,9 +109,10 @@ def _tp_context(tp_rank: int, tp_size: int) -> ParallelContext:
     ranks = tuple(range(tp_size))
     return ParallelContext(
         world=ParallelGroup(None, ranks, tp_rank, tp_size),
-        tensor=ParallelGroup(None, ranks, tp_rank, tp_size),
-        expert=ParallelGroup(None, (tp_rank,), 0, 1),
-        data=ParallelGroup(None, (tp_rank,), 0, 1),
+        moe_tp=ParallelGroup(None, ranks, tp_rank, tp_size),
+        attn_tp=ParallelGroup(None, ranks, tp_rank, tp_size),
+        moe_ep=ParallelGroup(None, (tp_rank,), 0, 1),
+        attn_dp=ParallelGroup(None, (tp_rank,), 0, 1),
     )
 
 
@@ -120,12 +122,12 @@ def _hybrid_context(world_rank: int) -> ParallelContext:
     moe_ep_ranks = (0, 2) if world_rank % 2 == 0 else (1, 3)
     return ParallelContext(
         world=ParallelGroup(None, ranks, world_rank, 4),
-        tensor=ParallelGroup(None, ranks, world_rank, 4),
-        expert=ParallelGroup(
+        attn_tp=ParallelGroup(None, ranks, world_rank, 4),
+        moe_ep=ParallelGroup(
             None, moe_ep_ranks, moe_ep_ranks.index(world_rank), 2
         ),
-        data=ParallelGroup(None, (world_rank,), 0, 1),
-        moe_tensor=ParallelGroup(
+        attn_dp=ParallelGroup(None, (world_rank,), 0, 1),
+        moe_tp=ParallelGroup(
             None, moe_tp_ranks, moe_tp_ranks.index(world_rank), 2
         ),
     )
@@ -586,42 +588,6 @@ def test_moe_chunking_does_not_concatenate_debug_metadata_when_disabled():
     assert cat.call_count == 1
 
 
-def test_decoder_layer_broadcasts_attention_output_before_post_norm():
-    config = _config()
-    context = _ep_context(0, 2)
-    model = _instantiate_model(config, context)
-    layer = model.model.layers[0]
-    hidden_states = torch.randn(3, config.hidden_size)
-    residual = torch.randn_like(hidden_states)
-    calls = []
-
-    with (
-        patch.object(
-            layer.input_layernorm,
-            "forward",
-            return_value=(hidden_states, residual),
-        ),
-        patch.object(layer.self_attn, "forward", return_value=hidden_states),
-        patch.object(
-            ParallelContext,
-            "ep_broadcast",
-            side_effect=lambda state, **_: calls.append(("broadcast", state.shape)),
-        ),
-        patch.object(
-            layer.post_attention_layernorm,
-            "forward",
-            side_effect=lambda state, res: (
-                calls.append(("post_norm", state.shape)) or (state, res)
-            ),
-        ),
-        patch.object(layer.mlp, "forward", return_value=hidden_states),
-    ):
-        layer(torch.arange(3), hidden_states, residual)
-
-    assert calls == [
-        ("broadcast", hidden_states.shape),
-        ("post_norm", hidden_states.shape),
-    ]
 
 
 def test_moe_warmup_uses_requested_tokens_and_balanced_local_assignments():
@@ -812,8 +778,8 @@ def test_moe_block_reduces_hybrid_partial_output_over_outer_world():
         ),
         patch.object(block.experts, "forward", return_value=local_output),
         patch.object(
-            ParallelContext,
-            "world_all_reduce",
+            ParallelGroup,
+            "all_reduce",
             return_value=local_output,
         ) as reduce,
     ):

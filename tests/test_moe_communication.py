@@ -15,25 +15,25 @@ from sparsevllm.distributed.parallel_context import (
     init_parallel_context,
     reset_parallel_context,
 )
-from sparsevllm.distributed.topology import ParallelMode, parallel_group_ranks
+from sparsevllm.distributed.topology import parallel_group_ranks
 
 
 def test_dp_attention_groups_share_experts_without_replicating_attention():
-    topology = ParallelTopology(1, 4, 4, ParallelMode.DP_ATTENTION)
+    topology = ParallelTopology(1, 4, 4)
     groups = parallel_group_ranks(topology)
     assert topology.world_size == 4
-    assert all(len(group) == 1 for group in groups["tensor"])
-    assert groups["expert"] == groups["data"]
-    assert set(groups["expert"][0]) == set(range(topology.world_size))
-    with pytest.raises(ValueError, match="EP=DP"):
-        ParallelTopology(1, 2, 4, ParallelMode.DP_ATTENTION)
+    assert all(len(group) == 1 for group in groups["attn_tp"])
+    assert groups["moe_ep"] == groups["attn_dp"]
+    assert set(groups["moe_ep"][0]) == set(range(topology.world_size))
+    topology = ParallelTopology(1, 2, 4)
+    assert topology.moe_tp_size == 2
 
 
 def _agrs_worker(rank, rendezvous):
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", init_method=rendezvous, rank=rank, world_size=2)
     parallel = init_parallel_context(
-        topology=ParallelTopology(1, 2, 2, ParallelMode.DP_ATTENTION)
+        topology=ParallelTopology(1, 2, 2)
     )
     communication = AllGatherReduceScatterMoeCommunication(parallel)
     try:
@@ -109,7 +109,7 @@ def _prepared_agrs_worker(
         "nccl", init_method=rendezvous, rank=rank, world_size=world_size
     )
     parallel = init_parallel_context(
-        topology=ParallelTopology(1, world_size, world_size, ParallelMode.DP_ATTENTION)
+        topology=ParallelTopology(1, world_size, world_size)
     )
     runtime = ParallelCollectiveRuntime(parallel, cuda_graph=True, device_index=rank)
     collectives = runtime.request_moe_collectives(

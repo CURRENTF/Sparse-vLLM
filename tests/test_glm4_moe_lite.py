@@ -26,7 +26,6 @@ from sparsevllm.engine.model_runner import ModelRunner
 from sparsevllm.layers.rotary_embedding import apply_interleaved_rotary_emb
 from sparsevllm.models.glm4_moe_lite import (
     Glm4MoeLiteAttention,
-    Glm4MoeLiteDecoderLayer,
     Glm4MoeLiteForCausalLM,
     Glm4MoeLiteRouter,
     Glm4MoeLiteSparseMoeBlock,
@@ -80,9 +79,10 @@ def _tp_context(tp_rank: int = 0, tp_size: int = 1) -> ParallelContext:
     ranks = tuple(range(tp_size))
     return ParallelContext(
         world=ParallelGroup(None, ranks, tp_rank, tp_size),
-        tensor=ParallelGroup(None, ranks, tp_rank, tp_size),
-        expert=ParallelGroup(None, (tp_rank,), 0, 1),
-        data=ParallelGroup(None, (tp_rank,), 0, 1),
+        moe_tp=ParallelGroup(None, ranks, tp_rank, tp_size),
+        attn_tp=ParallelGroup(None, ranks, tp_rank, tp_size),
+        moe_ep=ParallelGroup(None, (tp_rank,), 0, 1),
+        attn_dp=ParallelGroup(None, (tp_rank,), 0, 1),
     )
 
 
@@ -90,9 +90,10 @@ def _ep_context(ep_rank: int = 0, ep_size: int = 1) -> ParallelContext:
     ranks = tuple(range(ep_size))
     return ParallelContext(
         world=ParallelGroup(object(), ranks, ep_rank, ep_size),
-        tensor=ParallelGroup(None, (ep_rank,), 0, 1),
-        expert=ParallelGroup(object(), ranks, ep_rank, ep_size),
-        data=ParallelGroup(None, (ep_rank,), 0, 1),
+        moe_tp=ParallelGroup(None, (ep_rank,), 0, 1),
+        attn_tp=ParallelGroup(None, (ep_rank,), 0, 1),
+        moe_ep=ParallelGroup(object(), ranks, ep_rank, ep_size),
+        attn_dp=ParallelGroup(None, (ep_rank,), 0, 1),
     )
 
 
@@ -517,12 +518,12 @@ def test_glm_ep_loader_keeps_only_local_experts(
 
 
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
-def test_glm_sparse_moe_reduces_pure_ep_over_world(ep_size: int) -> None:
+def test_glm_sparse_moe_reduces_routed_and_shared_partials_over_world(ep_size: int) -> None:
     context = _ep_context(ep_rank=0, ep_size=ep_size)
     block = object.__new__(Glm4MoeLiteSparseMoeBlock)
     nn.Module.__init__(block)
     block.parallel_context = context
-    block.moe_communication = AllReduceMoeCommunication(context.world_all_reduce)
+    block.moe_communication = AllReduceMoeCommunication(context.world.all_reduce)
     block.parallel_collectives = None
     block.mlp_chunk_size = 8
     block.shared_experts = nn.Identity()
@@ -548,15 +549,15 @@ def test_glm_sparse_moe_reduces_pure_tp_over_world(
     moe_tp_process_group = object()
     context = ParallelContext(
         world=ParallelGroup(moe_tp_process_group, (0, 1), 0, 2),
-        tensor=ParallelGroup(moe_tp_process_group, (0, 1), 0, 2),
-        expert=ParallelGroup(object(), (0,), 0, 1),
-        data=ParallelGroup(object(), (0,), 0, 1),
-        moe_tensor=ParallelGroup(moe_tp_process_group, (0, 1), 0, 2),
+        attn_tp=ParallelGroup(moe_tp_process_group, (0, 1), 0, 2),
+        moe_ep=ParallelGroup(object(), (0,), 0, 1),
+        attn_dp=ParallelGroup(object(), (0,), 0, 1),
+        moe_tp=ParallelGroup(moe_tp_process_group, (0, 1), 0, 2),
     )
     block = object.__new__(Glm4MoeLiteSparseMoeBlock)
     nn.Module.__init__(block)
     block.parallel_context = context
-    block.moe_communication = AllReduceMoeCommunication(context.world_all_reduce)
+    block.moe_communication = AllReduceMoeCommunication(context.world.all_reduce)
     block.parallel_collectives = None
     block.mlp_chunk_size = 8
     block.shared_experts = nn.Identity()
@@ -585,7 +586,7 @@ def test_glm_tp1_prefill_uses_fused_routed_and_shared_path() -> None:
     block = object.__new__(Glm4MoeLiteSparseMoeBlock)
     nn.Module.__init__(block)
     block.parallel_context = context
-    block.moe_communication = AllReduceMoeCommunication(context.world_all_reduce)
+    block.moe_communication = AllReduceMoeCommunication(context.world.all_reduce)
     block.parallel_collectives = None
     block.mlp_chunk_size = 8
     block.experts = SimpleNamespace(
@@ -613,15 +614,15 @@ def test_glm_sparse_moe_reduces_hybrid_tp_ep_shards_over_outer_world() -> None:
     world_process_group = object()
     context = ParallelContext(
         world=ParallelGroup(world_process_group, (0, 1, 2, 3), 0, 4),
-        tensor=ParallelGroup(world_process_group, (0, 1, 2, 3), 0, 4),
-        expert=ParallelGroup(object(), (0, 2), 0, 2),
-        data=ParallelGroup(None, (0,), 0, 1),
-        moe_tensor=ParallelGroup(object(), (0, 1), 0, 2),
+        attn_tp=ParallelGroup(world_process_group, (0, 1, 2, 3), 0, 4),
+        moe_ep=ParallelGroup(object(), (0, 2), 0, 2),
+        attn_dp=ParallelGroup(None, (0,), 0, 1),
+        moe_tp=ParallelGroup(object(), (0, 1), 0, 2),
     )
     block = object.__new__(Glm4MoeLiteSparseMoeBlock)
     nn.Module.__init__(block)
     block.parallel_context = context
-    block.moe_communication = AllReduceMoeCommunication(context.world_all_reduce)
+    block.moe_communication = AllReduceMoeCommunication(context.world.all_reduce)
     block.parallel_collectives = None
     block.mlp_chunk_size = 8
     block.shared_experts = nn.Identity()
@@ -640,10 +641,10 @@ def test_glm_hybrid_tp_ep_shared_expert_defers_reduction_to_moe_block() -> None:
     world_process_group = object()
     context = ParallelContext(
         world=ParallelGroup(world_process_group, (0, 1), 0, 2),
-        tensor=ParallelGroup(world_process_group, (0, 1), 0, 2),
-        expert=ParallelGroup(world_process_group, (0, 1), 0, 2),
-        data=ParallelGroup(None, (0,), 0, 1),
-        moe_tensor=ParallelGroup(None, (0,), 0, 1),
+        attn_tp=ParallelGroup(world_process_group, (0, 1), 0, 2),
+        moe_ep=ParallelGroup(world_process_group, (0, 1), 0, 2),
+        attn_dp=ParallelGroup(None, (0,), 0, 1),
+        moe_tp=ParallelGroup(None, (0,), 0, 1),
     )
     config = _config()
     with _construction_context(context):
@@ -738,12 +739,11 @@ def test_glm_moe_debug_contract_populates_model_runner_summaries(reduced_scale) 
         "data_parallel_size": 1,
         "world_size": 1,
     }
-    assert summary["parallel"]["effective"]["expert"] == {
+    assert summary["parallel"]["effective"]["moe_ep"] == {
         "rank": 0,
         "size": 1,
         "ranks": [0],
     }
-    assert summary["parallel"]["attention_replicated_for_ep"] is False
 
     cpu_states = runner.debug_moe_states_cpu()
     assert cpu_states is not None
@@ -753,71 +753,3 @@ def test_glm_moe_debug_contract_populates_model_runner_summaries(reduced_scale) 
     assert consistency is not None
     assert set(consistency["moe_layers"]) == {"1"}
     assert consistency["moe_layers"]["1"]["topk_ids_mismatch"] is False
-
-
-@pytest.mark.parametrize("ep_size", [1, 2, 4])
-def test_glm_decoder_syncs_replicated_attention_before_post_norm(
-    ep_size: int,
-) -> None:
-    calls: list[str] = []
-    context = _ep_context(ep_rank=0, ep_size=ep_size)
-    layer = object.__new__(Glm4MoeLiteDecoderLayer)
-    nn.Module.__init__(layer)
-    layer.parallel_context = context
-    layer.parallel_collectives = None
-
-    class _InputNorm(nn.Module):
-        def forward(self, hidden_states, residual):
-            calls.append("input_norm")
-            return hidden_states + 1, residual
-
-    class _Attention(nn.Module):
-        def forward(self, positions, hidden_states, rotary_emb):
-            del positions, rotary_emb
-            calls.append("attention")
-            return hidden_states + 2
-
-    class _PostNorm(nn.Module):
-        def forward(self, hidden_states, residual):
-            calls.append("post_norm")
-            return hidden_states + 3, residual
-
-    class _Mlp(nn.Module):
-        def forward(self, hidden_states):
-            calls.append("mlp")
-            return hidden_states + 4
-
-    layer.input_layernorm = _InputNorm()
-    layer.self_attn = _Attention()
-    layer.post_attention_layernorm = _PostNorm()
-    layer.mlp = _Mlp()
-    hidden_states = torch.zeros((1, 4))
-    residual = torch.ones((1, 4))
-
-    def record_broadcast(*args, **kwargs):
-        calls.append("broadcast")
-
-    with patch.object(dist, "broadcast", side_effect=record_broadcast) as broadcast:
-        output, actual_residual = layer(
-            torch.zeros((1,), dtype=torch.long),
-            hidden_states,
-            residual,
-            object(),
-        )
-
-    torch.testing.assert_close(output, torch.full_like(output, 10))
-    assert actual_residual is residual
-    if ep_size == 1:
-        assert calls == ["input_norm", "attention", "post_norm", "mlp"]
-        broadcast.assert_not_called()
-    else:
-        assert calls == [
-            "input_norm",
-            "attention",
-            "broadcast",
-            "post_norm",
-            "mlp",
-        ]
-        broadcast.assert_called_once()
-        assert broadcast.call_args.kwargs["src"] == context.expert.ranks[0]
-        assert broadcast.call_args.kwargs["group"] is context.expert.process_group

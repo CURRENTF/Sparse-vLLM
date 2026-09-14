@@ -160,7 +160,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 else int(local_hit_count.item())
             )
 
-        output = self.parallel_context.world_all_reduce(local_output)
+        output = self.parallel_context.world.all_reduce(local_output)
         if debug_enabled:
             self.debug_last_output = output.detach().clone()
         return output
@@ -184,11 +184,6 @@ class Qwen3MoeDecoderLayer(Qwen3DecoderLayerBase):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)
 
-        if self.parallel_context.tp_size == 1 and self.parallel_context.ep_size > 1:
-            # The incoming residual is already replicated, so syncing attention
-            # output before RMSNorm preserves the old post-norm state with half
-            # the broadcast payload.
-            self.parallel_context.ep_broadcast(hidden_states, src_ep_rank=0)
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
@@ -221,7 +216,7 @@ class Qwen3MoeForCausalLM(nn.Module):
             "full_attention_provider": build_mha_full_attention_provider(
                 config,
                 sparse_method=engine_config.sparse_method,
-                attention_tp_size=parallel_context.attention_tp_size,
+                attention_tp_size=parallel_context.attn_tp_size,
                 device=device,
                 max_batch_size=engine_config.max_decoding_seqs,
                 cuda_graph=engine_config.decode_graph,
@@ -488,8 +483,8 @@ class Qwen3MoeForCausalLM(nn.Module):
             "[{}, {}) across {} layers; intentionally skipped {} remote expert tensors.",
             self.parallel_context.world_rank,
             self.model.layers[0].mlp.experts.provider.name,
-            self.parallel_context.tp_rank,
-            self.parallel_context.tp_size,
+            self.parallel_context.attn_tp_rank,
+            self.parallel_context.attn_tp_size,
             self.parallel_context.moe_tp_rank,
             self.parallel_context.moe_tp_size,
             self.model.layers[0].mlp.experts.local_expert_start,

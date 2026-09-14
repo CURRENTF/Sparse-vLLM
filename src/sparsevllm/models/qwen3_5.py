@@ -97,7 +97,7 @@ class Qwen35QKVGatedParallelLinear(ColumnParallelLinear):
         bias: bool = False,
         quantization=None,
     ) -> None:
-        tp_size = get_parallel_context().tp_size
+        tp_size = get_parallel_context().attn_tp_size
         self.head_size = int(head_size)
         self.total_num_heads = int(total_num_heads)
         self.total_num_kv_heads = int(total_num_kv_heads)
@@ -223,7 +223,7 @@ class Qwen35QKVGatedParallelLinear(ColumnParallelLinear):
 class Qwen35FullAttention(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
-        tp_size = get_parallel_context().tp_size
+        tp_size = get_parallel_context().attn_tp_size
         self.total_num_heads = int(config.num_attention_heads)
         self.total_num_kv_heads = int(config.num_key_value_heads)
         if self.total_num_heads % tp_size != 0 or self.total_num_kv_heads % tp_size != 0:
@@ -352,8 +352,8 @@ class Qwen35LinearConv1D(nn.Module):
         self.qk_dim = int(qk_dim)
         self.v_dim = int(v_dim)
         parallel_context = get_parallel_context()
-        self.tp_rank = parallel_context.tp_rank
-        self.tp_size = parallel_context.tp_size
+        self.tp_rank = parallel_context.attn_tp_rank
+        self.tp_size = parallel_context.attn_tp_size
         self.weight = nn.Parameter(torch.empty(self.conv_dim, self.kernel_size), requires_grad=False)
         self.register_parameter("bias", None)
         self.weight.weight_loader = self.weight_loader
@@ -386,7 +386,7 @@ class Qwen35LinearAttention(nn.Module):
 
     def __init__(self, config) -> None:
         super().__init__()
-        tp_size = get_parallel_context().tp_size
+        tp_size = get_parallel_context().attn_tp_size
         self.total_num_k_heads = int(getattr(config, "linear_num_key_heads"))
         self.total_num_v_heads = int(getattr(config, "linear_num_value_heads"))
         self.head_k_dim = int(getattr(config, "linear_key_head_dim"))
@@ -622,8 +622,8 @@ class Qwen35LinearAttention(nn.Module):
                 f"qwen3_5 linear vector parameter size mismatch: expected={expected}, got={loaded_weight.numel()}."
             )
         parallel_context = get_parallel_context()
-        shard_size = expected // parallel_context.tp_size
-        start = parallel_context.tp_rank * shard_size
+        shard_size = expected // parallel_context.attn_tp_size
+        start = parallel_context.attn_tp_rank * shard_size
         param.data.copy_(loaded_weight.reshape(-1).narrow(0, start, shard_size).to(dtype=param.dtype))
 
     def _project_qkvzba(self, hidden_states: torch.Tensor):
@@ -1029,7 +1029,7 @@ class Qwen35ForCausalLM(nn.Module):
         full_attention_provider = build_mha_full_attention_provider(
             config,
             sparse_method=engine_config.sparse_method,
-            attention_tp_size=parallel_context.attention_tp_size,
+            attention_tp_size=parallel_context.attn_tp_size,
             device=device,
             max_batch_size=engine_config.max_decoding_seqs,
             cuda_graph=engine_config.decode_graph,
@@ -1038,7 +1038,7 @@ class Qwen35ForCausalLM(nn.Module):
         try:
             gated_delta_rule_op = build_gated_delta_rule_op(
                 config,
-                attention_tp_size=parallel_context.attention_tp_size,
+                attention_tp_size=parallel_context.attn_tp_size,
                 device=device,
                 cuda_graph=engine_config.decode_graph,
             )

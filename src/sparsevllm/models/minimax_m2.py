@@ -86,7 +86,7 @@ def build_minimax_m2_runtime_config(
     device: torch.device,
     engine_config=None,
 ) -> MiniMaxM2RuntimeConfig:
-    tp_size = int(parallel_context.attention_tp_size)
+    tp_size = int(parallel_context.attn_tp_size)
     if (
         int(config.num_attention_heads) % tp_size
         or int(config.num_key_value_heads) % tp_size
@@ -101,7 +101,7 @@ def build_minimax_m2_runtime_config(
     full_attention_provider = build_mha_full_attention_provider(
         config,
         sparse_method=sparse_method,
-        attention_tp_size=parallel_context.attention_tp_size,
+        attention_tp_size=parallel_context.attn_tp_size,
         device=device,
         max_batch_size=max_decode_tokens,
         cuda_graph=cuda_graph,
@@ -249,7 +249,7 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
             local_output = torch.cat(local_output_chunks, dim=0)
         if self.runtime_config is not None:
             return self.runtime_config.parallel_collectives.moe.run(local_output)
-        return self.parallel_context.world_all_reduce(local_output)
+        return self.parallel_context.world.all_reduce(local_output)
 
 
 class MiniMaxM2Attention(nn.Module):
@@ -261,7 +261,7 @@ class MiniMaxM2Attention(nn.Module):
         super().__init__()
         self.parallel_context = get_parallel_context()
         self.runtime_config = runtime_config
-        tp_size = int(self.parallel_context.tp_size)
+        tp_size = int(self.parallel_context.attn_tp_size)
         self.total_num_heads = int(config.num_attention_heads)
         self.total_num_kv_heads = int(config.num_key_value_heads)
         if self.total_num_heads % tp_size or self.total_num_kv_heads % tp_size:
@@ -372,8 +372,6 @@ class MiniMaxM2DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)
-        if self.parallel_context.tp_size == 1 and self.parallel_context.ep_size > 1:
-            self.parallel_context.ep_broadcast(hidden_states, src_ep_rank=0)
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states,
             residual,
@@ -687,8 +685,8 @@ class MiniMaxM2ForCausalLM(nn.Module):
             self.model.layers[0].block_sparse_moe.experts.provider.name,
             prefill_provider,
             all_reduce_providers,
-            self.parallel_context.tp_rank,
-            self.parallel_context.tp_size,
+            self.parallel_context.attn_tp_rank,
+            self.parallel_context.attn_tp_size,
             self.parallel_context.moe_tp_rank,
             self.parallel_context.moe_tp_size,
             self.model.layers[0].block_sparse_moe.experts.local_expert_start,

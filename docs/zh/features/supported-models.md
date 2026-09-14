@@ -21,8 +21,13 @@
 TP 规模限制为 1 到 8，并且 checkpoint 维度（包括 attention head 数和 vocabulary
 大小）必须能被所选 TP 规模整除。
 
-MoE 模型可能在内部组合 tensor parallelism 和 expert parallelism；不合法的 TP/EP
-组合会在配置阶段被拒绝。
+`tensor_parallel_size` 和 `data_parallel_size` 描述 attention 拓扑，总进程数为
+`world_size = DP * TP`。`expert_parallel_size` 描述同一个 world 内的 routed expert
+分布，专家内部 TP 为 `world_size / EP`，因此 EP 必须整除 world size，且不会额外
+增加进程。例如 `TP=4, DP=1, EP=2` 使用四个进程，attention TP=4、专家内部 TP=2。
+
+拓扑合法不代表引擎已支持执行。目前尚未实现 attention TP×DP 混合执行；已有 DP
+路径要求 `TP=1, EP=DP`。旧的 `TP=1, DP=1, EP>1` 配置会明确报错，不会自动扩展进程数。
 
 块级 FP8 要求使用 E4M3 权重、动态激活量化以及 `128 x 128` 的权重块大小。
 Llama、Qwen2 和 Qwen3 Dense FP8 checkpoint 还要求每个 TP-local dense

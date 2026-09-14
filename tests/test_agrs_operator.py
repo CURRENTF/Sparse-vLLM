@@ -79,7 +79,7 @@ def test_agrs_workspace_survives_graph_replacement_and_closes_once(monkeypatch):
     # closed while an idle graph still references it, or allocated once per layer.
     world = ParallelGroup(object(), (0, 1), 0, 2)
     local = ParallelGroup(None, (0,), 0, 1)
-    context = ParallelContext(world, local, world, world, local)
+    context = ParallelContext(world=world, attn_tp=local, moe_ep=world, attn_dp=world, moe_tp=local)
     runtime = ParallelCollectiveRuntime(context, cuda_graph=True, device_index=0)
     handle = runtime.request_dp_collectives(
         max_rows=8, max_local_tokens=1024, hidden_size=2048, dtype=torch.bfloat16

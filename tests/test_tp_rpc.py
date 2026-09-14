@@ -332,7 +332,7 @@ def test_prefix_cache_control_rpc_reports_any_tp_worker_failure():
     runner.world_size = 2
     runner.device = torch.device("cpu")
     runner.parallel_context = SimpleNamespace(
-        world_all_reduce=lambda tensor, op: dist.all_reduce(tensor, op=op)
+        world=SimpleNamespace(all_reduce=lambda tensor, op: dist.all_reduce(tensor, op=op))
     )
 
     def mark_failed(tensor, op=None):
@@ -870,7 +870,7 @@ def test_model_runner_exit_drains_graphs_before_barrier():
         unlink=lambda: calls.append("unlink_shm"),
     )
     runner.parallel_context = SimpleNamespace(
-        world_barrier=lambda **_: calls.append("barrier"),
+        world=SimpleNamespace(barrier=lambda **_: calls.append("barrier")),
     )
 
     with (

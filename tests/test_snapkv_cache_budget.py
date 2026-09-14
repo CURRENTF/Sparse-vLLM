@@ -19,12 +19,12 @@ def _parallel_context():
     return SimpleNamespace(
         world_rank=0,
         world_size=1,
-        tp_rank=0,
-        tp_size=1,
-        ep_rank=0,
-        ep_size=1,
-        dp_rank=0,
-        dp_size=1,
+        attn_tp_rank=0,
+        attn_tp_size=1,
+        moe_ep_rank=0,
+        moe_ep_size=1,
+        attn_dp_rank=0,
+        attn_dp_size=1,
     )
 
 

@@ -94,7 +94,7 @@ def build_glm4_moe_lite_mla_attention(
         value_head_dim=int(config.v_head_dim),
         activation_dtype=activation_dtype,
         cache_dtype=activation_dtype,
-        tp_size=int(parallel_context.attention_tp_size),
+        tp_size=int(parallel_context.attn_tp_size),
         cuda_graph=bool(decode_graph),
         score_output=score_output,
         context_capacity=int(context_capacity),
@@ -361,7 +361,7 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
             hidden_size=int(config.hidden_size),
             intermediate_size=int(config.moe_intermediate_size),
             tp_size=int(parallel_context.moe_tp_size),
-            ep_size=int(parallel_context.ep_size),
+            ep_size=int(parallel_context.moe_ep_size),
             cuda_graph=decode_graph,
             weight_dtype=torch.float8_e4m3fn if fp8_enabled else model_activation_dtype(config),
             fp8_tensor_scales=fp8_tensor_scales,
@@ -373,7 +373,7 @@ class Glm4MoeLitePackedExperts(PackedMoeExperts):
             hidden_size=int(config.hidden_size),
             intermediate_size=int(config.moe_intermediate_size),
             tp_size=int(parallel_context.moe_tp_size),
-            ep_size=int(parallel_context.ep_size),
+            ep_size=int(parallel_context.moe_ep_size),
             cuda_graph=decode_graph,
             weight_dtype=torch.float8_e4m3fn if fp8_enabled else model_activation_dtype(config),
         )
@@ -566,7 +566,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 "Glm4MoeLiteSparseMoeBlock expects [tokens, hidden], got "
                 f"{tuple(hidden_states.shape)}."
             )
-        if self.parallel_context.uses_dp_attention:
+        if self.parallel_context.attn_dp_size > 1:
             return self._forward_distributed_tokens(hidden_states)
         debug_enabled = os.getenv("SPARSEVLLM_DEBUG_MOE", "0") == "1"
         if debug_enabled:
@@ -652,22 +652,13 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             routed = self.moe_communication.combine(routed)
             self.debug_last_routed_output = routed.detach().clone()
             shared = self._shared_chunk(hidden_states)
-            if self.parallel_context.tp_size > 1:
-                shared = self.parallel_context.tp_all_reduce(shared)
+            if self.parallel_context.attn_tp_size > 1:
+                shared = self.parallel_context.attn_tp.all_reduce(shared)
             output = routed + shared
-        elif self.parallel_context.ep_size > 1:
-            shared_local = self._shared_chunk(hidden_states)
-            if self.parallel_context.tp_size > 1:
-                # Hybrid TP+EP makes both branches partial over the same
-                # outer world. Sum them locally so one collective completes
-                # routed experts and the TP-sharded shared expert together.
-                local_output = routed + shared_local
-                output = self.moe_communication.combine(local_output)
-            else:
-                # Retain the pure-EP semantic path for direct module use: the
-                # shared expert is replicated rather than TP-sharded.
-                routed = self.moe_communication.combine(routed)
-                output = routed + shared_local
+        elif self.parallel_context.moe_ep_size > 1:
+            # With DP=1 both routed and shared branches are partial over world.
+            local_output = routed + self._shared_chunk(hidden_states)
+            output = self.moe_communication.combine(local_output)
         else:
             shared_local = self._shared_chunk(hidden_states)
             if context.is_prefill:
@@ -765,11 +756,6 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states, rotary_emb)
-        if (self.parallel_context.tp_size == 1 and self.parallel_context.ep_size > 1
-                and not self.parallel_context.uses_dp_attention):
-            # Replicated MLA must enter the post-attention norm identically on
-            # every expert rank before routed experts make their next decision.
-            self.parallel_context.ep_broadcast(hidden_states, src_ep_rank=0)
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states,
             residual,

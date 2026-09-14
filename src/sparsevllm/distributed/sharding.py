@@ -34,16 +34,16 @@ def validate_model_sharding(
     _validate_divisible(
         model_name,
         attention_fields,
-        topology.attention_tp_size,
+        topology.attn_tp_size,
         "attention TP",
     )
     if num_experts is None:
         return
     num_experts = int(num_experts)
-    if num_experts <= 0 or num_experts % topology.expert_parallel_size:
+    if num_experts <= 0 or num_experts % topology.moe_ep_size:
         raise ValueError(
             f"{model_name} num_experts must be positive and divisible by "
-            f"EP={topology.expert_parallel_size}, got {num_experts}."
+            f"EP={topology.moe_ep_size}, got {num_experts}."
         )
     if moe_fields:
         _validate_divisible(

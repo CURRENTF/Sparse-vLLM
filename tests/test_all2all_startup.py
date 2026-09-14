@@ -73,7 +73,7 @@ def test_expert_partition_contract_rejects_fractional_ownership():
 def test_dispatch_failure_propagates_without_replacing_transport():
     from sparsevllm.distributed.moe_all2all import AllToAllMoeCommunication
 
-    parallel = SimpleNamespace(uses_dp_attention=True, moe_tp_size=1, expert=object())
+    parallel = SimpleNamespace(attn_dp_size=2, attn_tp_size=1, moe_tp_size=1, moe_ep=object())
     spec = AllToAllOpSpec(2, 2048, 8, 2, 8, torch.bfloat16, True)
     comm = AllToAllMoeCommunication(parallel, spec)
     op = Mock()

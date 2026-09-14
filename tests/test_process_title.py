@@ -22,10 +22,10 @@ def _parallel_context(
     world = ParallelGroup(None, tuple(range(world_size)), 0, world_size)
     return ParallelContext(
         world=world,
-        tensor=ParallelGroup(None, tuple(range(tp_size)), tp_rank, tp_size),
-        expert=ParallelGroup(None, tuple(range(ep_size)), ep_rank, ep_size),
-        data=ParallelGroup(None, tuple(range(dp_size)), dp_rank, dp_size),
-        moe_tensor=ParallelGroup(None, tuple(range(tp_size)), tp_rank, tp_size),
+        attn_tp=ParallelGroup(None, tuple(range(tp_size)), tp_rank, tp_size),
+        moe_ep=ParallelGroup(None, tuple(range(ep_size)), ep_rank, ep_size),
+        attn_dp=ParallelGroup(None, tuple(range(dp_size)), dp_rank, dp_size),
+        moe_tp=ParallelGroup(None, tuple(range(tp_size)), tp_rank, tp_size),
     )
 
 

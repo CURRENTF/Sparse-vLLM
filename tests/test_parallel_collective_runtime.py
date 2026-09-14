@@ -30,10 +30,10 @@ def _context(*, world=None, attention=None):
     singleton = _group()
     return ParallelContext(
         world=world,
-        tensor=attention,
-        expert=singleton,
-        data=singleton,
-        moe_tensor=attention,
+        attn_tp=attention,
+        moe_ep=singleton,
+        attn_dp=singleton,
+        moe_tp=attention,
     )
 
 
@@ -57,7 +57,21 @@ def _hybrid_collective_worker(rank: int, world_size: int, init_method: str) -> N
     )
     runtime = None
     try:
-        context = init_parallel_context(topology=ParallelTopology(2, 2, 1))
+        context = init_parallel_context(topology=ParallelTopology(2, 2, 2))
+        # Verify every stage axis against its global member identities. Nonzero
+        # group-local sources catch accidental use of local ranks as world ranks.
+        for group in (context.attn_tp, context.attn_dp, context.moe_tp, context.moe_ep):
+            value = torch.tensor([float(rank)])
+            group.all_reduce(value)
+            assert value.item() == sum(group.ranks)
+            value.fill_(rank)
+            group.broadcast(value, src_rank=group.size - 1)
+            assert value.item() == group.ranks[-1]
+            gathered = group.gather(torch.tensor([rank]), dst_rank=group.size - 1)
+            if group.rank == group.size - 1:
+                assert [item.item() for item in gathered] == list(group.ranks)
+            else:
+                assert gathered is None
         runtime = ParallelCollectiveRuntime(
             context,
             cuda_graph=True,
@@ -336,13 +350,13 @@ def test_handle_uses_plain_collective_for_prefill_and_prepared_op_for_decode():
             return_value=SimpleNamespace(is_prefill=True),
         ),
         patch.object(
-            ParallelContext,
-            "_all_reduce",
+            ParallelGroup,
+            "all_reduce",
             return_value=tensor,
         ) as eager_reduce,
     ):
         assert handle.run(tensor) is tensor
-    eager_reduce.assert_called_once_with(tensor, context.attention)
+    eager_reduce.assert_called_once_with(tensor)
     op.run.assert_not_called()
 
     with patch(

@@ -13,9 +13,9 @@ from sparsevllm.utils.loader import load_model
 
 def _parallel_context():
     return SimpleNamespace(
-        tp_rank=0,
-        tp_size=1,
-        tp_all_reduce=lambda tensor: tensor,
+        attn_tp_rank=0,
+        attn_tp_size=1,
+        attn_tp=SimpleNamespace(all_reduce=lambda tensor: tensor),
     )
 
 

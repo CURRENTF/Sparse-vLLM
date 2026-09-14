@@ -672,7 +672,7 @@ def test_standard_manager_accounts_storage_tensors_explicitly(
         v_head_dim=256,
     )
     manager.parallel_context = SimpleNamespace(
-        attention_tp_size=attention_tp_size,
+        attn_tp_size=attention_tp_size,
     )
     manager.num_layers = 2
     manager.num_kv_layers = 2

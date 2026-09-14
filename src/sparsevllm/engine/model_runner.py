@@ -420,8 +420,8 @@ class ModelRunner:
             load_model(
                 self.model,
                 config.model,
-                tp_rank=self.parallel_context.tp_rank,
-                tp_size=self.parallel_context.tp_size,
+                tp_rank=self.parallel_context.attn_tp_rank,
+                tp_size=self.parallel_context.attn_tp_size,
                 num_threads=config.weight_loading_workers_per_rank,
                 show_progress=self.parallel_context.world_rank == 0,
                 progress_rank=0 if self.parallel_context.world_rank == 0 else None,
@@ -450,7 +450,7 @@ class ModelRunner:
                 "provide recurrent_state_spec()."
             )
         state_spec = (
-            state_spec_provider(config.hf_config, self.parallel_context.tp_size)
+            state_spec_provider(config.hf_config, self.parallel_context.attn_tp_size)
             if has_linear_layers
             else None
         )
@@ -497,12 +497,12 @@ class ModelRunner:
             if rank == 0:
                 # Rank 0 创建共享内存用于发送方法调用指令
                 self.shm = SharedMemory(name=self.tp_shm_name, create=True, size=TP_SHM_SIZE)
-                self.parallel_context.world_barrier(
+                self.parallel_context.world.barrier(
                     device_ids=self.platform.barrier_device_ids(rank)
                 )
             else:
                 # 其他 Rank 监听共享内存中的方法调用指令
-                self.parallel_context.world_barrier(
+                self.parallel_context.world.barrier(
                     device_ids=self.platform.barrier_device_ids(rank)
                 )
                 self.shm = SharedMemory(name=self.tp_shm_name)
@@ -766,7 +766,7 @@ class ModelRunner:
         close_workspace_manager()
         if self.world_size > 1 and not self.independent_scheduler:
             self.shm.close()
-            self.parallel_context.world_barrier(
+            self.parallel_context.world.barrier(
                 device_ids=self.platform.barrier_device_ids(self.rank)
             )
             if self.rank == 0:
@@ -960,7 +960,7 @@ class ModelRunner:
             dtype=torch.int32,
             device=self.device,
         )
-        self.parallel_context.world_all_reduce(failed, op=dist.ReduceOp.MAX)
+        self.parallel_context.world.all_reduce(failed, op=dist.ReduceOp.MAX)
         if int(failed.item()) != 0 and local_error is None:
             raise RuntimeError(f"At least one world worker failed during {method_name}.")
 
@@ -1393,7 +1393,7 @@ class ModelRunner:
                 candidate_start=range_start,
                 temp_seq_id=temp_seq_id,
             )
-            self.parallel_context.world_all_reduce(score, op=dist.ReduceOp.MAX)
+            self.parallel_context.world.all_reduce(score, op=dist.ReduceOp.MAX)
             candidate_scores = score[range_start:query_start]
             selected_candidates = select_global_keep_indices(
                 candidate_scores,
@@ -1426,7 +1426,7 @@ class ModelRunner:
                 )
                 torch.maximum(aggregate, step_score[:range_end], out=aggregate)
                 chunk_number += 1
-            self.parallel_context.world_all_reduce(aggregate, op=dist.ReduceOp.MAX)
+            self.parallel_context.world.all_reduce(aggregate, op=dist.ReduceOp.MAX)
             keep_indices = select_global_keep_indices(
                 aggregate[range_start:range_end], keep_tokens=keep_tokens
             )
@@ -1539,17 +1539,17 @@ class ModelRunner:
         }
         return {
             "world_rank": self.parallel_context.world_rank,
-            "ep_rank": self.parallel_context.ep_rank,
+            "ep_rank": self.parallel_context.moe_ep_rank,
             "parallel": {
                 "configured": {
                     "tensor_parallel_size": int(
-                        getattr(config, "tensor_parallel_size", parallel_context.tp_size)
+                        getattr(config, "tensor_parallel_size", parallel_context.attn_tp_size)
                     ),
                     "expert_parallel_size": int(
-                        getattr(config, "expert_parallel_size", parallel_context.ep_size)
+                        getattr(config, "expert_parallel_size", parallel_context.moe_ep_size)
                     ),
                     "data_parallel_size": int(
-                        getattr(config, "data_parallel_size", parallel_context.dp_size)
+                        getattr(config, "data_parallel_size", parallel_context.attn_dp_size)
                     ),
                     "world_size": int(
                         getattr(config, "world_size", parallel_context.world_size)
@@ -1557,18 +1557,13 @@ class ModelRunner:
                 },
                 "effective": {
                     "world": parallel_group_summary(parallel_context.world),
-                    "attention": parallel_group_summary(parallel_context.attention),
-                    "expert": parallel_group_summary(parallel_context.expert),
-                    "moe_tensor": parallel_group_summary(
-                        parallel_context.moe_tensor or parallel_context.tensor
+                    "attn_tp": parallel_group_summary(parallel_context.attn_tp),
+                    "moe_ep": parallel_group_summary(parallel_context.moe_ep),
+                    "moe_tp": parallel_group_summary(
+                        parallel_context.moe_tp
                     ),
-                    "data": parallel_group_summary(parallel_context.data),
+                    "attn_dp": parallel_group_summary(parallel_context.attn_dp),
                 },
-                "attention_replicated_for_ep": bool(
-                    parallel_context.ep_size > 1
-                    and parallel_context.attention_tp_size == 1
-                    and not parallel_context.uses_dp_attention
-                ),
             },
             "state": state,
             "decode_graph": graph_summary,
@@ -1652,8 +1647,8 @@ class ModelRunner:
         tolerance_ratio = (
             difference / (float(atol) + float(rtol) * reference.float().abs())
         ).max()
-        self.parallel_context.world_all_reduce(max_abs, op=dist.ReduceOp.MAX)
-        self.parallel_context.world_all_reduce(tolerance_ratio, op=dist.ReduceOp.MAX)
+        self.parallel_context.world.all_reduce(max_abs, op=dist.ReduceOp.MAX)
+        self.parallel_context.world.all_reduce(tolerance_ratio, op=dist.ReduceOp.MAX)
         return float(max_abs.item()), float(tolerance_ratio.item())
 
     def _debug_any_mismatch_from_world_rank_zero(self, tensor: torch.Tensor) -> bool:
@@ -1670,12 +1665,12 @@ class ModelRunner:
             dtype=torch.int32,
             device=self.device,
         )
-        self.parallel_context.world_all_reduce(mismatch, op=dist.ReduceOp.MAX)
+        self.parallel_context.world.all_reduce(mismatch, op=dist.ReduceOp.MAX)
         return bool(mismatch.item())
 
     def debug_replica_consistency(self) -> dict[str, object] | None:
         logits = getattr(self, "debug_last_logits", None)
-        if self.parallel_context.attention_tp_size > 1:
+        if self.parallel_context.attn_tp_size > 1:
             result: dict[str, object] = {
                 "last_logits_max_abs": None,
                 "last_logits_tolerance_ratio": None,

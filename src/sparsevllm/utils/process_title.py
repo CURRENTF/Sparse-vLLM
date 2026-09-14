@@ -6,12 +6,12 @@ def engine_process_title(parallel_context: ParallelContext) -> str:
         return "SVLLM_Engine"
 
     title = "SVLLM"
-    if parallel_context.tp_size > 1:
-        title += f"_TP{parallel_context.tp_rank}"
-    if parallel_context.dp_size > 1:
-        title += f"_DP{parallel_context.dp_rank}"
-    if parallel_context.ep_size > 1:
-        title += f"_EP{parallel_context.ep_rank}"
+    if parallel_context.attn_tp_size > 1:
+        title += f"_TP{parallel_context.attn_tp_rank}"
+    if parallel_context.attn_dp_size > 1:
+        title += f"_DP{parallel_context.attn_dp_rank}"
+    if parallel_context.moe_ep_size > 1:
+        title += f"_EP{parallel_context.moe_ep_rank}"
     return title
 
 

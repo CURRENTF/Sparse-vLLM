@@ -15,7 +15,6 @@ from sparsevllm.distributed.parallel_context import (
     init_parallel_context,
     reset_parallel_context,
 )
-from sparsevllm.distributed.topology import ParallelMode
 
 
 def _worker(rank, rendezvous, real_experts):
@@ -28,7 +27,7 @@ def _worker(rank, rendezvous, real_experts):
         timeout=timedelta(seconds=120),
     )
     parallel = init_parallel_context(
-        topology=ParallelTopology(1, 2, 2, ParallelMode.DP_ATTENTION)
+        topology=ParallelTopology(1, 2, 2)
     )
     runtime = ParallelCollectiveRuntime(parallel, cuda_graph=True, device_index=rank)
     comm = runtime.request_moe_collectives(
@@ -112,7 +111,7 @@ def _check_real_experts(comm, parallel):
     # and an independent FP32 Torch expert sum with fixed routes.
     from sparsevllm.operators.moe import MoeOpSpec, resolve_moe_provider
 
-    rank = parallel.expert.rank
+    rank = parallel.moe_ep.rank
     spec = MoeOpSpec(
         64,
         32,
@@ -187,7 +186,7 @@ def _check_real_experts(comm, parallel):
             local[: len(tensor)].copy_(tensor)
             global_tensor = tensor.new_empty((capacity * 2, *tensor.shape[1:]))
             dist.all_gather_into_tensor(
-                global_tensor, local, group=parallel.expert.process_group
+                global_tensor, local, group=parallel.moe_ep.process_group
             )
             gathered.append(global_tensor)
         global_x, global_ids, global_weights = gathered
@@ -202,7 +201,7 @@ def _check_real_experts(comm, parallel):
                 expected.index_add_(
                     0, rows, partial * global_weights[rows, choices, None]
                 )
-        dist.all_reduce(expected, group=parallel.expert.process_group)
+        dist.all_reduce(expected, group=parallel.moe_ep.process_group)
         reference = expected[rank * capacity : rank * capacity + sizes[rank]]
         torch.testing.assert_close(result.float(), reference, atol=0.004, rtol=0.02)
         torch.cuda.synchronize()

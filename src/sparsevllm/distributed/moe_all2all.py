@@ -8,9 +8,11 @@ from sparsevllm.operators.all2all import prepare_parallel_all2all
 
 class AllToAllMoeCommunication(MoeCommunication):
     def __init__(self, parallel_context, spec):
-        if not parallel_context.uses_dp_attention or parallel_context.moe_tp_size != 1:
+        if (parallel_context.attn_dp_size <= 1
+                or parallel_context.attn_tp_size != 1
+                or parallel_context.moe_tp_size != 1):
             raise ValueError("All-to-all currently requires TP=1, EP=DP attention.")
-        self.group = parallel_context.expert
+        self.group = parallel_context.moe_ep
         self.spec = spec
         self.op = None
 

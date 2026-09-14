@@ -53,8 +53,8 @@ class PackedMoeExperts(PackedExpertWeightLoader, nn.Module):
             parallel_context = get_parallel_context()
         self.tp_rank = parallel_context.moe_tp_rank
         self.tp_size = parallel_context.moe_tp_size
-        self.ep_rank = parallel_context.ep_rank
-        self.ep_size = parallel_context.ep_size
+        self.ep_rank = parallel_context.moe_ep_rank
+        self.ep_size = parallel_context.moe_ep_size
         self.num_experts = int(num_experts)
         self.hidden_size = int(hidden_size)
         self.global_intermediate_size = int(intermediate_size)

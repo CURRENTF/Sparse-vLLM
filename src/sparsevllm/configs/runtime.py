@@ -99,20 +99,20 @@ class Config(
     num_kvcache_slots: int | list = -1
 
     @property
-    def uses_outer_tp_moe_layout(self) -> bool:
-        return self.parallel_topology.is_outer_tp_moe
+    def attn_tp_size(self) -> int:
+        return self.parallel_topology.attn_tp_size
 
     @property
-    def attention_tensor_parallel_size(self) -> int:
-        return self.parallel_topology.attention_tp_size
+    def attn_dp_size(self) -> int:
+        return self.parallel_topology.attn_dp_size
 
     @property
-    def moe_expert_parallel_size(self) -> int:
-        return int(self.expert_parallel_size)
-
-    @property
-    def moe_tensor_parallel_size(self) -> int:
+    def moe_tp_size(self) -> int:
         return self.parallel_topology.moe_tp_size
+
+    @property
+    def moe_ep_size(self) -> int:
+        return self.parallel_topology.moe_ep_size
 
     @property
     def world_size(self) -> int:

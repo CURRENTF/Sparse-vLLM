@@ -156,7 +156,7 @@ class Gemma4Attention(nn.Module):
     ) -> None:
         super().__init__()
         parallel_context = get_parallel_context()
-        tp_size = parallel_context.attention_tp_size
+        tp_size = parallel_context.attn_tp_size
         self.layer_type = str(config.layer_types[layer_idx])
         self.is_sliding = self.layer_type == "sliding_attention"
         shared_start = int(config.num_hidden_layers) - int(config.num_kv_shared_layers)
@@ -424,7 +424,7 @@ class Gemma4DecoderLayer(nn.Module):
         hidden_states = self.mlp(dense_input)
         if self.enable_moe_block:
             weights, ids = self.router(residual)
-            expert_output = self.parallel_context.world_all_reduce(
+            expert_output = self.parallel_context.world.all_reduce(
                 self.experts(self.pre_feedforward_layernorm_2(residual), ids, weights)
             )
             hidden_states = self.post_feedforward_layernorm_1(
@@ -652,7 +652,7 @@ class Gemma4ForCausalLM(nn.Module):
         device,
         **_,
     ):
-        tp_size = int(parallel_context.attention_tp_size)
+        tp_size = int(parallel_context.attn_tp_size)
         contracts: set[tuple[int, int, int, int]] = set()
         for layer_idx in range(int(config.num_hidden_layers)):
             is_sliding = str(config.layer_types[layer_idx]) == "sliding_attention"
