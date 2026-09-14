@@ -1,7 +1,6 @@
 """Optionally fill TileLang's atomic disk cache on CPU, without GPU execution."""
 import argparse
 from concurrent.futures import ProcessPoolExecutor
-import hashlib
 import json
 import multiprocessing
 import os
@@ -58,7 +57,6 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     identity = {"command": sys.argv, "target": os.environ["TILELANG_TARGET"],
                 "cache": os.environ["TILELANG_CACHE_DIR"], "count": len(items),
-                "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 "status": "running", "gpu_execution": False}
     (args.output / "manifest.json").write_text(json.dumps(identity, indent=2) + "\n")
     with (args.output / "results.jsonl").open("x") as f:

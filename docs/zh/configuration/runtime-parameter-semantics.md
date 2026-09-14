@@ -69,8 +69,11 @@ method、policy、chunk size、context length、batch size 和 checkpoint 路径
 ## Prefill 稀疏
 
 `prefill_sparse_method` 独立选择 prefill 加速，不替代 `sparse_method`。当前有
-两种选择：`h2o_prefill` 在中间 prompt chunk 后压缩物理 KV；
-`flashprefill_v2` 稀疏化 prefill attention 计算。`flashprefill_v2` 支持
+三种选择：`h2o_prefill` 在中间 prompt chunk 后压缩物理 KV；
+`flashprefill_v2` 稀疏化 prefill attention 计算；`omnikv_prefill` 在分块 prefill
+中执行跨层历史选择。`omnikv_prefill` 支持显式 KV 或 MLA 下的 vanilla/OmniKV decode，
+包括 OmniKV offload 和 chain cache，不支持 radix 前缀复用；独立预算、Auto 完整层 profile 和限制见
+[稀疏方法](../features/sparse-methods.md)。`flashprefill_v2` 支持
 `vanilla`、`omnikv`、`quest`、
 `snapkv` 和 `h2o`，但仅限 explicit-KV MHA 模型；MLA latent 模型会在配置阶段拒绝
 该 prefill 方法。这些组合也支持各方法已经支持的 prefix-cache mode。
@@ -157,3 +160,16 @@ Compressor 训练由 [CURRENTF/DeltaKV](https://github.com/CURRENTF/DeltaKV)
 public 参数，构造原生 engine，并为 LongBench、MathBench、NIAH 和 RULER core
 提供轻量 generation callable。SCBench 使用原生 `sparsevllm` attention
 type，不存在 `--backend hf` 选项。
+
+## Decode 预留窗口
+
+`decode_reservation_tokens` 是所有缓存方法和 prefix 模式共用的正整数参数，
+默认 `1024`。它限制下一段 decode 步数，不是总输出上限，也不是稀疏驱逐间隔。
+首个输出 token 来自 prefill，后续 decode 每次预留最多一个窗口或剩余输出
+上限所需的容量。各方法按自己的资源单位计入页取整、驱逐峰值和压缩池需求。
+
+Scheduler 在接纳更多 prefill 工作前为活动 decode 续租。失败时使用现有
+抢占/recompute 恢复；只剩一个请求时，只要还能执行一步，就允许缩小窗口。
+窗口边界不会强制轮转队列或改变评分与驱逐。较小窗口可能增加高负载下的
+抢占，较大窗口可能延迟新请求。Chain 仍单独检查 suffix prefill 和 CPU
+快照恢复所需容量。

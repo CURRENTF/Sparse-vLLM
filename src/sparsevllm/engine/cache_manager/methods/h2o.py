@@ -224,7 +224,7 @@ class H2OCacheManager(SnapKVCacheManager):
                 trigger = self.h2o_decode_budget + self.h2o_decode_eviction_interval
                 decode_peak = min(decode_peak, max(resident_after_prefill + 1, trigger))
             required_by_layer.append(
-                max(0, max(prefill_peak, decode_peak) - existing)
+                max(0, max(prefill_peak, decode_peak) - (0 if needs_resident_row else existing))
             )
 
         slot_deficits = tuple(
@@ -1907,6 +1907,18 @@ class H2OCacheManager(SnapKVCacheManager):
         if not seqs:
             return
         self._evict_decode_rows(seqs)
+
+    def snapshot_chain_method_state(self, seq_id: int):
+        state = super().snapshot_chain_method_state(seq_id)
+        for layer in self.kv_transformer_layer_indices():
+            state.tensors[str(layer)] = self._h2o_scores[self._score_key(layer, seq_id)]
+        return state
+
+    def restore_chain_method_state(self, seq_id: int, state) -> None:
+        for layer in self.kv_transformer_layer_indices():
+            self._h2o_scores[self._score_key(layer, seq_id)] = state.tensors[str(layer)].to(
+                self.device, non_blocking=True,
+            )
 
     def free_seq(self, seq_id: int):
         seq_id = int(seq_id)

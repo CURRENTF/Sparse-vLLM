@@ -20,7 +20,7 @@ project, not endorsement by Vortex's authors or official algorithm parity.
 - `summarize.py`, `export_plot_data.py`: validate raw artifacts and export plot data.
 - `plot.py`: Matplotlib + Seaborn, one combined figure, automatic layout, no title,
   2.5:1 aspect ratio, arithmetic means with sample-standard-deviation error bars.
-- `capture_sources.py`: save source hashes, patches, source archives, model JSON
+- `capture_sources.py`: record Git versions/dirty status, model JSON
   identities, and GPU inventory without copying model weights.
 - `data/decode.json`: the default pure-decode figure data; `data/e2e.json` keeps
   the earlier end-to-end output metric separate. `data/decode_summary.json`
@@ -69,7 +69,7 @@ conda run -p "$NATIVE_ENV" python scripts/official_experiments/sparsevllm_vs_vor
 ```
 
 Outputs: `comparison.png`, `comparison.pdf`, `comparison.svg`, and
-`plot_manifest.json` (data/script hashes, versions and dimensions). Pass
+`plot_manifest.json` (data hashes, versions and dimensions). Pass
 `--data scripts/official_experiments/sparsevllm_vs_vortex/data/e2e.json` explicitly
 to redraw the separate E2E measurement; never combine the two metrics.
 
@@ -81,8 +81,8 @@ Vortex fork under `VORTEX_REPO`. `VORTEX_OVERLAY` must contain the recorded
 FlashInfer overlay's `flashinfer` and `nvidia_cutlass_dsl/dsl_packages` directories.
 The configured `cubins` location is a runtime artifact cache, not an obligatory
 pre-existing input; missing required runtime artifacts must still fail explicitly.
-This is not a stock-upstream Vortex recipe: preparation checks critical Vortex
-source hashes against `data/provenance.json` and fails on a mismatch.
+Use a Vortex checkout compatible with these interfaces and run a smoke before
+measurement. Preparation does not compare source hashes with historical runs.
 
 The recorded engines included source changes beyond their base commits.
 `data/provenance.json` retains source/archive hashes; the referenced source
@@ -106,7 +106,7 @@ Use `--conda` when Conda is not on PATH and `--cuda-home` for the toolkit locati
 available in `--help`. The exact paper concurrency is fixed: insufficient
 capacity is an error, not permission to silently lower the batch size.
 
-Before launching, capture the source state into a fresh external directory:
+Before launching, record Git versions and model identity in a fresh external directory:
 
 ```bash
 python3 scripts/official_experiments/sparsevllm_vs_vortex/capture_sources.py \
@@ -142,6 +142,6 @@ python3 scripts/official_experiments/sparsevllm_vs_vortex/export_plot_data.py \
 The validator requires complete per-request/probe artifacts, matched traces and
 valid replay-only windows; bundled plot JSON is not a replacement for those raw
 checks. A single-model run needs a matching case manifest passed via `--cases`
-to the validator. Capture sources again after a run to detect source drift.
+to the validator. Record relevant checkout changes when interpreting a rerun.
 Recorded JSON source paths are relative to their original external run roots.
 Keep raw logs, caches, model files and newly rendered figures outside Git.

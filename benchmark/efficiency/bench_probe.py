@@ -479,6 +479,8 @@ def _resolve_sparse_probe_protocol(
     hyper_params.setdefault("expert_parallel_size", getattr(args, "expert_parallel_size", 1))
     hyper_params.setdefault("gpu_memory_utilization", args.gpu_memory_utilization)
     hyper_params.setdefault("decode_graph", True)
+    from sparsevllm.config import Config
+    hyper_params.setdefault("decode_reservation_tokens", Config.decode_reservation_tokens)
     hyper_params.setdefault("max_num_batched_tokens", args.max_num_batched_tokens)
     hyper_params.setdefault("engine_prefill_chunk_size", args.max_num_batched_tokens)
     if args.sparse_method == "snapkv":

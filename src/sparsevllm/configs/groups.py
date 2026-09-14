@@ -106,6 +106,11 @@ class PrefillSparseMethodConfig:
     # None preserves the legacy H2O combined default. Explicit "" disables
     # prefill acceleration even when sparse_method="h2o" (decode-only H2O).
     prefill_sparse_method: str | None = None
+    omnikv_prefill_full_attention_layers: str | list[int] | None = "auto"
+    resolved_prefill_full_attention_profile: str | None = field(default=None, init=False)
+    omnikv_prefill_keep_tokens: int = 4096
+    omnikv_prefill_sink_keep_tokens: int = 8
+    omnikv_prefill_recent_keep_tokens: int = 128
     flashprefill_v2_k_block_m: int = 128
     flashprefill_v2_k_block_n: int = 128
     flashprefill_v2_abs_threshold: float | None = None

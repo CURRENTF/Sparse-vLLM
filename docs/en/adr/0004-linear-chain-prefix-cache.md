@@ -48,15 +48,59 @@ forward pass, so the stored boundary is `seq.num_tokens - 1`; that token
 belongs to the next suffix. A server-detected text stop invalidates the chain:
 the hidden stop text can contain already-processed tokens that are absent from
 the client-visible continuation, and the compressed physical layout cannot be
-rolled back generically. Disconnect, failure, preemption, cancellation, and
-parse failure also invalidate the chain and free all payload.
+rolled back generically. Disconnect, failure, cancellation, and parse failure also invalidate the
+chain and free all payload. Scheduler preemption is transient: it retains the
+logical request and chain identity, releases runtime KV/recurrent state, and
+uses recompute replay to rebuild it. The chain remains ACTIVE during recovery;
+preemption does not make it available to another writer.
 
 LRU eviction considers IDLE chains only and orders by
-`(last_access, chain_id)`. ACTIVE chains are pinned. Rank 0 supplies the exact
+`(last_access, chain_id)`. Before preempting decode for an insufficient reservation
+window, the scheduler reclaims resident IDLE chains in this order and retries the
+reservation after each synchronized multi-rank release. Reclamation stops when
+the window fits; valid offloaded snapshots retain their chain identity.
+ACTIVE chains are excluded from admission LRU
+eviction; this does not prohibit scheduler-driven preemption. Rank 0 supplies the exact
 victim plan through the TP RPC path and every rank executes and checks the
-same lifecycle result. Admission plans also reserve their per-layer physical
-peak and resident row before prefill allocation, preventing concurrently
-queued chains from overcommitting the same free slots.
+same lifecycle result. Chain admission reserves restoration and suffix-prefill
+capacity, not the request's maximum output length. Future decode capacity uses
+the same `decode_reservation_tokens` window as ordinary requests. Admission
+subtracts outstanding decode windows before choosing IDLE victims; the rank-0
+plan carries that headroom for rank-local validation. Prefill completion releases
+its admission reservation. Physical allocation remains incremental.
+
+## Whole-turn CPU snapshots
+
+With prefix offload enabled, completion schedules a full snapshot rather than
+waiting for GPU pressure. The cache manager's `ChainOffloadController` owns
+bounded pinned tensors and transfer events; the coordinator chooses LRU host
+victims and distinguishes device demotion from logical eviction. A CPU-only
+record keeps physical lengths as restore requirements but has `resident_rows=0`.
+Admission reserves those lengths plus suffix-prefill growth and one row.
+Rank-0 admission plans carry separate demotion and eviction lists.
+
+Unlike immutable radix blocks, a chain becomes mutable again each turn. Its
+CPU snapshot is invalidated before the next writer starts, after waiting for
+the preceding D2H operation. The host allocation may be reused when shapes
+match, but all retained tensors are copied again. GPU payloads are released
+only after a valid snapshot completes. H2D finishes at the admission boundary;
+decode has no additional per-step synchronization. Failure, invalidation, and
+warmup reset drain transfers before freeing their resources.
+
+Snapshots include per-layer KV (or latent/RoPE), H2O scores, R-KV query windows
+and positions, and SkipKV sentence tensors and metadata. Row and slot IDs are
+rebuilt on restoration, while logical token identity remains in the index.
+The host tensor budget is per rank; driver token-history capacity additionally
+grows by `floor(host_bytes / 4)` tokens so CPU-only chains can outnumber GPU
+rows. Python metadata and logical history remain separate from pinned tensors.
+
+The transfer cost per turn is linear in retained payload bytes, not logical
+context length: `sum_layer(length * (key_bytes + value_bytes)) + method_bytes`.
+SGL per-layer transfer APIs consume device slot indices directly, including
+separate token widths for MLA. vLLM's `swap_blocks` requires CPU block mappings;
+using it would add index readback and another runtime dependency. No new kernel
+or attention provider is introduced. Temporary device storage consists of slot
+indices and frozen method tensors retained until the D2H completion event.
 
 ## HTTP and routing contract
 

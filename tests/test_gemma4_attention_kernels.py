@@ -17,17 +17,26 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 
 @pytest.mark.parametrize(
-    ("head_dim", "q_heads", "kv_heads", "sliding_window"),
-    [(256, 4, 2, 32), (512, 4, 1, None)],
+    ("head_dim", "q_heads", "kv_heads", "sliding_window", "sparse_history"),
+    [(256, 4, 2, 32, False), (512, 4, 1, None, False),
+     (512, 4, 1, None, True)],
 )
 def test_gemma4_flashinfer_prefill_matches_torch(
-    head_dim, q_heads, kv_heads, sliding_window
+    head_dim, q_heads, kv_heads, sliding_window, sparse_history
 ):
     pytest.importorskip("flashinfer")
     torch.manual_seed(20260813)
     prefix, chunk, length = 11, 54, 65
-    slots = torch.randperm(length, device="cuda", dtype=torch.int64).to(torch.int32)
-    key = torch.randn(length, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    original_prefix = 2 * prefix if sparse_history else prefix
+    original_length = original_prefix + chunk
+    # Global sparse prefill must preserve the causal current tail when history
+    # is noncontiguous in original token positions, including shared-KV reads.
+    positions = torch.cat((
+        torch.arange(0, original_prefix, 2 if sparse_history else 1, device="cuda"),
+        torch.arange(original_prefix, original_length, device="cuda"),
+    ))
+    slots = torch.randperm(original_length, device="cuda")[positions].to(torch.int32)
+    key = torch.randn(original_length, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     value = torch.randn_like(key)
     query = torch.randn(chunk, q_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     view = SimpleNamespace(
@@ -64,8 +73,8 @@ def test_gemma4_flashinfer_prefill_matches_torch(
     logits = torch.einsum(
         "qhd,khd->hqk", query, logical_key[:, kv_head_ids]
     ).float()
-    query_positions = prefix + torch.arange(chunk, device="cuda")
-    key_positions = torch.arange(length, device="cuda")
+    query_positions = original_prefix + torch.arange(chunk, device="cuda")
+    key_positions = positions
     visible = key_positions[None] <= query_positions[:, None]
     if sliding_window is not None:
         visible &= key_positions[None] > query_positions[:, None] - sliding_window

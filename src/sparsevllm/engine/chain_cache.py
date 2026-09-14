@@ -8,6 +8,7 @@ from array import array
 from collections import OrderedDict
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 from enum import Enum
 from typing import Any, Iterable
 
@@ -115,6 +116,8 @@ class ChainAdmissionPlan:
     victim_chain_ids: tuple[str, ...] = ()
     reserved_slots_by_layer: tuple[int, ...] = ()
     reserved_rows: int = 0
+    demote_chain_ids: tuple[str, ...] = ()
+    decode_reserved_slots_by_layer: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +156,7 @@ def normalize_prefix_cache_mode(
     *,
     enabled: bool,
     method: str,
+    prefill_method: str = "",
 ) -> str:
     mode = str(requested or "auto").strip().lower()
     if mode not in PREFIX_CACHE_MODES:
@@ -164,7 +168,9 @@ def normalize_prefix_cache_mode(
         return "disabled"
     method = str(method or "")
     expected = (
-        "radix"
+        "chain"
+        if prefill_method == "omnikv_prefill" and method in ("", "omnikv")
+        else "radix"
         if method in RADIX_PREFIX_METHODS
         else "chain"
         if method in CHAIN_PREFIX_METHODS
@@ -206,6 +212,12 @@ def build_chain_cache_fingerprint(config: Any) -> bytes:
         or ""
     )
     method_fields = {
+        "omnikv": (
+            "sink_keep_tokens",
+            "recent_keep_tokens",
+            "decode_keep_tokens",
+            "sparse_attn_score_dtype",
+        ),
         "streamingllm": (
             "sink_keep_tokens",
             "recent_keep_tokens",
@@ -630,14 +642,9 @@ class ChainCacheIndex:
         slot_deficits = [max(0, int(value)) for value in required_slots_by_layer]
         remaining_row_deficit = max(0, int(row_deficit))
         victims: list[str] = []
-        candidates = sorted(
-            (
-                candidate
-                for candidate in self.records.values()
-                if candidate.state is ChainState.IDLE
-                and candidate.chain_id != chain_id
-            ),
-            key=lambda candidate: (candidate.last_access, candidate.chain_id),
+        candidates = (
+            candidate for candidate in self.idle_resident_lru()
+            if candidate.chain_id != chain_id
         )
         for victim in candidates:
             if remaining_row_deficit <= 0 and not any(slot_deficits):
@@ -805,6 +812,13 @@ class ChainCacheIndex:
         self._stats["chain_cache_invalidated"] += 1
         return record
 
+    def idle_resident_lru(self) -> list[ChainRecord]:
+        return sorted(
+            (record for record in self.records.values()
+             if record.state is ChainState.IDLE and record.resident_rows > 0),
+            key=lambda record: (record.last_access, record.chain_id),
+        )
+
     def evict(self, chain_id: str) -> ChainRecord:
         record = self.lookup(chain_id)
         if record.state is ChainState.ACTIVE:
@@ -896,6 +910,11 @@ class ChainCacheCoordinator:
         self.config = config
         self.cache_manager = cache_manager
         self.fingerprint = build_chain_cache_fingerprint(config)
+        self.offload = None
+        if bool(getattr(config, "enable_prefix_cache_offload", False)):
+            self.offload = cache_manager.create_chain_offload(
+                int(float(config.prefix_cache_host_size_gb) * 1024**3)
+            )
         self.index = ChainCacheIndex(
             max_tombstones=int(
                 getattr(config, "chain_cache_max_tombstones", 1024)
@@ -912,6 +931,10 @@ class ChainCacheCoordinator:
                 )
             ),
         )
+        if self.offload is not None:
+            # CPU-only chains may outnumber GPU rows. Keep logical history
+            # bounded separately, including the full (uncompressed) token list.
+            self.index.max_token_history_tokens += self.offload.capacity_bytes // 4
 
     def owner_seq_id(self, chain_id: str) -> int:
         return int(self.index.lookup(chain_id).seq_id)
@@ -921,8 +944,10 @@ class ChainCacheCoordinator:
         *,
         chain_id: str,
         token_count: int,
-        generation_tokens: int = 0,
+        decode_reserved_slots_by_layer: tuple[int, ...] = (),
     ) -> tuple[tuple[int, ...], int, tuple[int, ...], int]:
+        if self.offload is not None:
+            self.offload.poll()
         record = self.index.records.get(chain_id)
         reused = 0 if record is None else int(record.processed_token_count)
         existing_slots = (
@@ -937,13 +962,18 @@ class ChainCacheCoordinator:
         outstanding_slots, outstanding_rows = (
             self._outstanding_active_reservations()
         )
+        outstanding_slots = tuple(
+            (outstanding_slots[i] if i < len(outstanding_slots) else 0)
+            + (decode_reserved_slots_by_layer[i] if i < len(decode_reserved_slots_by_layer) else 0)
+            for i in range(max(len(outstanding_slots), len(decode_reserved_slots_by_layer)))
+        )
         required_slots, required_rows, slot_deficits, row_deficit = hook(
             suffix_tokens=suffix_tokens,
-            generation_tokens=max(0, int(generation_tokens)),
+            generation_tokens=0,
             existing_slots_by_layer=existing_slots,
             outstanding_reserved_slots_by_layer=outstanding_slots,
             outstanding_reserved_rows=outstanding_rows,
-            needs_resident_row=record is None,
+            needs_resident_row=record is None or record.resident_rows == 0,
         )
         return (
             tuple(int(value) for value in required_slots),
@@ -1013,16 +1043,19 @@ class ChainCacheCoordinator:
         chain_id: str,
         seq_id: int,
         token_ids: list[int],
-        generation_tokens: int = 0,
     ) -> ChainAdmissionPlan:
+        ledger = getattr(self, "decode_reservations", None)
+        reserved = {} if ledger is None else ledger.outstanding()
+        decode_reserved = tuple(reserved.get(f"layer_{layer}", reserved.get("slots", 0))
+                                for layer in self.cache_manager.kv_transformer_layer_indices()) if reserved else ()
         required_slots, required_rows, slots, rows = (
             self.admission_requirements(
                 chain_id=chain_id,
                 token_count=len(token_ids),
-                generation_tokens=generation_tokens,
+                decode_reserved_slots_by_layer=decode_reserved,
             )
         )
-        return self.index.plan_admission(
+        plan = self._offload_plan(self.index.plan_admission(
             chain_id=chain_id,
             seq_id=seq_id,
             token_ids=token_ids,
@@ -1031,7 +1064,16 @@ class ChainCacheCoordinator:
             row_deficit=rows,
             reserved_slots_by_layer=required_slots,
             reserved_rows=required_rows,
-        )
+        ))
+        return replace(plan, decode_reserved_slots_by_layer=decode_reserved)
+
+    def _offload_plan(self, plan: ChainAdmissionPlan) -> ChainAdmissionPlan:
+        if self.offload is None:
+            return plan
+        demote = tuple(chain_id for chain_id in plan.victim_chain_ids
+                       if self.index.records[chain_id].seq_id in self.offload.snapshots)
+        return replace(plan, demote_chain_ids=demote,
+                       victim_chain_ids=tuple(c for c in plan.victim_chain_ids if c not in demote))
 
     def validate_admission_plan(
         self,
@@ -1039,16 +1081,15 @@ class ChainCacheCoordinator:
         *,
         input_token_count: int,
         input_prefix_digest: bytes,
-        generation_tokens: int = 0,
     ) -> ChainAdmissionPlan:
         required_slots, required_rows, slots, rows = (
             self.admission_requirements(
                 chain_id=expected.chain_id,
                 token_count=int(input_token_count),
-                generation_tokens=generation_tokens,
+                decode_reserved_slots_by_layer=expected.decode_reserved_slots_by_layer,
             )
         )
-        local = self.index.plan_admission_digest(
+        local = self._offload_plan(self.index.plan_admission_digest(
             chain_id=expected.chain_id,
             seq_id=expected.seq_id,
             input_token_count=int(input_token_count),
@@ -1058,7 +1099,8 @@ class ChainCacheCoordinator:
             row_deficit=rows,
             reserved_slots_by_layer=required_slots,
             reserved_rows=required_rows,
-        )
+        ))
+        local = replace(local, decode_reserved_slots_by_layer=expected.decode_reserved_slots_by_layer)
         if local != expected:
             raise RuntimeError(
                 "Chain-cache admission plan diverged from the rank-0 plan: "
@@ -1067,7 +1109,60 @@ class ChainCacheCoordinator:
         return local
 
     def apply_admission(self, plan: ChainAdmissionPlan) -> ChainRecord:
-        return self.index.apply_admission(plan, fingerprint=self.fingerprint)
+        if self.offload is not None:
+            for chain_id in plan.demote_chain_ids:
+                victim = self.index.lookup(chain_id)
+                if victim.state is not ChainState.IDLE:
+                    raise ChainBusyError("Cannot demote an ACTIVE chain.", chain_id=chain_id)
+                if not self.offload.wait(victim.seq_id).valid:
+                    raise RuntimeError("Cannot demote a chain without a valid CPU snapshot.")
+                self.cache_manager.free_seq(victim.seq_id)
+                victim.resident_rows = 0
+            for chain_id in plan.victim_chain_ids:
+                self.offload.drop(self.index.lookup(chain_id).seq_id)
+        record = self.index.apply_admission(plan, fingerprint=self.fingerprint)
+        return record
+
+    def prepare_resumed_chain(self, record: ChainRecord) -> None:
+        if self.offload is None:
+            return
+        if record.resident_rows == 0:
+            self.offload.restore(record.seq_id)
+            record.resident_rows = 1
+            record.reserved_slots_by_layer = tuple(
+                reserved - existing for reserved, existing in
+                zip(record.reserved_slots_by_layer, record.physical_slots_by_layer)
+            )
+            record.reserved_rows = 0
+        # Wait even when the GPU copy survived: the next writer must not race
+        # the previous turn's D2H reader.
+        self.offload.invalidate(record.seq_id)
+
+    def save_finished_chain(self, record: ChainRecord) -> None:
+        if self.offload is None:
+            return
+        state = self.cache_manager.snapshot_chain_method_state(record.seq_id)
+        required = self.offload.required_bytes(record.seq_id, state)
+        if required > self.offload.capacity_bytes:
+            raise ChainCapacityError(
+                f"Whole-chain CPU snapshot needs {required} bytes; host budget is {self.offload.capacity_bytes}.",
+                chain_id=record.chain_id,
+            )
+        old_bytes = getattr(self.offload.snapshots.get(record.seq_id), "nbytes", 0)
+        candidates = sorted(
+            (r for r in self.index.records.values() if r.chain_id != record.chain_id
+             and r.seq_id in self.offload.snapshots),
+            # ACTIVE snapshots are obsolete allocations retained only for reuse.
+            # Their validity does not depend on rank-local event completion.
+            key=lambda r: (r.state is not ChainState.ACTIVE, r.last_access, r.chain_id),
+        )
+        for victim in candidates:
+            if self.offload.used_bytes - old_bytes + required <= self.offload.capacity_bytes:
+                break
+            self.offload.drop(victim.seq_id)
+            if victim.resident_rows == 0:
+                self.index.evict(victim.chain_id)
+        self.offload.save(record.seq_id, state)
 
     def finish(self, seq: Any) -> ChainRecord:
         chain_id = str(getattr(seq, "chain_id", "") or "")
@@ -1163,13 +1258,25 @@ class ChainCacheCoordinator:
         return record
 
     def invalidate(self, chain_id: str) -> ChainRecord:
+        if self.offload is not None:
+            self.offload.drop(self.index.lookup(chain_id).seq_id)
         return self.index.invalidate(chain_id)
 
     def routing_match(self, chain_id: str) -> dict[str, object]:
         return self.index.routing_match(chain_id)
 
     def stats(self) -> dict[str, int]:
-        return self.index.stats()
+        stats = self.index.stats()
+        if self.offload is not None:
+            self.offload.poll()
+            stats.update(chain_cache_host_bytes=self.offload.used_bytes,
+                         chain_cache_d2h_bytes=self.offload.d2h_bytes,
+                         chain_cache_h2d_bytes=self.offload.h2d_bytes,
+                         chain_cache_d2h_inflight=sum(s.completion is not None for s in self.offload.snapshots.values()),
+                         chain_cache_cpu_only=sum(r.resident_rows == 0 for r in self.index.records.values()))
+        return stats
 
     def reset(self) -> None:
+        if self.offload is not None:
+            self.offload.reset()
         self.index.reset()

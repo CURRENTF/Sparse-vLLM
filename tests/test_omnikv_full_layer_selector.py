@@ -165,6 +165,21 @@ class OmniKVFullLayerSelectorTest(unittest.TestCase):
         self.assertEqual(breakdown[1]["anchor"], 11)
         self.assertEqual(breakdown[1]["sparse_layers"], [15])
 
+    def test_global_calibration_excludes_truncated_sliding_attention_scores(self):
+        from sparsevllm.utils.select_omnikv_full_layers import topk_indices_from_decode_attentions
+
+        # Sliding layers return only their local window; mixing their local
+        # indices into full-history coverage can select the wrong observers.
+        sliding = torch.tensor([[[[0.8, 0.2]]]])
+        global_a = torch.tensor([[[[0.1, 0.2, 0.6, 0.1]]]])
+        global_b = torch.tensor([[[[0.1, 0.1, 0.1, 0.7]]]])
+        indices, k = topk_indices_from_decode_attentions(
+            (sliding, global_a, sliding, global_b), topk=1,
+            sink_keep_tokens=0, recent_keep_tokens=0, attention_layer_indices=[1, 3],
+        )
+        self.assertEqual(indices, [[2], [3]])
+        self.assertEqual(k, 1)
+
     def test_fp8_config_removes_only_nonlinear_gate_exclusions(self):
         config = SimpleNamespace(
             quantization_config={

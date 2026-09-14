@@ -7,7 +7,7 @@ Date/retry suffixes in arm IDs identify existing results, not required retries.
 | Script | Responsibility |
 | --- | --- |
 | `prepare_cohort.py` | Common untruncated medium cohort and exclusion audit |
-| `build_campaign.py` | Freeze/reuse model source; generate all final quality and new 32K jobs once |
+| `build_campaign.py` | Select a checkout; generate all final quality and new 32K jobs once |
 | `run_quality.py` | Longest-context smoke, then the complete paired cohort |
 | `serve_quality.py` | Own an external server, readiness deadline, quality run and cleanup |
 | `summarize_campaign.py` | Per-sample quality aggregation and raw 32K/128K stage validation |
@@ -39,12 +39,12 @@ python3 "$EXP/build_campaign.py" --paths "$PATHS_JSON" \
 `scratch_root`. Native/vLLM/Vortex use Conda; Tangram/HiSparse use prepared
 venvs. Keep the scratch path short for Unix sockets. Baselines require the
 compatible prepared forks/overlay, not arbitrary upstream installations; retain
-their source/binary provenance with the run as for the parent experiment.
+their Git version/dirty status and environment identity with the run.
 
 Generation launches no GPU work. Destinations must be fresh.
-`--source "$FROZEN_SOURCE"` reuses a frozen `source_v2` after checking every
-file against its adjacent `source_v2_manifest.json`; otherwise this checkout is
-frozen. New control scripts/config and hashes are captured independently.
+`--source "$REPO"` selects the checkout to execute directly; the default is
+this repository. Git commit/dirty status and resolved configuration are recorded.
+Control scripts are also executed from that checkout, without source copies or hash gates.
 Outputs include `plan.json`, `campaign.json`, `queued_commands.json`,
 individual configs and sealed `queues/<gpu>/jobs/`.
 

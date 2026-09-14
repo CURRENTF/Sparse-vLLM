@@ -132,6 +132,7 @@ def build_mha_prefill_attention_spec(
         causal=True,
         page_size=1,
         score_output=contract.main_score_kind,
+        optional_score_output=contract.optional_score_output,
         layer_varying_page_table=contract.layer_varying_page_table,
         return_softmax_lse=(
             cache_method == "h2o"

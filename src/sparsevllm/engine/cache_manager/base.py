@@ -1622,6 +1622,23 @@ class CacheManager(ABC):
         """Scheduler-side capacity consumed by scheduling a prefill chunk."""
         return int(scheduled_tokens)
 
+    def decode_window_budgets(self) -> dict[str, int]:
+        return {"slots": int(self.prompt_admission_free_slots())}
+
+    def decode_window_costs(self, seq: Sequence, tokens: int) -> dict[str, int]:
+        return {"slots": int(tokens)}
+
+    def prefill_capacity_after_decode_reservations(
+        self, free_slots: int, reserved: dict[str, int], *, admission: bool,
+    ) -> int:
+        """Deduct token-slot headroom from a scalar prefill capacity.
+
+        The default covers one slot pool or homogeneous per-layer slot pools.
+        Mixed raw/compressed pools must project their own capacity. Return the
+        unclamped balance so RuntimeState can add reclaimable prefix slots.
+        """
+        return int(free_slots) - max(reserved.values(), default=0)
+
     def decode_step_free_slots(self) -> int:
         """Writable KV capacity for one decode step."""
         return int(self.num_free_slots)

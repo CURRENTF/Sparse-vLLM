@@ -136,7 +136,6 @@ def main():
     manifest = {"command": [sys.executable, *sys.argv], "data_sha256": hashlib.sha256(source).hexdigest(),
                 "metric": payload["metric"], "error_bars": "sample standard deviation across iterations",
                 "layout": "combined_quest_and_h2o_with_wave",
-                "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 "figsize_inches": [args.width, args.width / 2.5], "title": None,
                 "versions": {"matplotlib": matplotlib.__version__, "seaborn": sns.__version__, "pandas": pd.__version__},
                 "outputs": [str(p) for p in targets[:-1]]}

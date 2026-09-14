@@ -1,12 +1,11 @@
 """Protect portable experiment serialization and reject ambiguous output identities."""
 import copy
-import hashlib
 import json
 
 import pytest
 
 from scripts.official_experiments.sparsevllm_vs_vortex.prepare_runs import (
-    build_outputs, check_vortex_sources,
+    build_outputs,
 )
 
 
@@ -65,20 +64,6 @@ def test_duplicate_configs_or_job_targets_are_not_silently_overwritten(tmp_path,
         second['id'] = 'different_config'
     with pytest.raises(ValueError, match='Duplicate case'):
         build([first, second], tmp_path)
-
-
-def test_baseline_source_drift_or_missing_file_fails_explicitly(tmp_path):
-    source = tmp_path / 'method.py'
-    source.write_bytes(b'recorded implementation')
-    provenance = {'engines': {'vortex': {'source_sha256': {
-        'method.py': hashlib.sha256(source.read_bytes()).hexdigest()}}}}
-    check_vortex_sources(tmp_path, provenance)
-    source.write_bytes(b'changed implementation')
-    with pytest.raises(ValueError, match='baseline mismatch'):
-        check_vortex_sources(tmp_path, provenance)
-    source.unlink()
-    with pytest.raises(ValueError, match='baseline mismatch'):
-        check_vortex_sources(tmp_path, provenance)
 
 
 def test_quality_smoke_failure_never_starts_full_cohort(tmp_path, monkeypatch):

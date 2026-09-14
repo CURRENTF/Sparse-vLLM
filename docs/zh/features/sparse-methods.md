@@ -33,11 +33,46 @@ OmniKV offload 将全注意力层 KV 保留在 GPU，稀疏层历史保存在 CP
 | `enable_omnikv_offload` | 默认 `False`。在 `sparse_method="omnikv"` 时设为 `True` 开启。 |
 | `omnikv_offload_cache_tokens` | 每个稀疏层、每个请求的 GPU 缓存 token 数。默认 `None` 自动设置；`0` 关闭 LRU 缓存；正数必须覆盖所选 token 预算。增大缓存可减少搬运，但会占用更多显存。 |
 
-Prefill 加速由 `prefill_sparse_method` 独立选择。当前支持两种方法：
+Prefill 加速由 `prefill_sparse_method` 独立选择。当前支持三种方法：
 `h2o_prefill` 用于中间 chunk 的物理 KV 压缩，`flashprefill_v2` 用于稀疏化
-prefill attention 计算。它们是同一条轴上的备选项，可以分别与兼容的 cache/decode
+prefill attention 计算，`omnikv_prefill` 用于分块 prefill 的跨层历史选择。
+它们是同一条轴上的备选项，可以分别与兼容的 cache/decode
 方法组合。H2O prefill/decode 组合矩阵及“省略”和“显式空字符串”的兼容规则见
 [runtime 参数语义](../configuration/runtime-parameter-semantics.md#prefill-sparsity)。
+
+`omnikv_prefill` 可搭配 vanilla（`sparse_method=""`）或 OmniKV decode。
+它保留完整 KV 存储，只改变 prefill attention 的读取范围。
+`omnikv_prefill_full_attention_layers="auto"`（默认）优先使用已登记的 prefill
+profile，否则复用模型的 OmniKV decode profile，并仅保留全局 KV 层；
+未登记的模型会报错，需要先校准。也可显式指定
+层列表，必须包含第一个全局 KV 层。滑动窗口层不参与选择，始终使用原有
+attention。这些层配置及以下预算均独立于 decode 配置：
+
+| 参数 | 含义 |
+|---|---|
+| `omnikv_prefill_keep_tokens` | 选中的历史 token 数，不含 sink、recent 和当前 chunk；默认 4096。 |
+| `omnikv_prefill_sink_keep_tokens` | 始终保留的开头 token 数；默认 8。 |
+| `omnikv_prefill_recent_keep_tokens` | 当前 chunk 之前始终保留的最近历史 token 数；默认 128。 |
+
+当前 chunk 始终完整保留，并使用 causal mask。评分固定为完整 chunk 的 raw QK，
+使用 float32：显式 KV 对 query 取均值后取 head 最大值；MLA 对 query 和 head
+一起取最大值。`sparse_prefill_score_mode` 不改变此方法。
+`engine_prefill_chunk_size` 同时影响质量和可减少的历史 attention 计算量；
+整个 prompt 只有一个 chunk 时，没有历史计算可裁减。即使搭配 vanilla decode，
+稀疏 prefill 仍可能影响质量。
+
+支持显式 KV、MLA latent，以及 Gemma 4 全局 attention（包括共享 KV 的后续层）。
+Gemma 4 滑动窗口层既不评分，也不使用 OmniKV prefill 的选择结果。连续显式 KV
+和 MLA 可开启 `enable_omnikv_offload=true`，使用 OmniKV 的 CPU KV backing；
+prefill 和 decode 的完整 attention 层列表可以不同。异构 Gemma 4 KV 存储仍受
+原有 offload 限制。
+
+开启 `enable_prefix_caching=true` 后，`prefix_cache_mode="auto"` 自动选择 `chain`，
+也可显式指定 `chain`。下一轮发送完整逻辑上下文和返回的 `chain_id`，续接已完成的
+同一条链。复用的是实际计算过的 KV，不会按新的 chunk 划分重算历史轮次。
+跨整个 chunk 的 query 选择可能改变共享前缀的 KV，因此拒绝 `radix`。
+保持 `enable_prefix_cache_offload=false`：空闲链快照尚不支持这种共享槽位布局；
+独立的 `enable_omnikv_offload` 仍可启用。
 
 > [!NOTE]
 > 两种 score-free decode contract 的论文来源不同。[SnapKV 论文](https://arxiv.org/abs/2404.14469)
@@ -90,7 +125,8 @@ DeltaKV family 方法和 PyramidKV 只对外提供 `long_bs1full_short_batch` po
 
 `enable_prefix_caching=true` 支持两种有意分离的布局。
 `prefix_cache_mode=auto` 为 vanilla/OmniKV/QuEST 选择 radix，为
-SnapKV/H2O/PyramidKV/R-KV/SkipKV 选择线性 chain。也可以显式请求 `radix`
+SnapKV/H2O/PyramidKV/R-KV/SkipKV 选择线性 chain。选择 `omnikv_prefill` 后，
+vanilla/OmniKV 改用 chain 模式。也可以显式请求 `radix`
 或 `chain`，但不兼容的方法/模式组合会快速失败。
 GLM-4.7-Flash latent QuEST 支持设备驻留的 radix Prefix Cache 与 decode CUDA
 Graph 组合，prefix block 大小须等于 `quest_chunk_size`。页选择保持 TP rank
@@ -101,12 +137,35 @@ Graph 组合，prefix block 大小须等于 `quest_chunk_size`。页选择保持
 [Prefix cache 修剪](prefix-cache-pruning.md)中的 SnapKV 或 KVzip 打分维护接口
 进行物理压紧；QuEST tree 会明确拒绝修剪。
 
-Chain 布局跨 turn 保留同一个驻留 `seq_id`，且永不分支。调用方发送完整逻辑
+Chain 布局跨 turn 保留同一个 owner `seq_id`，且永不分支。调用方发送完整逻辑
 上下文和服务端返回的 `chain_id`；服务端验证 processed boundary 后只转发新增
 suffix。方法 KV 与 metadata 仍由 cache manager 持有。Idle chain 采用严格
 LRU 回收，active writer 保持 pinned。Rank 0 使用紧凑 32-bit storage 保存
 processed logical token ID，以便文本 continuation 保持驻留的 BPE tokenization。
 该 CPU 历史受 `max_model_len * max_num_seqs_in_gpu` 限制，并随 chain 一起回收。
+
+### Chain CPU offload
+
+设置 `enable_prefix_caching=true`、`enable_prefix_cache_offload=true`、
+`prefix_cache_mode="chain"`（或 `auto`），并显式设置
+`prefix_cache_host_size_gb`。沿用现有 offload 参数，适用于 StreamingLLM、
+SnapKV、H2O、PyramidKV、R-KV、SkipKV 各自支持的模型路径，TP 为 1 或 2。
+支持连续的显式 KV 和 MLA latent/RoPE 存储；包含 recurrent/linear layer 的
+模型在初始化时明确拒绝。需要 pinned host memory、device stream 和已安装的
+SGL cache-transfer 接口。
+
+每轮正常结束后，异步将全部保留缓存及方法状态复制到 CPU，同时保留 GPU
+副本供快速续轮。GPU 容量不足时，已有完整 CPU 快照的 idle chain 可以释放
+GPU slot 和 row，保留 chain ID。仅有 CPU 副本的 chain 会先完整恢复，再处理
+新增 suffix。下一轮写入前会等待上一轮拷贝完成，并使旧 CPU 快照失效；本轮
+结束后重新复制，包括旧 token 和累计 score 的变化。
+
+Host size 限制**每个 rank** 的快照 tensor 字节数。CPU 容量不足时按 LRU
+回收 CPU 副本：仍有 GPU 副本的 chain 保留 ID，仅有 CPU 副本的被淘汰 chain
+变为 `chain_gone`。单条快照超过预算时，在轮次结束阶段明确报错。逻辑 token
+历史与 Python metadata 不计入快照 tensor 预算；offload 会按每 4 字节配置
+host 容量增加 1 个 token，扩展 driver 的有界历史配额。CUDA Graph 使用恢复后
+的同一存储，传输与分配均在 capture/replay 外执行。
 
 `Config` 会把 `None`、空字符串和 `auto` 解析为 registry default。与方法默认值不一致的显式 policy 会快速失败，避免实验静默改变 scheduler 语义。任何 policy override 都应视为显式 ablation，并随 benchmark result 一起记录。
 

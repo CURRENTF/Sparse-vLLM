@@ -75,9 +75,13 @@ and the selected `sparse_prefill_score_mode` retain their existing meanings.
 ## Prefill sparsity
 
 `prefill_sparse_method` selects prefill acceleration independently from
-`sparse_method`. Sparse-vLLM currently exposes two choices:
-`h2o_prefill`, which compacts physical KV after intermediate prompt chunks, and
-`flashprefill_v2`, which sparsifies the prefill attention computation.
+`sparse_method`. Sparse-vLLM exposes `h2o_prefill` for physical KV compaction
+after intermediate prompt chunks, `flashprefill_v2` for sparse prefill attention,
+and `omnikv_prefill` for cross-layer history selection during chunked prefill.
+`omnikv_prefill` supports vanilla/OmniKV decode with explicit KV or MLA, including
+OmniKV offload and chain cache;
+its independent budgets, automatic full-layer profile and restrictions are described
+in [sparse methods](../features/sparse-methods.md). Radix prefix reuse is unsupported.
 `flashprefill_v2` supports `vanilla`, `omnikv`, `quest`,
 `snapkv`, and `h2o` on explicit-KV MHA models, including their supported
 prefix-cache modes. MLA latent models reject this prefill method during
@@ -184,3 +188,19 @@ Text benchmarks share `benchmark/model_adapters/sparsevllm.py`. It accepts the
 same public parameter names, constructs the native engine, and exposes a small
 generation callable for LongBench, MathBench, NIAH, and RULER core. SCBench uses
 its native `sparsevllm` attention type. There is no `--backend hf` option.
+
+## Decode reservation window
+
+`decode_reservation_tokens` is a positive integer (default: `1024`) shared by
+all cache methods and prefix modes. It bounds the next decode-step window,
+not total output length or a sparse eviction interval. The first output token
+comes from prefill; subsequent decode steps reserve up to this window or the
+remaining output limit. Methods account for page rounding, eviction peaks,
+and compressed pools in their own resource units.
+
+The scheduler renews active decode windows before admitting more prefill work.
+Renewal failure uses existing preemption/recompute recovery. A sole request may
+receive a smaller window if at least one step fits. A window boundary never
+forces a queue rotation or changes scoring/eviction. Small windows can increase
+preemption under load; larger windows can delay new requests. Chain admission
+still checks suffix-prefill and CPU restore capacity separately.

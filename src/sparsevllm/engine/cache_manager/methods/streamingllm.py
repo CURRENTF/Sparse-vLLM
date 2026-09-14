@@ -34,6 +34,22 @@ class StreamingLLMCacheManager(SnapKVCacheManager):
     def prefill_batched_tokens_margin(self) -> int:
         return int(self.config.recent_keep_tokens)
 
+    def decode_window_costs(self, seq: Sequence, tokens: int) -> dict[str, int]:
+        tokens = max(0, int(tokens))
+        budget = int(self.config.sink_keep_tokens) + int(self.config.recent_keep_tokens)
+        costs = {}
+        for layer, resident in zip(
+            self.kv_transformer_layer_indices(),
+            self.chain_physical_residency(seq.seq_id),
+        ):
+            # Decode appends before compacting at twice the retained budget.
+            # An already oversized row still needs one writable append slot.
+            costs[f"layer_{layer}"] = (
+                min(tokens, max(1, 2 * budget - int(resident)))
+                if budget > 0 else tokens
+            )
+        return costs
+
     def _decode_graph_metadata_always_uniform(self) -> bool:
         return True
 

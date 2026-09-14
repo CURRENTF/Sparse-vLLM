@@ -24,6 +24,7 @@ from sparsevllm.engine.decode_graph_contract import (
     DecodeGraphContract,
     DecodeGraphInputs,
 )
+from sparsevllm.engine.runtime_state import RuntimeState
 from sparsevllm.engine.scheduler import Scheduler
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.sparse_controller import SparseController
@@ -108,6 +109,7 @@ def _manager_with_layer_rows(
         {idx: idx for idx in range(batch_size)}
         for _ in lengths_by_layer
     ]
+    manager.free_rows = [deque() for _ in lengths_by_layer]
     manager.row_seq_lens = [
         np.asarray(lengths, dtype=np.int32) for lengths in lengths_by_layer
     ]
@@ -1506,21 +1508,20 @@ def test_h2o_decode_pressure_reclaims_over_budget_row_before_interval():
         "dropped_tokens": 1,
     }
 
-    scheduler = Scheduler(
-        SimpleNamespace(
-            max_num_seqs_in_batch=1,
-            max_num_batched_tokens=1,
-            max_decoding_seqs=1,
-            engine_prefill_chunk_size=1,
-            prefill_schedule_policy=PREFILL_POLICY_ALL_CHUNKED,
-            eos=-1,
-            sink_keep_tokens=0,
-            recent_keep_tokens=0,
-            decode_keep_tokens=4,
-            sparse_method="h2o",
-        ),
-        manager,
+    scheduler_config = SimpleNamespace(
+        max_num_seqs_in_batch=1,
+        max_num_seqs_in_gpu=1,
+        max_num_batched_tokens=1,
+        max_decoding_seqs=1,
+        engine_prefill_chunk_size=1,
+        prefill_schedule_policy=PREFILL_POLICY_ALL_CHUNKED,
+        eos=-1,
+        sink_keep_tokens=0,
+        recent_keep_tokens=0,
+        decode_keep_tokens=4,
+        sparse_method="h2o",
     )
+    scheduler = Scheduler(scheduler_config, RuntimeState(scheduler_config, manager))
     scheduler.decoding.append(seq)
 
     scheduled, is_prefill, preempted = scheduler.schedule()
@@ -2468,6 +2469,7 @@ def test_h2o_capacity_hooks_reserve_prefill_peak_and_gate_chunk_with_real_free_s
 
     scheduler_config = SimpleNamespace(
         max_num_seqs_in_batch=4,
+        max_num_seqs_in_gpu=4,
         max_num_batched_tokens=16,
         max_decoding_seqs=4,
         engine_prefill_chunk_size=16,
@@ -2478,7 +2480,7 @@ def test_h2o_capacity_hooks_reserve_prefill_peak_and_gate_chunk_with_real_free_s
         decode_keep_tokens=4,
         sparse_method="h2o",
     )
-    scheduler = Scheduler(scheduler_config, manager)
+    scheduler = Scheduler(scheduler_config, RuntimeState(scheduler_config, manager))
     scheduler.waiting.append(seq)
     scheduled, is_prefill, _ = scheduler.schedule()
     assert is_prefill
@@ -2510,6 +2512,7 @@ def test_h2o_scheduler_does_not_admit_partial_prefills_that_fill_all_slots():
     seqs = [_seq(seq_id, 20, prefilled=0, chunk=0) for seq_id in range(3)]
     scheduler_config = SimpleNamespace(
         max_num_seqs_in_batch=3,
+        max_num_seqs_in_gpu=3,
         max_num_batched_tokens=12,
         max_decoding_seqs=3,
         engine_prefill_chunk_size=4,
@@ -2520,7 +2523,7 @@ def test_h2o_scheduler_does_not_admit_partial_prefills_that_fill_all_slots():
         decode_keep_tokens=4,
         sparse_method="h2o",
     )
-    scheduler = Scheduler(scheduler_config, manager)
+    scheduler = Scheduler(scheduler_config, RuntimeState(scheduler_config, manager))
     scheduler.waiting.extend(seqs)
 
     scheduled, is_prefill, _ = scheduler.schedule()
@@ -2570,6 +2573,7 @@ def test_h2o_scheduler_reserves_until_first_prefill_eviction_peak():
     second = _seq(1, 300, prefilled=0, chunk=0)
     scheduler_config = SimpleNamespace(
         max_num_seqs_in_batch=2,
+        max_num_seqs_in_gpu=2,
         max_num_batched_tokens=8,
         max_decoding_seqs=2,
         engine_prefill_chunk_size=4,
@@ -2580,7 +2584,7 @@ def test_h2o_scheduler_reserves_until_first_prefill_eviction_peak():
         decode_keep_tokens=50,
         sparse_method="h2o",
     )
-    scheduler = Scheduler(scheduler_config, manager)
+    scheduler = Scheduler(scheduler_config, RuntimeState(scheduler_config, manager))
     scheduler.waiting.extend((first, second))
 
     assert manager.reserved_prefill_slots(scheduler.waiting, 4) == 100

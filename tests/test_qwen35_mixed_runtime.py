@@ -350,6 +350,15 @@ def test_qwen35_moe_skips_single_rank_output_packing():
 
 
 class _ResidentAdmissionCache:
+    def decode_window_budgets(self):
+        return {"slots": self.num_free_slots}
+
+    def decode_window_costs(self, seq, tokens):
+        return {"slots": tokens}
+
+    def prefill_capacity_after_decode_reservations(self, free_slots, reserved, *, admission):
+        return free_slots - reserved.get("slots", 0)
+
     def prefill_private_slots_for(self, seq):
         return 0
 
@@ -1653,6 +1662,120 @@ def test_mixed_admission_counts_inflight_d2h_before_pressure_prompt():
     assert runtime_state.prompt_admission_free_slots() == 4
 
 
+@pytest.fixture
+def mixed_decode_capacity():
+    # Real radix ownership and scheduler decisions; only tensor allocation and
+    # forward computation are replaced with CPU resource accounting.
+    released = []
+
+    class Cache(_ResidentAdmissionCache):
+        def free_prefix_kv_payload(self, payload):
+            self.num_free_slots += payload
+            released.append("kv")
+
+        def prepare_step(self, seqs, is_prefill):
+            assert not is_prefill
+            assert self.num_free_slots >= len(seqs)
+            self.num_free_slots -= len(seqs)
+
+    cache = Cache()
+    cache.num_free_slots = 0
+    config = _resident_scheduler_config()
+    config.decode_reservation_tokens = 2
+    index = RadixPrefixIndex(block_size=4, fingerprint=b"decode-reclaimable")
+    block = PrefixCacheBlock(
+        stable_block_id=index.stable_block_id([1, 2, 3, 4], None),
+        parent_block_id=None, block_size=4, logical_block_idx=0,
+        payload=MixedPrefixBlockPayload(
+            kv_payload=4, recurrent_payload="state", token_count=4,
+            accounting_bytes=8, recurrent_bytes=4,
+        ),
+        token_ids=(1, 2, 3, 4),
+    )
+    index.insert_block(block)
+    coordinator = object.__new__(PrefixCacheCoordinator)
+    coordinator.prefix_cache = index
+    coordinator.block_size = 4
+    coordinator.offload_controller = None
+    coordinator.cache_manager = cache
+    coordinator.recurrent_state_manager = SimpleNamespace(
+        free_prefix_recurrent_payload=lambda payload: released.append("recurrent"),
+    )
+    runtime = RuntimeState(config, cache, prefix_cache_coordinator=coordinator)
+    scheduler = Scheduler(config, runtime)
+    for _ in range(2):
+        seq = Sequence([8, 9], SamplingParams(max_tokens=8))
+        seq.num_prefilled_tokens = 2
+        seq.append_token(10)
+        scheduler.decoding.append(seq)
+    return cache, runtime, scheduler, block, released
+
+
+def test_mixed_decode_reserves_reclaimable_prefix_once_and_evicts_before_forward(mixed_decode_capacity):
+    cache, runtime, scheduler, block, released = mixed_decode_capacity
+    assert runtime.reserve_decode_windows(scheduler.decoding, scheduler.waiting) is None
+    seqs, is_prefill, preempted = scheduler.schedule()
+    assert len(seqs) == 2 and not is_prefill and not preempted
+    assert runtime.decode_reservations.outstanding() == {"slots": 4}
+    assert runtime.prompt_admission_budgets(deque(), 2)["slots"] == 0
+    assert runtime.prompt_admission_free_slots() == 0
+    assert runtime.prefill_step_free_slots() == 0
+    assert not released and cache.num_free_slots == 0
+    extra = Sequence([8, 9], SamplingParams(max_tokens=8))
+    extra.num_prefilled_tokens = 2
+    extra.append_token(10)
+    assert runtime.reserve_decode_windows([*seqs, extra], []) is extra
+    assert extra.seq_id not in runtime.decode_reservations.requests
+    runtime.prepare_step(seqs, is_prefill=False)
+    assert released == ["kv", "recurrent"]
+    assert block.stable_block_id not in runtime.prefix_cache_coordinator.prefix_cache.blocks
+    scheduler.postprocess(seqs, [11, 11], is_prefill=False)
+    assert cache.num_free_slots == 2
+    assert runtime.decode_reservations.outstanding() == {"slots": 2}
+    assert runtime.prompt_admission_budgets(deque(), 2)["slots"] == 0
+
+
+@pytest.mark.parametrize("protection", ["referenced", "negative_priority"])
+def test_mixed_decode_cannot_reserve_protected_prefix(mixed_decode_capacity, protection):
+    _, runtime, scheduler, block, released = mixed_decode_capacity
+    if protection == "referenced":
+        runtime.prefix_cache_coordinator.prefix_cache.acquire_block_ref(block)
+    else:
+        block.eviction_priority = -1
+    assert runtime.reserve_decode_windows(scheduler.decoding, scheduler.waiting) is scheduler.decoding[0]
+    assert not runtime.decode_reservations.requests
+    assert not released
+
+
+@pytest.mark.parametrize("inflight_d2h", [False, True])
+def test_mixed_sole_decode_shortens_window_to_reclaimable_capacity(mixed_decode_capacity, inflight_d2h):
+    _, runtime, scheduler, block, _ = mixed_decode_capacity
+    if inflight_d2h:
+        coordinator = runtime.prefix_cache_coordinator
+        coordinator.offload_controller = object()
+        coordinator.prefix_cache.begin_d2h(block)
+        assert coordinator.evictable_slots() == 0
+    scheduler.decoding.pop()
+    runtime.decode_reservations.window = 8
+    seqs, is_prefill, preempted = scheduler.schedule()
+    assert len(seqs) == 1 and not is_prefill and not preempted
+    assert runtime.decode_reservations.outstanding() == {"slots": 4}
+
+
+def test_mixed_decode_preserves_pending_prefill_when_physical_budget_is_clamped(mixed_decode_capacity):
+    cache, runtime, scheduler, _, released = mixed_decode_capacity
+    partial = Sequence([1, 2, 3, 4], SamplingParams(max_tokens=8))
+    partial.num_prefilled_tokens = 2
+    cache.reserved_prefill_slots = lambda waiting, step: sum(
+        seq.num_prompt_tokens - seq.num_prefilled_tokens for seq in waiting
+    )
+    # Free GPU slots are zero, so the cache's clamped admission budget is zero
+    # with or without this partial prefill. It still owns two future slots.
+    assert runtime.reserve_decode_windows(scheduler.decoding, [partial]) is scheduler.decoding[1]
+    assert runtime.decode_reservations.outstanding() == {"slots": 2}
+    assert not released
+
+
 def test_mixed_cpu_only_hit_reclaims_other_device_block_before_promotion():
     prefix_cache = RadixPrefixIndex(block_size=4, fingerprint=b"mixed-promotion-pressure")
     pressure_kv = SimpleNamespace(token_slots=torch.arange(4, dtype=torch.int32))
@@ -2675,3 +2798,30 @@ def test_quantized_loader_rejects_unloaded_fp8_modules():
 
     with pytest.raises(ValueError, match="Missing FP8 weight loads"):
         _validate_all_quantized_weights_loaded(model)
+
+
+def test_decode_window_failure_preempts_and_releases_lease_before_replay():
+    config = _resident_scheduler_config()
+    config.decode_reservation_tokens = 4
+    cache = _ResidentAdmissionCache()
+    cache.num_free_slots = 6
+    runtime = RuntimeState(config, cache)
+    scheduler = Scheduler(config, runtime)
+    seqs = [Sequence([1, 2], SamplingParams(max_tokens=20)) for _ in range(2)]
+    for seq in seqs:
+        seq.num_prefilled_tokens = 2
+        seq.append_token(3)
+        scheduler.decoding.append(seq)
+    scheduled, is_prefill, victims = scheduler.schedule()
+    assert not scheduled and not is_prefill
+    assert victims == [seqs[1]]
+    assert seqs[1].is_recompute_replay
+    assert list(scheduler.decoding) == [seqs[0]]
+    assert runtime.decode_reservations.outstanding() == {'slots': 4}
+    runtime.free_seq(seqs[1].seq_id)
+    scheduled, is_prefill, victims = scheduler.schedule()
+    assert scheduled == [seqs[0]] and not is_prefill and not victims
+    # Recovery must not immediately reconsume the capacity just released.
+    assert seqs[1] in scheduler.waiting
+    runtime.free_seq(seqs[0].seq_id)
+    assert runtime.decode_reservations.outstanding() == {}

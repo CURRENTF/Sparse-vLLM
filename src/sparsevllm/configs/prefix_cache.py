@@ -22,6 +22,7 @@ def normalize_prefix_cache(config) -> None:
         config.prefix_cache_mode,
         enabled=config.enable_prefix_caching,
         method=cache_method,
+        prefill_method=getattr(config, "prefill_sparse_method", ""),
     )
 
     config.prefix_cache_block_size = _coerce_optional_positive_int(
@@ -53,13 +54,19 @@ def normalize_prefix_cache(config) -> None:
                 f"got {config.prefix_cache_host_size_gb}."
             )
     if config.enable_prefix_cache_offload:
+        if getattr(config, "prefill_sparse_method", "") == "omnikv_prefill":
+            raise ValueError(
+                "OmniKV prefill chain cache retains its shared slot pool; "
+                "enable_prefix_cache_offload does not support this layout. "
+                "Use enable_omnikv_offload for OmniKV CPU KV backing."
+            )
         if not config.enable_prefix_caching:
             raise ValueError(
                 "enable_prefix_cache_offload requires enable_prefix_caching=True."
             )
-        if cache_method not in ("", "omnikv", "quest"):
+        if cache_method not in ("", "omnikv", "quest") and config.resolved_prefix_cache_mode != "chain":
             raise ValueError(
-                "prefix cache offload currently supports only vanilla, OmniKV, and QuEST; "
+                "prefix cache offload requires a supported radix or chain cache; "
                 f"got cache method={cache_method!r}."
             )
         if int(config.tensor_parallel_size) not in (1, 2) and not getattr(config, "enable_omnikv_offload", False):

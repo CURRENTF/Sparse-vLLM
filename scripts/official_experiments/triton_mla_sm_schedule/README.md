@@ -19,15 +19,16 @@ upstream-first provider portfolio and separate TileLang overlay are unchanged.
 Only H100 has local performance evidence. The manual legacy configuration is
 retained as a numerical/benchmark baseline, not a production batch table.
 
-- `prepare.py` freezes source, hashes, Git diff and jobs for the existing GPU
-  guard/queue. Explicit repo, output root, conda and environment arguments are
-  required. No new worktree or implicit model path is used.
+- `prepare.py` records Git commit/dirty status and prepares jobs for the existing
+  GPU guard/queue, executing directly from `--repo`. Explicit repo, output root,
+  conda and environment arguments are required.
 - `micro.py --config micro.json --output-dir <NEW_OUTPUT>` compares the frozen
   legacy table with the production selector at 21 representative cases. `tune.json`
   adds the finite head-tile/target-wave diagnostic matrix. Timings include schedule,
   score reset, stage1 and stage2; independent FP32 Torch checks precede timing.
-- `prepare_related.py` copies the historical H2O benchmark source and replaces
-  only schedule/init/provider files. `summarize_related.py` delegates trace,
+- `prepare_related.py` reuses historical H2O job settings with an explicitly
+  prepared `--updated-source` checkout. Apply the intended schedule change there
+  before preparing jobs. `summarize_related.py` delegates trace,
   residency, output and window validation to the existing shared summarizer.
   These 32K/512 edge-synchronized windows are separate from the 128K/2K stage plot.
 
@@ -85,8 +86,8 @@ The adjusted curve is labelled `Tangram*`; actual lengths and the reason are in
 `config.curve_protocols` for the figure caption. Standard 128K/2K data remain
 available separately. Outputs still complete in full; no truncation is introduced.
 
-`capture_external.py` preserves imported fork source, binary hashes, checkout
-patches, package versions and checkpoint identity. `bundle.py` packages the raw
-steps/output/config/capacity evidence under portable artifact IDs alongside
-validation results and exact measurement adapters; large compiled caches and
-weights are excluded. All paths are supplied as arguments.
+`capture_external.py` records imported package locations, Git versions/dirty
+status, package versions and checkpoint identity. `bundle.py` packages raw
+steps/output/config/capacity evidence and validation results under portable
+artifact IDs. Source code, patches, compiled caches and weights are excluded.
+All paths are supplied as arguments.

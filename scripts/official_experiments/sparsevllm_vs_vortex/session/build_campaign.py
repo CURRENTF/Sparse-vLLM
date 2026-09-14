@@ -4,7 +4,6 @@ import copy
 import hashlib
 import json
 from pathlib import Path
-import shutil
 import subprocess
 
 HERE = Path(__file__).resolve().parent
@@ -24,31 +23,6 @@ def interpreter(backend, paths):
         raise ValueError(f'Unknown backend: {backend}')
     return ['bash', '-ec', 'source "$1/bin/activate"; shift; exec python -u "$@"',
             'venv', paths[backend + '_env']]
-
-
-def freeze(root):
-    source = root / 'source_v2'
-    source.mkdir()
-    files = subprocess.check_output(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], cwd=REPO).decode().split('\0')
-    paths = {Path(p) for p in files if p and Path(p).parts[0] in {'src', 'benchmark', 'scripts', 'configs'}}
-    upstream = REPO / 'benchmark/long_bench_v2/upstream'
-    paths.update(p.relative_to(REPO) for p in upstream.rglob('*') if p.is_file() and '.git' not in p.parts)
-    hashes = {}
-    for rel in sorted(paths):
-        file = REPO / rel
-        if not file.is_file() or '__pycache__' in rel.parts or file.suffix not in {'.py', '.json', '.txt', '.yaml', '.yml', '.sh', '.toml', '.cu', '.cuh', '.h', '.cpp'}:
-            continue
-        hashes[str(rel)] = hashlib.sha256(file.read_bytes()).hexdigest()
-        (source / rel).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(file, source / rel)
-    gitdir = subprocess.check_output(['git', '-C', str(upstream), 'rev-parse', '--absolute-git-dir'], text=True).strip()
-    (source / 'benchmark/long_bench_v2/upstream/.git').write_text('gitdir: ' + gitdir + '\n')
-    if any(hashlib.sha256((REPO / p).read_bytes()).hexdigest() != h for p, h in hashes.items()):
-        raise RuntimeError('Source changed during snapshot')
-    write(root / 'source_v2_manifest.json', dict(repo=str(REPO), source_sha256=hashes,
-          head=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=REPO, text=True).strip()))
-    (root / 'source_v2.patch').write_bytes(subprocess.check_output(['git', 'diff', 'HEAD', '--binary'], cwd=REPO))
-    return source
 
 
 def generate(config, paths, root, source, prepared, gpus, port_base=25500):
@@ -92,7 +66,7 @@ def generate(config, paths, root, source, prepared, gpus, port_base=25500):
         dest = root / 'quality' / name
         qspec = emit(f'configs/{name}.job.json', dict(command=command, cwd=str(source), output=str(dest),
                      prepared=str(prepared / model['name'] / 'prepared_samples.json'), timeout=36000))
-        runner = ['python3', str(root / 'control/run_quality.py'), qspec]
+        runner = ['python3', str(source / HERE.relative_to(REPO) / 'run_quality.py'), qspec]
         if backend in ('hisparse', 'vortex'):
             server_env, server_cwd = {}, str(REPO)
             if backend == 'hisparse':
@@ -121,7 +95,7 @@ def generate(config, paths, root, source, prepared, gpus, port_base=25500):
                     SGLANG_ENABLE_TORCH_COMPILE='0', MAX_JOBS='8')
             spec = emit(f'configs/{name}.server_job.json', dict(output=str(dest), server_command=server, server_cwd=server_cwd,
                          server_env=server_env, server_url=f'http://127.0.0.1:{port}', quality_spec=qspec))
-            runner = ['python3', str(root / 'control/serve_quality.py'), spec]
+            runner = ['python3', str(source / HERE.relative_to(REPO) / 'serve_quality.py'), spec]
         queue(index, name, runner, 41000)
     index = len(config['quality'])
     for lane in config['efficiency32']:
@@ -151,7 +125,7 @@ def main():
     p.add_argument('--paths', type=Path, required=True, help='JSON paths: model_root, dataset, conda, native/vllm/vortex/tangram/hisparse_env, vortex_repo/overlay, scratch_root, cuda_home')
     p.add_argument('--root', type=Path, required=True, help='Fresh external run directory')
     p.add_argument('--prepared', type=Path, required=True)
-    p.add_argument('--source', type=Path, help='Reuse a frozen source_v2 with its adjacent manifest; otherwise freeze this checkout')
+    p.add_argument('--source', type=Path, default=REPO, help='Checkout to execute directly (default: this repository)')
     p.add_argument('--gpus', required=True, help='Comma-separated physical GPU indices; generation does not reserve them')
     p.add_argument('--port-base', type=int, default=25500)
     a = p.parse_args()
@@ -171,28 +145,17 @@ def main():
             raise FileNotFoundError(model['name'])
         if not (a.prepared / model['name'] / 'prepared_samples.json').is_file():
             raise FileNotFoundError(f'Missing prepared cohort for {model["name"]}')
-    source = a.source.resolve() if a.source else a.root.resolve() / 'source_v2'
-    if a.source:
-        manifest = json.loads((source.parent / 'source_v2_manifest.json').read_text())
-        for rel, digest in manifest['source_sha256'].items():
-            if hashlib.sha256((source / rel).read_bytes()).hexdigest() != digest:
-                raise ValueError(f'Frozen source drift: {rel}')
+    source = a.source.resolve(strict=True)
     plan = generate(config, paths, a.root.resolve(), source, a.prepared.resolve(), gpus, a.port_base)
     a.root.mkdir(parents=True, exist_ok=False)
-    if not a.source:
-        freeze(a.root)
     for relative, data in plan.items():
         write(a.root / relative, data)
-    control = a.root / 'control'
-    control.mkdir()
-    hashes = {}
-    for file in [*HERE.glob('*.py'), a.config]:
-        shutil.copy2(file, control / file.name)
-        hashes[file.name] = hashlib.sha256(file.read_bytes()).hexdigest()
     write(a.root / 'campaign.json', config)
-    write(a.root / 'plan.json', dict(source=str(source), source_manifest=str(source.parent / 'source_v2_manifest.json'),
+    write(a.root / 'plan.json', dict(source=str(source),
+          git_head=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=source, text=True).strip(),
+          git_dirty=bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=source, text=True).strip()),
           prepared=str(a.prepared.resolve()), config_sha256=hashlib.sha256(a.config.read_bytes()).hexdigest(),
-          control_sha256=hashes, paths=paths, gpus=gpus, status='prepared_not_launched'))
+          paths=paths, gpus=gpus, status='prepared_not_launched'))
     print(f'Prepared {len(plan["queued_commands.json"])} jobs; launch via ../run_queue.py on idle GPUs.')
 
 

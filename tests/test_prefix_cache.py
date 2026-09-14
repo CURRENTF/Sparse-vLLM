@@ -2808,6 +2808,42 @@ def test_quest_attach_pins_pages_and_free_seq_keeps_cached_page():
     assert reused.tolist() == [10]
 
 
+def test_quest_prefix_hit_preserves_mla_latent_page_payload():
+    manager = _make_quest_manager_for_prefix(page_size=2)
+    storage = MlaLatentStorage(
+        kv_lora_rank=512,
+        rope_dim=64,
+        dtype=torch.bfloat16,
+    )
+    storage.allocate(num_layers=1, num_slots=20, device=torch.device("cpu"))
+    manager.attention_cache_storage = storage
+
+    owner = Sequence([1, 2])
+    owner_slots = manager._allocate(owner.seq_id, 2).clone()
+    payload = storage.layer_payload(0)
+    payload.latent_cache[owner_slots] = 11
+    payload.rope_cache[owner_slots] = 22
+    manager._record_prefix_materialization(owner, [1, 2], owner_slots)
+    manager.on_forward_end([owner], is_prefill=True)
+    manager.free_seq(owner.seq_id)
+
+    replay = Sequence([1, 2, 3])
+    manager.refresh_prefix_cache_hit(replay)
+    manager._attach_prefix_cache_if_needed(replay)
+    row = manager.seq_id_to_row[replay.seq_id]
+    replay_slots = manager.buffer_req_to_token_slots[row, :2].clone()
+
+    assert replay_slots.tolist() == owner_slots.tolist()
+    torch.testing.assert_close(
+        payload.latent_cache[replay_slots],
+        torch.full_like(payload.latent_cache[replay_slots], 11),
+    )
+    torch.testing.assert_close(
+        payload.rope_cache[replay_slots],
+        torch.full_like(payload.rope_cache[replay_slots], 22),
+    )
+
+
 def test_quest_prefill_replaces_stale_decode_graph_context_capacity():
     """Catches post-capture prefill reusing decode-only context metadata."""
 

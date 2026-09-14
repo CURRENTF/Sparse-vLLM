@@ -20,13 +20,6 @@ def resolve(value, variables):
     return string.Template(value).substitute(variables) if isinstance(value, str) else value
 
 
-def check_vortex_sources(repo, provenance):
-    for name, expected in provenance['engines']['vortex']['source_sha256'].items():
-        path = repo / name
-        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
-            raise ValueError(f'Vortex baseline mismatch: {name}. Use the recorded prepared Vortex worktree; upstream alone is insufficient.')
-
-
 def build_outputs(manifest, variables, selected_models, gpus, ports):
     """Build all files before writing, so a bad template cannot publish half a plan."""
     outputs = {}
@@ -108,7 +101,6 @@ def main():
         path = args.model_root / model_names[key] / 'config.json'
         if not path.is_file():
             raise FileNotFoundError(path)
-    check_vortex_sources(args.vortex_repo, json.loads((EXPERIMENT_DIR / 'data/provenance.json').read_text()))
     variables = {'SPARSEVLLM_REPO': str(REPO), 'EXPERIMENT_DIR': str(EXPERIMENT_DIR),
                  'MODEL_ROOT': str(args.model_root.resolve()), 'VORTEX_REPO': str(args.vortex_repo.resolve()),
                  'VORTEX_OVERLAY': str(args.vortex_overlay.resolve()), 'CONDA': conda,

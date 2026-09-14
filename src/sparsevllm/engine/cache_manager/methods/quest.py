@@ -614,6 +614,12 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             else 0
         )
 
+    def decode_window_budgets(self) -> dict[str, int]:
+        return {"slots": int(self.prompt_admission_free_slots())}
+
+    def decode_window_costs(self, seq: Sequence, tokens: int) -> dict[str, int]:
+        return {"slots": int(self._required_new_pages(seq.seq_id, tokens)) * self.page_size}
+
     def decode_step_reservation_cost(self, seq: Sequence) -> int:
         if self._required_new_pages(seq.seq_id, 1) == 0:
             return 1

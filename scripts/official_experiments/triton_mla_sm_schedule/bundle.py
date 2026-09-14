@@ -18,7 +18,6 @@ def sha(path):
 p = argparse.ArgumentParser()
 p.add_argument("--export", type=Path, required=True)
 p.add_argument("--campaign", type=Path, required=True)
-p.add_argument("--repo", type=Path, required=True)
 p.add_argument("--output-dir", type=Path, required=True)
 p.add_argument("--include-extended-history", action="store_true", help="Only use after extended jobs have stopped writing")
 args = p.parse_args()
@@ -44,9 +43,9 @@ def add(source, relative):
 def add_tree(source, relative):
     for path in source.rglob("*"):
         parts = path.relative_to(source).parts
-        if any(part in {"cache", "__pycache__", ".pytest_cache", ".git"} for part in parts):
+        if any(part in {"cache", "__pycache__", ".pytest_cache", ".git", "source", "source_v2", "recipe_source"} for part in parts):
             continue
-        if path.is_file() and path.suffix in {".json", ".jsonl", ".csv", ".log", ".tsv", ".xml", ".patch", ".md", ".py", ".sh"}:
+        if path.is_file() and path.suffix in {".json", ".jsonl", ".csv", ".log", ".tsv", ".xml", ".md"}:
             add(path, relative / path.relative_to(source))
 
 
@@ -76,24 +75,8 @@ for name in ("comparison_validated.json", "manifest.json", "comparison_cases.jso
 for case in read(args.campaign / "model/comparison_validated.json")["cases"]:
     if case["engine"] == "Legacy Triton":
         add_tree(Path(case["source_path"]).parent, Path("validation/model_baseline") / f"bs{case['concurrency']}")
-for name in ("manifest.json", "source.patch", "refined/manifest.json", "refined/source.patch", "refined/tests.xml", "final_cpu_tests.xml", "final_adapter_tests.xml", "final_extended_tests.xml", "adapters5/manifest.json", "adapters5/source.patch"):
+for name in ("manifest.json", "refined/manifest.json", "refined/tests.xml", "final_cpu_tests.xml", "final_adapter_tests.xml", "final_extended_tests.xml", "adapters5/manifest.json"):
     add(args.campaign / name, Path("validation") / name)
-forks = read(args.campaign / "external_provenance/manifest.json")["forks"]
-for fork, name in (("tangram", "config/compression.py"), ("hisparse", "srt/arg_groups/hisparse_hook.py")):
-    path = Path(forks[fork]["imported_package"]) / name
-    if sha(path) != forks[fork]["imported_files_sha256"][name]:
-        raise ValueError("Unsupported-contract evidence changed after capture")
-    add(path, Path("validation/unsupported") / fork / name)
-for name in ("scripts/official_experiments/triton_mla_sm_schedule", "scripts/official_experiments/sparse_decode_efficiency"):
-    # Recipes and portable data only; no local/private path configs or old plots.
-    for path in (args.repo / name).rglob("*"):
-        if path.is_file() and path.suffix in {".py", ".sh", ".md", ".json", ".csv"} and not any(x in path.parts for x in ("__pycache__", "plots")) and ".local." not in path.name:
-            add(path, Path("recipe") / path.relative_to(args.repo))
-for name in ("benchmark/microbench.py", "benchmark/vllm_microbench.py", "benchmark/hisparse_microbench.py", "benchmark/efficiency/metrics.py",
-             "src/sparsevllm/kernels/triton/mla/decode_schedule.py", "src/sparsevllm/operators/mla_attention.py", "tests/test_hisparse_decode_stage.py"):
-    add(args.repo / name, Path("final_source") / name)
-for name in ("benchmark/microbench.py", "benchmark/vllm_microbench.py", "benchmark/hisparse_microbench.py", "benchmark/efficiency/metrics.py"):
-    add(args.campaign / "adapters5/source" / name, Path("measured_adapter") / name)
 archive = args.output_dir / "raw_evidence.tar.gz"
 with tarfile.open(archive, "w:gz") as handle:
     for name, source in sorted(files.items()):

@@ -116,6 +116,41 @@ CacheManager/Runtime ownership。逐层执行时不再查询注册表，也不�
 
 当前 Runtime 按实际处理方式进行少量继承：
 
+`omnikv_prefill` 在 factory 中通过 `PrefillOverrideRuntime` 组合：prefill 交给
+`OmniKVPrefillRuntime`，decode 保留原 vanilla/OmniKV runtime。`finish_step`
+结束后立即恢复 decode 状态，因为 Graph replay 恢复引用时不会调用 `prepare_step`。
+这种互斥阶段委托仅用于没有 prefill 评分/压缩职责的 decoder。
+
+Chain 模式跨轮保留 Standard/OmniKV 的共享物理槽位池；逐层驻留量重复同一个分配
+长度，准入取预留量的最大值，不把它们当成独立池相加。Chain fingerprint 包含
+prefill 观察层、预算和 chunk 限制。由于 chunk 后面的 query 能改变前面 token 的
+深层 KV，radix 仍不适用。OmniKV offload 复用已有 prefill gather：选中的历史从
+host backing 读取，完整当前 chunk 直接来自 GPU 张量。选择表将当前 token 放在
+末尾，满足已有 gather 的索引契约。
+
+Prefill 复用 `context_attention_fwd` 的 causal raw-QK 累加，除以 query 数后取
+head max，并在 attention TP 组内做 MAX 归约，然后选择历史。
+`build_omnikv_keep_and_slots` 构造共享逻辑视图，完整物理 KV 不变。
+Operator 的可选评分契约在初始化时分别准备评分和无评分 provider，普通 attention
+仍遵循 upstream-first 选择。检查过的 SGL context kernel 和 vLLM FA 接口没有提供
+该逐 head raw-QK 累加输出，attention output/LSE 不能直接替代这一评分契约。
+
+MLA 使用已有分块 prefill 评分器，对 raw QK 取 query/head 最大值。视图中的
+float32 `[B, L]` 输出映射为覆盖当前全部 query 的评分请求；历史评分复用每个
+有界 block 已展开的 K，观察层之间将共享 atomic-max 缓冲重置为负无穷。
+Gemma 4 仅在全局层使用已有逐 head raw-QK 评分。层选择遍历逻辑 KV 消费者，
+包括共享 KV 的别名层；跳过滑动窗口层时保留前一个全局观察层。因此滑动层继续
+使用完整位置域，不需要修改稀疏 window mask。
+
+设 batch 为 `B`，本地 query heads 为 `H`，上下文为 `L`，chunk 为 `C`，
+历史预算为 `K`，head dimension 为 `D`。每个观察层需要 `O(B H C L D)` attention，
+以及对 `B H L` 分数的归约/选择。后续层最多读取 `sink + K + recent + C` 个 token。
+共享 float32 评分缓冲占 `4 B H L` 字节，归约分数占 `4 B L` 字节；每个观察区间
+保留两张 int32 选择表，共最多 `8 B (sink + K + recent + C)` 字节，另有行长度和
+top-k workspace。`B=8, H=32, L=32768` 时共享评分缓冲为 32 MiB。
+Startup prefill profiling 包含这些分配。观察层之间清零评分，step 结束释放；
+不物化完整 QK 矩阵、不新增持久 KV pool。收益取决于观察层数及 chunk/budget，需实测。
+
 | Runtime | 当前方法 | 共同点 |
 | --- | --- | --- |
 | `PassThroughRuntime` | vanilla、QuEST | Controller 侧返回完整逻辑选择，特殊物理视图由 CacheManager 或 Provider 构造。 |

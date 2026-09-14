@@ -1,4 +1,4 @@
-"""Freeze a boundary-sync campaign, then orchestrate the existing sweeps in tmux."""
+"""Prepare a boundary-sync campaign and run the existing sweeps from its checkout."""
 from __future__ import annotations
 
 import argparse
@@ -6,7 +6,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -30,22 +29,6 @@ def prepare(args):
     if Path(config["output_root"]).resolve() != args.run_root:
         raise ValueError("DECODE_OUTPUT_ROOT must equal --run-root")
     args.run_root.mkdir(parents=True, exist_ok=False)
-    snapshot = args.run_root / "source"
-    names = subprocess.check_output(
-        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], cwd=repo
-    ).decode().split("\0")
-    for name in sorted(set(names)):
-        path = Path(name)
-        if not name or not (repo / path).is_file():
-            continue
-        if path.parts[0] not in ("src", "benchmark", "configs", "scripts") and len(path.parts) != 1:
-            continue
-        if "data" in path.parts or "tmp" in path.parts or (repo / path).stat().st_size > 5_000_000:
-            continue
-        source = repo / path
-        target = snapshot / path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
     write(args.run_root / "manifest.json", {
         "git_head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
         "git_dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=repo, text=True).strip()),
@@ -54,19 +37,19 @@ def prepare(args):
     write(args.run_root / "config.json", config)
     write(args.run_root / "launch.json", {"data_root": str(args.data_root)})
     for model in config["models"]:
-        subprocess.run([sys.executable, str(snapshot / RELATIVE_PACKAGE / "sweep_decode_capacity.py"),
-                        "--config", str(args.run_root / "config.json"), "--repo", str(snapshot),
+        subprocess.run([sys.executable, str(repo / RELATIVE_PACKAGE / "sweep_decode_capacity.py"),
+                        "--config", str(args.run_root / "config.json"), "--repo", str(repo),
                         "--model", model, "--gpus", f"auto:{config['models'][model]['tp']}",
                         "--check-only"], check=True)
-    print(f"Prepared {args.run_root}; run this frozen script with --run-root ... --run", flush=True)
+    print(f"Prepared {args.run_root}; run this script with --run-root ... --run", flush=True)
 
 
 def run(args):
     root = args.run_root
     config = json.loads((root / "config.json").read_text())
     data_root = Path(json.loads((root / "launch.json").read_text())["data_root"])
-    snapshot = root / "source"
-    package = snapshot / RELATIVE_PACKAGE
+    repo = Path(json.loads((root / "manifest.json").read_text())["repo"]).resolve(strict=True)
+    package = repo / RELATIVE_PACKAGE
     processes = []
     with (root / "status.tsv").open("x", buffering=1) as status:
         def record(stage, result):
@@ -76,12 +59,12 @@ def run(args):
             lanes = ["svllm-vanilla", "svllm-snapkv", "svllm-quest", "svllm-omnikv", "vllm-vanilla"]
             lanes += [lane for lane in config["external_lanes"] if lane not in config["unsupported"].get(model, {})]
             command = [sys.executable, str(package / "sweep_decode_capacity.py"),
-                       "--config", str(root / "config.json"), "--repo", str(snapshot),
+                       "--config", str(root / "config.json"), "--repo", str(repo),
                        "--model", model, "--gpus", f"auto:{spec['tp']}", "--lanes", ",".join(lanes),
                        "--attempt", "boundary-v2", "--export-measurements-dir", str(data_root / "measurements")]
             write(root / f"{model}.command.json", command)
             with (root / f"{model}.run.log").open("x") as log:
-                processes.append((model, subprocess.Popen(command, cwd=snapshot, stdout=log, stderr=subprocess.STDOUT)))
+                processes.append((model, subprocess.Popen(command, cwd=repo, stdout=log, stderr=subprocess.STDOUT)))
         codes = []
         for model, process in processes:
             code = process.wait()

@@ -336,16 +336,8 @@ class SparseMethodRuntime(ABC):
             max_len = self._state_max_context_len(state)
             with profiler.record("sparse_prepare_attn_score"):
                 if step.is_prefill:
-                    score_shape = self.prefill_score_shape(
-                        batch_size,
-                        num_heads,
-                        max_len,
-                    )
-                    state.attn_score = torch.full(
-                        score_shape,
-                        self.prefill_score_fill_value(),
-                        dtype=self.attn_score_dtype,
-                        device=self.device,
+                    self._prepare_prefill_attention_score(
+                        state, batch_size, num_heads, max_len
                     )
                 else:
                     self._prepare_decode_attention_score(
@@ -373,6 +365,16 @@ class SparseMethodRuntime(ABC):
 
     def prefill_score_fill_value(self) -> float:
         return 0.0
+
+    def _prepare_prefill_attention_score(
+        self, state, batch_size: int, num_heads: int, max_len: int
+    ) -> None:
+        state.attn_score = torch.full(
+            self.prefill_score_shape(batch_size, num_heads, max_len),
+            self.prefill_score_fill_value(),
+            dtype=self.attn_score_dtype,
+            device=self.device,
+        )
 
     def _prepare_decode_attention_score(
         self,

@@ -30,6 +30,7 @@ class Scheduler:
         config: Config,
         memory_oracle: MemoryOracle,
         prefix_cache_hit_refresher: Callable[[Sequence], None] | None = None,
+        decode_capacity_reclaimer: Callable[[Sequence], Sequence | None] | None = None,
     ):
         self.config = config
         self.max_num_seqs_in_batch = config.max_num_seqs_in_batch
@@ -54,6 +55,7 @@ class Scheduler:
         # memory_oracle 引用 Rank 0 的 CacheManager，作为全局显存余量参考。
         # 对多层异构预算，采用更保守的可用空间估计。
         self.memory_oracle = memory_oracle
+        self.decode_capacity_reclaimer = decode_capacity_reclaimer
         self.prefix_cache_hit_refresher = (
             memory_oracle.refresh_prefix_cache_hit
             if prefix_cache_hit_refresher is None
@@ -165,6 +167,13 @@ class Scheduler:
             # one request needs to run to completion and free its full row.
             if replay_pending and not seq.is_recompute_replay:
                 continue
+            # Partial prefills already own reserved capacity; let them finish
+            # at the decode admission limit while keeping fresh prompts queued.
+            if (
+                len(self.decoding) >= self.max_decoding_seqs
+                and seq.num_prefilled_tokens == 0
+            ):
+                continue
             if self._prefill_batch_key(seq) == (
                 target_mode,
                 target_compatibility,
@@ -206,11 +215,16 @@ class Scheduler:
             for seq in list(queue):
                 if seq.seq_id != seq_id:
                     continue
+                may_own_slots = (
+                    seq.status == SequenceStatus.RUNNING
+                    or seq.num_prefilled_tokens > 0
+                    or queue is self.decoding
+                )
                 queue.remove(seq)
                 seq.status = SequenceStatus.FINISHED
                 self._admission_defer_warned_seq_ids.discard(seq_id)
                 self.memory_oracle.reset_prefill_execution_state(seq_id)
-                return seq.num_prefilled_tokens > 0 or queue is self.decoding
+                return may_own_slots
         return False
 
     def _reserved_prefill_tokens(self) -> int:
@@ -232,8 +246,6 @@ class Scheduler:
             # A replay rebuilds cache for an already accepted request. Keep the
             # whole prefill step isolated so a fresh or partial prompt cannot
             # inflate its compute workspace or consume the slots it needs.
-            return False
-        if len(self.decoding) >= self.max_decoding_seqs:
             return False
         if target_mode == PREFILL_EXECUTION_RAW_OFFLOAD:
             return not scheduled_seqs and step_free_count > 0
@@ -332,6 +344,10 @@ class Scheduler:
                 has_waiting_replay and made_progress_since_handoff
             )
         ):
+            # The caller popped the candidate, but a rejected preemption must
+            # retain scheduler ownership so cancellation can reclaim its KV.
+            self.decoding.appendleft(victim)
+            self.decoding.extendleft(reversed(scheduled_seqs))
             raise RuntimeError(
                 "KV cache is too small for the sole remaining decode request "
                 "to make forward progress. Recompute replay would rebuild the "
@@ -409,7 +425,17 @@ class Scheduler:
         preempted_seqs = []
         num_batched_seqs = 0
         num_batched_tokens = 0
-        
+        decode_reservation_failure = self.memory_oracle.reserve_decode_windows(self.decoding, self.waiting)
+        if decode_reservation_failure is not None and self.decode_capacity_reclaimer is not None:
+            decode_reservation_failure = self.decode_capacity_reclaimer(decode_reservation_failure)
+        if decode_reservation_failure is not None and len(self.decoding) > 1:
+            self.decoding.remove(decode_reservation_failure)
+            return self._preempt_decode_victim(
+                decode_reservation_failure, scheduled_seqs, preempted_seqs,
+                physical_free_count=self.memory_oracle.num_free_slots,
+                reserved_prefill=self._reserved_prefill_tokens(),
+            )
+
         # 逻辑可用空间计数器，用于在本轮调度中预估显存占用
         physical_free_count = self.memory_oracle.num_free_slots
         if self.waiting:
@@ -637,6 +663,16 @@ class Scheduler:
         # 如果有 Prefill 请求被选中，直接返回，本次 step 只跑 Prefill。
         if scheduled_seqs:
             return scheduled_seqs, True, []
+
+        # A partial prefill may release capacity through compaction. Give it
+        # the opportunity to finish before declaring a sole decode unable to run.
+        if decode_reservation_failure is not None:
+            self.decoding.remove(decode_reservation_failure)
+            return self._preempt_decode_victim(
+                decode_reservation_failure, scheduled_seqs, preempted_seqs,
+                physical_free_count=physical_free_count,
+                reserved_prefill=reserved_prefill,
+            )
 
         # --- 阶段 2: Decode 调度 ---
         # 只有在没有 Prefill 任务时才处理增量生成任务。

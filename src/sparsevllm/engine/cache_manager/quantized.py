@@ -189,6 +189,9 @@ class QuantizedCacheManager(StandardCacheManager):
     def prefill_step_reservation_cost(self, seq, scheduled_tokens):
         return self.page_pool.append_cost(seq.seq_id, int(scheduled_tokens)) * self.page_size
 
+    def decode_window_costs(self, seq, tokens):
+        return {"slots": self.page_pool.append_cost(seq.seq_id, tokens) * self.page_size}
+
     def decode_step_reservation_cost(self, seq):
         return self.page_pool.append_cost(seq.seq_id, 1) * self.page_size
 

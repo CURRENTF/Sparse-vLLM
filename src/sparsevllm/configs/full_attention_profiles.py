@@ -12,7 +12,7 @@ from sparsevllm.utils.log import logger
 
 
 _PROFILE_RESOURCE = "profiles/full_attention_layers.json"
-_PROFILE_METHODS = frozenset({"omnikv", "deltakv"})
+_PROFILE_METHODS = frozenset({"omnikv", "deltakv", "omnikv_prefill"})
 
 
 @dataclass(frozen=True)
@@ -145,6 +145,10 @@ def resolve_full_attention_layer_profile(
             for alias in profile.model_names
         )
     ]
+    # A prefill-specific calibration can override the shared decode profile;
+    # existing explicit-KV/MLA profiles remain reusable without duplication.
+    if method == "omnikv_prefill" and not matches:
+        return resolve_full_attention_layer_profile(candidates, "omnikv", profiles=available)
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
@@ -165,6 +169,7 @@ def resolve_full_attention_layer_profile(
 
 
 def resolve_auto_full_attention_layers(config: Any) -> None:
+    resolve_auto_prefill_full_attention_layers(config)
     value = config.full_attention_layers
     if not isinstance(value, str) or value.strip().lower() != "auto":
         return
@@ -186,4 +191,35 @@ def resolve_auto_full_attention_layers(config: Any) -> None:
         profile.profile_id,
         config.model,
         config.full_attention_layers,
+    )
+
+
+def resolve_auto_prefill_full_attention_layers(config: Any) -> None:
+    """Use the decode catalog while keeping the prefill layer axis independent."""
+    if getattr(config, "prefill_sparse_method", "") != "omnikv_prefill":
+        return
+    value = config.omnikv_prefill_full_attention_layers
+    if not isinstance(value, str) or value.strip().lower() != "auto":
+        return
+    from sparsevllm.method_registry import omnikv_prefill_layer_indices
+
+    model_names = [config.model]
+    for hf_config in (config.outer_hf_config, config.hf_config):
+        for key in ("_name_or_path", "name_or_path"):
+            candidate = config_get(hf_config, key, None)
+            if candidate:
+                model_names.append(str(candidate))
+    profile = resolve_full_attention_layer_profile(model_names, "omnikv_prefill")
+    invalid_layers = set(profile.full_attention_layers) - set(range(config.hf_config.num_hidden_layers))
+    if invalid_layers:
+        raise ValueError(f"Prefill profile {profile.profile_id!r} contains unknown layer indices: {sorted(invalid_layers)}.")
+    eligible = set(omnikv_prefill_layer_indices(config))
+    config.omnikv_prefill_full_attention_layers = [
+        layer for layer in profile.full_attention_layers if layer in eligible
+    ]
+    config.resolved_prefill_full_attention_profile = profile.profile_id
+    logger.info(
+        "Resolved omnikv_prefill_full_attention_layers='auto' with profile {} "
+        "for model {} (global layers only): {}.",
+        profile.profile_id, config.model, config.omnikv_prefill_full_attention_layers,
     )

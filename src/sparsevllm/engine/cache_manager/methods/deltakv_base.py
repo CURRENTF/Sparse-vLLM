@@ -1104,13 +1104,47 @@ class DeltaKVCacheManager(CacheManager):
                 reserved += min(remaining, int(engine_prefill_chunk_size))
         return reserved
 
+    def decode_window_budgets(self) -> dict[str, int]:
+        return {
+            "full_layers": int(self._num_free_slots_full),
+            "deltakv_raw": max(0, int(self._num_free_slots_deltakv_full)
+                               - self._deltakv_unallocated_temp_full_reserve()),
+            "deltakv_latent": int(self._num_free_slots_deltakv_latent),
+        }
+
+    def decode_window_costs(self, seq: Sequence, tokens: int) -> dict[str, int]:
+        row = self.seq_id_to_row[seq.seq_id]
+        end = int(self.row_seq_lens[row]) + int(tokens)
+        # Include history that can be compressed in one indivisible eviction;
+        # the horizon does not truncate or reschedule that eviction.
+        latent = max(0, self._estimate_deltakv_latent_slots_for_total_len(end)
+                     - int(self.row_deltakv_compressed_lens[row]))
+        return {"full_layers": int(tokens), "deltakv_raw": int(tokens),
+                "deltakv_latent": latent}
+
+    def prefill_capacity_after_decode_reservations(
+        self, free_slots: int, reserved: dict[str, int], *, admission: bool,
+    ) -> int:
+        if admission:
+            return int(free_slots) - reserved.get("full_layers", 0)
+        # Prefill appends to both raw pools; latent slots and quantized blocks
+        # retain their separate admission budgets and cannot consume raw space.
+        raw_free = max(
+            0, self._num_free_slots_deltakv_full - self._deltakv_unallocated_temp_full_reserve()
+        )
+        return min(
+            int(free_slots),
+            self._num_free_slots_full - reserved.get("full_layers", 0),
+            raw_free - reserved.get("deltakv_raw", 0),
+        )
+
     def prompt_admission_free_slots(self) -> int:
         # Full-attention layers store every token and cannot be evicted, so gate admission by that pool.
         return self.num_free_slots_full_layers()
 
     def prompt_admission_cost(self, seq: Sequence) -> int:
-        # Full-attn layers must hold prompt + maximum decode length for this sequence.
-        return int(seq.num_prompt_tokens + (getattr(seq, "max_tokens", 0) or 0))
+        # Prompt capacity only; future decode growth uses the shared window ledger.
+        return int(seq.num_prompt_tokens)
 
     def prompt_logical_reservation_cost(self, seq: Sequence) -> int:
         # DeltaKV does not need to reserve the full prompt in sparse layers.
@@ -1152,8 +1186,13 @@ class DeltaKVCacheManager(CacheManager):
         return len(plan.center_positions)
 
     def _estimate_deltakv_latent_slots_for_total_len(self, total_len: int) -> int:
-        plan = self._deltakv_plan_for_total_len_cpu(total_len)
-        return len(plan.latent_positions)
+        # Same finalized-history extent as the prefill plan, without building
+        # token-position tuples on the decode scheduling path.
+        buffer_len = max(0, int(total_len) - int(self.config.sink_keep_tokens))
+        recent = int(self._deltakv_full_prefill_recent_tokens())
+        if buffer_len <= recent:
+            return 0
+        return ((buffer_len - recent) // recent) * recent if recent > 0 else buffer_len
 
     def _estimate_deltakv_raw_slots_for_total_len(self, total_len: int) -> int:
         plan = self._deltakv_plan_for_total_len_cpu(total_len)
@@ -1196,9 +1235,9 @@ class DeltaKVCacheManager(CacheManager):
 
     def prompt_admission_costs(self, seq: Sequence) -> dict[str, int]:
         prompt_len = int(seq.num_prompt_tokens)
-        total_len = int(seq.num_prompt_tokens + (getattr(seq, "max_tokens", 0) or 0))
+        total_len = int(seq.num_prompt_tokens)
         return {
-            "full_layers": int(seq.num_prompt_tokens + (getattr(seq, "max_tokens", 0) or 0)),
+            "full_layers": int(seq.num_prompt_tokens),
             "deltakv_centers": self._estimate_centers_for_total_len(total_len),
             "deltakv_raw": self._estimate_deltakv_raw_slots_for_total_len(prompt_len),
         }

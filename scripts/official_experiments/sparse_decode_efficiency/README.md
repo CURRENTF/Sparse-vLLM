@@ -113,8 +113,8 @@ points into the original curve. `run_lanes.sh` accepts additional sweep argument
 after its seven positional arguments and `--` (use an empty wait-status argument
 when no queue dependency is needed).
 
-For the complete two-model campaign, `run_boundary_sync.py` freezes the current
-source (without creating a Git worktree), resolves the config, and checks paths.
+For the complete two-model campaign, `run_boundary_sync.py` records the current
+checkout path and Git version, resolves the config, and checks paths.
 Set the environment variables below, then prepare a new run:
 
 ```bash
@@ -123,7 +123,7 @@ python scripts/official_experiments/sparse_decode_efficiency/run_boundary_sync.p
   --data-root "$DECODE_DATA_ROOT/<new-run>"
 ```
 
-Run the frozen `source/scripts/official_experiments/sparse_decode_efficiency/run_boundary_sync.py`
+Run `scripts/official_experiments/sparse_decode_efficiency/run_boundary_sync.py`
 under tmux with `--run-root "$DECODE_OUTPUT_ROOT" --run`. It starts separate
 idle-GPU queues for Qwen TP1 and GLM TP2/EP2, each with fresh per-lane smoke,
 and exports plots only after both capacity sweeps succeed. Inspect `status.tsv`,
@@ -154,7 +154,7 @@ vLLM lanes (default `--lanes`). External MLA combinations remain unsupported
 metadata and are omitted from plots. Full sweeps should run in tmux.
 
 After a classification-only repair, native SnapKV boundary-sync sweeps may use
-`--reuse-cases-from PREVIOUS_ATTEMPT_ROOT` with a new attempt and frozen source
+`--reuse-cases-from PREVIOUS_ATTEMPT_ROOT` with a new attempt and selected checkout
 manifest. A fresh smoke still runs. Reuse requires identical campaign, GPU,
 command (except artifact paths), hyperparameters and model config.
 Source-file equality is not checked; decide whether code changes require remeasurement.
@@ -193,7 +193,7 @@ reservation loss/contention, and user interruption stop the whole queue.
 For an already-running legacy fail-fast sweep, `continue_failed_queue.py --help`
 describes a one-shot sidecar. It waits for an explicitly classified method error,
 then starts only untouched methods with fresh smokes and the same benchmark
-snapshot/config. It requires an idle held reservation and uses verified Linux
+checkout/config. It requires an idle held reservation and uses verified Linux
 pidfds for handoff; it never retries failed/started methods or mutates old source.
 Include the sidecar's terminal status in plot dependencies. A failed curve still
 requires explicit partial-figure policy; continuation does not fabricate a
@@ -475,7 +475,7 @@ Use the original measured runtime with **only** the reviewed MLA runtime and
 provider-binding patch. `update_mla_profile_results.py prepare --repo
 "$BENCHMARK_REPO" --base-plot "$BASE_PLOT_DATA" --run-root "$PROFILE_RUN_ROOT"
 --scratch-root "$DECODE_SCRATCH_ROOT"`
-records Git commit/dirty status, config checksums and a source archive, without
+records Git commit/dirty status and config checksums, without copying source or
 checking source-file equality. `BASE_PLOT_DATA` is the full-path, raw-validated aligned-budget
 export, not its portable copy. Use a short absolute scratch path on the output
 volume (at most 65 characters) for multiprocessing Unix sockets.
@@ -527,10 +527,10 @@ replace the ten capacity curves or establish a universal split-count default.
 # Vortex supplement
 
 `prepare_vortex.py --help` prepares the missing QuEST curves for both input
-lengths from a resolved boundary-sync config. It freezes native and Vortex
-sources, writes per-model JSON configs and `jobs.json`, and invokes the existing
+lengths from a resolved boundary-sync config. It records native and Vortex
+checkout versions, writes per-model JSON configs and `jobs.json`, and invokes the existing
 capacity sweep with `--run-root`. Model paths, environment, overlay and output
-directories are explicit arguments. Run the frozen entry point in tmux.
+directories are explicit arguments. Run the entry point in tmux from the selected checkout.
 
 The `vortex` engine uses the shared SGLang completed-work window collector,
 preserves overlap, and synchronizes the TP group only at the two boundaries.

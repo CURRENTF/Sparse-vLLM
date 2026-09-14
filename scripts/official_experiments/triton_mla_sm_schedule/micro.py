@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, replace
-import hashlib
 import json
 import math
 from pathlib import Path
@@ -144,7 +143,7 @@ def main():
     cfg = json.loads(args.config.read_text())
     write(args.output_dir / "manifest.json", {"config": cfg, "torch": torch.__version__,
         "triton": triton.__version__, "cuda": torch.version.cuda,
-        "gpu": torch.cuda.get_device_name(), "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "gpu": torch.cuda.get_device_name(),
         "boundary": "schedule + score reset + stage1 + stage2; GPU CUDA event Graph replay", "warmups": 5, "replays_per_sample": 5})
     results = []
     try:

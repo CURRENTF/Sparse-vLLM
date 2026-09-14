@@ -42,6 +42,6 @@ payload = {'schema_version': 1, 'metric': summary['metric'], 'unit': 'token/s',
                'QuEST head policies differ, especially MLA; no official algorithm parity claim.',
                'Tested residency bounds are not exhaustive maximum concurrency measurements.'],
            'source_summary': str(args.summary),
-           'source_snapshot': str(args.summary.parent / 'provenance_finished'), 'cases': cases}
+           'cases': cases}
 with args.output.open('x') as handle:
     json.dump(payload, handle, indent=2)

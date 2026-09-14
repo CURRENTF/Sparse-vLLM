@@ -132,6 +132,8 @@ class SweBenchLiteRunnerTest(unittest.TestCase):
             max_tokens=4096,
             temperature=0.0,
             top_p=1.0,
+            enable_thinking=True,
+            preserve_thinking=True,
             api_base="http://127.0.0.1:18000/v1",
         )
 
@@ -143,7 +145,9 @@ class SweBenchLiteRunnerTest(unittest.TestCase):
         )
         self.assertIn("step_limit: 80", config)
         self.assertNotIn("api_key", config)
-        self.assertNotIn("thinking", config)
+        self.assertIn("enable_thinking: true", config)
+        self.assertIn("preserve_thinking: true", config)
+        self.assertIn("clear_thinking: false", config)
 
     def test_zero_wall_time_disables_agent_timeout(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -169,6 +173,8 @@ class SweBenchLiteRunnerTest(unittest.TestCase):
             max_tokens=4096,
             temperature=0.0,
             top_p=1.0,
+            enable_thinking=True,
+            preserve_thinking=True,
             api_base="http://127.0.0.1:18000/v1",
         )
         self.assertIn("wall_time_limit_seconds: 0", config)
@@ -217,7 +223,19 @@ class SweBenchLiteRunnerTest(unittest.TestCase):
             env = runner._model_env()
 
         self.assertTrue(runner.args.chain_cache)
+        self.assertTrue(runner.args.preserve_thinking)
         self.assertEqual(env["SPARSEVLLM_CHAIN_CACHE"], "1")
+
+    def test_chain_rejects_explicit_reasoning_removal_before_recording_config(self):
+        """The adapter must not silently override a recorded CLI setting."""
+        with tempfile.TemporaryDirectory() as tmp:
+            args = build_parser().parse_args([
+                "--stage", "summarize", "--run-dir", tmp,
+                "--chain-cache", "--no-preserve-thinking",
+            ])
+            with self.assertRaisesRegex(RunnerError, "requires --preserve-thinking"):
+                SweBenchLiteRunner(args)
+            self.assertFalse((Path(tmp) / "run_config.json").exists())
 
     def test_chain_cache_cli_override_clears_ambient_setting(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(

@@ -12,6 +12,7 @@ from sparsevllm.method_registry import (
     SKIPKV_ASSET_MODEL_NAMES,
     SUPPORTED_SPARSE_METHODS,
     normalize_sparse_method,
+    omnikv_prefill_layer_indices,
     resolve_cache_sparse_method,
     resolve_prefill_sparse_method,
     resolve_sparse_prefill_score_mode,
@@ -358,6 +359,22 @@ def _normalize_skipkv(config) -> None:
 
 
 def _validate_prefill_sparse_method_model_compatibility(config) -> None:
+    if config.prefill_sparse_method == "omnikv_prefill":
+        if config.attention_cache_layout not in {"explicit_kv", "mla_latent"}:
+            raise NotImplementedError(
+                "omnikv_prefill requires explicit KV or MLA latent cache storage."
+            )
+        if config.sparse_attn_score_dtype != "float32":
+            raise ValueError("omnikv_prefill raw-QK accumulation requires float32 scores.")
+        for name in (
+            "omnikv_prefill_keep_tokens",
+            "omnikv_prefill_sink_keep_tokens",
+            "omnikv_prefill_recent_keep_tokens",
+        ):
+            value = getattr(config, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer.")
+        return
     if config.prefill_sparse_method != "flashprefill_v2":
         return
     cache_layout = str(config.attention_cache_layout)
@@ -393,6 +410,26 @@ def finalize_sparse_layout(config) -> None:
     configured_full_layers = {int(layer) for layer in config.full_attention_layers}
     kv_layers = tuple(int(layer) for layer in config.runtime_layout.kv_idx_to_layer_idx)
     kv_positions = {layer: index for index, layer in enumerate(kv_layers)}
+    if config.prefill_sparse_method == "omnikv_prefill":
+        prefill_layers = omnikv_prefill_layer_indices(config)
+        layers = config.omnikv_prefill_full_attention_layers
+        if isinstance(layers, str):
+            layers = [int(item.strip()) for item in layers.split(",") if item.strip()]
+        if (
+            not isinstance(layers, list)
+            or not layers
+            or any(isinstance(layer, bool) or not isinstance(layer, int) for layer in layers)
+            or len(set(layers)) != len(layers)
+            or not prefill_layers
+            or not set(layers).issubset(prefill_layers)
+            or prefill_layers[0] not in layers
+        ):
+            raise ValueError(
+                "omnikv_prefill_full_attention_layers must explicitly list unique "
+                "global KV layer indices including the first KV layer eligible "
+                "for global prefill; sliding-window layers are excluded."
+            )
+        config.omnikv_prefill_full_attention_layers = sorted(layers)
     unknown_full_layers = sorted(configured_full_layers - set(kv_layers))
     if unknown_full_layers and config.sparse_method in {"omnikv", "deltakv"}:
         raise ValueError(

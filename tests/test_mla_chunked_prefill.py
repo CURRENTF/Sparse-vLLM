@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from dataclasses import replace
 
 import pytest
 import torch
@@ -12,6 +13,36 @@ from sparsevllm.engine.cache_manager.base import (
 from sparsevllm.kernels.triton.mla.prefill import attention_partial
 from sparsevllm.operators.mla_attention import MlaAttentionOpSpec, MlaSglFa3Provider
 from sparsevllm.operators.mla_prefill import ChunkedMlaPrefill
+
+
+def test_reused_mla_plan_tracks_current_layer_score_request():
+    # Adjacent full layers share packing but only the final one may observe
+    # scores for a sparse successor. Single-view numerical tests miss this.
+    runner = ChunkedMlaPrefill(SimpleNamespace(), SimpleNamespace(), 4)
+    meta = AttentionViewMeta(
+        active_slots=torch.arange(16, dtype=torch.int32).reshape(2, 8),
+        req_indices=torch.tensor([1, 0], dtype=torch.int32),
+        context_lens=torch.tensor([8, 5], dtype=torch.int32),
+    )
+    cu_q = torch.tensor([0, 2, 5], dtype=torch.int32)
+    scope = object()
+    plan = runner.prepare(SimpleNamespace(meta=meta), cu_q, scope)
+    current_slots = plan.current_slots
+    score = torch.full((2, 8), -torch.inf)
+    cache_request = PrefillScoreRequest(((6, 8), (2, 5)), "logits")
+    for output in (None, score, None, score.clone()):
+        view = SimpleNamespace(meta=replace(meta, attn_score=output))
+        plan = runner.prepare(view, cu_q, scope)
+        assert plan.current_slots is current_slots
+        assert plan.meta.attn_score is output
+        request = runner.score_request(plan)
+        if output is None:
+            assert request is None
+            assert runner.score_request(plan, cache_request) is cache_request
+        else:
+            assert request.query_ranges == ((6, 8), (2, 5))
+            with pytest.raises(ValueError, match="cannot combine"):
+                runner.score_request(plan, cache_request)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -107,6 +138,35 @@ def make_case(contexts=(73, 29, 41), queries=(17, 29, 9), heads=5):
         return torch.bmm(x.transpose(0, 1), weight[:, :192]).transpose(0, 1)
 
     return spec, q, view, cu, project, absorb
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_main_attention_max_scores_reuse_output_and_match_full_qk():
+    # Main-attention scores must cover every current query, reuse the runtime's
+    # output, reset atomic maxima, and preserve ragged padding. Cache-method
+    # tests above/below instead allocate outputs for trailing query windows.
+    spec, q, view, cu, project, absorb = make_case(queries=(65, 29, 9))
+    buffer = torch.full((3, 73), 1e6, device=q.device, dtype=torch.float32)
+    view = replace(view, meta=replace(view.meta, attn_score=buffer))
+    runner = ChunkedMlaPrefill(spec, SimpleNamespace(), 19)
+    scope = object()
+    plan = runner.prepare(view, cu, scope)
+    request = runner.score_request(plan)
+    for query in (q, -q):
+        actual, _, scores = runner.run(query, view, cu, scope, project, absorb, request)
+        assert scores is buffer
+        for i, n in enumerate(plan.contexts):
+            a, b = plan.query_starts[i:i + 2]
+            slots = view.meta.active_slots[plan.rows[i], :n].long()
+            expanded = project(view.payload.latent_cache[slots, 0]).view(n, spec.local_q_heads, 448)
+            key = torch.cat((expanded[..., :192], view.payload.rope_cache[slots, 0, None].expand(-1, spec.local_q_heads, -1)), -1)
+            raw = torch.einsum("qhd,khd->hqk", query[a:b].float(), key.float())
+            visible = torch.arange(n, device=q.device)[None] <= torch.arange(n - (b - a), n, device=q.device)[:, None]
+            raw.masked_fill_(~visible[None], -torch.inf)
+            torch.testing.assert_close(scores[i, :n], raw.amax((0, 1)), atol=0.001, rtol=0.015)
+            assert torch.isneginf(scores[i, n:]).all()
+            reference = torch.einsum("hqk,khd->qhd", (raw * spec.softmax_scale).softmax(-1), expanded[..., 192:].float())
+            torch.testing.assert_close(actual[a:b].float(), reference, atol=0.006, rtol=0.03)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

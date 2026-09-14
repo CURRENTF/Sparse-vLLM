@@ -5,7 +5,6 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import time
@@ -36,17 +35,7 @@ def validate_export_namespaces(jobs):
         destinations[destination] = job["name"]
 
 
-def freeze(repo, destination, metadata):
-    names = subprocess.check_output(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], cwd=repo).decode().split("\0")
-    for name in sorted(set(names)):
-        path = repo / name
-        if (not name or not path.is_file() or "tmp" in Path(name).parts
-                or "data" in Path(name).parts or "__pycache__" in Path(name).parts
-                or path.stat().st_size > 5_000_000):
-            continue
-        target = destination / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, target)
+def record_version(repo, metadata):
     manifest = dict(repo=str(repo), git_head=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
         git_dirty=bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=repo, text=True).strip()))
     write(metadata, manifest)
@@ -54,7 +43,7 @@ def freeze(repo, destination, metadata):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-root", type=Path, help="Execute the already frozen jobs sequentially")
+    parser.add_argument("--run-root", type=Path, help="Execute the already prepared jobs sequentially")
     parser.add_argument("--prepare-plot", type=Path, help="Build raw grid sources from a previous portable 2x2 export")
     parser.add_argument("--job-names", help="Comma-separated unstarted jobs; does not restart existing queues")
     parser.add_argument("--after-queues", type=Path, nargs="*", default=[], help="Wait for these guarded sweep directories")
@@ -84,9 +73,9 @@ def main():
     base = json.loads(args.base_config.read_text())
     if base["measurement_protocol"] != "boundary_sync_v2" or base["output_len"] != 2048:
         raise ValueError("Expected the existing boundary-sync 2K-output protocol")
-    source, vortex = root / "source", root / "vortex"
-    freeze(REPO, source, root / "manifest.json")
-    freeze(args.vortex_repo.resolve(), vortex, root / "vortex_manifest.json")
+    source, vortex = REPO, args.vortex_repo.resolve(strict=True)
+    record_version(source, root / "manifest.json")
+    record_version(vortex, root / "vortex_manifest.json")
     write(root / "prepare.json", {key: str(value) for key, value in vars(args).items()})
     scripts = source / PACKAGE.relative_to(REPO)
     jobs = []

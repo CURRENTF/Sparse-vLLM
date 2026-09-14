@@ -29,12 +29,14 @@ from ..base import (
     AttentionCacheWrite,
     CacheManager,
     ExplicitKVPayload,
+    MlaLatentPayload,
     LayerBatchStates,
     PrefillComputeView,
     PrefillScoreRequest,
     SparseSelection,
 )
 from ..raw_kv_offload import RawKVOffloadBuffer
+from ..chain_offload import ChainMethodState, ChainOffloadController
 from ..storage import ExplicitKVStorage, create_attention_cache_storage
 
 
@@ -595,6 +597,19 @@ class SnapKVCacheManager(CacheManager):
     def num_free_slots(self) -> int:
         return min(self._num_free_slots[layer_idx] for layer_idx in self.kv_transformer_layer_indices())
 
+    def decode_window_budgets(self) -> dict[str, int]:
+        return {f"layer_{layer}": int(self._num_free_slots[layer])
+                for layer in self.kv_transformer_layer_indices()}
+
+    def decode_window_costs(self, seq: Sequence, tokens: int) -> dict[str, int]:
+        required, _, _, _ = self.chain_capacity_deficits(
+            suffix_tokens=0, generation_tokens=int(tokens) + 1,
+            existing_slots_by_layer=self.chain_physical_residency(seq.seq_id),
+            needs_resident_row=False,
+        )
+        return {f"layer_{layer}": int(cost) for layer, cost in
+                zip(self.kv_transformer_layer_indices(), required)}
+
     def chain_capacity_deficits(
         self,
         *,
@@ -611,6 +626,7 @@ class SnapKVCacheManager(CacheManager):
         method = str(self.config.sparse_method)
         use_new_pyramid_staging = (
             needs_resident_row
+            and not any(existing_slots_by_layer)
             and method == "pyramidkv"
             and self._pyramidkv_can_use_full_prefill_staging()
         )
@@ -687,9 +703,11 @@ class SnapKVCacheManager(CacheManager):
                     prefill_physical_peak + generated_kv_tokens
                 )
             else:
+                # Decode-only reservations start from the live row; only an
+                # actual suffix prefill can compact PyramidKV to its budget.
                 resident_after_prefill = (
                     existing + suffix_tokens
-                    if method in ("rkv", "skipkv")
+                    if suffix_tokens == 0 or method in ("rkv", "skipkv")
                     else min(existing + suffix_tokens, int(budget))
                 )
                 if use_new_pyramid_staging:
@@ -706,7 +724,8 @@ class SnapKVCacheManager(CacheManager):
                         int(trigger_len) - resident_after_prefill,
                     )
             required_by_layer.append(
-                max(prefill_physical_peak, decode_physical_peak) - existing
+                max(prefill_physical_peak, decode_physical_peak)
+                - (0 if needs_resident_row else existing)
             )
         slot_deficits = tuple(
             max(
@@ -745,6 +764,27 @@ class SnapKVCacheManager(CacheManager):
             slot_deficits,
             row_deficit,
         )
+
+    def create_chain_offload(self, capacity_bytes: int) -> ChainOffloadController:
+        return ChainOffloadController(self, capacity_bytes)
+
+    def chain_storage_tensors(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+        storage = getattr(self, "attention_cache_storage", None)
+        if storage is not None:
+            payload = storage.layer_payload(self.kv_layer_index(layer))
+            if isinstance(payload, MlaLatentPayload):
+                return payload.latent_cache, payload.rope_cache
+            if isinstance(payload, ExplicitKVPayload):
+                return payload.k_cache, payload.v_cache
+            raise TypeError("Unsupported chain offload storage payload.")
+        return self.get_layer_kv_cache(layer)
+
+    def snapshot_chain_method_state(self, seq_id: int) -> ChainMethodState:
+        return ChainMethodState()
+
+    def restore_chain_method_state(self, seq_id: int, state: ChainMethodState) -> None:
+        if state.tensors or state.metadata is not None:
+            raise RuntimeError("Unexpected auxiliary state in a SnapKV chain snapshot.")
 
     def chain_physical_residency(self, seq_id: int) -> tuple[int, ...]:
         seq_id = int(seq_id)
