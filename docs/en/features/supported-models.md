@@ -64,7 +64,7 @@ performance improvement over BF16; compare matched workloads before deployment.
 | Qwen3MoE | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
 | Qwen3.5 / 3.6 / 3.8 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | Matched checkpoint³ |
 | Qwen3.6 MoE | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
-| GLM-4.7-Flash | ✅⁵ | ✅⁵ | ✅⁵ | Experimental⁴⁵ | — | ✅⁵ | Experimental⁵ | ✅⁵ | — | — |
+| GLM-4.7-Flash | ✅ | ✅ | ✅ | Experimental⁴ | — | ✅ | ✅⁵ | ✅ | — | — |
 | Gemma 4 Dense / MoE | ✅ | ✅⁶ | — | — | — | ✅ | — | — | — | — |
 | Llama 3 / 3.1 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | Selected checkpoint¹ | Compressor required² |
 | MiniMax M2.7 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
@@ -81,7 +81,9 @@ by the mixed-attention runtime.
 ⁴ H2O tensor-parallel execution may produce different sparse selections from
 TP=1. Model-specific TP, EP, and DP restrictions still apply.
 
-⁵ GLM QuEST support is experimental; its prefix-cache restrictions remain in effect.
+⁵ GLM QuEST supports device-resident radix prefix caching and decode CUDA Graph.
+Selection uses TP-local heads; equivalence with TP=1 is not guaranteed. Prefix
+CPU offload remains unsupported.
 
 ⁶ Gemma 4 checkpoints with shared KV layers reject per-layer StreamingLLM
 eviction. Vanilla and OmniKV remain supported.

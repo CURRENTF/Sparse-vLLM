@@ -40,11 +40,29 @@ def test_glm_config_rejects_flashprefill_v2_for_mla_latent_storage():
         )
 
 
-def test_glm_config_rejects_latent_quest_prefix_cache():
-    with pytest.raises(ValueError, match="prefix caching is validated only"):
+@pytest.mark.parametrize("tp,dp", [(1, 1), (2, 1), (2, 2)])
+def test_glm_latent_quest_accepts_prefix_cache_with_graph(tp, dp):
+    config = _glm_config(
+        sparse_method="quest",
+        enable_prefix_caching=True,
+        decode_graph=True,
+        tensor_parallel_size=tp,
+        data_parallel_size=dp,
+        expert_parallel_size=tp * dp,
+    )
+    assert config.resolved_prefix_cache_mode == "radix"
+    assert config.prefix_cache_block_size == config.quest_chunk_size
+    assert config.decode_graph is True
+
+
+def test_glm_latent_quest_keeps_cpu_prefix_offload_unsupported():
+    # Enabling device prefix reuse must not enter the explicit-KV host pool.
+    with pytest.raises(ValueError, match="MLA QuEST.*CPU offload"):
         _glm_config(
             sparse_method="quest",
             enable_prefix_caching=True,
+            enable_prefix_cache_offload=True,
+            prefix_cache_host_size_gb=1,
         )
 
 

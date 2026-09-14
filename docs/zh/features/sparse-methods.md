@@ -92,8 +92,9 @@ DeltaKV family 方法和 PyramidKV 只对外提供 `long_bs1full_short_batch` po
 `prefix_cache_mode=auto` 为 vanilla/OmniKV/QuEST 选择 radix，为
 SnapKV/H2O/PyramidKV/R-KV/SkipKV 选择线性 chain。也可以显式请求 `radix`
 或 `chain`，但不兼容的方法/模式组合会快速失败。
-GLM-4.7-Flash QuEST 是 storage-specific 例外：当前 latent QuEST 路径不支持
-Prefix Cache 或 Prefix offload，配置会明确拒绝这两种组合。
+GLM-4.7-Flash latent QuEST 支持设备驻留的 radix Prefix Cache 与 decode CUDA
+Graph 组合，prefix block 大小须等于 `quest_chunk_size`。页选择保持 TP rank
+本地 query head 打分，因此不保证与单卡结果等价。Prefix CPU offload 暂不支持。
 已有 vanilla/OmniKV radix tree 可通过
 [Prefix cache 修剪](prefix-cache-pruning.md)中的 SnapKV 或 KVzip 打分维护接口
 进行物理压紧；QuEST tree 会明确拒绝修剪。

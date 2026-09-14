@@ -2771,9 +2771,9 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             is_long_text = bool(get_context().is_long_text)
             dense_slots = None
             if not is_long_text:
-                dense_slots = self.buffer_req_to_token_slots.index_select(
+                dense_slots = self.buffer_req_to_token_slots[:, :max_keep].index_select(
                     0, req_indices.to(torch.long)
-                )[:, :max_keep]
+                )
             page_scores, row_page_slots, num_pages, previous_page_counts = (
                 self._score_previous_decode_pages(
                     layer_idx,

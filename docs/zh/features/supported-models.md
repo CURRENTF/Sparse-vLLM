@@ -54,7 +54,7 @@ GLM 逐张量 FP8 加载支持 E4M3 权重以及每个量化投影对应的 BF16
 | Qwen3MoE | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
 | Qwen3.5 / 3.6 / 3.8 | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | 匹配的 checkpoint³ |
 | Qwen3.6 MoE | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
-| GLM-4.7-Flash | ✅⁵ | ✅⁵ | ✅⁵ | 实验性⁴⁵ | — | ✅⁵ | 实验性⁵ | ✅⁵ | — | — |
+| GLM-4.7-Flash | ✅ | ✅ | ✅ | 实验性⁴ | — | ✅ | ✅⁵ | ✅ | — | — |
 | Gemma 4 Dense / MoE | ✅ | ✅⁶ | — | — | — | ✅ | — | — | — | — |
 | Llama 3 / 3.1 | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | 指定 checkpoint¹ | 需要 compressor² |
 | MiniMax M2.7 | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | — | — |
@@ -70,7 +70,8 @@ GLM 逐张量 FP8 加载支持 E4M3 权重以及每个量化投影对应的 BF16
 ⁴ H2O 的 tensor-parallel 执行可能产生与 TP=1 不同的稀疏选择。各模型原有的
 TP、EP、DP 限制仍然适用。
 
-⁵ GLM QuEST 支持仍为实验性，其 prefix-cache 限制保持不变。
+⁵ GLM QuEST 支持设备驻留的 radix Prefix Cache 与 decode CUDA Graph。
+打分使用 TP rank 本地 heads，不保证与 TP=1 等价；Prefix CPU offload 暂不支持。
 
 ⁶ 带共享 KV 层的 Gemma 4 checkpoint 不支持逐层 StreamingLLM eviction；
 Vanilla 和 OmniKV 仍受支持。

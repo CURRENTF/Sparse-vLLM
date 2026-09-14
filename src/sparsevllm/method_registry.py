@@ -389,10 +389,8 @@ GLM4_MOE_LITE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
         {"", "streamingllm", "snapkv", "h2o", "omnikv", "quest", "rkv"}
     ),
     prefix_cache_methods=frozenset(
-        {"", "streamingllm", "snapkv", "h2o", "omnikv", "rkv"}
+        {"", "streamingllm", "snapkv", "h2o", "omnikv", "quest", "rkv"}
     ),
-    # TODO: Validate GLM latent QuEST numerical correctness and interleaved
-    # CUDA Graph capture/replay on the supported TP/EP matrix.
     decode_graph_methods=frozenset(
         {"", "streamingllm", "snapkv", "h2o", "omnikv", "quest", "rkv"}
     ),
