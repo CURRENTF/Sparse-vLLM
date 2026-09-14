@@ -78,8 +78,7 @@ class Config(
     tensor_parallel_size: int = 1
     expert_parallel_size: int = 1
     data_parallel_size: int = 1
-    moe_communication_backend: str = "auto"
-    resolved_moe_communication_backend: str = field(default="allreduce", init=False)
+    moe_backend: str | None = None
     # Soft host-side I/O budget shared across ranks; every rank retains at
     # least one synchronous loading path when the budget is smaller.
     weight_loading_workers: int = 1
@@ -152,9 +151,9 @@ class Config(
         normalize_deltakv_storage(self)
         normalize_platform(self)
         load_and_validate_model(self)
-        from sparsevllm.configs.moe_communication import normalize_moe_communication
+        from sparsevllm.configs.moe_communication import validate_moe_backend
 
-        normalize_moe_communication(self)
+        validate_moe_backend(self)
         from sparsevllm.configs.kv_quant import validate_quantized_kv
 
         validate_quantized_kv(self)
@@ -167,7 +166,7 @@ class Config(
 
         logger.info(
             "Runtime config: model={} sparse_method={} prefill_sparse_method={} "
-            "cache_method={} tp={} ep={} dp={} moe_communication={} "
+            "cache_method={} tp={} ep={} dp={} moe_backend={} "
             "max_model_len={} max_batched_tokens={} prefill_chunk={} "
             "max_prefill_batch={} max_decode_batch={} gpu_utilization={:.3f} "
             "decode_graph={}.",
@@ -178,7 +177,7 @@ class Config(
             self.tensor_parallel_size,
             self.expert_parallel_size,
             self.data_parallel_size,
-            self.resolved_moe_communication_backend,
+            self.moe_backend,
             self.max_model_len,
             self.max_num_batched_tokens,
             self.engine_prefill_chunk_size,

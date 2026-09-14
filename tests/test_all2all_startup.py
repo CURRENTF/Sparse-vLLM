@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from sparsevllm.configs.moe_communication import normalize_moe_communication
+from sparsevllm.configs.moe_communication import validate_moe_backend
 from sparsevllm.kernels.external import deepep
 from sparsevllm.operators.all2all import AllToAllOpSpec
 
@@ -15,11 +15,11 @@ from sparsevllm.operators.all2all import AllToAllOpSpec
 def test_unselected_transport_does_not_load_optional_dependency(monkeypatch):
     check = Mock(side_effect=AssertionError("unselected optional dependency imported"))
     monkeypatch.setattr("sparsevllm.operators.all2all.check_all2all_dependency", check)
-    for backend, dp in (("auto", 1), ("auto", 2), ("agrs", 2)):
+    for backend, dp in ((None, 1), (None, 2), ("all-reduce", 1), ("agrs", 2)):
         config = SimpleNamespace(
-            moe_communication_backend=backend, data_parallel_size=dp
+            moe_backend=backend, data_parallel_size=dp
         )
-        normalize_moe_communication(config)
+        validate_moe_backend(config)
     check.assert_not_called()
 
 
@@ -27,13 +27,13 @@ def test_selected_transport_dependency_failure_is_not_replaced(monkeypatch):
     check = Mock(side_effect=RuntimeError("extension ABI mismatch"))
     monkeypatch.setattr("sparsevllm.operators.all2all.check_all2all_dependency", check)
     config = SimpleNamespace(
-        moe_communication_backend="all2all",
+        moe_backend="deepepv1",
         data_parallel_size=2,
         expert_parallel_size=2,
     )
     with pytest.raises(RuntimeError, match="ABI mismatch"):
-        normalize_moe_communication(config)
-    assert config.resolved_moe_communication_backend == "all2all"
+        validate_moe_backend(config)
+    assert config.moe_backend == "deepepv1"
 
 
 def test_missing_package_and_incompatible_major_fail_before_import(monkeypatch):
@@ -121,3 +121,25 @@ def test_incompatible_topology_fails_before_creating_ipc_buffer(monkeypatch, nvl
     with pytest.raises(RuntimeError, match="NVLink validation failed"):
         deepep.DeepEPV1Normal(spec, group=group, device_index=0)
     buffer.assert_not_called()
+
+
+@pytest.mark.parametrize("backend", ["auto", "all2all", "allreduce", "AGRS", " agrs ", 1])
+def test_moe_backend_rejects_aliases_and_coercions(backend):
+    config = SimpleNamespace(moe_backend=backend, data_parallel_size=2)
+    with pytest.raises(ValueError, match="moe_backend must be"):
+        validate_moe_backend(config)
+
+
+@pytest.mark.parametrize("backend,dp", [("all-reduce", 2), ("agrs", 1), ("deepepv1", 1)])
+def test_moe_backend_rejects_incompatible_token_ownership(backend, dp):
+    config = SimpleNamespace(moe_backend=backend, data_parallel_size=dp)
+    with pytest.raises(ValueError, match="DP attention"):
+        validate_moe_backend(config)
+
+
+def test_moe_backend_cli_uses_the_same_config_field():
+    from sparsevllm.entrypoints.openai.api_server import _parse_engine_kwargs
+
+    assert _parse_engine_kwargs(["--moe-backend", "agrs"]) == {"moe_backend": "agrs"}
+    with pytest.raises(ValueError, match="Unknown"):
+        _parse_engine_kwargs(["--moe-communication-backend", "agrs"])

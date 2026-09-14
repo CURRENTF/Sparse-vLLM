@@ -59,7 +59,7 @@ GLM 逐张量 FP8 加载支持 E4M3 权重以及每个量化投影对应的 BF16
 ⁴ H2O 的 tensor-parallel 执行可能产生与 TP=1 不同的稀疏选择。各模型原有的
 TP、EP、DP 限制仍然适用。
 
-⁵ GLM 支持 `TP=1`、`DP=EP` 的 [DP attention](dp-attention.md)。
+⁵ GLM 支持 `TP=1`、`DP=EP` 的 DP attention。
 QuEST 支持仍为实验性。
 
 ⁶ 带共享 KV 层的 Gemma 4 checkpoint 不支持逐层 StreamingLLM eviction；

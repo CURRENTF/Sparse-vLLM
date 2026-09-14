@@ -214,6 +214,8 @@ def test_glm_runtime_kwargs_bind_shared_operators(
         max_model_len=32768,
         max_num_seqs_in_batch=4,
         max_decoding_seqs=8,
+        max_num_batched_tokens=64,
+        moe_backend="all-reduce",
         mla_prefill_workspace_bytes=1024,
         mla_prefill_history_chunk_size=17,
         mlp_chunk_size=16,
@@ -224,7 +226,7 @@ def test_glm_runtime_kwargs_bind_shared_operators(
     mla = object()
     all_reduce = object()
     collective_runtime = Mock()
-    collective_runtime.request_decode_collectives.return_value = all_reduce
+    collective_runtime.request_moe_collectives.return_value = all_reduce
     with patch(
         "sparsevllm.models.glm4_moe_lite.build_glm4_moe_lite_mla_attention",
         return_value=mla,
@@ -259,9 +261,13 @@ def test_glm_runtime_kwargs_bind_shared_operators(
             else AttentionScoreKind.NONE
         ),
     )
-    collective_runtime.request_decode_collectives.assert_called_once_with(
+    collective_runtime.request_moe_collectives.assert_called_once_with(
         attention_max_rows=8,
         moe_max_rows=16,
+        max_local_tokens=64,
+        backend="all-reduce",
+        num_experts=config.n_routed_experts,
+        top_k=config.num_experts_per_tok,
         hidden_size=64,
         dtype=torch.bfloat16,
     )
@@ -651,12 +657,15 @@ def test_glm_hybrid_tp_ep_shared_expert_defers_reduction_to_moe_block() -> None:
     assert block.shared_experts.down_proj.reduce_results is False
 
 
-def test_glm_moe_debug_contract_populates_model_runner_summaries() -> None:
+@pytest.mark.parametrize("reduced_scale", [1, 2])
+def test_glm_moe_debug_contract_populates_model_runner_summaries(reduced_scale) -> None:
     context = _ep_context()
     block = object.__new__(Glm4MoeLiteSparseMoeBlock)
     nn.Module.__init__(block)
     block.parallel_context = context
-    block.moe_communication = AllReduceMoeCommunication(context.world_all_reduce)
+    block.moe_communication = AllReduceMoeCommunication(
+        lambda x: x * reduced_scale
+    )
     block.parallel_collectives = None
     block.mlp_chunk_size = 8
 
@@ -693,10 +702,10 @@ def test_glm_moe_debug_contract_populates_model_runner_summaries() -> None:
     ):
         output = block(hidden_states)
 
-    torch.testing.assert_close(output, hidden_states * 3)
+    torch.testing.assert_close(output, hidden_states * (2 * reduced_scale + 1))
     assert isinstance(block.debug_last_local_hit_count, torch.Tensor)
     torch.testing.assert_close(block.debug_last_local_output, hidden_states * 2)
-    torch.testing.assert_close(block.debug_last_routed_output, hidden_states * 2)
+    torch.testing.assert_close(block.debug_last_routed_output, hidden_states * (2 * reduced_scale))
     torch.testing.assert_close(block.debug_last_output, output)
 
     runner = object.__new__(ModelRunner)
@@ -709,7 +718,7 @@ def test_glm_moe_debug_contract_populates_model_runner_summaries() -> None:
         )
     )
     runner.parallel_context = context
-    runner.sparse_controller = SimpleNamespace(debug_state_summary=lambda: {})
+    runner.sparse_controller = SimpleNamespace(debug_state_summary=dict)
     runner.prefix_cache_coordinator = None
     runner.debug_last_logits = torch.ones((1, 8), dtype=torch.float32)
     runner.rank = 0

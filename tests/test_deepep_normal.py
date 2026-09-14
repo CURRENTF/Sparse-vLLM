@@ -31,11 +31,12 @@ def _worker(rank, rendezvous, real_experts):
         topology=ParallelTopology(1, 2, 2, ParallelMode.DP_ATTENTION)
     )
     runtime = ParallelCollectiveRuntime(parallel, cuda_graph=True, device_index=rank)
-    comm = runtime.request_dp_collectives(
-        max_rows=8,
+    comm = runtime.request_moe_collectives(
+        attention_max_rows=8,
+        moe_max_rows=16,
         hidden_size=2048,
         dtype=torch.bfloat16,
-        backend="all2all",
+        backend="deepepv1",
         max_local_tokens=8,
         num_experts=64 if real_experts else 8,
         top_k=4 if real_experts else 2,

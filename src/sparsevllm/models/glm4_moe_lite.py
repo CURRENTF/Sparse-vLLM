@@ -10,16 +10,19 @@ from transformers import Glm4MoeLiteConfig
 
 from sparsevllm.distributed import (
     DecodeParallelCollectives,
-    ParallelContext,
     ParallelCollectiveRuntime,
+    ParallelContext,
     get_parallel_context,
 )
-from sparsevllm.models.layout import resolve_attention_qk_head_dim
+from sparsevllm.distributed.moe_communication import prepare_moe_communication
+from sparsevllm.kernels.triton.glm_mla_decode import (
+    project_and_fuse_glm_mla_decode_rope,
+)
+from sparsevllm.layers.activation import SiluAndMul
 from sparsevllm.layers.embed_head import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sparsevllm.layers.activation import SiluAndMul
 from sparsevllm.layers.layernorm import RMSNorm
 from sparsevllm.layers.linear import (
     AbsorbedColumnParallelLinear,
@@ -29,16 +32,13 @@ from sparsevllm.layers.linear import (
 )
 from sparsevllm.layers.mla_attention import MLAAttention
 from sparsevllm.layers.packed_moe import PackedMoeExperts
-from sparsevllm.distributed.moe_communication import prepare_moe_communication
 from sparsevllm.layers.rotary_embedding import RotaryEmbedding, get_rope
-from sparsevllm.kernels.triton.glm_mla_decode import (
-    project_and_fuse_glm_mla_decode_rope,
-)
 from sparsevllm.method_registry import sparse_decode_attention_score_kind
-from sparsevllm.operators.attention_capabilities import AttentionScoreKind
+from sparsevllm.models.layout import resolve_attention_qk_head_dim
 from sparsevllm.models.qwen3 import Qwen3MLP
-from sparsevllm.operators.mla_attention import MlaAttentionOpSpec
 from sparsevllm.operators.activation import resolve_silu_and_mul_provider
+from sparsevllm.operators.attention_capabilities import AttentionScoreKind
+from sparsevllm.operators.mla_attention import MlaAttentionOpSpec
 from sparsevllm.operators.moe import (
     MoeOpSpec,
     append_shared_expert_route,
@@ -55,7 +55,6 @@ from sparsevllm.operators.moe_router import (
 from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.weight_target import WeightTarget
-
 
 _EXPERT_SOURCE_RE = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
@@ -650,7 +649,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         if debug_enabled:
             # Preserve the general EP composition and routed-only debug
             # evidence while keeping shared-expert reductions explicit.
-            self.moe_communication.combine(routed)
+            routed = self.moe_communication.combine(routed)
             self.debug_last_routed_output = routed.detach().clone()
             shared = self._shared_chunk(hidden_states)
             if self.parallel_context.tp_size > 1:
@@ -691,13 +690,9 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         return output
 
     def _forward_distributed_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        capacity = get_context().moe_token_capacity
-        if capacity is None:
-            # Startup warmup/capture uses identical shapes on every replica.
-            capacity = hidden_states.shape[0]
         return self.moe_communication.run_with_shared_experts(
             hidden_states, route=self._route, experts=self.experts,
-            chunk_size=self.mlp_chunk_size, capacity=capacity,
+            chunk_size=self.mlp_chunk_size,
             shared_experts=self._shared_chunk,
         )
 
@@ -941,25 +936,16 @@ class Glm4MoeLiteForCausalLM(nn.Module):
             "mlp_chunk_size": engine_config.mlp_chunk_size,
             "decode_graph": decode_graph,
         }
-        if parallel_context.uses_dp_attention:
-            kwargs["parallel_collectives"] = collective_runtime.request_dp_collectives(
-                max_rows=int(max_decode_tokens),
-                hidden_size=int(config.hidden_size),
-                dtype=model_activation_dtype(config),
-                backend=engine_config.resolved_moe_communication_backend,
-                max_local_tokens=max(int(max_decode_tokens), engine_config.max_num_batched_tokens),
-                num_experts=int(config.n_routed_experts),
-                top_k=int(config.num_experts_per_tok),
-            )
-        elif parallel_context.world_size > 1:
-            kwargs["parallel_collectives"] = (
-                collective_runtime.request_decode_collectives(
-                    attention_max_rows=int(max_decode_tokens),
-                    moe_max_rows=2 * int(max_decode_tokens),
-                    hidden_size=int(config.hidden_size),
-                    dtype=model_activation_dtype(config),
-                )
-            )
+        kwargs["parallel_collectives"] = collective_runtime.request_moe_collectives(
+            attention_max_rows=int(max_decode_tokens),
+            moe_max_rows=2 * int(max_decode_tokens),
+            max_local_tokens=engine_config.max_num_batched_tokens,
+            hidden_size=int(config.hidden_size),
+            dtype=model_activation_dtype(config),
+            backend=engine_config.moe_backend,
+            num_experts=int(config.n_routed_experts),
+            top_k=int(config.num_experts_per_tok),
+        )
         return kwargs
 
     def __init__(

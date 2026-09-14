@@ -16,6 +16,7 @@ import torch.distributed as dist
 
 from sparsevllm.distributed.parallel_context import ParallelContext
 from sparsevllm.operators.agrs import prepare_parallel_agrs
+from sparsevllm.utils.context import get_context
 
 
 @dataclass(frozen=True)
@@ -43,10 +44,15 @@ class MoeCommunication:
         return self.combine(output, dispatch)
 
     def run_with_shared_experts(
-        self, hidden_states, *, shared_experts, **kwargs
+        self, hidden_states, *, shared_experts, capacity=None, **kwargs
     ):
         """Compose a reduced routed output with an owner-local shared branch."""
-        routed = self.run(hidden_states, **kwargs)
+        if capacity is None:
+            capacity = get_context().moe_token_capacity
+            if capacity is None:
+                # Startup warmup/capture uses identical shapes on every replica.
+                capacity = hidden_states.shape[0]
+        routed = self.run(hidden_states, capacity=capacity, **kwargs)
         return routed + shared_experts(hidden_states) if len(hidden_states) else routed
 
 

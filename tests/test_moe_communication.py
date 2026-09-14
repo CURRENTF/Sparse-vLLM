@@ -112,8 +112,10 @@ def _prepared_agrs_worker(
         topology=ParallelTopology(1, world_size, world_size, ParallelMode.DP_ATTENTION)
     )
     runtime = ParallelCollectiveRuntime(parallel, cuda_graph=True, device_index=rank)
-    collectives = runtime.request_dp_collectives(
-        max_rows=1024, hidden_size=hidden_size, dtype=dtype
+    collectives = runtime.request_moe_collectives(
+        attention_max_rows=1024, moe_max_rows=2048, max_local_tokens=1024,
+        hidden_size=hidden_size, dtype=dtype, backend="agrs",
+        num_experts=8, top_k=2,
     )
     runtime.prepare()
     communication = collectives.moe_transport
@@ -221,3 +223,19 @@ def test_prepared_agrs_rank_order_idle_and_replaced_graphs(
         nprocs=world_size,
         join=True,
     )
+
+
+@pytest.mark.parametrize("step_capacity,expected", [(None, 3), (8, 8)])
+def test_shared_expert_execution_uses_the_agreed_step_capacity(monkeypatch, step_capacity, expected):
+    from unittest.mock import Mock
+
+    from sparsevllm.distributed.moe_communication import MoeCommunication
+    from sparsevllm.utils.context import get_context
+
+    # A replica's local row count must not override the capacity agreed with peers.
+    monkeypatch.setattr(get_context(), "moe_token_capacity", step_capacity)
+    transport = MoeCommunication()
+    x = torch.ones(3, 4)
+    transport.run = Mock(return_value=x)
+    transport.run_with_shared_experts(x, shared_experts=lambda t: t)
+    assert transport.run.call_args.kwargs["capacity"] == expected

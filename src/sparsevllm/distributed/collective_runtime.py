@@ -190,6 +190,25 @@ class ParallelCollectiveRuntime:
         )
         return DecodeParallelCollectives(attention=attention, moe=moe)
 
+    def request_moe_collectives(
+        self, *, attention_max_rows, moe_max_rows, max_local_tokens,
+        hidden_size, dtype, backend, num_experts, top_k,
+    ):
+        """Prepare transport from token ownership; models supply tensor contracts."""
+        if self.parallel_context.uses_dp_attention:
+            return self.request_dp_collectives(
+                max_rows=attention_max_rows,
+                max_local_tokens=max(attention_max_rows, max_local_tokens),
+                hidden_size=hidden_size, dtype=dtype, backend=backend,
+                num_experts=num_experts, top_k=top_k,
+            )
+        if self.parallel_context.world_size == 1:
+            return None
+        return self.request_decode_collectives(
+            attention_max_rows=attention_max_rows, moe_max_rows=moe_max_rows,
+            hidden_size=hidden_size, dtype=dtype,
+        )
+
     def request_dp_collectives(
         self, *, max_rows, hidden_size, dtype, backend="agrs",
         max_local_tokens=None, num_experts=None, top_k=None,
@@ -205,7 +224,7 @@ class ParallelCollectiveRuntime:
                 hidden_size=hidden_size,
                 dtype=dtype,
             )
-        elif backend == "all2all":
+        elif backend == "deepepv1":
             from sparsevllm.distributed.moe_all2all import AllToAllMoeCommunication
             from sparsevllm.operators.all2all import AllToAllOpSpec
 

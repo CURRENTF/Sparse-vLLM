@@ -67,7 +67,7 @@ by the mixed-attention runtime.
 ⁴ H2O tensor-parallel execution may produce different sparse selections from
 TP=1. Model-specific TP, EP, and DP restrictions still apply.
 
-⁵ GLM supports [DP attention](dp-attention.md) with `TP=1` and `DP=EP`.
+⁵ GLM supports DP attention with `TP=1` and `DP=EP`.
 QuEST support is experimental.
 
 ⁶ Gemma 4 checkpoints with shared KV layers reject per-layer StreamingLLM
