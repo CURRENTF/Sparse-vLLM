@@ -94,10 +94,6 @@ class ParallelContext:
     def dp_size(self) -> int:
         return self.data.size
 
-    @property
-    def uses_dp_attention(self) -> bool:
-        return self.dp_size > 1 and self.data.ranks == self.expert.ranks
-
     @staticmethod
     def _all_reduce(
         tensor: torch.Tensor,

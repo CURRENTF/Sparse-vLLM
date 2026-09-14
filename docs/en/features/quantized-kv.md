@@ -37,8 +37,7 @@ and head dimensions 64/128/256. TP is supported with the model's legal head
 sharding; Qwen3-MoE also supports EP and its existing outer-TP/EP layout.
 Quantization uses rank-local KV heads and adds no communication. Model TP/EP
 collectives are unchanged. Independent inference replicas keep separate KV
-caches. The models supported by this KV quantization path require
-`data_parallel_size=1`; GLM DP attention uses its separate MLA latent cache.
+caches; the model runtime still rejects internal `data_parallel_size>1`.
 FP8 requires a GPU with native FP8
 support. `kv_quant_page_size` must be a power of two from 16 to 128 and divide
 the head dimension. Decode CUDA Graphs are supported. Prefix caching/offload and sparse prefill

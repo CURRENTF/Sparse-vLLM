@@ -1132,7 +1132,6 @@ def test_general_page_scores_preserve_dimension_tails_and_head_tiles(
             torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
 
 
-@CUDA_REQUIRED
 @pytest.mark.parametrize("dtype,heads,kv_heads,dim,pages", [
     (torch.bfloat16, 32, 4, 128, 2053),
     (torch.bfloat16, 34, 1, 129, 37),

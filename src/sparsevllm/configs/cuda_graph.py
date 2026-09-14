@@ -261,11 +261,6 @@ def normalize_decode_cuda_graph(config) -> None:
     if not config.decode_graph:
         return
 
-    if config.data_parallel_size > 1 and config.decode_graph_capture_sampling:
-        raise ValueError(
-            "DP attention does not support decode_graph_capture_sampling=True; "
-            "sampling runs outside the captured decode graph."
-        )
     if config.enable_prefix_caching and config.decode_graph_capture_sampling:
         raise ValueError(
             "prefix caching with decode_graph does not support "

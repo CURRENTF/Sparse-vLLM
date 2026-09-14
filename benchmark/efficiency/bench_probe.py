@@ -599,13 +599,6 @@ def _format_markdown_report(
     return "\n".join(lines)
 
 
-def _replica_concurrency(global_concurrency: int, hyper_params: dict[str, Any]) -> int:
-    replicas = int(hyper_params.get("data_parallel_size", 1))
-    if replicas <= 0:
-        raise ValueError("data_parallel_size must be positive")
-    return (global_concurrency + replicas - 1) // replicas
-
-
 def run_sparsevllm_probe(
     args: argparse.Namespace,
     model_specs: ModelArchitectureSpecs,
@@ -639,11 +632,9 @@ def run_sparsevllm_probe(
         "max_model_len": max_len_needed,
         "enable_prefix_caching": False,
         **sparse_kwargs,
-        "max_num_seqs_in_batch": _replica_concurrency(
-            min(wave_size, max_concurrency) if wave_size else max_concurrency, hyper_params
-        ),
-        "max_decoding_seqs": _replica_concurrency(max_concurrency, hyper_params),
-        "max_num_seqs_in_gpu": _replica_concurrency(max_concurrency, hyper_params),
+        "max_num_seqs_in_batch": min(wave_size, max_concurrency) if wave_size else max_concurrency,
+        "max_decoding_seqs": max_concurrency,
+        "max_num_seqs_in_gpu": max_concurrency,
     }
 
     print(f"[Sparse-vLLM Probe] Initializing LLM with method={args.sparse_method}, max_model_len={max_len_needed}...")
@@ -746,7 +737,7 @@ def run_sparsevllm_probe(
                                 wave_events.append({"admitted_seq_ids": sorted(current_wave),
                                                     "time_since_start_s": time.perf_counter() - t_start,
                                                     "previous_first_tokens": len(first_token_times),
-                                                    "free_slot_stats": llm.worker_load()["cache"]})
+                                                    "free_slot_stats": llm.scheduler.memory_oracle.free_slot_stats()})
                         admit_wave()
 
                         while not llm.is_finished():
@@ -769,11 +760,10 @@ def run_sparsevllm_probe(
                                 peak_first_token_live_requests,
                                 len(first_token_times.keys() - finished_times.keys()),
                             )
-                            decoding_requests = llm.worker_routing_load()["decoding_requests"]
-                            if decoding_requests > peak_scheduler_decoding_requests:
-                                peak_scheduler_decoding_requests = decoding_requests
+                            if len(llm.scheduler.decoding) > peak_scheduler_decoding_requests:
+                                peak_scheduler_decoding_requests = len(llm.scheduler.decoding)
                                 if wave_size:
-                                    peak_decode_free_slot_stats = llm.worker_load()["cache"]
+                                    peak_decode_free_slot_stats = llm.scheduler.memory_oracle.free_slot_stats()
                             if next_request < len(trace) and current_wave <= first_token_times.keys():
                                 admit_wave()
                         if len(seq_to_request) != len(trace):
@@ -967,9 +957,9 @@ def run_sparsevllm_churn(
             "max_model_len": max_len_needed,
             "sparse_method": args.sparse_method,
             "enable_prefix_caching": False,
-            "max_num_seqs_in_batch": _replica_concurrency(concurrency, base_hyper_params),
-            "max_decoding_seqs": _replica_concurrency(concurrency, base_hyper_params),
-            "max_num_seqs_in_gpu": _replica_concurrency(concurrency, base_hyper_params),
+            "max_num_seqs_in_batch": concurrency,
+            "max_decoding_seqs": concurrency,
+            "max_num_seqs_in_gpu": concurrency,
         }
         print(
             "[Sparse-vLLM Churn] Initializing "
@@ -1844,10 +1834,6 @@ def parse_args():
 def main():
     args = parse_args()
     if args.decode_only_steps:
-        if args.engine == "sparsevllm" and int(
-            _parse_json_arg(args.hyper_params).get("data_parallel_size", 1)
-        ) > 1:
-            raise ValueError("DP attention currently supports request-mode probes only")
         from benchmark.efficiency.paper import run_paper_decode
         run_paper_decode(args)
         return

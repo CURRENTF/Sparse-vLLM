@@ -276,7 +276,6 @@ class ModelRunner:
     负责模型执行的类。每个 GPU Rank 进程都拥有一个 ModelRunner 实例。
     主要职责：权重加载、显存分配 (KV Cache)、槽位管理 (Rank-Local)、前向计算。
     """
-    independent_scheduler = False
 
     def __init__(
         self,
@@ -286,11 +285,8 @@ class ModelRunner:
         tp_shm_name: str | None = None,
         master_port: int | None = None,
         trtllm_cache_root: str | None = None,
-        *,
-        independent_scheduler: bool = False,
     ):
         self.config = config
-        self.independent_scheduler = independent_scheduler
         # Inference-only engine: disable autograd graph construction globally in this process.
         # (This is process-local; must be set inside every spawned TP worker.)
         torch.set_grad_enabled(False)
@@ -325,13 +321,6 @@ class ModelRunner:
         self.parallel_context = init_parallel_context(
             topology=config.parallel_topology,
         )
-        self.dp_control_group = (
-            dist.new_group(backend="gloo") if independent_scheduler else None
-        )
-        self.dp_control_buffer = torch.empty(2, dtype=torch.int64, device="cpu") if independent_scheduler else None
-        self.dp_idle_graphs = {}
-        self.dp_idle_replay_count = 0
-        self.dp_idle_eager_count = 0
         set_engine_process_title(self.parallel_context)
         # CUDA allocator peaks are process-global and survive LLMEngine.exit().
         # Start a new lifecycle before model construction so KV sizing observes
@@ -352,7 +341,7 @@ class ModelRunner:
                         "max_num_batched_tokens",
                         config.mlp_chunk_size,
                     )
-                ) * (config.data_parallel_size if independent_scheduler else 1),
+                ),
                 int(config.mlp_chunk_size),
             ),
         )
@@ -491,7 +480,7 @@ class ModelRunner:
         torch.set_default_dtype(default_dtype)
 
         # TP 场景下的多进程指令同步
-        if self.world_size > 1 and not self.independent_scheduler:
+        if self.world_size > 1:
             if not self.tp_shm_name:
                 raise ValueError("tp_shm_name is required when world_size > 1.")
             if rank == 0:
@@ -606,7 +595,7 @@ class ModelRunner:
             local_record,
             group=self.parallel_context.world.process_group,
         )
-        return records if self.rank == 0 or self.independent_scheduler else None
+        return records if self.rank == 0 else None
 
     def begin_startup_memory_profile(self, phase: str) -> None:
         self.startup_memory_profiler.begin(phase)
@@ -644,7 +633,6 @@ class ModelRunner:
             self.device,
         )
         self.decode_graph_runner.clear_captured_graphs()
-        self.dp_idle_graphs.clear()
         if self.config.decode_graph:
             self.collective_runtime.reset_for_cuda_graph_recapture()
         release_unused_device_memory(self.platform)
@@ -749,11 +737,9 @@ class ModelRunner:
 
     def exit(self):
         """释放资源并注销分布式进程组"""
-        self.platform.set_device(self.device)
         # Graph replay is asynchronous on every rank. Drain and release captured
         # NCCL work before entering the shutdown barrier or destroying its group.
         self.platform.synchronize()
-        self.dp_idle_graphs.clear()
         if self.config.decode_graph and self.decode_graph_runner is not None:
             self.decode_graph_runner.clear_captured_graphs()
             self.platform.synchronize()
@@ -764,7 +750,7 @@ class ModelRunner:
         self.collective_runtime.close()
         self.platform.synchronize()
         close_workspace_manager()
-        if self.world_size > 1 and not self.independent_scheduler:
+        if self.world_size > 1:
             self.shm.close()
             self.parallel_context.world_barrier(
                 device_ids=self.platform.barrier_device_ids(self.rank)
@@ -834,9 +820,6 @@ class ModelRunner:
 
     def call(self, method_name, *args):
         """RPC 风格的调用：如果是 Rank 0 则先广播指令，然后所有进程执行本地逻辑"""
-        if self.independent_scheduler:
-            with torch.inference_mode():
-                return getattr(self, method_name)(*args)
         synchronizes_status = method_name in TP_RPC_STATUS_SYNC_METHODS
         if self.world_size > 1 and self.rank == 0:
             # A status-synchronized RPC already waits for every worker before
@@ -953,7 +936,7 @@ class ModelRunner:
         method_name: str,
         local_error: BaseException | None,
     ) -> None:
-        if self.independent_scheduler or self.world_size <= 1 or not dist.is_initialized():
+        if self.world_size <= 1 or not dist.is_initialized():
             return
         failed = torch.tensor(
             [1 if local_error is not None else 0],
@@ -1042,14 +1025,13 @@ class ModelRunner:
                 "world_rank": int(self.parallel_context.world_rank),
                 "bindings": operator_registry.operator_binding_reports(),
                 "operators": operator_registry.operator_runtime_stats(),
-                "moe_communication": self.collective_runtime.moe_transport_stats(),
             }
         except BaseException as exc:
             local_error = exc
         self._sync_tp_rpc_status("operator_runtime_stats", local_error)
         if local_error is not None:
             raise local_error
-        if self.world_size == 1 or self.independent_scheduler:
+        if self.world_size == 1:
             return [local_stats]
         stats = [None] * self.world_size
         dist.all_gather_object(
@@ -1494,9 +1476,6 @@ class ModelRunner:
         graph_runner = getattr(self, "decode_graph_runner", None)
         graph_key = getattr(graph_runner, "last_state_key", None)
         graph_summary = {
-            "dp_idle_graph_count": len(getattr(self, "dp_idle_graphs", {})),
-            "dp_idle_replay_count": int(getattr(self, "dp_idle_replay_count", 0)),
-            "dp_idle_eager_count": int(getattr(self, "dp_idle_eager_count", 0)),
             "enabled": bool(
                 getattr(config, "decode_graph", False)
             ),
@@ -1567,7 +1546,6 @@ class ModelRunner:
                 "attention_replicated_for_ep": bool(
                     parallel_context.ep_size > 1
                     and parallel_context.attention_tp_size == 1
-                    and not parallel_context.uses_dp_attention
                 ),
             },
             "state": state,
@@ -1582,7 +1560,7 @@ class ModelRunner:
         }
 
     def debug_last_logits_cpu(self) -> torch.Tensor | None:
-        if self.rank != 0 and not self.independent_scheduler:
+        if self.rank != 0:
             return None
         logits = getattr(self, "debug_last_logits", None)
         if logits is None:
@@ -1736,15 +1714,13 @@ class ModelRunner:
             if synchronize:
                 self.platform.synchronize()
             local_summary = self.debug_sparse_state_summary()
-            local_summary["replica_consistency"] = (
-                None if self.independent_scheduler else self.debug_replica_consistency()
-            )
+            local_summary["replica_consistency"] = self.debug_replica_consistency()
         except BaseException as exc:
             local_error = exc
         self._sync_tp_rpc_status("debug_sparse_state_summaries", local_error)
         if local_error is not None:
             raise local_error
-        if self.world_size == 1 or self.independent_scheduler:
+        if self.world_size == 1:
             return [local_summary]
         summaries = [None] * self.world_size
         dist.all_gather_object(
@@ -1907,14 +1883,8 @@ class ModelRunner:
                 )
             return [int(token_id) for token_id in graph_token_ids.tolist()]
 
-        # Most batches publish every row. Advanced indexing would still copy
-        # the entire vocabulary matrix and upload an index tensor each step.
-        if len(publish_indices) == len(seqs):
-            publish_seqs = seqs
-            publish_logits = logits
-        else:
-            publish_seqs = [seqs[idx] for idx in publish_indices]
-            publish_logits = logits[publish_indices]
+        publish_seqs = [seqs[idx] for idx in publish_indices]
+        publish_logits = logits[publish_indices]
         all_greedy = all(seq.temperature <= 1e-10 for seq in publish_seqs)
         temperatures = None
         top_ps = None
@@ -1967,49 +1937,13 @@ class ModelRunner:
     def capture_decode_cuda_graph_warmup(self, seqs: list[Sequence]) -> None:
         """Capture one planned graph without advancing scheduler sequence state."""
         try:
-            if self.independent_scheduler:
-                self.decode_graph_runner.dp_batch_capacity = None
             self.decode_graph_runner.run(
                 seqs,
                 capture_sampling=False,
                 replay_after_capture=False,
             )
-            if self.independent_scheduler:
-                capacity = self.decode_graph_runner.last_state_key.batch_size
-                self.capture_dp_idle_graph(capacity)
         finally:
             reset_context()
-
-    def _forward_dp_idle(self) -> None:
-        # No fabricated request or KV row: idle replicas execute only the
-        # expert transport/compute schedule, with zero owner-local tokens.
-        hidden = torch.empty(
-            (0, int(self.config.hf_config.hidden_size)),
-            dtype=self.config.hf_config.dtype, device=self.device,
-        )
-        self.model.forward_idle_experts(hidden)
-
-    def capture_dp_idle_graph(self, capacity: int) -> None:
-        if capacity in self.dp_idle_graphs:
-            return
-        get_context().moe_token_capacity = capacity
-        self.dp_idle_graphs[capacity] = self.decode_graph_runner.capture_idle_experts(
-            self._forward_dp_idle, self.device
-        )
-
-    def run_dp_idle(self, *, use_graph: bool) -> None:
-        capacity = get_context().moe_token_capacity
-        if not capacity:
-            return
-        if use_graph:
-            graph = self.dp_idle_graphs.get(capacity)
-            if graph is None:
-                raise RuntimeError(f"No startup-captured idle DP graph for capacity {capacity}.")
-            graph.replay()
-            self.dp_idle_replay_count += 1
-        else:
-            self._forward_dp_idle()
-            self.dp_idle_eager_count += 1
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
@@ -2105,21 +2039,11 @@ class ModelRunner:
         is_prefill: bool,
     ) -> tuple[list[int], tuple[list[float | None], list[dict[int, float] | None]] | None]:
         """单步执行主逻辑"""
-        dp_eager = False
-        if self.independent_scheduler:
-            from sparsevllm.engine.dp_step import coordinate_dp_step
-            dp_eager = coordinate_dp_step(self, seqs, is_prefill)
-            if not seqs:
-                try:
-                    self.run_dp_idle(use_graph=self.config.decode_graph and not dp_eager)
-                    return [], None
-                finally:
-                    reset_context()
         name = "model_run_prefill" if is_prefill else "model_run_decode"
         with profiler.record(name):
             if not is_prefill:
                 try:
-                    if self.config.decode_graph and not dp_eager:
+                    if self.config.decode_graph:
                         logits, graph_token_ids = self.decode_graph_runner.run(
                             seqs,
                             capture_sampling=self._auto_capture_greedy_sampling(seqs),
@@ -2128,7 +2052,7 @@ class ModelRunner:
                         logits = self.decode_graph_runner.run_eager_static(seqs)
                         graph_token_ids = None
                     self._record_debug_logits(logits)
-                    if self.rank != 0 and not self.independent_scheduler:
+                    if self.rank != 0:
                         self._post_sparse_forward(seqs, is_prefill)
                         return None, None
                     self._post_sparse_forward(seqs, is_prefill)
@@ -2161,7 +2085,7 @@ class ModelRunner:
             
             # 4. Token 采样 (仅 Rank 0)
             with profiler.record("model_sampler"):
-                if self.rank == 0 or self.independent_scheduler:
+                if self.rank == 0:
                     sampling_logits = self._apply_sampling_penalties(logits, seqs)
                     token_ids = self._sample_model_outputs(sampling_logits, seqs)
                 else:
@@ -2172,7 +2096,7 @@ class ModelRunner:
                     seqs,
                     self._collect_logprobs(sampling_logits, token_ids, seqs),
                 )
-                if self.rank == 0 or self.independent_scheduler
+                if self.rank == 0
                 else None
             )
 

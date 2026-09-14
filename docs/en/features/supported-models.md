@@ -17,7 +17,7 @@ parallel size must use that value.
 | Qwen3MoE | `qwen3_moe` | BF16 / FP16 / block FP8 | ✅ | 1 only | ✅ |
 | Qwen3.5 / 3.6 / 3.8 | `qwen3_5` | BF16 / block FP8 | ✅ | 1 only | 1 only |
 | Qwen3.6 MoE | `qwen3_5_moe` | BF16 / block FP8 | ✅ | 1 only | ✅ |
-| GLM-4.7-Flash | `glm4_moe_lite` | BF16 / experimental per-tensor FP8 | ✅ | 1 / 2 / 4⁵ | 1 / 2 / 4 |
+| GLM-4.7-Flash | `glm4_moe_lite` | BF16 / experimental per-tensor FP8 | ✅ | 1 only | 1 / 2 / 4 |
 | Gemma 4 Dense / MoE | `gemma4` | BF16 / FP16 | ✅ | 1 only | ✅ (MoE only) |
 | Llama 3 / 3.1 | `llama` | BF16 / FP16 / block FP8 | ✅ | 1 only | 1 only |
 | MiniMax M2.7 | `minimax_m2` | block FP8 with BF16 non-quantized weights | ✅ | 1 only | ✅ |
@@ -67,8 +67,7 @@ by the mixed-attention runtime.
 ⁴ H2O tensor-parallel execution may produce different sparse selections from
 TP=1. Model-specific TP, EP, and DP restrictions still apply.
 
-⁵ GLM supports DP attention with `TP=1` and `DP=EP`.
-QuEST support is experimental.
+⁵ GLM requires `DP=1`. QuEST support is experimental.
 
 ⁶ Gemma 4 checkpoints with shared KV layers reject per-layer StreamingLLM
 eviction. Vanilla and OmniKV remain supported.

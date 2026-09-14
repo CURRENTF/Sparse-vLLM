@@ -61,60 +61,6 @@ class CudaPlatform(Platform):
     def barrier_device_ids(self, rank: int) -> list[int] | None:
         return [int(rank)]
 
-    def supports_nvlink_group(self, device_indices: tuple[int, ...]) -> bool:
-        try:
-            import pynvml
-        except ImportError as exc:
-            raise RuntimeError("NVLink validation requires optional nvidia-ml-py.") from exc
-        try:
-            pynvml.nvmlInit()
-            try:
-                handles = [
-                    pynvml.nvmlDeviceGetHandleByUUID(str(torch.cuda.get_device_properties(i).uuid))
-                    for i in device_indices
-                ]
-                return all(
-                    torch.cuda.can_device_access_peer(device_indices[i], device_indices[j])
-                    and pynvml.nvmlDeviceGetP2PStatus(
-                        left, right, pynvml.NVML_P2P_CAPS_INDEX_NVLINK
-                    ) == pynvml.NVML_P2P_STATUS_OK
-                    for i, left in enumerate(handles)
-                    for j, right in enumerate(handles)
-                    if i != j
-                )
-            finally:
-                pynvml.nvmlShutdown()
-        except pynvml.NVMLError as exc:
-            raise RuntimeError(f"NVLink topology validation failed: {exc}") from exc
-
-    def supports_multicast(self, device_index: int) -> bool:
-        # Called only by providers whose cuda-python dependency is available.
-        from cuda.bindings import driver
-
-        status, supported = driver.cuDeviceGetAttribute(
-            driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED,
-            int(device_index),
-        )
-        if status != driver.CUresult.CUDA_SUCCESS:
-            raise RuntimeError(f"CUDA multicast capability query failed: {status}")
-        return bool(supported)
-
-    def supports_peer_atomics(self, device_index: int, peer_index: int) -> bool:
-        from cuda.bindings import driver
-
-        for attribute in (
-            driver.CUdevice_P2PAttribute.CU_DEVICE_P2P_ATTRIBUTE_ACCESS_SUPPORTED,
-            driver.CUdevice_P2PAttribute.CU_DEVICE_P2P_ATTRIBUTE_NATIVE_ATOMIC_SUPPORTED,
-        ):
-            status, supported = driver.cuDeviceGetP2PAttribute(
-                attribute, int(device_index), int(peer_index),
-            )
-            if status != driver.CUresult.CUDA_SUCCESS:
-                raise RuntimeError(f"CUDA peer capability query failed: {status}")
-            if not supported:
-                return False
-        return True
-
     @lru_cache(maxsize=None)
     def get_device_caps(self, device_index: int = 0) -> DeviceCaps:
         device_index = int(device_index)

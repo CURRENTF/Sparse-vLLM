@@ -41,7 +41,6 @@ def test_decode_graph_runner_blocks_replay_until_collectives_are_ready() -> None
     graph = SimpleNamespace(replay=Mock())
     state = SimpleNamespace(key=object(), graph=graph, logits=None, token_ids=None)
     runner.cache_manager = SimpleNamespace()
-    runner.dp_batch_capacity = None
     runner.method = ""
     runner._select_graph_batch_size = lambda batch_size: batch_size
     runner.is_long_text_batch = lambda seqs, is_prefill: False

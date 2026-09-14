@@ -1,6 +1,5 @@
 import os
 import sys
-from dataclasses import replace
 from io import StringIO
 from types import ModuleType, SimpleNamespace
 from unittest.mock import ANY, Mock, patch
@@ -8,17 +7,11 @@ from unittest.mock import ANY, Mock, patch
 import pytest
 import torch
 
-from sparsevllm.kernels.external.support import (
-    KernelFamilyHealth,
-    KernelFamilyState,
-    RequiredExternalKernelFamilyError,
-)
 from sparsevllm.operators.all_reduce import (
     ALL_REDUCE_REGISTRY,
     AllReduceGraphBufferMetadata,
     AllReduceOpSpec,
     FlashInferTrtllmAllReduceProvider,
-    FlashInferVllmAllReduceProfile,
     FlashInferVllmAllReduceProvider,
     TorchDistributedAllReduceProvider,
     _expandable_segments_enabled,
@@ -27,6 +20,11 @@ from sparsevllm.operators.all_reduce import (
 )
 from sparsevllm.operators.registry import OpResolver, SupportResult
 from sparsevllm.platforms import DeviceCaps, PlatformEnum
+from sparsevllm.kernels.external.support import (
+    KernelFamilyHealth,
+    KernelFamilyState,
+    RequiredExternalKernelFamilyError,
+)
 
 
 def _spec(
@@ -396,128 +394,3 @@ def test_vllm_all_reduce_stages_only_eager_input():
         (7, ANY, ANY, 0, 0, 32),
         (7, ANY, ANY, 1000, 4096, 32),
     ]
-
-
-@pytest.mark.parametrize("world_size,full_nvlink", [(2, False), (4, True), (4, False)])
-def test_vllm_all_reduce_initializes_the_upstream_nvlink_mode(world_size, full_nvlink):
-    # For >2 ranks the upstream kernel launches only with full_nvlink=True.
-    modules = _fake_flashinfer_modules()
-    comm = modules["flashinfer.comm"]
-    comm.create_shared_buffer = Mock(return_value=list(range(world_size)))
-    comm.vllm_meta_size = Mock(return_value=64)
-    comm.vllm_init_custom_ar = Mock(return_value=7)
-    comm.vllm_register_buffer = Mock()
-    topology = Mock(return_value=full_nvlink)
-    spec = replace(
-        _spec((0, 1)),
-        world_size=world_size,
-        ranks=tuple(range(world_size)),
-        device_ordinals=tuple(range(world_size)),
-    )
-    rank_data = torch.empty(0, dtype=torch.uint8)
-    with (
-        patch.dict(sys.modules, modules),
-        patch(
-            "sparsevllm.operators.all_reduce.platforms",
-            SimpleNamespace(
-                current_platform=SimpleNamespace(supports_nvlink_group=topology)
-            ),
-        ),
-        patch("sparsevllm.operators.all_reduce._prepare_flashinfer_cuda_runtime"),
-        patch.object(torch.cuda, "current_device", return_value=0),
-        patch.object(torch.cuda, "can_device_access_peer", return_value=True),
-        patch.object(torch, "empty", return_value=rank_data),
-    ):
-        provider = FlashInferVllmAllReduceProvider()
-        if world_size > 2 and not full_nvlink:
-            with pytest.raises(RuntimeError, match="fully connected NVLink"):
-                provider.prepare(spec, group="tp", rank=0)
-            comm.create_shared_buffer.assert_not_called()
-            comm.vllm_init_custom_ar.assert_not_called()
-        else:
-            provider.prepare(spec, group="tp", rank=0)
-            comm.vllm_init_custom_ar.assert_called_once_with(
-                list(range(world_size)), rank_data, 0, full_nvlink
-            )
-    if world_size == 2:
-        topology.assert_not_called()
-    else:
-        topology.assert_called_once_with(spec.device_ordinals)
-
-
-@pytest.mark.parametrize(
-    "nvml_present,full_nvlink", [(False, False), (True, False), (True, True)]
-)
-def test_extended_all_reduce_profile_requires_verified_nvlink(
-    nvml_present, full_nvlink
-):
-    # A larger service capacity must not opt an unmeasured PCIe fabric into the profile.
-    spec = replace(
-        _spec((0, 1), cuda_graph=True),
-        max_rows=FlashInferVllmAllReduceProfile.max_rows_without_nvlink + 1,
-    )
-    topology = Mock(return_value=full_nvlink)
-    with (
-        patch(
-            "sparsevllm.operators.all_reduce.importlib.util.find_spec",
-            return_value=object() if nvml_present else None,
-        ),
-        patch(
-            "sparsevllm.operators.all_reduce.platforms",
-            SimpleNamespace(
-                current_platform=SimpleNamespace(supports_nvlink_group=topology)
-            ),
-        ),
-    ):
-        result = FlashInferVllmAllReduceProfile.matches(spec, _caps())
-    assert result.matched == (nvml_present and full_nvlink)
-    if nvml_present:
-        topology.assert_called_once_with(spec.device_ordinals)
-    else:
-        topology.assert_not_called()
-
-
-def test_extended_all_reduce_profile_surfaces_topology_query_failure():
-    spec = replace(
-        _spec((0, 1), cuda_graph=True),
-        max_rows=FlashInferVllmAllReduceProfile.max_rows_without_nvlink + 1,
-    )
-    with (
-        patch(
-            "sparsevllm.operators.all_reduce.importlib.util.find_spec",
-            return_value=object(),
-        ),
-        patch(
-            "sparsevllm.operators.all_reduce.platforms",
-            SimpleNamespace(
-                current_platform=SimpleNamespace(
-                    supports_nvlink_group=Mock(
-                        side_effect=RuntimeError("NVML query failed")
-                    )
-                )
-            ),
-        ),
-        pytest.raises(RuntimeError, match="NVML query failed"),
-    ):
-        FlashInferVllmAllReduceProfile.matches(spec, _caps())
-
-
-def test_vllm_all_reduce_rejects_odd_rank_count_before_loading_extension():
-    spec = replace(
-        _spec((0, 1)), world_size=3, ranks=(0, 1, 2), device_ordinals=(0, 1, 2)
-    )
-    with patch(
-        "sparsevllm.operators.all_reduce._flashinfer_dependency_support"
-    ) as dependency:
-        assert not FlashInferVllmAllReduceProvider.supports(spec, _caps()).supported
-    dependency.assert_not_called()
-
-
-def test_extended_all_reduce_profile_does_not_change_eager_selection():
-    spec = replace(
-        _spec((0, 1)),
-        max_rows=FlashInferVllmAllReduceProfile.max_rows_without_nvlink + 1,
-    )
-    with patch("sparsevllm.operators.all_reduce.importlib.util.find_spec") as discover:
-        assert not FlashInferVllmAllReduceProfile.matches(spec, _caps()).matched
-    discover.assert_not_called()
