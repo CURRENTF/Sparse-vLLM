@@ -75,7 +75,6 @@ class DecodeCudaGraphRunner:
         self._graphs: dict[DecodeCudaGraphKey, DecodeCudaGraphState] = {}
         self.last_state_key: DecodeCudaGraphKey | None = None
         self.last_real_batch_size: int | None = None
-        self.dp_batch_capacity: int | None = None
         self.graph_pool = graph_pool
         self.collective_runtime = collective_runtime
         self.capture_count = 0
@@ -86,19 +85,6 @@ class DecodeCudaGraphRunner:
         self._captured_keys: set[DecodeCudaGraphKey] = set()
         self.startup_plan_sealed = False
 
-    @staticmethod
-    def capture_idle_experts(forward: Callable[[], None], device):
-        """Capture the expert collective schedule without attention/cache rows."""
-        stream = torch.cuda.Stream(device=device)
-        stream.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(stream):
-            forward()
-        stream.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            forward()
-        return graph
-
     def seal_startup_plan(self):
         self.startup_plan_sealed = True
 
@@ -108,7 +94,6 @@ class DecodeCudaGraphRunner:
         self._graphs.clear()
         self.last_state_key = None
         self.last_real_batch_size = None
-        self.dp_batch_capacity = None
 
     @staticmethod
     def _release_graph_state(state: DecodeCudaGraphState):
@@ -453,7 +438,7 @@ class DecodeCudaGraphRunner:
             self.force_eager_count += 1
             return self.run_eager_static(seqs), None
 
-        graph_batch_size = self.dp_batch_capacity or self._select_graph_batch_size(real_batch_size)
+        graph_batch_size = self._select_graph_batch_size(real_batch_size)
         is_long_text = self.is_long_text_batch(seqs, False)
         graph_path_id = self._graph_path_id(is_long_text)
         context_capacity = self._graph_path_capacity(
@@ -508,7 +493,7 @@ class DecodeCudaGraphRunner:
         self.eager_static_count += 1
 
         real_batch_size = len(seqs)
-        graph_batch_size = self.dp_batch_capacity or self._select_graph_batch_size(real_batch_size)
+        graph_batch_size = self._select_graph_batch_size(real_batch_size)
         is_long_text = self.is_long_text_batch(seqs, False)
         graph_path_id = self._graph_path_id(is_long_text)
         context_capacity = self._graph_path_capacity(

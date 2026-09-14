@@ -112,10 +112,6 @@ def stream_context(stream: Any):
     return torch.cuda.stream(stream)
 
 
-def current_stream(device: torch.device | str | int | None = None) -> Any | None:
-    return torch.cuda.current_stream(device) if supports_streams(device) else None
-
-
 def stream_wait_event(stream: Any, event: Any) -> None:
     if stream is None:
         wait_event(event)

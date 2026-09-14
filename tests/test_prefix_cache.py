@@ -1449,7 +1449,6 @@ def test_prefix_delete_plan_rejects_tp_divergence_before_mutation():
     manager.world_size = 2
     manager.parallel_context = SimpleNamespace(
         world=SimpleNamespace(process_group=None),
-        uses_dp_attention=False,
     )
     block_id = _insert_tokens(manager.prefix_cache, [1, 2])
     local_plan = manager.prefix_cache.preview_delete_subtree([1, 2]).to_dict()

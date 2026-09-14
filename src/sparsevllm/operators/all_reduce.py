@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ctypes
-import importlib.util
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -9,7 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
-from sparsevllm import platforms
+import sparsevllm.platforms as platforms
 from sparsevllm.kernels.external.flashinfer.support import flashinfer_kernel_support
 from sparsevllm.kernels.external.support import (
     KernelFamilyHealth,
@@ -351,7 +350,7 @@ class FlashInferTrtllmAllReduceProvider(AllReduceProvider):
 )
 class FlashInferVllmAllReduceProvider(AllReduceProvider):
     name = "flashinfer_vllm_sm90"
-    max_rows = 1024
+    max_rows = 256
     num_ctas = 32
 
     @classmethod
@@ -362,10 +361,6 @@ class FlashInferVllmAllReduceProvider(AllReduceProvider):
             )
         if spec.cuda_graph and not caps.supports_graph_capture:
             return SupportResult.unsupported("requires CUDA Graph capture support")
-        if spec.world_size not in (2, 4, 6, 8):
-            return SupportResult.unsupported(
-                "upstream custom all-reduce requires 2, 4, 6 or 8 ranks"
-            )
         if spec.backend != "nccl":
             return SupportResult.unsupported(f"requires NCCL, got {spec.backend}")
         if spec.dtype != torch.bfloat16:
@@ -480,22 +475,12 @@ class FlashInferVllmAllReduceProvider(AllReduceProvider):
             for peer in device_ordinals
         ):
             raise RuntimeError("FlashInfer vLLM all-reduce requires CUDA peer access.")
-        # The upstream kernel for >2 ranks launches only in full-NVLink mode.
-        full_nvlink = (
-            spec.world_size > 2
-            and platforms.current_platform.supports_nvlink_group(device_ordinals)
-        )
-        if spec.world_size > 2 and not full_nvlink:
-            raise RuntimeError(
-                "FlashInfer vLLM all-reduce with more than two ranks requires "
-                "fully connected NVLink."
-            )
         cudart = _prepare_flashinfer_cuda_runtime()
         max_size_bytes = spec.max_rows * spec.hidden_size * spec.dtype.itemsize
         meta_ptrs = create_shared_buffer(vllm_meta_size() + max_size_bytes, group)
         buffer_ptrs = create_shared_buffer(max_size_bytes, group)
         rank_data = torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device="cuda")
-        handle = vllm_init_custom_ar(meta_ptrs, rank_data, rank, full_nvlink)
+        handle = vllm_init_custom_ar(meta_ptrs, rank_data, rank, False)
         vllm_register_buffer(handle, buffer_ptrs)
         self._group = group
         self._rank = rank
@@ -673,7 +658,6 @@ class FlashInferTrtllmAllReduceProfile(_FlashInferAllReduceProfile):
 
 @ALL_REDUCE_REGISTRY.register_profile
 class FlashInferVllmAllReduceProfile(_FlashInferAllReduceProfile):
-    max_rows_without_nvlink = 256
     name = "flashinfer_vllm_sm90_profile"
     atomic_provider_name = "flashinfer_vllm_sm90"
 
@@ -690,29 +674,10 @@ class FlashInferVllmAllReduceProfile(_FlashInferAllReduceProfile):
             or spec.dtype != torch.bfloat16
         ):
             return ProfileMatch.no(
-                "requires profiled TP2 BF16 [..., 2048] with "
-                f"max_rows <= {FlashInferVllmAllReduceProvider.max_rows}, "
+                "requires profiled TP2 BF16 [..., 2048] with max_rows <= 256, "
                 f"got world_size={spec.world_size} max_rows={spec.max_rows} "
                 f"hidden_size={spec.hidden_size} dtype={spec.dtype}"
             )
-        if spec.max_rows > cls.max_rows_without_nvlink:
-            if not spec.cuda_graph:
-                return ProfileMatch.no("extended row range is profiled with CUDA Graphs")
-            if (
-                spec.device_ordinals is None
-                or len(set(spec.device_ordinals)) != spec.world_size
-            ):
-                return ProfileMatch.no("extended row range requires distinct CUDA ordinals")
-            if importlib.util.find_spec("pynvml") is None:
-                return ProfileMatch.no(
-                    "extended row range needs nvidia-ml-py for NVLink validation"
-                )
-            if not platforms.current_platform.supports_nvlink_group(
-                spec.device_ordinals
-            ):
-                return ProfileMatch.no(
-                    "extended row range is profiled on fully connected NVLink"
-                )
         return ProfileMatch.yes("matched exact FlashInfer vLLM profile")
 
 

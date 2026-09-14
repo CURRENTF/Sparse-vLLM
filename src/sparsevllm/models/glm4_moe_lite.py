@@ -10,19 +10,16 @@ from transformers import Glm4MoeLiteConfig
 
 from sparsevllm.distributed import (
     DecodeParallelCollectives,
-    ParallelCollectiveRuntime,
     ParallelContext,
+    ParallelCollectiveRuntime,
     get_parallel_context,
 )
-from sparsevllm.distributed.moe_communication import prepare_moe_communication
-from sparsevllm.kernels.triton.glm_mla_decode import (
-    project_and_fuse_glm_mla_decode_rope,
-)
-from sparsevllm.layers.activation import SiluAndMul
+from sparsevllm.models.layout import resolve_attention_qk_head_dim
 from sparsevllm.layers.embed_head import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sparsevllm.layers.activation import SiluAndMul
 from sparsevllm.layers.layernorm import RMSNorm
 from sparsevllm.layers.linear import (
     AbsorbedColumnParallelLinear,
@@ -33,12 +30,14 @@ from sparsevllm.layers.linear import (
 from sparsevllm.layers.mla_attention import MLAAttention
 from sparsevllm.layers.packed_moe import PackedMoeExperts
 from sparsevllm.layers.rotary_embedding import RotaryEmbedding, get_rope
+from sparsevllm.kernels.triton.glm_mla_decode import (
+    project_and_fuse_glm_mla_decode_rope,
+)
 from sparsevllm.method_registry import sparse_decode_attention_score_kind
-from sparsevllm.models.layout import resolve_attention_qk_head_dim
-from sparsevllm.models.qwen3 import Qwen3MLP
-from sparsevllm.operators.activation import resolve_silu_and_mul_provider
 from sparsevllm.operators.attention_capabilities import AttentionScoreKind
+from sparsevllm.models.qwen3 import Qwen3MLP
 from sparsevllm.operators.mla_attention import MlaAttentionOpSpec
+from sparsevllm.operators.activation import resolve_silu_and_mul_provider
 from sparsevllm.operators.moe import (
     MoeOpSpec,
     append_shared_expert_route,
@@ -55,6 +54,7 @@ from sparsevllm.operators.moe_router import (
 from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.weight_target import WeightTarget
+
 
 _EXPERT_SOURCE_RE = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
@@ -507,7 +507,6 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         self.parallel_context = get_parallel_context()
         self.parallel_collectives = parallel_collectives
         self.mlp_chunk_size = int(mlp_chunk_size)
-        self.moe_communication = prepare_moe_communication(self.parallel_context, parallel_collectives)
         if self.mlp_chunk_size <= 0:
             raise ValueError(
                 f"mlp_chunk_size must be positive, got {self.mlp_chunk_size}."
@@ -536,12 +535,8 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             )
         )
 
-    def _route(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        _, topk_weights, topk_ids = self.gate(hidden_states)
-        return topk_ids, topk_weights
-
     def _routed_chunk(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        topk_ids, topk_weights = self._route(hidden_states)
+        _, topk_weights, topk_ids = self.gate(hidden_states)
         return self.experts(hidden_states, topk_ids, topk_weights)
 
     def _shared_chunk(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -566,8 +561,6 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 "Glm4MoeLiteSparseMoeBlock expects [tokens, hidden], got "
                 f"{tuple(hidden_states.shape)}."
             )
-        if self.parallel_context.uses_dp_attention:
-            return self._forward_distributed_tokens(hidden_states)
         debug_enabled = os.getenv("SPARSEVLLM_DEBUG_MOE", "0") == "1"
         if debug_enabled:
             self.debug_last_input = hidden_states.detach().clone()
@@ -597,7 +590,11 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                     ],
                     dim=0,
                 )
-            return self.moe_communication.combine(local_output)
+            if context.is_prefill:
+                return self.parallel_context.world_all_reduce(local_output)
+            if self.parallel_collectives is not None:
+                return self.parallel_collectives.moe.run(local_output)
+            return self.parallel_context.world_all_reduce(local_output)
         if not debug_enabled:
             if int(hidden_states.shape[0]) <= self.mlp_chunk_size:
                 routed = self._routed_chunk(hidden_states)
@@ -649,7 +646,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         if debug_enabled:
             # Preserve the general EP composition and routed-only debug
             # evidence while keeping shared-expert reductions explicit.
-            routed = self.moe_communication.combine(routed)
+            self.parallel_context.world_all_reduce(routed)
             self.debug_last_routed_output = routed.detach().clone()
             shared = self._shared_chunk(hidden_states)
             if self.parallel_context.tp_size > 1:
@@ -662,11 +659,19 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 # outer world. Sum them locally so one collective completes
                 # routed experts and the TP-sharded shared expert together.
                 local_output = routed + shared_local
-                output = self.moe_communication.combine(local_output)
+                output = (
+                    self.parallel_collectives.moe.run(local_output)
+                    if self.parallel_collectives is not None
+                    else self.parallel_context.world_all_reduce(local_output)
+                )
             else:
                 # Retain the pure-EP semantic path for direct module use: the
                 # shared expert is replicated rather than TP-sharded.
-                routed = self.moe_communication.combine(routed)
+                routed = (
+                    self.parallel_collectives.moe.run(routed)
+                    if self.parallel_collectives is not None
+                    else self.parallel_context.world_all_reduce(routed)
+                )
                 output = routed + shared_local
         else:
             shared_local = self._shared_chunk(hidden_states)
@@ -674,13 +679,17 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 # Both branches are TP partials. Compose them locally so the
                 # full MoE block needs one collective, matching the fused-MoE
                 # communication contract used by the reference runtime.
-                output = self.moe_communication.combine(routed + shared_local)
+                output = self.parallel_context.world_all_reduce(routed + shared_local)
             else:
                 # Decode tensors are small. Pack both partials into one
                 # collective, then add the independently reduced rows. This
                 # preserves the original BF16 reduction/addition order.
                 partials = torch.stack((routed, shared_local), dim=0)
-                partials = self.moe_communication.combine(partials)
+                partials = (
+                    self.parallel_collectives.moe.run(partials)
+                    if self.parallel_collectives is not None
+                    else self.parallel_context.world_all_reduce(partials)
+                )
                 output = partials[0] + partials[1]
         if debug_enabled:
             # ModelRunner's cross-rank evidence contract consumes the final
@@ -688,13 +697,6 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             # the synchronized shared-expert branch.
             self.debug_last_output = output.detach().clone()
         return output
-
-    def _forward_distributed_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.moe_communication.run_with_shared_experts(
-            hidden_states, route=self._route, experts=self.experts,
-            chunk_size=self.mlp_chunk_size,
-            shared_experts=self._shared_chunk,
-        )
 
 
 class Glm4MoeLiteDecoderLayer(nn.Module):
@@ -765,8 +767,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states, rotary_emb)
-        if (self.parallel_context.tp_size == 1 and self.parallel_context.ep_size > 1
-                and not self.parallel_context.uses_dp_attention):
+        if self.parallel_context.tp_size == 1 and self.parallel_context.ep_size > 1:
             # Replicated MLA must enter the post-attention norm identically on
             # every expert rank before routed experts make their next decision.
             self.parallel_context.ep_broadcast(hidden_states, src_ep_rank=0)
@@ -936,16 +937,15 @@ class Glm4MoeLiteForCausalLM(nn.Module):
             "mlp_chunk_size": engine_config.mlp_chunk_size,
             "decode_graph": decode_graph,
         }
-        kwargs["parallel_collectives"] = collective_runtime.request_moe_collectives(
-            attention_max_rows=int(max_decode_tokens),
-            moe_max_rows=2 * int(max_decode_tokens),
-            max_local_tokens=engine_config.max_num_batched_tokens,
-            hidden_size=int(config.hidden_size),
-            dtype=model_activation_dtype(config),
-            backend=engine_config.moe_backend,
-            num_experts=int(config.n_routed_experts),
-            top_k=int(config.num_experts_per_tok),
-        )
+        if parallel_context.world_size > 1:
+            kwargs["parallel_collectives"] = (
+                collective_runtime.request_decode_collectives(
+                    attention_max_rows=int(max_decode_tokens),
+                    moe_max_rows=2 * int(max_decode_tokens),
+                    hidden_size=int(config.hidden_size),
+                    dtype=model_activation_dtype(config),
+                )
+            )
         return kwargs
 
     def __init__(
@@ -1145,11 +1145,6 @@ class Glm4MoeLiteForCausalLM(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)
-
-    def forward_idle_experts(self, hidden_states: torch.Tensor) -> None:
-        for layer in self.model.layers:
-            if isinstance(layer.mlp, Glm4MoeLiteSparseMoeBlock):
-                layer.mlp(hidden_states)
 
 
 __all__ = [

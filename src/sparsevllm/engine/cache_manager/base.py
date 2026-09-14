@@ -406,8 +406,7 @@ class CacheManager(ABC):
         self,
         local_plan: dict[str, object],
     ) -> None:
-        if (int(getattr(self, "world_size", 1)) <= 1
-                or self.parallel_context.uses_dp_attention):
+        if int(getattr(self, "world_size", 1)) <= 1:
             return
         plans: list[dict[str, object] | None] = [None] * self.world_size
         dist.all_gather_object(

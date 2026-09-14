@@ -95,7 +95,14 @@ CUDA_VERSION=cu130
 python -m pip config --site set global.extra-index-url \
   "https://download.pytorch.org/whl/${CUDA_VERSION} https://flashinfer.ai/whl"
 python -m pip install -e ".[${CUDA_VERSION}]"
+
+# 可选安装
+MAX_JOBS=8 pip install flash-attn --no-build-isolation
+pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130
 ```
+
+PyTorch wheel 自带 CUDA 运行时，而 `flash-attn` 等编译扩展使用当前环境中
+启用的 CUDA 工具链。
 
 ### uv
 
@@ -104,25 +111,22 @@ uv venv --python 3.10
 source .venv/bin/activate
 
 uv pip install -e ".[cu130]"
+
+# 可选安装
+MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
+uv pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130
 ```
 
 CUDA 12.9 环境将 `cu130` 换成 `cu129`。
 
-### 可选安装
+主依赖固定使用 `sglang-kernel==0.4.5`，因为其编译算子必须匹配已经验证的
+PyTorch/CUDA ABI；其他版本会在 Provider 准备阶段明确失败，不会静默 fallback。
 
-完成基础环境安装后，可按需安装以下依赖。
-
-**FlashInfer JIT Cache**：提供预编译算子缓存，减少首次使用时的编译开销。
-
-```bash
-pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130
-```
-
-**DeepEP V1**：为 `moe_backend="deepepv1"` 提供 NVLink MoE 通信，在已安装的 PyTorch/CUDA 环境中构建。
-
-```bash
-pip install --no-build-isolation -e ".[deepepv1]"
-```
+Sparse-vLLM 支持未量化 BF16 和 block-scaled FP8 格式的
+Qwen3.5/Qwen3.6/Qwen3.8 checkpoint。三者共享 `qwen3_5` 运行时架构，以及
+相同的精度、并行方式、稀疏方法和多模态支持。其 prefill causal Conv1D 和
+decode Conv1D/GDN packing 路径使用仓库内置的 Triton kernel；无需安装
+`sglang-kernel`，也无需编译本地 CUDA 扩展。
 
 完整依赖列表和最小 `LLM(...)` 示例请参阅[快速开始](docs/zh/getting_started/README.md)。
 

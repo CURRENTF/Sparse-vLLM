@@ -46,9 +46,7 @@ class ModelSpec:
             int(ep_size),
             int(dp_size),
             (
-                ParallelMode.DP_ATTENTION
-                if self.supports_data_parallel and int(dp_size) > 1
-                else ParallelMode.OUTER_TP_MOE
+                ParallelMode.OUTER_TP_MOE
                 if use_outer_tp_moe and int(tp_size) > 1
                 else ParallelMode.STANDARD
             ),
@@ -182,7 +180,6 @@ MODEL_SPECS.update(
             tiny_random_requires_standard_head_shape=False,
             supports_expert_parallel=True,
             supports_outer_tp_moe=True,
-            supports_data_parallel=True,
             runtime_class_name="Glm4MoeLiteForCausalLM",
             attention_cache_layout="mla_latent",
             attention_tp_fields=("num_attention_heads", "vocab_size"),
