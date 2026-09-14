@@ -119,7 +119,7 @@ def test_model_runner_gathers_one_debug_summary_per_world_rank():
 
     assert [summary["world_rank"] for summary in summaries] == [0, 1]
     assert summaries[0]["state"] == summaries[1]["state"]
-    assert summaries[0]["decode_graph"] == {
+    expected_graph = {
         "enabled": True,
         "capture_count": 1,
         "replay_count": 3,
@@ -140,6 +140,7 @@ def test_model_runner_gathers_one_debug_summary_per_world_rank():
             "capture_sampling": False,
         },
     }
+    assert {key: summaries[0]["decode_graph"][key] for key in expected_graph} == expected_graph
     sync_status.assert_called_once_with("debug_sparse_state_summaries", None)
 
 

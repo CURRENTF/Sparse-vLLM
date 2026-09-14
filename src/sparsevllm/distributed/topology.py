@@ -7,6 +7,7 @@ from enum import Enum
 class ParallelMode(str, Enum):
     STANDARD = "standard"
     OUTER_TP_MOE = "outer_tp_moe_tp_ep"
+    DP_ATTENTION = "dp_attention"
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,9 @@ class ParallelTopology:
                 "Parallel sizes must be positive, "
                 f"got TP={sizes[0]}, EP={sizes[1]}, DP={sizes[2]}."
             )
+        if self.mode is ParallelMode.DP_ATTENTION:
+            if self.tensor_parallel_size != 1 or self.expert_parallel_size != self.data_parallel_size:
+                raise ValueError("DP attention requires TP=1 and EP=DP.")
         if self.mode is ParallelMode.OUTER_TP_MOE:
             if self.data_parallel_size != 1:
                 raise ValueError(
@@ -64,6 +68,8 @@ class ParallelTopology:
 
     @property
     def world_size(self) -> int:
+        if self.mode is ParallelMode.DP_ATTENTION:
+            return self.data_parallel_size
         return (
             self.tensor_parallel_size
             if self.is_outer_tp_moe
@@ -89,6 +95,10 @@ def world_rank_from_parallel_ranks(
     ):
         if not 0 <= rank < size:
             raise ValueError(f"{name} must be in [0, {size}), got {rank}.")
+    if topology.mode is ParallelMode.DP_ATTENTION:
+        if dp_rank != ep_rank:
+            raise ValueError("DP attention shares the data and expert rank axis.")
+        return dp_rank
     return (
         (dp_rank * topology.expert_parallel_size + ep_rank)
         * topology.tensor_parallel_size
@@ -107,6 +117,8 @@ def parallel_ranks_from_world_rank(
         raise ValueError(
             f"world_rank must be in [0, {topology.world_size}), got {world_rank}."
         )
+    if topology.mode is ParallelMode.DP_ATTENTION:
+        return world_rank, world_rank, 0
     dp_ep_rank, tp_rank = divmod(world_rank, topology.tensor_parallel_size)
     dp_rank, ep_rank = divmod(dp_ep_rank, topology.expert_parallel_size)
     return dp_rank, ep_rank, tp_rank
@@ -169,6 +181,10 @@ def _outer_tp_moe_group_ranks(
 def parallel_group_ranks(
     topology: ParallelTopology,
 ) -> dict[str, tuple[tuple[int, ...], ...]]:
+    if topology.mode is ParallelMode.DP_ATTENTION:
+        singleton = tuple((rank,) for rank in range(topology.world_size))
+        world = (tuple(range(topology.world_size)),)
+        return {"tensor": singleton, "expert": world, "data": world, "moe_tensor": singleton}
     return (
         _outer_tp_moe_group_ranks(topology)
         if topology.is_outer_tp_moe

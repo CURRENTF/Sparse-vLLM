@@ -8,3 +8,4 @@
 - [DeltaKV](deltakv.md)
 - [KV cache 量化压缩](quantized-kv.md)
 - [Tiny Random 调试模式](tiny-random-debug.md)
+- [DP Attention 与 Expert Parallelism](dp-attention.md)

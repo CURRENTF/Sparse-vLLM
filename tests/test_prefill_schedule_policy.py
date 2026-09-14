@@ -1058,6 +1058,7 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
         return SimpleNamespace(
             sparse_method=method,
             decode_graph=decode_graph,
+            data_parallel_size=1,
         )
 
     def test_startup_batch_uses_distinct_prompts_and_requested_shapes(self):
@@ -1150,6 +1151,7 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
     def test_engine_runs_each_moe_workspace_shape_after_regular_warmup(self):
         engine = object.__new__(LLMEngine)
         engine.config = SimpleNamespace(
+            data_parallel_size=1,
             max_decoding_seqs=24,
             max_num_batched_tokens=56_214,
             mlp_chunk_size=16_384,
@@ -1173,6 +1175,7 @@ class DecodeCudaGraphWarmupPolicyTest(unittest.TestCase):
     def test_moe_workspace_oom_fails_startup(self):
         engine = object.__new__(LLMEngine)
         engine.config = SimpleNamespace(
+            data_parallel_size=1,
             max_decoding_seqs=24,
             max_num_batched_tokens=56_214,
             mlp_chunk_size=16_384,

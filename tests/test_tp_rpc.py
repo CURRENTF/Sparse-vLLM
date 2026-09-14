@@ -277,6 +277,7 @@ def test_operator_implementation_log_runs_only_on_rank_zero():
 
 def test_operator_runtime_stats_gather_one_record_per_world_rank():
     runner = object.__new__(ModelRunner)
+    runner.collective_runtime = SimpleNamespace(moe_transport_stats=lambda: {"provider": "test"})
     runner.world_size = 2
     runner.rank = 0
     runner.parallel_context = SimpleNamespace(
@@ -301,7 +302,8 @@ def test_operator_runtime_stats_gather_one_record_per_world_rank():
 
     assert sync_calls == [("operator_runtime_stats", None)]
     assert stats == [
-        {"world_rank": 0, "bindings": [], "operators": {"MLA": []}},
+        {"world_rank": 0, "bindings": [], "operators": {"MLA": []},
+         "moe_communication": {"provider": "test"}},
         {"world_rank": 1, "bindings": [], "operators": {}},
     ]
 
@@ -659,6 +661,7 @@ def test_model_runner_releases_the_complete_profiling_cache_runtime():
     controller = object()
     cache_manager = object()
     runner = object.__new__(ModelRunner)
+    runner.dp_idle_graphs = {1: object()}
     runner.cache_runtime_phase = "profiling"
     runner.platform = SimpleNamespace(synchronize=lambda: calls.append("sync"))
     runner.reset_after_warmup = lambda: calls.append("reset")
@@ -711,6 +714,7 @@ def test_model_runner_releases_the_complete_profiling_cache_runtime():
     assert runner.decode_graph_runner is None
     assert runner.runtime_state is None
     assert runner.cache_manager is None
+    assert not runner.dp_idle_graphs
     assert records == [
         {
             "world_rank": 0,
@@ -842,7 +846,10 @@ def test_model_runner_decode_graph_startup_controls_use_live_runner():
 def test_model_runner_exit_drains_graphs_before_barrier():
     calls = []
     runner = object.__new__(ModelRunner)
+    runner.device = torch.device("cuda:1")
+    runner.dp_idle_graphs = {1: object()}
     runner.platform = SimpleNamespace(
+        set_device=lambda device: calls.append(("device", device)),
         synchronize=lambda: calls.append("sync"),
         barrier_device_ids=lambda rank: [rank],
     )
@@ -879,6 +886,7 @@ def test_model_runner_exit_drains_graphs_before_barrier():
         ModelRunner.exit(runner)
 
     assert calls == [
+        ("device", runner.device),
         "sync",
         "clear_graphs",
         "sync",
@@ -892,6 +900,7 @@ def test_model_runner_exit_drains_graphs_before_barrier():
         "reset",
         "destroy",
     ]
+    assert not runner.dp_idle_graphs
 
 
 def test_tp_worker_decode_skips_rank0_sampling_path():

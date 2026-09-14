@@ -12,14 +12,14 @@ from sparsevllm.utils.process_title import (
 def _parallel_context(
     *,
     world_size: int,
+    tp_size: int = 1,
+    ep_size: int = 1,
     tp_rank: int = 0,
     ep_rank: int = 0,
     dp_rank: int = 0,
     dp_size: int = 1,
 ) -> ParallelContext:
     world = ParallelGroup(None, tuple(range(world_size)), 0, world_size)
-    tp_size = max(tp_rank + 1, 1)
-    ep_size = max(ep_rank + 1, 1)
     return ParallelContext(
         world=world,
         tensor=ParallelGroup(None, tuple(range(tp_size)), tp_rank, tp_size),
@@ -33,21 +33,37 @@ def _parallel_context(
     ("parallel_context", "expected"),
     [
         (_parallel_context(world_size=1), "SVLLM_Engine"),
-        (_parallel_context(world_size=2, tp_rank=1), "SVLLM_TP1"),
+        (_parallel_context(world_size=2, tp_size=2, tp_rank=1), "SVLLM_TP1"),
         (
-            _parallel_context(world_size=4, tp_rank=1, ep_rank=1),
+            _parallel_context(world_size=4, tp_size=2, ep_size=2, tp_rank=1, ep_rank=1),
             "SVLLM_TP1_EP1",
         ),
         (
             _parallel_context(
                 world_size=8,
+                tp_size=2,
+                ep_size=2,
                 tp_rank=1,
                 ep_rank=1,
                 dp_rank=1,
                 dp_size=2,
             ),
-            "SVLLM_TP1_EP1_DP1",
+            "SVLLM_TP1_DP1_EP1",
         ),
+        (
+            _parallel_context(world_size=2, ep_size=2, dp_size=2),
+            "SVLLM_DP0_EP0",
+        ),
+        (
+            _parallel_context(world_size=2, ep_size=2, dp_size=2, ep_rank=1, dp_rank=1),
+            "SVLLM_DP1_EP1",
+        ),
+        (
+            _parallel_context(world_size=8, tp_size=2, ep_size=2, dp_size=2),
+            "SVLLM_TP0_DP0_EP0",
+        ),
+        (_parallel_context(world_size=2, ep_size=2), "SVLLM_EP0"),
+        (_parallel_context(world_size=2, dp_size=2), "SVLLM_DP0"),
     ],
 )
 def test_engine_process_title(parallel_context, expected):

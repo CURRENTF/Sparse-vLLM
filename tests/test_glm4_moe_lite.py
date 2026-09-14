@@ -21,6 +21,7 @@ from sparsevllm.debug.tiny_random import (
     initialize_sparse_model,
 )
 from sparsevllm.distributed import ParallelContext, ParallelGroup
+from sparsevllm.distributed.moe_communication import AllReduceMoeCommunication
 from sparsevllm.engine.model_runner import ModelRunner
 from sparsevllm.layers.rotary_embedding import apply_interleaved_rotary_emb
 from sparsevllm.models.glm4_moe_lite import (
@@ -515,6 +516,7 @@ def test_glm_sparse_moe_reduces_pure_ep_over_world(ep_size: int) -> None:
     block = object.__new__(Glm4MoeLiteSparseMoeBlock)
     nn.Module.__init__(block)
     block.parallel_context = context
+    block.moe_communication = AllReduceMoeCommunication(context.world_all_reduce)
     block.parallel_collectives = None
     block.mlp_chunk_size = 8
     block.shared_experts = nn.Identity()
@@ -548,6 +550,7 @@ def test_glm_sparse_moe_reduces_pure_tp_over_world(
     block = object.__new__(Glm4MoeLiteSparseMoeBlock)
     nn.Module.__init__(block)
     block.parallel_context = context
+    block.moe_communication = AllReduceMoeCommunication(context.world_all_reduce)
     block.parallel_collectives = None
     block.mlp_chunk_size = 8
     block.shared_experts = nn.Identity()
@@ -576,6 +579,7 @@ def test_glm_tp1_prefill_uses_fused_routed_and_shared_path() -> None:
     block = object.__new__(Glm4MoeLiteSparseMoeBlock)
     nn.Module.__init__(block)
     block.parallel_context = context
+    block.moe_communication = AllReduceMoeCommunication(context.world_all_reduce)
     block.parallel_collectives = None
     block.mlp_chunk_size = 8
     block.experts = SimpleNamespace(
@@ -611,6 +615,7 @@ def test_glm_sparse_moe_reduces_hybrid_tp_ep_shards_over_outer_world() -> None:
     block = object.__new__(Glm4MoeLiteSparseMoeBlock)
     nn.Module.__init__(block)
     block.parallel_context = context
+    block.moe_communication = AllReduceMoeCommunication(context.world_all_reduce)
     block.parallel_collectives = None
     block.mlp_chunk_size = 8
     block.shared_experts = nn.Identity()
@@ -651,6 +656,7 @@ def test_glm_moe_debug_contract_populates_model_runner_summaries() -> None:
     block = object.__new__(Glm4MoeLiteSparseMoeBlock)
     nn.Module.__init__(block)
     block.parallel_context = context
+    block.moe_communication = AllReduceMoeCommunication(context.world_all_reduce)
     block.parallel_collectives = None
     block.mlp_chunk_size = 8
 

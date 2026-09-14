@@ -47,6 +47,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+all2all = [
+    "deep-ep @ git+https://github.com/deepseek-ai/DeepEP.git@9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee",
+    "nvidia-ml-py>=12",
+]
 cu129 = [
     "torch==2.11.0",
     "flashinfer-python[cu12]>=0.6.15,<0.7",

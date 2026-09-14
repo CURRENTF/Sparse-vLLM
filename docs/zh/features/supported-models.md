@@ -13,7 +13,7 @@
 | Qwen3MoE | `qwen3_moe` | BF16 / FP16 / 块级 FP8 | ✅ | 仅支持 1 | ✅ |
 | Qwen3.5 / 3.6 / 3.8 | `qwen3_5` | BF16 / 块级 FP8 | ✅ | 仅支持 1 | 仅支持 1 |
 | Qwen3.6 MoE | `qwen3_5_moe` | BF16 / 块级 FP8 | ✅ | 仅支持 1 | ✅ |
-| GLM-4.7-Flash | `glm4_moe_lite` | BF16 / 实验性逐张量 FP8 | ✅ | 仅支持 1 | 1 / 2 / 4 |
+| GLM-4.7-Flash | `glm4_moe_lite` | BF16 / 实验性逐张量 FP8 | ✅ | 1 / 2 / 4⁵ | 1 / 2 / 4 |
 | Gemma 4 Dense / MoE | `gemma4` | BF16 / FP16 | ✅ | 仅支持 1 | ✅（仅 MoE） |
 | Llama 3 / 3.1 | `llama` | BF16 / FP16 / 块级 FP8 | ✅ | 仅支持 1 | 仅支持 1 |
 | MiniMax M2.7 | `minimax_m2` | 块级 FP8，非量化权重使用 BF16 | ✅ | 仅支持 1 | ✅ |
@@ -59,7 +59,8 @@ GLM 逐张量 FP8 加载支持 E4M3 权重以及每个量化投影对应的 BF16
 ⁴ H2O 的 tensor-parallel 执行可能产生与 TP=1 不同的稀疏选择。各模型原有的
 TP、EP、DP 限制仍然适用。
 
-⁵ GLM 要求 `DP=1`。QuEST 支持仍为实验性。
+⁵ GLM 支持 `TP=1`、`DP=EP` 的 [DP attention](dp-attention.md)。
+QuEST 支持仍为实验性。
 
 ⁶ 带共享 KV 层的 Gemma 4 checkpoint 不支持逐层 StreamingLLM eviction；
 Vanilla 和 OmniKV 仍受支持。

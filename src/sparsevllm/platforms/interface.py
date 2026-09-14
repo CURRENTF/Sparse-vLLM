@@ -99,6 +99,15 @@ class Platform:
     def get_communicator_cls(self) -> type | None:
         return None
 
+    def supports_multicast(self, device_index: int) -> bool:
+        return False
+
+    def supports_nvlink_group(self, device_indices: tuple[int, ...]) -> bool:
+        return False
+
+    def supports_peer_atomics(self, device_index: int, peer_index: int) -> bool:
+        return False
+
     @lru_cache(maxsize=None)
     def get_device_caps(self, device_index: int = 0) -> DeviceCaps:
         return DeviceCaps(

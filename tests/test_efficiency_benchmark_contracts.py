@@ -1299,3 +1299,12 @@ def test_unified_suite_validator_requires_identical_output_length_trace(tmp_path
 
     assert report["status"] == "failed"
     assert any("synthetic random traces differ" in error for error in report["errors"])
+
+
+def test_probe_dp_concurrency_covers_global_trace_without_multiplying_each_replica():
+    from benchmark.efficiency.bench_probe import _replica_concurrency
+
+    for requests, replicas in ((1, 2), (5, 2), (16, 4)):
+        local = _replica_concurrency(requests, {"data_parallel_size": replicas})
+        assert local * replicas >= requests
+        assert (local - 1) * replicas < requests

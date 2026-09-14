@@ -417,6 +417,7 @@ MODEL_RUNTIME_COMPATIBILITY = {
     ("minimax_m2", ParallelMode.OUTER_TP_MOE): MINIMAX_M2_TP_EP_COMPATIBILITY,
     ("glm4_moe_lite", ParallelMode.STANDARD): GLM4_MOE_LITE_EP_COMPATIBILITY,
     ("glm4_moe_lite", ParallelMode.OUTER_TP_MOE): GLM4_MOE_LITE_EP_COMPATIBILITY,
+    ("glm4_moe_lite", ParallelMode.DP_ATTENTION): GLM4_MOE_LITE_EP_COMPATIBILITY,
     ("gemma4", ParallelMode.STANDARD): GEMMA4_COMPATIBILITY,
     ("gemma4", ParallelMode.OUTER_TP_MOE): GEMMA4_COMPATIBILITY,
 }

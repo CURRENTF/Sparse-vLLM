@@ -31,7 +31,8 @@ llm = LLM(
 支持 CUDA、FP16/BF16 的 Llama/Qwen2/Qwen3/Qwen3-MoE、head dimension 64/128/256，
 以及模型合法的 TP head 分片。Qwen3-MoE 也支持 EP 和现有 outer-TP/EP 布局。
 量化只处理本 rank 的 KV heads，不新增通信；模型已有的 TP/EP 通信不变。
-独立推理副本各自维护 KV cache；模型运行时仍不支持内部 `data_parallel_size>1`。
+独立推理副本各自维护 KV cache。本 KV 量化路径支持的模型要求
+`data_parallel_size=1`；GLM DP attention 使用单独的 MLA latent cache。
 FP8 需要 GPU 原生 FP8 支持。页大小必须是 16～128 的 2 的幂，
 且能整除 head dimension。支持 decode CUDA Graph；prefix cache/offload 和 sparse prefill
 组合会明确报错。尚未实现 Palu。

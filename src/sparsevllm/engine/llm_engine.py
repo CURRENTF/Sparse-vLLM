@@ -72,10 +72,11 @@ def _moe_workspace_warmup_token_counts(config: Config) -> tuple[int, ...]:
             f"mlp_chunk_size, got {max_batched_tokens} and {mlp_chunk_size}."
         )
 
-    max_moe_tokens = min(max_batched_tokens, mlp_chunk_size)
+    token_replicas = int(config.data_parallel_size)
+    max_moe_tokens = min(max_batched_tokens * token_replicas, mlp_chunk_size)
     decode_tokens = min(
         max_moe_tokens,
-        max(1, int(config.max_decoding_seqs)),
+        max(1, int(config.max_decoding_seqs)) * token_replicas,
     )
     return tuple(dict.fromkeys((decode_tokens, max_moe_tokens)))
 
@@ -219,17 +220,22 @@ class LLMEngine:
     管理多进程张量并行 (Tensor Parallelism) 的生命周期。
     """
 
-    def __init__(self, model, **kwargs):
-        # 1. 初始化配置
+    def __new__(cls, model, **kwargs):
         config_fields = {field.name for field in fields(Config) if field.init}
-        config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        ignored_keys = sorted(set(kwargs) - config_fields)
+        ignored_keys = sorted(set(kwargs) - config_fields - {"_dp_worker"})
         if ignored_keys:
             raise ValueError(
                 f"Unknown Sparse-vLLM config keys: {ignored_keys}. "
                 "Runtime parameter aliases and unknown keys are not accepted."
             )
-        config = Config(model, **config_kwargs)
+        if int(kwargs.get("data_parallel_size", 1)) > 1 and kwargs.get("_dp_worker") is None:
+            from sparsevllm.engine.dp_engine import DPAttentionEngine
+            return DPAttentionEngine(model, **kwargs)
+        return super().__new__(cls)
+
+    def __init__(self, model, *, _dp_worker=None, **kwargs):
+        # 1. 初始化配置
+        config = Config(model, **kwargs)
         self.config = config
         trtllm_cache_root = None
         if platforms.get_current_platform().enum is PlatformEnum.CUDA:
@@ -242,13 +248,13 @@ class LLMEngine:
         profiler.set_enabled(config.enable_profiler)
         
         # 2. 启动 world worker 进程；TP/EP/DP 语义由 ParallelContext 管理。
-        master_port = select_master_port()
+        master_port = select_master_port() if _dp_worker is None else _dp_worker[1]
         logger.info("Using distributed master port: {}", master_port)
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
         tp_shm_name = make_tp_shm_name() if config.world_size > 1 else None
-        for i in range(1, config.world_size):
+        for i in range(1, config.world_size if _dp_worker is None else 1):
             event = (ctx.Event(), ctx.Event())
             # 为每一个非零 Rank 启动一个独立的 ModelRunner 进程
             process = ctx.Process(
@@ -262,7 +268,9 @@ class LLMEngine:
         # 3. 初始化主进程的 ModelRunner (Rank 0)
         # 注意：必须先初始化 ModelRunner 以便在本地 GPU 分配 KV Cache 账本
         self.model_runner = ModelRunner(
-            config, 0, self.events, tp_shm_name, master_port, trtllm_cache_root,
+            config, 0 if _dp_worker is None else _dp_worker[0], self.events,
+            tp_shm_name, master_port, trtllm_cache_root,
+            independent_scheduler=_dp_worker is not None,
         )
         
         # 加载分词器
@@ -1268,7 +1276,8 @@ class LLMEngine:
 
     def debug_sparse_state_summaries(self, synchronize: bool = False) -> list[dict[str, object]]:
         summaries = self.model_runner.call("debug_sparse_state_summaries", synchronize)
-        if not isinstance(summaries, list) or len(summaries) != self.config.world_size:
+        expected = 1 if self.model_runner.independent_scheduler else self.config.world_size
+        if not isinstance(summaries, list) or len(summaries) != expected:
             raise RuntimeError(
                 "Sparse-state summary did not return one record per world rank: "
                 f"expected={self.config.world_size}, got={summaries!r}."
@@ -1277,7 +1286,8 @@ class LLMEngine:
 
     def operator_runtime_stats(self) -> list[dict[str, object]]:
         stats = self.model_runner.call("operator_runtime_stats")
-        if not isinstance(stats, list) or len(stats) != self.config.world_size:
+        expected = 1 if self.model_runner.independent_scheduler else self.config.world_size
+        if not isinstance(stats, list) or len(stats) != expected:
             raise RuntimeError(
                 "Operator runtime stats did not return one record per world rank: "
                 f"expected={self.config.world_size}, got={stats!r}."
@@ -1289,6 +1299,16 @@ class LLMEngine:
         if not isinstance(logits, torch.Tensor):
             raise RuntimeError(f"Rank 0 did not return debug logits: {logits!r}.")
         return logits
+
+    def debug_set_next_decode_token(self, seq_id: int, token_id: int) -> None:
+        """Teacher-force the unprocessed token for independent logit validation."""
+        if not 0 <= int(token_id) < int(self.config.hf_config.vocab_size):
+            raise ValueError("Teacher-forced token is outside the vocabulary.")
+        seq = next(seq for seq in self.scheduler.decoding if seq.seq_id == seq_id)
+        if seq.chain_id or seq.has_sampling_penalty:
+            raise ValueError("Teacher-forced validation requires no chain or sampling penalties.")
+        seq.token_ids[-1] = int(token_id)
+        seq.last_token = int(token_id)
 
     def debug_hidden_states(self) -> dict[int, torch.Tensor]:
         snapshots = self.model_runner.call("debug_hidden_states_cpu")
@@ -1525,6 +1545,8 @@ class LLMEngine:
                 self._release_preempted_sequences(preempted_seqs)
                 
             if not seqs:
+                if self.model_runner.independent_scheduler:
+                    self.model_runner.call("run", [], False)
                 # No progress can be made; avoid infinite busy-looping in callers.
                 if preempted_seqs or self.is_finished():
                     prefill_seqs = len(self.scheduler.waiting)

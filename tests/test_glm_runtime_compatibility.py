@@ -116,8 +116,8 @@ def test_glm_config_rejects_nondivisible_outer_tp_moe_ep_layout():
         _glm_config(tensor_parallel_size=2, expert_parallel_size=4)
 
 
-def test_glm_config_rejects_data_parallelism():
-    with pytest.raises(ValueError, match="does not support data parallelism"):
+def test_glm_config_rejects_dp_without_matching_expert_ranks():
+    with pytest.raises(ValueError, match="EP=DP"):
         _glm_config(data_parallel_size=2)
 
 

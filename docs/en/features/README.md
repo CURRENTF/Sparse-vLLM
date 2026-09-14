@@ -9,3 +9,4 @@ behavior.
 - [DeltaKV](deltakv.md)
 - [Quantized KV Cache](quantized-kv.md)
 - [Tiny Random Debug Mode](tiny-random-debug.md)
+- [DP Attention with Expert Parallelism](dp-attention.md)
