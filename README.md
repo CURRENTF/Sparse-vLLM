@@ -118,14 +118,7 @@ python -m pip config --site set global.extra-index-url \
   "https://download.pytorch.org/whl/cu130 https://flashinfer.ai/whl"
 python -m pip install "transformers==5.13.1" -e ".[cu130]"
 python -m pip check
-
-# Optional
-MAX_JOBS=8 pip install flash-attn --no-build-isolation
-pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130
 ```
-
-PyTorch wheels include their CUDA runtime, while compiled extensions such as
-`flash-attn` use the CUDA toolchain active in the environment.
 
 ### uv
 
@@ -134,29 +127,25 @@ uv venv --python 3.12
 source .venv/bin/activate
 
 uv pip install -e ".[cu130]"
-
-# Optional
-MAX_JOBS=8 uv pip install flash-attn --no-build-isolation
-uv pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130
 ```
 
 Use `cu129` instead of `cu130` for CUDA 12.9.
 
-`einops`, `sglang-kernel==0.4.5`, and the training, benchmark, and test packages
-are all part of the main installation; no workflow-specific extras are required.
-The SGL kernel package is pinned because its compiled operators must match the
-validated PyTorch/CUDA ABI; other versions are rejected during provider setup.
-The CUDA extras also require FlashInfer. GPU engine startup fails with the
-matching `pip install -e ".[cu129]"` or `pip install -e ".[cu130]"` repair hint
-when either required kernel family is absent or broken.
+### Optional dependencies
 
-Sparse-vLLM supports Qwen3.5/Qwen3.6/Qwen3.8 checkpoints in unquantized BF16
-and block-scaled FP8 formats. These releases share the `qwen3_5` runtime
-architecture and the same precision, parallelism, sparse-method, and
-multimodal support.
+After installing the base environment, add these packages as needed.
 
-Their prefill causal Conv1D and decode Conv1D/GDN packing paths use
-repository-local Triton kernels; they do not call `sglang-kernel` themselves.
+**FlashInfer JIT Cache** provides precompiled kernel caches to reduce compilation overhead on first use.
+
+```bash
+pip install flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130
+```
+
+**DeepEP V1** provides the NVLink MoE communication backend selected by `moe_backend="deepepv1"` and builds against the installed PyTorch/CUDA environment.
+
+```bash
+pip install --no-build-isolation -e ".[deepepv1]"
+```
 
 For the full dependency list and a minimal `LLM(...)` example, see
 [Getting Started](docs/en/getting_started/README.md).
