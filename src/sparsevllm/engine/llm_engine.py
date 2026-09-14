@@ -253,13 +253,15 @@ class LLMEngine:
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
-        tp_shm_name = make_tp_shm_name() if config.world_size > 1 else None
-        for i in range(1, config.world_size if _dp_worker is None else 1):
+        replica_rank = 0 if _dp_worker is None else _dp_worker[0]
+        leader_rank = replica_rank * config.attn_tp_size
+        tp_shm_name = make_tp_shm_name() if config.attn_tp_size > 1 else None
+        for i in range(1, config.attn_tp_size):
             event = (ctx.Event(), ctx.Event())
             # 为每一个非零 Rank 启动一个独立的 ModelRunner 进程
             process = ctx.Process(
                 target=ModelRunner,
-                args=(config, i, event, tp_shm_name, master_port, trtllm_cache_root),
+                args=(config, leader_rank + i, event, tp_shm_name, master_port, trtllm_cache_root),
             )
             process.start()
             self.ps.append(process)
@@ -268,9 +270,8 @@ class LLMEngine:
         # 3. 初始化主进程的 ModelRunner (Rank 0)
         # 注意：必须先初始化 ModelRunner 以便在本地 GPU 分配 KV Cache 账本
         self.model_runner = ModelRunner(
-            config, 0 if _dp_worker is None else _dp_worker[0], self.events,
+            config, leader_rank, self.events,
             tp_shm_name, master_port, trtllm_cache_root,
-            independent_scheduler=_dp_worker is not None,
         )
         
         # 加载分词器
@@ -1276,21 +1277,21 @@ class LLMEngine:
 
     def debug_sparse_state_summaries(self, synchronize: bool = False) -> list[dict[str, object]]:
         summaries = self.model_runner.call("debug_sparse_state_summaries", synchronize)
-        expected = 1 if self.model_runner.independent_scheduler else self.config.world_size
+        expected = self.config.attn_tp_size
         if not isinstance(summaries, list) or len(summaries) != expected:
             raise RuntimeError(
-                "Sparse-state summary did not return one record per world rank: "
-                f"expected={self.config.world_size}, got={summaries!r}."
+                "Sparse-state summary did not return one record per attention TP rank: "
+                f"expected={expected}, got={summaries!r}."
             )
         return summaries
 
     def operator_runtime_stats(self) -> list[dict[str, object]]:
         stats = self.model_runner.call("operator_runtime_stats")
-        expected = 1 if self.model_runner.independent_scheduler else self.config.world_size
+        expected = self.config.attn_tp_size
         if not isinstance(stats, list) or len(stats) != expected:
             raise RuntimeError(
-                "Operator runtime stats did not return one record per world rank: "
-                f"expected={self.config.world_size}, got={stats!r}."
+                "Operator runtime stats did not return one record per attention TP rank: "
+                f"expected={expected}, got={stats!r}."
             )
         return stats
 
@@ -1545,7 +1546,7 @@ class LLMEngine:
                 self._release_preempted_sequences(preempted_seqs)
                 
             if not seqs:
-                if self.model_runner.independent_scheduler:
+                if self.config.attn_dp_size > 1:
                     self.model_runner.call("run", [], False)
                 # No progress can be made; avoid infinite busy-looping in callers.
                 if preempted_seqs or self.is_finished():

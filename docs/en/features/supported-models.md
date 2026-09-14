@@ -14,13 +14,13 @@ parallel size must use that value.
 | --- | --- | --- | :---: | :---: | :---: |
 | Qwen2.5 | `qwen2` | BF16 / FP16 / block FP8 | ✅ | 1 only | 1 only |
 | Qwen3 Dense | `qwen3` | BF16 / FP16 / block FP8 | ✅ (FP8: 1/2/4/8) | 1 only | 1 only |
-| Qwen3MoE | `qwen3_moe` | BF16 / FP16 / block FP8 | ✅ | 1 only | ✅ |
+| Qwen3MoE | `qwen3_moe` | BF16 / FP16 / block FP8 | ✅ | ✅ | ✅ |
 | Qwen3.5 / 3.6 / 3.8 | `qwen3_5` | BF16 / block FP8 | ✅ | 1 only | 1 only |
 | Qwen3.6 MoE | `qwen3_5_moe` | BF16 / block FP8 | ✅ | 1 only | ✅ |
-| GLM-4.7-Flash | `glm4_moe_lite` | BF16 / experimental per-tensor FP8 | ✅ | 1 / 2 / 4⁵ | 1 / 2 / 4 |
+| GLM-4.7-Flash | `glm4_moe_lite` | BF16 / experimental per-tensor FP8 | ✅ | ✅⁵ | ✅ |
 | Gemma 4 Dense / MoE | `gemma4` | BF16 / FP16 | ✅ | 1 only | ✅ (MoE only) |
 | Llama 3 / 3.1 | `llama` | BF16 / FP16 / block FP8 | ✅ | 1 only | 1 only |
-| MiniMax M2.7 | `minimax_m2` | block FP8 with BF16 non-quantized weights | ✅ | 1 only | ✅ |
+| MiniMax M2.7 | `minimax_m2` | block FP8 with BF16 non-quantized weights | ✅ | ✅ | ✅ |
 
 TP is limited to sizes 1 through 8 and requires the checkpoint dimensions,
 including the attention heads and vocabulary size, to be divisible by the
@@ -32,9 +32,16 @@ expert placement within that same world; expert TP is `world_size / EP`, so EP
 must divide the world size. EP does not add processes. For example, `TP=4,
 DP=1, EP=2` uses four processes with attention TP=4 and expert TP=2.
 
-Topology validity does not imply engine support. Attention TP×DP execution is
-not yet implemented; the supported DP path requires `TP=1, EP=DP`. A former
-`TP=1, DP=1, EP>1` configuration is rejected rather than expanded automatically.
+GLM, Qwen3MoE, and MiniMax support attention TP×DP with `moe_backend="agrs"`
+and `EP=world_size` (expert TP=1). For example, `TP=2, DP=2, EP=4` uses four
+GPUs; valid larger topologies are accepted subject to model and hardware limits.
+Dense MLPs and shared experts use attention TP within each DP replica.
+Each replica owns its scheduler and prefix cache; decode CUDA Graphs are supported.
+Existing sparse-method and prefix-cache restrictions still apply.
+
+AG/RS is the default DP transport. `moe_backend="deepepv1"` still requires
+attention TP=1 and supported NVLink hardware; unsupported combinations fail at
+startup. With DP=1, the default remains `all-reduce`.
 
 Block FP8 support requires E4M3 weights, dynamic activation quantization, and
 a `128 x 128` weight block size. Llama, Qwen2, and Qwen3 dense FP8 checkpoints
@@ -74,8 +81,7 @@ by the mixed-attention runtime.
 ⁴ H2O tensor-parallel execution may produce different sparse selections from
 TP=1. Model-specific TP, EP, and DP restrictions still apply.
 
-⁵ GLM supports DP attention with `TP=1` and `DP=EP`.
-QuEST support is experimental.
+⁵ GLM QuEST support is experimental; its prefix-cache restrictions remain in effect.
 
 ⁶ Gemma 4 checkpoints with shared KV layers reject per-layer StreamingLLM
 eviction. Vanilla and OmniKV remain supported.

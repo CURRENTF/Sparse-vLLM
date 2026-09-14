@@ -107,7 +107,7 @@ def test_glm_config_rejects_nondivisible_outer_tp_moe_ep_layout():
 
 
 def test_glm_config_rejects_dp_without_matching_expert_ranks():
-    with pytest.raises(ValueError, match="EP=DP"):
+    with pytest.raises(ValueError, match="EP=world size"):
         _glm_config(data_parallel_size=2)
 
 
@@ -167,8 +167,8 @@ def test_glm_config_rejects_startup_budget_smaller_than_batch_plan():
         )
 
 
-@pytest.mark.parametrize("ep_size", [2, 4])
-def test_hybrid_attention_topology_is_valid_but_engine_rejects_it(ep_size):
+def test_hybrid_attention_rejects_only_unimplemented_moe_tp():
+    ep_size = 2
     from sparsevllm.distributed import ParallelTopology
     from sparsevllm.models.spec import resolve_model_spec
 
@@ -183,3 +183,15 @@ def test_glm_dense_mlp_width_uses_attention_tp_even_with_pure_ep_experts():
     with pytest.raises(ValueError, match="attention TP.*intermediate_size"):
         _glm_config(tensor_parallel_size=4, expert_parallel_size=4,
                     hf_overrides={"intermediate_size": 6})
+
+
+@pytest.mark.parametrize("model_type,dp_size,tp_size", [
+    ("glm4_moe_lite", 2, 2), ("qwen3_moe", 2, 4),
+    ("minimax_m2", 4, 2), ("glm4_moe_lite", 3, 2),
+])
+def test_hybrid_attention_execution_has_no_four_gpu_limit(dp_size, tp_size, model_type):
+    from sparsevllm.distributed import ParallelTopology
+    from sparsevllm.models.spec import resolve_model_spec
+
+    topology = ParallelTopology(tp_size, dp_size * tp_size, dp_size)
+    resolve_model_spec(model_type).validate_parallel_execution(topology)

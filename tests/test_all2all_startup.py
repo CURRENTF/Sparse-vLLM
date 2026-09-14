@@ -30,6 +30,7 @@ def test_selected_transport_dependency_failure_is_not_replaced(monkeypatch):
         moe_backend="deepepv1",
         data_parallel_size=2,
         expert_parallel_size=2,
+        attn_tp_size=1,
     )
     with pytest.raises(RuntimeError, match="ABI mismatch"):
         validate_moe_backend(config)
@@ -143,3 +144,13 @@ def test_moe_backend_cli_uses_the_same_config_field():
     assert _parse_engine_kwargs(["--moe-backend", "agrs"]) == {"moe_backend": "agrs"}
     with pytest.raises(ValueError, match="Unknown"):
         _parse_engine_kwargs(["--moe-communication-backend", "agrs"])
+
+
+def test_hybrid_deepep_is_rejected_before_optional_dependency_check(monkeypatch):
+    check = Mock(side_effect=AssertionError("unsupported topology imported DeepEP"))
+    monkeypatch.setattr("sparsevllm.operators.all2all.check_all2all_dependency", check)
+    config = SimpleNamespace(moe_backend="deepepv1", data_parallel_size=2,
+                             expert_parallel_size=4, attn_tp_size=2)
+    with pytest.raises(ValueError, match="attention TP=1"):
+        validate_moe_backend(config)
+    check.assert_not_called()

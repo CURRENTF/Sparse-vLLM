@@ -778,8 +778,8 @@ def test_moe_block_reduces_hybrid_partial_output_over_outer_world():
         ),
         patch.object(block.experts, "forward", return_value=local_output),
         patch.object(
-            ParallelGroup,
-            "all_reduce",
+            block.moe_communication,
+            "_reduce",
             return_value=local_output,
         ) as reduce,
     ):

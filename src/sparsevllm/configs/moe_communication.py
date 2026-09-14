@@ -11,8 +11,10 @@ def validate_moe_backend(config):
     if dp and backend == "all-reduce":
         raise ValueError("DP attention requires moe_backend=agrs or deepepv1.")
     if not dp and backend != "all-reduce":
-        raise ValueError("AG/RS and DeepEP require DP attention (TP=1, EP=DP).")
+        raise ValueError("AG/RS and DeepEP require DP attention (DP>1, EP=world size).")
     if backend == "deepepv1":
+        if config.attn_tp_size != 1:
+            raise ValueError("DeepEP V1 currently requires attention TP=1; use agrs for DP×TP.")
         if config.expert_parallel_size not in (2, 4, 8):
             raise ValueError("DeepEP V1 normal NVLink requires EP=DP in {2, 4, 8}.")
         # Only the selected transport imports/checks the optional dependency.

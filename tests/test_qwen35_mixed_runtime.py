@@ -930,6 +930,7 @@ def test_model_runner_resets_inherited_allocator_peak_before_model_construction(
     config = SimpleNamespace(
         enable_profiler=False,
         world_size=1,
+        attn_dp_size=1,
         tensor_parallel_size=1,
         expert_parallel_size=1,
         data_parallel_size=1,

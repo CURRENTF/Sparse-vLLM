@@ -1,9 +1,10 @@
-"""Single-node DP attention frontend with one scheduler/cache owner per rank."""
+"""Single-node DP attention frontend with one scheduler/cache owner per TP replica."""
 
 from __future__ import annotations
 
 import atexit
 import os
+import signal
 import threading
 import time
 import traceback
@@ -33,6 +34,8 @@ class DPAttentionPrefixSnapshot:
 def _worker_main(connection, model, kwargs, rank, port):
     from sparsevllm.engine.llm_engine import LLMEngine
 
+    # A replica owns TP children; fatal teardown must also stop those workers.
+    os.setsid()
     engine = None
     try:
         engine = LLMEngine(model, _dp_worker=(rank, port), **kwargs)
@@ -417,8 +420,11 @@ class DPAttentionEngine:
     def _terminate(self):
         self._closed = True
         for process in self.ps:
-            if process.is_alive():
-                process.terminate()
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                if process.is_alive():
+                    process.kill()
         for process in self.ps:
             process.join(timeout=5)
         for connection in self._connections:

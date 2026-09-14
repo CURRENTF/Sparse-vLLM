@@ -236,6 +236,93 @@ def test_shared_expert_execution_uses_the_agreed_step_capacity(monkeypatch, step
     monkeypatch.setattr(get_context(), "moe_token_capacity", step_capacity)
     transport = MoeCommunication()
     x = torch.ones(3, 4)
-    transport.run = Mock(return_value=x)
+    transport._run = Mock(return_value=x)
     transport.run_with_shared_experts(x, shared_experts=lambda t: t)
-    assert transport.run.call_args.kwargs["capacity"] == expected
+    assert transport._run.call_args.kwargs["capacity"] == expected
+
+
+def _hybrid_agrs_worker(rank, rendezvous, cuda):
+    from sparsevllm.distributed.collective_runtime import ParallelCollectiveRuntime
+    from sparsevllm.utils.context import reset_context, set_context
+
+    device = torch.device("cuda", rank) if cuda else torch.device("cpu")
+    if cuda:
+        torch.cuda.set_device(device)
+    dist.init_process_group(
+        "nccl" if cuda else "gloo", init_method=rendezvous, rank=rank, world_size=4
+    )
+    parallel = init_parallel_context(topology=ParallelTopology(2, 4, 2))
+    runtime = ParallelCollectiveRuntime(parallel, cuda_graph=cuda, device_index=rank)
+    transport = runtime.request_moe_collectives(
+        attention_max_rows=8, moe_max_rows=8, max_local_tokens=8,
+        hidden_size=256, dtype=torch.bfloat16 if cuda else torch.float32,
+        backend="agrs", num_experts=8, top_k=2,
+    ).moe_transport
+    runtime.prepare()
+    set_context(False)
+    graphs = []
+    try:
+        if cuda:
+            runtime.begin_cuda_graph_capture()
+        for sizes in ((3, 1), (0, 5), (5, 0)):
+            source = torch.full(
+                (sizes[parallel.attn_dp_rank], 256),
+                parallel.attn_dp_rank + 1.0, device=device,
+                dtype=torch.bfloat16 if cuda else torch.float32,
+            )
+
+            capacity = max(sizes)
+
+            def forward(source=source, capacity=capacity):
+                return transport.run_with_shared_experts(
+                    source,
+                    route=lambda x: (torch.zeros(len(x), 1, device=device, dtype=torch.int64),
+                                     torch.ones(len(x), 1, device=device)),
+                    experts=lambda x, ids, weights: x * (rank + 1),
+                    shared_experts=lambda x: x * (parallel.attn_tp_rank + 1),
+                    chunk_size=2, capacity=capacity,
+                )
+
+            # Four expert partitions contribute 1+2+3+4; the two shared
+            # shards contribute 1+2 once per replica, regardless of padding.
+            torch.testing.assert_close(forward(), source * 13)
+            if cuda:
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    forward()
+                stream.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    output = forward()
+                graphs.append((graph, source, output))
+        if cuda:
+            runtime.collect_local_cuda_graph_metadata()
+            runtime.exchange_cuda_graph_metadata()
+            runtime.register_cuda_graph_buffers()
+            runtime.mark_cuda_graph_replayable()
+            for graph, source, output in graphs:
+                for _ in range(3):
+                    source.add_(1)
+                    graph.replay()
+                    torch.testing.assert_close(output, source * 13)
+            torch.cuda.synchronize()
+    finally:
+        graphs.clear()
+        runtime.close()
+        reset_context()
+        reset_parallel_context()
+        dist.destroy_process_group()
+
+
+def test_hybrid_agrs_preserves_replica_ownership_and_sums_shared_shards(tmp_path, monkeypatch):
+    monkeypatch.setenv("SPARSEVLLM_PLATFORM", "cpu")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    mp.spawn(_hybrid_agrs_worker,
+             args=(f"file://{tmp_path / 'hybrid'}", False), nprocs=4, join=True)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires four idle CUDA devices")
+def test_hybrid_agrs_prepared_collectives_and_graph_replay(tmp_path):
+    mp.spawn(_hybrid_agrs_worker,
+             args=(f"file://{tmp_path / 'hybrid-cuda'}", True), nprocs=4, join=True)

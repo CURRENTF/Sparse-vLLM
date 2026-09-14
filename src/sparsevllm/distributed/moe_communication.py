@@ -34,7 +34,7 @@ class MoeCommunication:
     model's router and compatible local expert provider.
     """
 
-    def run(self, hidden_states, *, route, experts, chunk_size, capacity=None):
+    def _run(self, hidden_states, *, route, experts, chunk_size, capacity):
         dispatch = self.dispatch(hidden_states, capacity=capacity)
         outputs = []
         for chunk in dispatch.hidden_states.split(chunk_size, dim=0):
@@ -43,17 +43,23 @@ class MoeCommunication:
         output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
         return self.combine(output, dispatch)
 
-    def run_with_shared_experts(
-        self, hidden_states, *, shared_experts, capacity=None, **kwargs
-    ):
-        """Compose a reduced routed output with an owner-local shared branch."""
+    def _finish(self, output):
+        return output
+
+    def run(self, hidden_states, *, shared_experts=None, capacity=None, **kwargs):
         if capacity is None:
             capacity = get_context().moe_token_capacity
             if capacity is None:
                 # Startup warmup/capture uses identical shapes on every replica.
                 capacity = hidden_states.shape[0]
-        routed = self.run(hidden_states, capacity=capacity, **kwargs)
-        return routed + shared_experts(hidden_states) if len(hidden_states) else routed
+        output = self._run(hidden_states, capacity=capacity, **kwargs)
+        if shared_experts is not None and len(hidden_states):
+            output = output + shared_experts(hidden_states)
+        return self._finish(output)
+
+    def run_with_shared_experts(self, hidden_states, *, shared_experts, **kwargs):
+        """Sum routed and shared partials before completing the TP reduction."""
+        return self.run(hidden_states, shared_experts=shared_experts, **kwargs)
 
 
 class AllReduceMoeCommunication(MoeCommunication):
@@ -76,7 +82,7 @@ class AllReduceMoeCommunication(MoeCommunication):
 
 
 class AllGatherReduceScatterMoeCommunication(MoeCommunication):
-    """Disjoint tokens, replicated dispatch, owner-local summed expert outputs.
+    """Gather DP tokens per TP lane, scatter partials, then complete the TP sum.
 
     The runner agrees on capacity once per step, outside the layer loop. Equal
     padded rank segments make NCCL AG/RS capturable; slicing restores the local
@@ -84,16 +90,23 @@ class AllGatherReduceScatterMoeCommunication(MoeCommunication):
     """
 
     def __init__(
-        self, parallel_context: ParallelContext, *, max_rows=None, hidden_size=None, dtype=None
+        self, parallel_context: ParallelContext, *, max_rows=None, hidden_size=None,
+        dtype=None, reduce=None,
     ):
-        if parallel_context.attn_tp_size != 1 or parallel_context.moe_tp_size != 1:
-            raise ValueError("AG/RS currently requires attention TP=1 and MoE TP=1.")
-        self.group = parallel_context.moe_ep
+        if parallel_context.moe_tp_size != 1:
+            raise ValueError("AG/RS currently requires MoE TP=1 (EP=world size).")
+        self.group = parallel_context.attn_dp
+        self._reduce = reduce or parallel_context.attn_tp.all_reduce
         self.max_rows = max_rows
         self.hidden_size = hidden_size
         self.dtype = dtype
         self.op = None
         self.closed = False
+
+    def _finish(self, output):
+        # RS sums experts on one TP lane; complete the other lanes locally.
+        # Idle replicas have no output rows and need no TP collective.
+        return self._reduce(output) if len(output) else output
 
     @property
     def name(self):

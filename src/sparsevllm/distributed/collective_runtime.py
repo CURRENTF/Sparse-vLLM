@@ -202,8 +202,6 @@ class ParallelCollectiveRuntime:
                 hidden_size=hidden_size, dtype=dtype, backend=backend,
                 num_experts=num_experts, top_k=top_k,
             )
-        if self.parallel_context.world_size == 1:
-            return None
         return self.request_decode_collectives(
             attention_max_rows=attention_max_rows, moe_max_rows=moe_max_rows,
             hidden_size=hidden_size, dtype=dtype,
@@ -217,12 +215,21 @@ class ParallelCollectiveRuntime:
             raise RuntimeError("DP collectives must be requested once before preparation.")
         if self.parallel_context.attn_dp_size <= 1:
             raise ValueError("DP collectives require the DP attention topology.")
+        attention = self._request_all_reduce(
+            "attention", self.parallel_context.attn_tp,
+            max_rows=max_rows, hidden_size=hidden_size, dtype=dtype,
+        )
+        moe = self._request_all_reduce(
+            "moe", self.parallel_context.attn_tp,
+            max_rows=max_rows, hidden_size=hidden_size, dtype=dtype,
+        )
         if backend == "agrs":
             self._moe_transport = AllGatherReduceScatterMoeCommunication(
                 self.parallel_context,
                 max_rows=max(max_rows, max_local_tokens or max_rows),
                 hidden_size=hidden_size,
                 dtype=dtype,
+                reduce=moe.run,
             )
         elif backend == "deepepv1":
             from sparsevllm.distributed.moe_all2all import AllToAllMoeCommunication
@@ -235,8 +242,7 @@ class ParallelCollectiveRuntime:
             self._moe_transport = AllToAllMoeCommunication(self.parallel_context, spec)
         else:
             raise ValueError(f"Unsupported DP MoE transport: {backend}")
-        identity = ParallelAllReduceHandle(self.parallel_context.attn_tp)
-        return DecodeParallelCollectives(identity, identity, self._moe_transport)
+        return DecodeParallelCollectives(attention, moe, self._moe_transport)
 
     def prepare(self) -> None:
         if self.state is not ParallelCollectiveState.OPEN:

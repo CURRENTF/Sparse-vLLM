@@ -40,12 +40,10 @@ class ModelSpec:
                 f"{self.name} does not support data parallelism, "
                 f"got DP={topology.attn_dp_size}."
             )
-        if topology.attn_dp_size > 1 and (
-            topology.attn_tp_size != 1 or topology.moe_tp_size != 1
-        ):
+        if topology.attn_dp_size > 1 and topology.moe_tp_size != 1:
             raise ValueError(
                 "The engine currently supports DP attention only with "
-                "attention TP=1 and MoE TP=1 (EP=DP); "
+                "MoE TP=1 (EP=world size); "
                 f"got attention DP={topology.attn_dp_size}, TP={topology.attn_tp_size}, "
                 f"MoE EP={topology.moe_ep_size}, TP={topology.moe_tp_size}."
             )
@@ -124,6 +122,7 @@ MODEL_SPECS.update(
         "qwen3_moe": ModelSpec(
             "Qwen3MoE",
             supports_expert_parallel=True,
+            supports_data_parallel=True,
             runtime_class_name="Qwen3MoeForCausalLM",
             attention_tp_fields=_MOE_TP_FIELDS,
             num_experts_field="num_experts",
@@ -149,6 +148,7 @@ MODEL_SPECS.update(
         ),
         "minimax_m2": ModelSpec(
             "MiniMax M2.7",
+            supports_data_parallel=True,
             requires_fp8=True,
             supports_quantized_tiny_random=True,
             tiny_random_requires_standard_head_shape=False,

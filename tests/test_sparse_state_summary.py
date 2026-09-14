@@ -79,7 +79,7 @@ def test_model_runner_gathers_one_debug_summary_per_world_rank():
     )
     runner.parallel_context = ParallelContext(
         world=world_group,
-        attn_tp=singleton_group,
+        attn_tp=world_group,
         moe_ep=world_group,
         attn_dp=singleton_group,
         moe_tp=singleton_group,
@@ -108,7 +108,7 @@ def test_model_runner_gathers_one_debug_summary_per_world_rank():
     )
 
     def gather(output, local, group):
-        assert group is runner.parallel_context.world.process_group
+        assert group is runner.parallel_context.attn_tp.process_group
         output[:] = [local, {"world_rank": 1, "ep_rank": 1, "state": local["state"]}]
 
     with (
@@ -168,7 +168,7 @@ def test_tp_debug_replica_consistency_marks_vocab_sharded_logits_not_applicable(
 
 def test_nonzero_rank_debug_logits_rpc_returns_none_before_tensor_access():
     runner = object.__new__(ModelRunner)
-    runner.rank = 1
+    runner.parallel_context = SimpleNamespace(attn_tp_rank=1)
 
     assert runner.debug_last_logits_cpu() is None
 

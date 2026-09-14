@@ -25,7 +25,7 @@ class AllToAllMoeCommunication(MoeCommunication):
             self.spec, group=self.group, device_index=device_index
         )
 
-    def run(self, hidden_states, *, route, experts, chunk_size, capacity=None):
+    def _run(self, hidden_states, *, route, experts, chunk_size, capacity):
         if self.op is None:
             raise RuntimeError("All-to-all transport is not prepared.")
         # Even an idle owner participates. Received rows may belong to any

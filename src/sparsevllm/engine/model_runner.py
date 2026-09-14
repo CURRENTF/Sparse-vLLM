@@ -276,7 +276,6 @@ class ModelRunner:
     负责模型执行的类。每个 GPU Rank 进程都拥有一个 ModelRunner 实例。
     主要职责：权重加载、显存分配 (KV Cache)、槽位管理 (Rank-Local)、前向计算。
     """
-    independent_scheduler = False
 
     def __init__(
         self,
@@ -286,11 +285,8 @@ class ModelRunner:
         tp_shm_name: str | None = None,
         master_port: int | None = None,
         trtllm_cache_root: str | None = None,
-        *,
-        independent_scheduler: bool = False,
     ):
         self.config = config
-        self.independent_scheduler = independent_scheduler
         # Inference-only engine: disable autograd graph construction globally in this process.
         # (This is process-local; must be set inside every spawned TP worker.)
         torch.set_grad_enabled(False)
@@ -326,9 +322,9 @@ class ModelRunner:
             topology=config.parallel_topology,
         )
         self.dp_control_group = (
-            dist.new_group(backend="gloo") if independent_scheduler else None
+            dist.new_group(backend="gloo") if config.attn_dp_size > 1 else None
         )
-        self.dp_control_buffer = torch.empty(2, dtype=torch.int64, device="cpu") if independent_scheduler else None
+        self.dp_control_buffer = torch.empty(2, dtype=torch.int64, device="cpu") if config.attn_dp_size > 1 else None
         self.dp_idle_graphs = {}
         self.dp_idle_replay_count = 0
         self.dp_idle_eager_count = 0
@@ -352,7 +348,7 @@ class ModelRunner:
                         "max_num_batched_tokens",
                         config.mlp_chunk_size,
                     )
-                ) * (config.data_parallel_size if independent_scheduler else 1),
+                ) * config.attn_dp_size,
                 int(config.mlp_chunk_size),
             ),
         )
@@ -491,18 +487,18 @@ class ModelRunner:
         torch.set_default_dtype(default_dtype)
 
         # TP 场景下的多进程指令同步
-        if self.world_size > 1 and not self.independent_scheduler:
+        if self.parallel_context.attn_tp_size > 1:
             if not self.tp_shm_name:
-                raise ValueError("tp_shm_name is required when world_size > 1.")
-            if rank == 0:
+                raise ValueError("tp_shm_name is required when attention TP > 1.")
+            if self.parallel_context.attn_tp_rank == 0:
                 # Rank 0 创建共享内存用于发送方法调用指令
                 self.shm = SharedMemory(name=self.tp_shm_name, create=True, size=TP_SHM_SIZE)
-                self.parallel_context.world.barrier(
+                self.parallel_context.attn_tp.barrier(
                     device_ids=self.platform.barrier_device_ids(rank)
                 )
             else:
                 # 其他 Rank 监听共享内存中的方法调用指令
-                self.parallel_context.world.barrier(
+                self.parallel_context.attn_tp.barrier(
                     device_ids=self.platform.barrier_device_ids(rank)
                 )
                 self.shm = SharedMemory(name=self.tp_shm_name)
@@ -606,7 +602,7 @@ class ModelRunner:
             local_record,
             group=self.parallel_context.world.process_group,
         )
-        return records if self.rank == 0 or self.independent_scheduler else None
+        return records if self.parallel_context.attn_tp_rank == 0 else None
 
     def begin_startup_memory_profile(self, phase: str) -> None:
         self.startup_memory_profiler.begin(phase)
@@ -764,12 +760,12 @@ class ModelRunner:
         self.collective_runtime.close()
         self.platform.synchronize()
         close_workspace_manager()
-        if self.world_size > 1 and not self.independent_scheduler:
+        if self.parallel_context.attn_tp_size > 1:
             self.shm.close()
-            self.parallel_context.world.barrier(
+            self.parallel_context.attn_tp.barrier(
                 device_ids=self.platform.barrier_device_ids(self.rank)
             )
-            if self.rank == 0:
+            if self.parallel_context.attn_tp_rank == 0:
                 self.shm.unlink()
         reset_parallel_context()
         dist.destroy_process_group()
@@ -795,7 +791,7 @@ class ModelRunner:
 
     def read_shm(self):
         """反序列化共享内存中的方法名和参数"""
-        assert self.world_size > 1 and self.rank > 0
+        assert self.parallel_context.attn_tp_size > 1 and self.parallel_context.attn_tp_rank > 0
         command_event, _ = self.event
         command_event.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
@@ -805,10 +801,10 @@ class ModelRunner:
 
     def write_shm(self, method_name, *args, wait_for_read: bool = True):
         """序列化方法名 and 参数并写入共享内存"""
-        assert self.world_size > 1 and self.rank == 0
+        assert self.parallel_context.attn_tp_size > 1 and self.parallel_context.attn_tp_rank == 0
         data = pickle.dumps([method_name, *args])
         n = len(data)
-        command_capacity = len(self.shm.buf) - self.world_size
+        command_capacity = len(self.shm.buf) - self.parallel_context.attn_tp_size
         if n + 4 > command_capacity:
             raise RuntimeError(
                 f"Shared memory command is too large: {n + 4} > {command_capacity}"
@@ -834,11 +830,8 @@ class ModelRunner:
 
     def call(self, method_name, *args):
         """RPC 风格的调用：如果是 Rank 0 则先广播指令，然后所有进程执行本地逻辑"""
-        if self.independent_scheduler:
-            with torch.inference_mode():
-                return getattr(self, method_name)(*args)
         synchronizes_status = method_name in TP_RPC_STATUS_SYNC_METHODS
-        if self.world_size > 1 and self.rank == 0:
+        if self.parallel_context.attn_tp_size > 1 and self.parallel_context.attn_tp_rank == 0:
             # A status-synchronized RPC already waits for every worker before
             # the shared command buffer can be reused.  Let rank 0 begin its
             # local work immediately instead of polling for a separate read ACK.
@@ -878,9 +871,9 @@ class ModelRunner:
             return method(*args)
 
     def _run_status_offset(self, rank: int) -> int:
-        if not 0 < rank < self.world_size:
-            raise ValueError(f"Invalid TP worker rank {rank} for world_size={self.world_size}.")
-        return len(self.shm.buf) - self.world_size + rank
+        if not 0 < rank < self.parallel_context.attn_tp_size:
+            raise ValueError(f"Invalid TP worker rank {rank} for attention TP={self.parallel_context.attn_tp_size}.")
+        return len(self.shm.buf) - self.parallel_context.attn_tp_size + rank
 
     def _synchronize_tp_run_stream(self) -> None:
         if self.device.type == "cuda":
@@ -896,7 +889,7 @@ class ModelRunner:
         method_name: str,
         local_error: BaseException | None,
     ) -> None:
-        if self.world_size <= 1:
+        if self.parallel_context.attn_tp_size <= 1:
             return
 
         sync_error: BaseException | None = None
@@ -908,14 +901,14 @@ class ModelRunner:
             except BaseException as exc:
                 sync_error = exc
 
-        if self.rank > 0:
+        if self.parallel_context.attn_tp_rank > 0:
             _, completion_event = self.event
             status = (
                 TP_RUN_STATUS_FAILED
                 if local_error is not None or sync_error is not None
                 else TP_RUN_STATUS_SUCCESS
             )
-            self.shm.buf[self._run_status_offset(self.rank)] = status
+            self.shm.buf[self._run_status_offset(self.parallel_context.attn_tp_rank)] = status
             completion_event.set()
             if sync_error is not None:
                 raise sync_error
@@ -953,16 +946,16 @@ class ModelRunner:
         method_name: str,
         local_error: BaseException | None,
     ) -> None:
-        if self.independent_scheduler or self.world_size <= 1 or not dist.is_initialized():
+        if self.parallel_context.attn_tp_size <= 1 or not dist.is_initialized():
             return
         failed = torch.tensor(
             [1 if local_error is not None else 0],
             dtype=torch.int32,
             device=self.device,
         )
-        self.parallel_context.world.all_reduce(failed, op=dist.ReduceOp.MAX)
+        self.parallel_context.attn_tp.all_reduce(failed, op=dist.ReduceOp.MAX)
         if int(failed.item()) != 0 and local_error is None:
-            raise RuntimeError(f"At least one world worker failed during {method_name}.")
+            raise RuntimeError(f"At least one attention TP worker failed during {method_name}.")
 
     def _sync_prefix_cache_control_rpc_status(
         self,
@@ -972,32 +965,32 @@ class ModelRunner:
         self._sync_tp_rpc_status(method_name, local_error)
 
     def _sync_prefix_cache_lookup_result(self, local_result: dict[str, object]) -> None:
-        if self.world_size <= 1:
+        if self.parallel_context.attn_tp_size <= 1:
             return
-        results = [None] * self.world_size
+        results = [None] * self.parallel_context.attn_tp_size
         dist.all_gather_object(
             results,
             local_result,
-            group=self.parallel_context.world.process_group,
+            group=self.parallel_context.attn_tp.process_group,
         )
         if any(result != results[0] for result in results[1:]):
             raise RuntimeError(
-                "Prefix-cache lookup diverged across world ranks: "
+                "Prefix-cache lookup diverged across attention TP ranks: "
                 f"results={results!r}."
             )
 
     def _sync_chain_cache_result(self, method_name: str, local_result) -> None:
-        if self.world_size <= 1:
+        if self.parallel_context.attn_tp_size <= 1:
             return
-        results = [None] * self.world_size
+        results = [None] * self.parallel_context.attn_tp_size
         dist.all_gather_object(
             results,
             local_result,
-            group=self.parallel_context.world.process_group,
+            group=self.parallel_context.attn_tp.process_group,
         )
         if any(result != results[0] for result in results[1:]):
             raise RuntimeError(
-                f"Chain-cache {method_name} diverged across world ranks: "
+                f"Chain-cache {method_name} diverged across attention TP ranks: "
                 f"results={results!r}."
             )
 
@@ -1049,15 +1042,15 @@ class ModelRunner:
         self._sync_tp_rpc_status("operator_runtime_stats", local_error)
         if local_error is not None:
             raise local_error
-        if self.world_size == 1 or self.independent_scheduler:
+        if self.parallel_context.attn_tp_size == 1:
             return [local_stats]
-        stats = [None] * self.world_size
+        stats = [None] * self.parallel_context.attn_tp_size
         dist.all_gather_object(
             stats,
             local_stats,
-            group=self.parallel_context.world.process_group,
+            group=self.parallel_context.attn_tp.process_group,
         )
-        return stats if self.rank == 0 else None
+        return stats if self.parallel_context.attn_tp_rank == 0 else None
 
     def warmup_moe_workspace(self, num_tokens: int) -> None:
         warmup_moe = getattr(self.model, "warmup_moe", None)
@@ -1577,7 +1570,7 @@ class ModelRunner:
         }
 
     def debug_last_logits_cpu(self) -> torch.Tensor | None:
-        if self.rank != 0 and not self.independent_scheduler:
+        if self.parallel_context.attn_tp_rank != 0:
             return None
         logits = getattr(self, "debug_last_logits", None)
         if logits is None:
@@ -1594,7 +1587,7 @@ class ModelRunner:
                 "No hidden-state snapshots are available. Set "
                 "SPARSEVLLM_DEBUG_HIDDEN_LAYERS before model execution."
             )
-        if self.rank != 0:
+        if self.parallel_context.attn_tp_rank != 0:
             return None
         return {
             int(layer_idx): tensor.detach().cpu()
@@ -1625,47 +1618,47 @@ class ModelRunner:
                 name: tensor.detach().cpu()
                 for name, tensor in required.items()
             }
-        return snapshots if self.rank == 0 else None
+        return snapshots if self.parallel_context.attn_tp_rank == 0 else None
 
-    def _debug_float_error_from_world_rank_zero(
+    def _debug_float_error_from_tp_leader(
         self,
         tensor: torch.Tensor,
         *,
         atol: float,
         rtol: float,
     ) -> tuple[float, float]:
-        if self.world_size == 1:
+        if self.parallel_context.attn_tp_size == 1:
             return 0.0, 0.0
         reference = tensor.detach().clone()
         dist.broadcast(
             reference,
-            src=self.parallel_context.world.ranks[0],
-            group=self.parallel_context.world.process_group,
+            src=self.parallel_context.attn_tp.ranks[0],
+            group=self.parallel_context.attn_tp.process_group,
         )
         difference = (tensor.detach().float() - reference.float()).abs()
         max_abs = difference.max()
         tolerance_ratio = (
             difference / (float(atol) + float(rtol) * reference.float().abs())
         ).max()
-        self.parallel_context.world.all_reduce(max_abs, op=dist.ReduceOp.MAX)
-        self.parallel_context.world.all_reduce(tolerance_ratio, op=dist.ReduceOp.MAX)
+        self.parallel_context.attn_tp.all_reduce(max_abs, op=dist.ReduceOp.MAX)
+        self.parallel_context.attn_tp.all_reduce(tolerance_ratio, op=dist.ReduceOp.MAX)
         return float(max_abs.item()), float(tolerance_ratio.item())
 
-    def _debug_any_mismatch_from_world_rank_zero(self, tensor: torch.Tensor) -> bool:
-        if self.world_size == 1:
+    def _debug_any_mismatch_from_tp_leader(self, tensor: torch.Tensor) -> bool:
+        if self.parallel_context.attn_tp_size == 1:
             return False
         reference = tensor.detach().clone()
         dist.broadcast(
             reference,
-            src=self.parallel_context.world.ranks[0],
-            group=self.parallel_context.world.process_group,
+            src=self.parallel_context.attn_tp.ranks[0],
+            group=self.parallel_context.attn_tp.process_group,
         )
         mismatch = torch.tensor(
             [int(not torch.equal(tensor.detach(), reference))],
             dtype=torch.int32,
             device=self.device,
         )
-        self.parallel_context.world.all_reduce(mismatch, op=dist.ReduceOp.MAX)
+        self.parallel_context.attn_tp.all_reduce(mismatch, op=dist.ReduceOp.MAX)
         return bool(mismatch.item())
 
     def debug_replica_consistency(self) -> dict[str, object] | None:
@@ -1681,7 +1674,7 @@ class ModelRunner:
             if logits is None:
                 return None
             logits_max_abs, logits_tolerance_ratio = (
-                self._debug_float_error_from_world_rank_zero(
+                self._debug_float_error_from_tp_leader(
                     logits,
                     atol=0.05,
                     rtol=0.05,
@@ -1700,21 +1693,21 @@ class ModelRunner:
             if not hasattr(block, "debug_last_topk_ids"):
                 continue
             topk_weights_max_abs, topk_weights_tolerance_ratio = (
-                self._debug_float_error_from_world_rank_zero(
+                self._debug_float_error_from_tp_leader(
                     block.debug_last_topk_weights,
                     atol=0.01,
                     rtol=0.01,
                 )
             )
             output_max_abs, output_tolerance_ratio = (
-                self._debug_float_error_from_world_rank_zero(
+                self._debug_float_error_from_tp_leader(
                     block.debug_last_output,
                     atol=0.05,
                     rtol=0.05,
                 )
             )
             result["moe_layers"][str(layer_idx)] = {
-                "topk_ids_mismatch": self._debug_any_mismatch_from_world_rank_zero(
+                "topk_ids_mismatch": self._debug_any_mismatch_from_tp_leader(
                     block.debug_last_topk_ids
                 ),
                 "topk_weights_max_abs": topk_weights_max_abs,
@@ -1732,22 +1725,22 @@ class ModelRunner:
                 self.platform.synchronize()
             local_summary = self.debug_sparse_state_summary()
             local_summary["replica_consistency"] = (
-                None if self.independent_scheduler else self.debug_replica_consistency()
+                self.debug_replica_consistency()
             )
         except BaseException as exc:
             local_error = exc
         self._sync_tp_rpc_status("debug_sparse_state_summaries", local_error)
         if local_error is not None:
             raise local_error
-        if self.world_size == 1 or self.independent_scheduler:
+        if self.parallel_context.attn_tp_size == 1:
             return [local_summary]
-        summaries = [None] * self.world_size
+        summaries = [None] * self.parallel_context.attn_tp_size
         dist.all_gather_object(
             summaries,
             local_summary,
-            group=self.parallel_context.world.process_group,
+            group=self.parallel_context.attn_tp.process_group,
         )
-        return summaries if self.rank == 0 else None
+        return summaries if self.parallel_context.attn_tp_rank == 0 else None
 
     def _long_text_threshold(self, is_prefill: bool) -> int:
         del is_prefill
@@ -1962,14 +1955,14 @@ class ModelRunner:
     def capture_decode_cuda_graph_warmup(self, seqs: list[Sequence]) -> None:
         """Capture one planned graph without advancing scheduler sequence state."""
         try:
-            if self.independent_scheduler:
+            if self.parallel_context.attn_dp_size > 1:
                 self.decode_graph_runner.dp_batch_capacity = None
             self.decode_graph_runner.run(
                 seqs,
                 capture_sampling=False,
                 replay_after_capture=False,
             )
-            if self.independent_scheduler:
+            if self.parallel_context.attn_dp_size > 1:
                 capacity = self.decode_graph_runner.last_state_key.batch_size
                 self.capture_dp_idle_graph(capacity)
         finally:
@@ -2048,7 +2041,7 @@ class ModelRunner:
                 logits = self.decode_graph_runner.run_eager_static(seqs)
             with profiler.record("model_sparse_post"):
                 self.sparse_controller.post_forward(seqs, is_prefill)
-            return logits if self.rank == 0 else None
+            return logits if self.parallel_context.attn_tp_rank == 0 else None
         finally:
             reset_context()
 
@@ -2101,7 +2094,7 @@ class ModelRunner:
     ) -> tuple[list[int], tuple[list[float | None], list[dict[int, float] | None]] | None]:
         """单步执行主逻辑"""
         dp_eager = False
-        if self.independent_scheduler:
+        if self.parallel_context.attn_dp_size > 1:
             from sparsevllm.engine.dp_step import coordinate_dp_step
             dp_eager = coordinate_dp_step(self, seqs, is_prefill)
             if not seqs:
@@ -2123,7 +2116,7 @@ class ModelRunner:
                         logits = self.decode_graph_runner.run_eager_static(seqs)
                         graph_token_ids = None
                     self._record_debug_logits(logits)
-                    if self.rank != 0 and not self.independent_scheduler:
+                    if self.parallel_context.attn_tp_rank != 0:
                         self._post_sparse_forward(seqs, is_prefill)
                         return None, None
                     self._post_sparse_forward(seqs, is_prefill)
@@ -2156,7 +2149,7 @@ class ModelRunner:
             
             # 4. Token 采样 (仅 Rank 0)
             with profiler.record("model_sampler"):
-                if self.rank == 0 or self.independent_scheduler:
+                if self.parallel_context.attn_tp_rank == 0:
                     sampling_logits = self._apply_sampling_penalties(logits, seqs)
                     token_ids = self._sample_model_outputs(sampling_logits, seqs)
                 else:
@@ -2167,7 +2160,7 @@ class ModelRunner:
                     seqs,
                     self._collect_logprobs(sampling_logits, token_ids, seqs),
                 )
-                if self.rank == 0 or self.independent_scheduler
+                if self.parallel_context.attn_tp_rank == 0
                 else None
             )
 

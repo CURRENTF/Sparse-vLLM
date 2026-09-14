@@ -14,6 +14,7 @@ from sparsevllm.distributed import (
     ParallelCollectiveRuntime,
     get_parallel_context,
 )
+from sparsevllm.distributed.moe_communication import prepare_moe_communication
 from sparsevllm.layers.attention import Attention
 from sparsevllm.layers.embed_head import ParallelLMHead
 from sparsevllm.layers.layernorm import ColumnParallelRMSNorm, RMSNorm
@@ -117,9 +118,14 @@ def build_minimax_m2_runtime_config(
         ),
         device_index=int(device.index or 0),
     )
-    parallel_collectives = collective_runtime.request_decode_collectives(
+    parallel_collectives = collective_runtime.request_moe_collectives(
         attention_max_rows=int(max_decode_tokens),
         moe_max_rows=int(max_decode_tokens),
+        max_local_tokens=(
+            max_decode_tokens if engine_config is None else engine_config.max_num_batched_tokens
+        ),
+        backend=("all-reduce" if engine_config is None else engine_config.moe_backend),
+        num_experts=int(config.num_local_experts), top_k=int(config.num_experts_per_tok),
         hidden_size=int(config.hidden_size),
         dtype=activation_dtype,
     )
@@ -217,6 +223,10 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
             raise ValueError(
                 f"mlp_chunk_size must be > 0, got {self.mlp_chunk_size}."
             )
+        self.moe_communication = prepare_moe_communication(
+            self.parallel_context,
+            None if runtime_config is None else runtime_config.parallel_collectives,
+        )
         self.gate = MiniMaxM2Router(config)
         self.experts = MiniMaxM2PackedExperts(
             config,
@@ -227,10 +237,19 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
     def e_score_correction_bias(self) -> nn.Parameter:
         return self.gate.e_score_correction_bias
 
+    def _route(self, hidden_states):
+        _, weights, ids = self.gate(hidden_states)
+        return ids, weights
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.ndim != 2:
             raise ValueError(
                 f"MiniMax M2 MoE expects [tokens, hidden], got {tuple(hidden_states.shape)}."
+            )
+        if self.parallel_context.attn_dp_size > 1:
+            return self.moe_communication.run(
+                hidden_states, route=self._route, experts=self.experts,
+                chunk_size=self.mlp_chunk_size,
             )
         if int(hidden_states.shape[0]) <= self.mlp_chunk_size:
             _, topk_weights, topk_ids = self.gate(hidden_states)
@@ -247,9 +266,7 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
                     self.experts(chunk, topk_ids, topk_weights)
                 )
             local_output = torch.cat(local_output_chunks, dim=0)
-        if self.runtime_config is not None:
-            return self.runtime_config.parallel_collectives.moe.run(local_output)
-        return self.parallel_context.world.all_reduce(local_output)
+        return self.moe_communication.combine(local_output)
 
 
 class MiniMaxM2Attention(nn.Module):
@@ -697,6 +714,10 @@ class MiniMaxM2ForCausalLM(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return self.model(input_ids, positions)
+
+    def forward_idle_experts(self, hidden_states):
+        for layer in self.model.layers:
+            layer.block_sparse_moe(hidden_states)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)

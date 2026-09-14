@@ -406,18 +406,17 @@ class CacheManager(ABC):
         self,
         local_plan: dict[str, object],
     ) -> None:
-        if (int(getattr(self, "world_size", 1)) <= 1
-                or (self.parallel_context.attn_dp_size > 1)):
+        if self.parallel_context.attn_tp_size <= 1:
             return
-        plans: list[dict[str, object] | None] = [None] * self.world_size
+        plans: list[dict[str, object] | None] = [None] * self.parallel_context.attn_tp_size
         dist.all_gather_object(
             plans,
             local_plan,
-            group=self.parallel_context.world.process_group,
+            group=self.parallel_context.attn_tp.process_group,
         )
         if any(plan != plans[0] for plan in plans[1:]):
             raise RuntimeError(
-                "Prefix-cache subtree deletion plan diverged across world ranks: "
+                "Prefix-cache subtree deletion plan diverged across attention TP ranks: "
                 f"plans={plans!r}."
             )
 
