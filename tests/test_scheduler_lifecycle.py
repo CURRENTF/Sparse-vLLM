@@ -84,10 +84,12 @@ def test_streamingllm_bounded_residency_keeps_both_decoders_running(window):
     assert not runtime.decode_reservations.requests
 
 
-def test_partial_prefill_finishes_and_frees_capacity_at_decode_limit():
+@pytest.mark.parametrize("favor", [0, 1])
+def test_partial_prefill_finishes_and_frees_capacity_at_decode_limit(favor):
     # Both prompts fit, but decode cannot spend B's reserved eight slots.
     # B must finish and compact before A can publish another token.
     manager, runtime, scheduler = make_runtime()
+    scheduler.favor_min_decoding_seqs = favor
     a, b = request(4), request(12)
     scheduler.add(a)
     scheduler.add(b)

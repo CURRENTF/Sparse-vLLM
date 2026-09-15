@@ -1,4 +1,5 @@
 import os
+import time
 from collections import deque
 from collections.abc import Callable
 
@@ -37,6 +38,12 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         logger.debug(f'set max_num_batched_tokens = {config.max_num_batched_tokens} in Scheduler')
         self.max_decoding_seqs = config.max_decoding_seqs
+        self.favor_min_decoding_seqs = getattr(config, "favor_min_decoding_seqs", 0)
+        self.phase = "prefill"
+        self._prefill_wait_since: dict[int, float] = {}
+        self._phase_started_at = time.monotonic()
+        self.last_phase_decision: dict = {}
+        self._phase_reason = "prefill_priority"
 
         self.engine_prefill_chunk_size = config.engine_prefill_chunk_size
         self.prefill_schedule_policy = config.prefill_schedule_policy
@@ -203,6 +210,10 @@ class Scheduler:
 
     def add(self, seq: Sequence):
         """将新请求加入等待队列"""
+        if self.is_finished():
+            self.phase = "prefill"
+            self._phase_started_at = time.monotonic()
+        self._prefill_wait_since.setdefault(seq.seq_id, time.monotonic())
         self.waiting.append(seq)
 
     def abort(self, seq_id: int) -> bool:
@@ -211,6 +222,7 @@ class Scheduler:
         Returns True when the sequence may own KV slots and the caller should
         notify ModelRunner.free_slots(seq_id).
         """
+        self._prefill_wait_since.pop(seq_id, None)
         for queue in (self.waiting, self.decoding):
             for seq in list(queue):
                 if seq.seq_id != seq_id:
@@ -391,6 +403,7 @@ class Scheduler:
         # Requeue to the tail. While a replay is pending, prefill scheduling is
         # suspended until active decodes drain; the victim therefore cannot
         # immediately consume the slots it just released.
+        self._prefill_wait_since.setdefault(victim.seq_id, time.monotonic())
         self.waiting.append(victim)
         # Any decode sequences already popped into `scheduled_seqs` in this round
         # have not been executed yet. Put them back before returning, otherwise
@@ -403,16 +416,71 @@ class Scheduler:
         logger.warning(f'驱逐请求 id = {victim.seq_id} | slots={self.memory_oracle.free_slot_stats()}')
         return [], False, preempted_seqs
 
+    def _eligible_decode_batch(self) -> list[Sequence]:
+        """Mirror short-first decode selection without popping or preempting."""
+        if not self.decoding:
+            return []
+        target_long = all(self._is_long_text(seq, False) for seq in self.decoding)
+        free = max(0, int(self.memory_oracle.decode_step_free_slots()))
+        batch = []
+        for seq in self.decoding:
+            if self._is_long_text(seq, False) != target_long:
+                continue
+            cost = int(self.memory_oracle.decode_step_reservation_cost(seq))
+            if min(free, int(self.memory_oracle.decode_step_free_slots_for(seq))) < cost:
+                if free <= 0:
+                    break
+                continue
+            free -= cost
+            batch.append(seq)
+            if len(batch) == self.max_decoding_seqs:
+                break
+        return batch
+
     def schedule(self) -> tuple[list[Sequence], bool, list[Sequence]]:
-        snapshot = getattr(
-            self.memory_oracle,
-            "scheduler_capacity_snapshot",
-            None,
-        )
-        if not callable(snapshot):
-            return self._schedule_impl()
-        with snapshot():
-            return self._schedule_impl()
+        now = time.monotonic()
+        for seq in self.waiting:
+            self._prefill_wait_since.setdefault(seq.seq_id, now)
+        waiting_before = list(self.waiting)
+        decoding_before = list(self.decoding)
+        self.last_phase_decision = {}
+        try:
+            snapshot = getattr(self.memory_oracle, "scheduler_capacity_snapshot", None)
+            if callable(snapshot):
+                with snapshot():
+                    result = self._schedule_impl()
+            else:
+                result = self._schedule_impl()
+        except Exception:
+            # A popped prefill candidate must remain abortable after hook failure.
+            owned = {seq.seq_id for seq in (*self.waiting, *self.decoding)}
+            for seq in waiting_before:
+                if seq.seq_id not in owned:
+                    self.waiting.append(seq)
+            for seq in decoding_before:
+                if seq.seq_id not in owned and seq not in self.waiting:
+                    self.decoding.append(seq)
+            raise
+        seqs, is_prefill, _ = result
+        if seqs:
+            phase = "prefill" if is_prefill else "decode"
+            waits = []
+            if is_prefill:
+                for seq in seqs:
+                    since = self._prefill_wait_since.pop(seq.seq_id, now)
+                    waits.append({"seq_id": seq.seq_id, "partial": seq.num_prefilled_tokens > 0,
+                                  "seconds": now - since})
+            switched = phase != self.phase
+            self.last_phase_decision = {
+                "phase": phase, "reason": self._phase_reason,
+                "switched": switched, "previous_phase_seconds": now - self._phase_started_at,
+                "decode_batch": 0 if is_prefill else len(seqs), "prefill_waits": waits,
+            }
+            if switched:
+                self._phase_started_at = now
+            self.phase = phase
+            logger.debug("scheduler_phase {}", self.last_phase_decision)
+        return result
 
     def _schedule_impl(self) -> tuple[list[Sequence], bool, list[Sequence]]:
         """
@@ -468,8 +536,27 @@ class Scheduler:
         blocked_prefill_step_failure: tuple[Sequence, int, int] | None = None
         blocked_prefill_capacity_failure: tuple[Sequence, int, int, int] | None = None
 
+        self._phase_reason = "prefill_priority"
+        if self.favor_min_decoding_seqs:
+            overdue = any(time.monotonic() - since >= 60.0
+                          for since in self._prefill_wait_since.values())
+            if overdue:
+                # Give the oldest compatible, admissible prompt first chance.
+                self.waiting = deque(sorted(
+                    self.waiting, key=lambda seq: self._prefill_wait_since[seq.seq_id]
+                ))
+            self._phase_reason = (
+                "prefill_wait_timeout" if overdue else
+                "prefill_continue" if self.phase == "prefill" else "decode_below_threshold"
+            )
+            if self.phase == "decode" and not overdue and decode_reservation_failure is None:
+                batch = self._eligible_decode_batch()
+                if batch and (not self.waiting or len(batch) >= self.favor_min_decoding_seqs):
+                    self._phase_reason = "no_prefill" if not self.waiting else "decode_affinity"
+                    return batch, False, []
+
         # --- 阶段 1: Prefill 调度 ---
-        # 只要 waiting 队列有活，就优先处理 Prefill，因为它是计算密集型的。
+        # Affinity may already have selected decode above.
         prefill_mode_order: list[tuple[str, object]] = []
         replay_waiting = [seq for seq in self.waiting if seq.is_recompute_replay]
         if self.waiting and not (replay_waiting and self.decoding):
@@ -629,6 +716,9 @@ class Scheduler:
                     self._admission_defer_warned_seq_ids.discard(seq.seq_id)
                     for name, need in costs.items():
                         admission_budgets[name] = int(admission_budgets.get(name, 0) or 0) - int(need)
+                    # Admission hooks may acquire residency before raising.
+                    # Keep cancellation responsible for releasing that ownership.
+                    seq.status = SequenceStatus.RUNNING
                     self.memory_oracle.on_prompt_admitted(seq, costs)
                     if int(getattr(seq, "prefix_cache_hit_len", 0) or 0) > 0:
                         seq.num_prefilled_tokens = int(seq.prefix_cache_hit_len)
@@ -674,6 +764,7 @@ class Scheduler:
                 reserved_prefill=reserved_prefill,
             )
 
+        self._phase_reason = "prefill_unavailable" if self.waiting else "no_prefill"
         # --- 阶段 2: Decode 调度 ---
         # 只有在没有 Prefill 任务时才处理增量生成任务。
         # Decode 优先短序列：如果当前 decoding 队列里存在 short，则本轮只调度 short；
@@ -860,6 +951,7 @@ class Scheduler:
                 if seq.num_prefilled_tokens < seq.num_prompt_tokens:
                     # 没跑完，塞回等待队列头部下次继续
                     seq.status = SequenceStatus.WAITING
+                    self._prefill_wait_since.setdefault(seq.seq_id, time.monotonic())
                     self.waiting.appendleft(seq)
                 else:
                     self.memory_oracle.complete_prefill_execution(seq)

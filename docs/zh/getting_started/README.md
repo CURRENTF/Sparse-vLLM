@@ -150,3 +150,28 @@ Sparse-vLLM runtime 参数定义在 `src/sparsevllm/configs/groups.py` 和 `runt
 - [基准测试](../benchmarking/README.md)
 - [DeltaKV](../features/deltakv.md)
 - [故障排查](troubleshooting.md)
+
+### Scheduler 阶段亲和性
+
+设置 `favor_min_decoding_seqs=4`、`max_decoding_seqs=8` 可启用阶段亲和性。
+前者是用户指定的软阈值，不自动估算；默认 `0` 关闭亲和性并保留 prefill 优先。
+取值必须是 `0..max_decoding_seqs` 的整数。Python API 将它作为 LLM 参数；
+OpenAI 服务 CLI 使用 `--favor-min-decoding-seqs 4`；效率 probe 使用
+`--hyper-params '{"favor_min_decoding_seqs":4}'`。
+
+Decode 阶段中，下一步可执行 decode 数达到阈值时保持 decode，否则尝试 prefill。
+计数沿用已有 short 优先、short/long 分批、decode batch 上限和可写 KV 容量规则，
+包含可执行的 recompute decode；不使用 resident KV 行数。
+没有 prefill 时继续 decode，不等待凑批。最老 prefill 等待达到 60 秒时，
+取消 decode 偏好并优先尝试最老可接纳的 prefill；容量和 replay 恢复约束仍然有效。
+这是执行机会的出口，不是完成时间保证。
+
+进入 prefill 阶段后持续推进 chunk，也接纳符合容量和入场限制的新请求，
+不固定请求集合、不因 decode 数重新达到阈值而逐 chunk 切换。
+没有可执行 prefill 时回到 decode；入场上限不阻止已开始的 partial prefill。
+不设置 prefill 阶段最长时间。连续到达、立即完成并释放容量的短请求仍可能延后 decode。
+
+新请求从 scheduler 入队开始计时；partial 从前一 chunk 完成、重新等待时计时；
+recompute prefill 从抢占入队计时。扫描／容量不足重新入队不会重置计时，
+获得 prefill 执行机会后结束本次等待，取消时清理。策略仅作用于单个 scheduler，
+不实现 DP 副本协调或 mixed prefill/decode。

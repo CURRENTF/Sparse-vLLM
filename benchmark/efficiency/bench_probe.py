@@ -608,6 +608,17 @@ def _replica_concurrency(global_concurrency: int, hyper_params: dict[str, Any]) 
     return (global_concurrency + replicas - 1) // replicas
 
 
+def _resident_sequence_rows(
+    global_concurrency: int, hyper_params: dict[str, Any]
+) -> int:
+    return int(
+        hyper_params.get(
+            "max_num_seqs_in_gpu",
+            _replica_concurrency(global_concurrency, hyper_params),
+        )
+    )
+
+
 def run_sparsevllm_probe(
     args: argparse.Namespace,
     model_specs: ModelArchitectureSpecs,
@@ -645,7 +656,9 @@ def run_sparsevllm_probe(
             min(wave_size, max_concurrency) if wave_size else max_concurrency, hyper_params
         ),
         "max_decoding_seqs": _replica_concurrency(max_concurrency, hyper_params),
-        "max_num_seqs_in_gpu": _replica_concurrency(max_concurrency, hyper_params),
+        "max_num_seqs_in_gpu": _resident_sequence_rows(
+            max_concurrency, hyper_params
+        ),
     }
 
     print(f"[Sparse-vLLM Probe] Initializing LLM with method={args.sparse_method}, max_model_len={max_len_needed}...")
@@ -954,6 +967,7 @@ def run_sparsevllm_churn(
     import torch
     from sparsevllm import LLM, SamplingParams
     from sparsevllm.utils.profiler import profiler
+    from benchmark.efficiency.metrics import scheduler_phase_metrics
 
     results: list[dict[str, Any]] = []
     output_dir = Path(args.output_dir)
@@ -971,7 +985,9 @@ def run_sparsevllm_churn(
             "enable_prefix_caching": False,
             "max_num_seqs_in_batch": _replica_concurrency(concurrency, base_hyper_params),
             "max_decoding_seqs": _replica_concurrency(concurrency, base_hyper_params),
-            "max_num_seqs_in_gpu": _replica_concurrency(concurrency, base_hyper_params),
+            "max_num_seqs_in_gpu": _resident_sequence_rows(
+                concurrency, base_hyper_params
+            ),
         }
         print(
             "[Sparse-vLLM Churn] Initializing "
@@ -1064,10 +1080,18 @@ def run_sparsevllm_churn(
                                 arrival_times[seq_id] = time.perf_counter()
 
                             step_count = 0
+                            scheduler_steps = []
                             while not llm.is_finished():
                                 finished_outputs, _num_tokens = llm.step()
                                 now = time.perf_counter()
                                 step_count += 1
+                                scheduler = getattr(llm, "scheduler", None)
+                                if scheduler is not None:
+                                    scheduler_steps.append({
+                                        "step": step_count,
+                                        "elapsed_s": now - started,
+                                        **scheduler.last_phase_decision,
+                                    })
                                 for seq_id, token_ids in getattr(
                                     llm, "last_step_token_outputs", []
                                 ):
@@ -1149,6 +1173,8 @@ def run_sparsevllm_churn(
                                 "status": "success",
                                 "elapsed_s": elapsed_s,
                                 "step_count": step_count,
+                                "scheduler_steps": scheduler_steps,
+                                "scheduler_metrics": scheduler_phase_metrics(scheduler_steps),
                                 "engine_init_s": engine_init_s,
                                 "startup_decode_cuda_graph": startup_graph_summary,
                                 "decode_cuda_graph_before": graph_before,

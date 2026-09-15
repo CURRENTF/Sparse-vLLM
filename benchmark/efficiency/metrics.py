@@ -529,5 +529,58 @@ def main() -> None:
     print(json.dumps({"status": "success", "records": rows}, indent=2, allow_nan=False))
 
 
+def scheduler_phase_metrics(steps: list[dict]) -> dict:
+    """Host step-return observations, including final/censored phase runs."""
+    durations = {"prefill": [], "decode": []}
+    waits = {"new": [], "partial": []}
+    batches = []
+    reasons = {}
+    previous_time = 0.0
+    phase = None
+    duration = 0.0
+    switches = 0
+    for step in steps:
+        now = float(step["elapsed_s"])
+        if not math.isfinite(now) or now < previous_time:
+            raise ValueError("Scheduler observations must have monotonic finite times.")
+        current = step.get("phase")
+        if current not in durations:
+            previous_time = now
+            continue
+        if phase is not None and current != phase:
+            durations[phase].append(duration)
+            duration = 0.0
+            switches += 1
+        phase = current
+        duration += now - previous_time
+        previous_time = now
+        reason = step["reason"]
+        reasons[reason] = reasons.get(reason, 0) + 1
+        if phase == "decode":
+            batches.append(step["decode_batch"])
+        for wait in step["prefill_waits"]:
+            waits["partial" if wait["partial"] else "new"].append(float(wait["seconds"]))
+    if phase is not None:
+        durations[phase].append(duration)
+
+    def distribution(values):
+        return {
+            "count": len(values),
+            "mean": statistics.mean(values) if values else None,
+            "p50": percentile(values, .5) if values else None,
+            "p95": percentile(values, .95) if values else None,
+            "max": max(values) if values else None,
+        }
+
+    return {
+        "timing_source": "host_step_return_no_extra_sync",
+        "phase_switches": switches,
+        "decision_counts": reasons,
+        "decode_batch": distribution(batches),
+        "phase_run_seconds": {key: distribution(value) for key, value in durations.items()},
+        "prefill_wait_seconds": {key: distribution(value) for key, value in waits.items()},
+    }
+
+
 if __name__ == "__main__":
     main()

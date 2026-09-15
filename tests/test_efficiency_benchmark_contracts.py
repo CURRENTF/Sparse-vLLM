@@ -113,9 +113,19 @@ def test_probe_cli_parser_builds_with_new_workload_options(monkeypatch):
     assert args.churn_request_multiplier == 4
 
 
+@pytest.mark.parametrize(
+    "hyper_params,expected_batch,expected_resident",
+    [
+        ("{}", 16, 16),
+        ('{"data_parallel_size":2,"max_num_seqs_in_gpu":64}', 8, 64),
+    ],
+)
 def test_fixed_probe_sets_engine_capacity_from_largest_batch_size(
     monkeypatch,
     tmp_path,
+    hyper_params,
+    expected_batch,
+    expected_resident,
 ):
     import sparsevllm
 
@@ -132,7 +142,7 @@ def test_fixed_probe_sets_engine_capacity_from_largest_batch_size(
     args = SimpleNamespace(
         scenario="fixed",
         output_dir=str(tmp_path),
-        hyper_params="{}",
+        hyper_params=hyper_params,
         tensor_parallel_size=1,
         expert_parallel_size=1,
         gpu_memory_utilization=0.8,
@@ -149,9 +159,9 @@ def test_fixed_probe_sets_engine_capacity_from_largest_batch_size(
     with pytest.raises(StopAfterEngineInit):
         bench_probe.run_sparsevllm_probe(args, SimpleNamespace())
 
-    assert captured["max_num_seqs_in_batch"] == 16
-    assert captured["max_decoding_seqs"] == 16
-    assert captured["max_num_seqs_in_gpu"] == 16
+    assert captured["max_num_seqs_in_batch"] == expected_batch
+    assert captured["max_decoding_seqs"] == expected_batch
+    assert captured["max_num_seqs_in_gpu"] == expected_resident
     assert captured["expert_parallel_size"] == 1
 
 

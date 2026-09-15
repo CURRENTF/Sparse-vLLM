@@ -67,6 +67,7 @@ class Config(
     # decode and prefill to use different per-step sequence limits.
     decode_reservation_tokens: int = 1024
     max_decoding_seqs: int | None = None
+    favor_min_decoding_seqs: int = 0
     max_num_seqs_in_gpu: int | None = None
 
     engine_prefill_chunk_size: int | None = None
@@ -169,7 +170,7 @@ class Config(
             "Runtime config: model={} sparse_method={} prefill_sparse_method={} "
             "cache_method={} tp={} ep={} dp={} moe_backend={} "
             "max_model_len={} max_batched_tokens={} prefill_chunk={} "
-            "max_prefill_batch={} max_decode_batch={} gpu_utilization={:.3f} "
+            "max_prefill_batch={} max_decode_batch={} favor_min_decoding_seqs={} gpu_utilization={:.3f} "
             "decode_graph={}.",
             self.model,
             self.sparse_method or "vanilla",
@@ -184,6 +185,7 @@ class Config(
             self.engine_prefill_chunk_size,
             self.max_num_seqs_in_batch,
             self.max_decoding_seqs,
+            self.favor_min_decoding_seqs,
             self.gpu_memory_utilization,
             self.decode_graph,
         )

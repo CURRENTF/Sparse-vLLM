@@ -168,3 +168,33 @@ Sparse knobs:
 - [Benchmarks](../benchmarking/README.md)
 - [DeltaKV](../features/deltakv.md)
 - [Troubleshooting](troubleshooting.md)
+
+### Scheduler phase affinity
+
+Set `favor_min_decoding_seqs=4` with `max_decoding_seqs=8` to enable phase affinity.
+The soft threshold is a user-selected hyperparameter, not an automatic estimate.
+The default `0` preserves prefill priority; valid integers range from zero to
+`max_decoding_seqs`. Pass it as an LLM Python argument, as
+`--favor-min-decoding-seqs 4` to the OpenAI server, or via
+`--hyper-params '{"favor_min_decoding_seqs":4}'` to the efficiency probe.
+
+During decode, retain the phase while the next executable decode batch meets the
+threshold; otherwise try prefill. Counting respects existing short-first grouping,
+the decode batch cap and writable KV capacity, including recompute decode work.
+Resident KV rows are not the count. Without waiting prefill, decode continues
+without waiting to fill a batch. After 60 seconds of prefill waiting, override the
+decode preference and try the oldest admissible prefill first. Capacity and replay
+recovery constraints still apply: this grants an execution opportunity, not a
+completion deadline.
+
+Once prefill starts, continue chunks and admit eligible arrivals without fixing
+the request set or switching back merely because decode reaches the threshold.
+Return to decode when no prefill can execute. New-request admission limits do not
+block admitted partial prefills. There is no prefill phase duration cap; continuously
+arriving short requests that finish immediately can still delay decode.
+
+Fresh waiting starts at scheduler admission, partial waiting after the previous
+chunk completes, and recompute waiting at preemption. Queue scans and unsuccessful
+rescheduling preserve timestamps; prefill execution ends that wait and cancellation
+clears it. This policy is local to one scheduler, without DP phase coordination or
+mixed prefill/decode execution.
