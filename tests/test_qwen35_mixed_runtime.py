@@ -411,6 +411,12 @@ class _ResidentAdmissionCache:
     def decode_step_reservation_cost(self, seq):
         return 1
 
+    def step_resource_budgets(self, *, is_prefill):
+        return {}
+
+    def step_resource_costs(self, seq, scheduled_tokens, *, is_prefill):
+        return {}
+
     def prompt_admission_free_slots(self):
         return self.num_free_slots
 

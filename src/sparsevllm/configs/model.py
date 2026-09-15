@@ -20,7 +20,7 @@ from sparsevllm.models.rope import (
     resolve_rope_max_position,
     resolve_rope_parameters,
 )
-from sparsevllm.models.spec import ModelSpec, resolve_model_spec
+from sparsevllm.models.spec import MODEL_SPECS, ModelSpec, resolve_model_spec
 from sparsevllm.quantization import QuantizationConfig
 from sparsevllm.utils.config import config_get
 from sparsevllm.utils.log import logger, log_once
@@ -40,19 +40,26 @@ def _config_to_namespace(config: dict[str, Any]) -> SimpleNamespace:
 
 
 def _load_model_config(model_path: str) -> Any:
+    config_path = os.path.join(model_path, "config.json")
+    raw_config = None
+    if os.path.isfile(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw_config = json.load(f)
+        model_spec = MODEL_SPECS.get(raw_config.get("model_type", ""))
+        # Some native checkpoints use fields that AutoConfig rewrites into a
+        # different model contract (including compression and RoPE metadata).
+        if model_spec is not None and model_spec.prefer_raw_config:
+            return _config_to_namespace(raw_config)
     try:
         return AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     except Exception as error:
         load_error = error
-    config_path = os.path.join(model_path, "config.json")
-    if not os.path.isfile(config_path):
+    if raw_config is None:
         raise RuntimeError(
             "AutoConfig.from_pretrained failed and no config.json exists for an "
             f"explicit raw-config fallback. model={model_path} "
             f"error={type(load_error).__name__}: {load_error}"
         ) from load_error
-    with open(config_path, "r", encoding="utf-8") as f:
-        raw_config = json.load(f)
     model_type = str(config_get(raw_config, "model_type", "") or "")
     model_spec = resolve_model_spec(model_type)
     if not model_spec.allow_raw_config:
@@ -201,6 +208,18 @@ def load_and_validate_model(config) -> None:
         )
     config.outer_hf_config = _load_model_config(config.model)
     model_type = str(config_get(config.outer_hf_config, "model_type", "") or "")
+    from sparsevllm.method_registry import resolve_model_sparse_method
+
+    native_method = resolve_model_sparse_method(model_type, config.sparse_method)
+    if native_method != config.sparse_method:
+        from sparsevllm.configs.sparse import normalize_prefill_sparse_method
+        from sparsevllm.configs.prefix_cache import normalize_prefix_cache
+        from sparsevllm.configs.scheduling import normalize_scheduling
+
+        config.sparse_method = native_method
+        normalize_prefill_sparse_method(config)
+        normalize_prefix_cache(config)
+        normalize_scheduling(config)
     model_spec = resolve_model_spec(model_type)
     config.hf_config = _extract_text_config(config.outer_hf_config)
     outer_dtype = _normalize_hf_config_dtype(config.outer_hf_config, torch.bfloat16)

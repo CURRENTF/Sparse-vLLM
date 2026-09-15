@@ -327,7 +327,28 @@ def _gemma4_checkpoint(outer, config, _raw, quantization, topology) -> None:
         raise ValueError("Gemma 4 MoE requires a positive num_experts.")
 
 
+def _deepseek_v4_checkpoint(outer, config, _raw, quantization, topology):
+    _validate_architecture("DeepSeek V4", outer, "DeepseekV4ForCausalLM")
+    _validate_bf16("DeepSeek V4", config, "BF16 activations")
+    if topology.attn_tp_size != 1 or topology.moe_tp_size != 1:
+        raise ValueError("DeepSeek V4 requires attention TP=1 and MoE TP=1; use DP x EP.")
+    _validate_fields("DeepSeek V4", config, {
+        "head_dim": 512, "num_attention_heads": 64, "num_key_value_heads": 1,
+        "index_head_dim": 128, "index_n_heads": 64, "index_topk": 512, "hc_mult": 4,
+        "expert_dtype": "fp4", "scoring_func": "sqrtsoftplus", "norm_topk_prob": True,
+        "topk_method": "noaux_tc", "tie_word_embeddings": False, "attention_bias": False,
+    })
+    if (not quantization.enabled or quantization.scale_fmt != "ue8m0"
+            or quantization.weight_block_size != (128, 128)):
+        raise ValueError("DeepSeek V4 requires 128x128 FP8 weights with UE8M0 scales.")
+    layers = int(config.num_hidden_layers)
+    ratios = tuple(config_get(config, "compress_ratios", ()))
+    if layers <= 0 or len(ratios) < layers or any(ratio not in (0, 4, 128) for ratio in ratios[:layers]):
+        raise ValueError("DeepSeek V4 requires one supported compression ratio per main layer.")
+
+
 CHECKPOINT_VALIDATORS = {
+    "deepseek_v4": _deepseek_v4_checkpoint,
     "llama": _llama_checkpoint,
     "qwen2": _qwen2_checkpoint,
     "qwen3": _qwen3_checkpoint,

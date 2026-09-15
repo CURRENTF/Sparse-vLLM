@@ -173,17 +173,19 @@ def test_special_weight_resolves_rank_local_slice_from_target_module(tmp_path):
     torch.testing.assert_close(model.experts.weight, full_weight[2:4])
 
 
-def test_load_model_keeps_remote_expert_tensors_as_metadata(tmp_path):
+@pytest.mark.parametrize("scale_suffix", [".weight_scale_inv", ".scale"])
+def test_load_model_keeps_remote_expert_tensors_as_metadata(tmp_path, scale_suffix):
     local_weight = torch.arange(4, dtype=torch.float32).reshape(2, 2)
     save_file(
         {
             "local.weight": local_weight,
             "remote.weight": torch.ones(4, 2),
-            "remote.weight_scale_inv": torch.ones(1, 1),
+            "remote" + scale_suffix: torch.ones(1, 1),
         },
         tmp_path / "model.safetensors",
     )
     model = _ExpertOwnershipModel()
+    model.checkpoint_scale_suffix = scale_suffix
 
     shard = loader._read_safetensors_shard(
         str(tmp_path / "model.safetensors"),
@@ -192,7 +194,7 @@ def test_load_model_keeps_remote_expert_tensors_as_metadata(tmp_path):
     assert set(shard.metadata) == {
         "local.weight",
         "remote.weight",
-        "remote.weight_scale_inv",
+        "remote" + scale_suffix,
     }
     assert set(shard.tensors) == {"local.weight"}
 
@@ -202,6 +204,29 @@ def test_load_model_keeps_remote_expert_tensors_as_metadata(tmp_path):
     assert model.skipped == [
         ("remote.weight", (4, 2), "F32", (1, 1), "F32")
     ]
+
+
+def test_native_scale_reaches_special_loader_and_orphan_scale_is_rejected(tmp_path):
+    # Native FP4/FP8 shards pair .weight with .scale. A scale must neither be
+    # mistaken for a parameter nor silently discarded before provider loading.
+    class ScaledModel(_SpecialRankLocalModel):
+        checkpoint_scale_suffix = ".scale"
+
+        def load_special_weight(self, name, weight, scale):
+            self.seen_scale = scale.clone()
+            return super().load_special_weight(name, weight, None)
+
+    weight = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    scale = torch.tensor([[2., 3.], [4., 5.], [6., 7.], [8., 9.]])
+    path = tmp_path / "model.safetensors"
+    save_file({"expert.weight": weight, "expert.scale": scale}, path)
+    model = ScaledModel()
+    loader.load_model(model, str(tmp_path), show_progress=False)
+    torch.testing.assert_close(model.seen_scale, scale[2:4])
+    torch.testing.assert_close(model.experts.weight, weight[2:4])
+    save_file({"expert.weight": weight, "expert.scale": scale, "experts.scale": scale.clone()}, path)
+    with pytest.raises(ValueError, match="without a grouped"):
+        loader.load_model(model, str(tmp_path), show_progress=False)
 
 
 def test_load_model_selects_all_files_for_local_checkpoint_rank(tmp_path):
