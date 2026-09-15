@@ -11,7 +11,7 @@ from sparsevllm.platforms import current_platform
 
 @pytest.mark.parametrize("load_op", [sqrt_softplus_op, clipped_swiglu_op])
 def test_absent_optional_library_does_not_import_engine(monkeypatch, load_op):
-    import sparsevllm.kernels.external.vllm_moe as adapter
+    import sparsevllm.kernels.external.vllm_support as adapter
     load_op.cache_clear()
     try:
         monkeypatch.delenv("SPARSEVLLM_VLLM_MOE_LIBRARY", raising=False)

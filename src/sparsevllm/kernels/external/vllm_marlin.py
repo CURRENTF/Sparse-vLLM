@@ -9,7 +9,8 @@ from functools import lru_cache
 
 import torch
 
-from sparsevllm.kernels.external.vllm_moe import _load_op, clipped_swiglu_op
+from sparsevllm.kernels.external.vllm_moe import clipped_swiglu_op
+from sparsevllm.kernels.external.vllm_support import _load_op
 
 # vLLM ScalarType.float_(2, 1, finite_values_only=True, nan_repr=NONE).
 MXFP4_TYPE_ID = 2 | (1 << 8) | (1 << 16) | (1 << 49)
