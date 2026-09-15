@@ -23,6 +23,14 @@ extensions. Keep the original checkpoint configuration, tokenizer, safetensors
 index and all weight shards together. The chat example also uses the
 checkpoint's `encoding/encoding_dsv4.py` formatter.
 
+Optionally, reuse routing and clipped SwiGLU kernels from a separate vLLM 0.29 installation
+by setting `SPARSEVLLM_VLLM_MOE_LIBRARY` to that installation's
+`vllm/_moe_C_stable_libtorch.abi3.so`. Keep its sibling
+`_C_stable_libtorch.abi3.so` and wheel metadata in place.
+This loads the kernel libraries without importing the vLLM engine or changing
+Sparse-vLLM's Torch installation. Without this optional library, the portable
+router and activation implementations remain available; an incompatible configured library fails at startup.
+
 ## Four-GPU example
 
 This configuration has been exercised on four H100 80 GB GPUs. Set the model

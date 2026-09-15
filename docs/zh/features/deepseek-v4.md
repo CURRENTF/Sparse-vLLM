@@ -20,6 +20,13 @@ uv sync --extra cu130 --extra deepseek-v4
 全部权重分片保存在同一 checkpoint 目录。下面的聊天示例还使用 checkpoint 自带的
 `encoding/encoding_dsv4.py` 格式化函数。
 
+可选复用独立 vLLM 0.29 环境中的路由和带截断 SwiGLU 算子：将
+`SPARSEVLLM_VLLM_MOE_LIBRARY` 指向该环境的
+`vllm/_moe_C_stable_libtorch.abi3.so`，并保留同目录的
+`_C_stable_libtorch.abi3.so` 和 wheel 元数据。
+此方式只加载算子库，不导入 vLLM 引擎，也不更换 Sparse-vLLM 的 Torch 环境。
+未提供该可选库时仍可使用可移植路由与激活实现；配置了不兼容的库则在启动时明确报错。
+
 ## 四卡示例
 
 以下配置已在四张 H100 80 GB 上运行验证。启动前设置模型目录并选择四张可用 GPU：
