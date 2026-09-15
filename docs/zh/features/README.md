@@ -3,6 +3,7 @@
 本目录收录定义 Sparse-vLLM 行为的稀疏方法文档。
 
 - [支持的模型](supported-models.md)
+- [DeepSeek-V4-Flash-0731（实验性）](deepseek-v4.md)
 - [核心稀疏方法](sparse-methods.md)
 - [FlashPrefill V2](flashprefill-v2.md)
 - [DeltaKV](deltakv.md)
