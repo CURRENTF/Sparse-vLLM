@@ -2,20 +2,23 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sparsevllm.operators.moe_router import MoeRouterOpSpec, resolve_moe_router_provider
+from sparsevllm.operators.moe_router import MoeRouterOpSpec, SqrtSoftplusRouterProvider
+from sparsevllm.platforms import current_platform
 from sparsevllm.operators.workspace import close_workspace_manager, lock_workspace_manager
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("use_hash", [False, True])
-def test_sqrt_softplus_router_matches_reference_and_replays_changed_metadata(use_hash):
+def test_portable_sqrt_softplus_router_matches_reference_and_replays_changed_metadata(use_hash):
     close_workspace_manager()
     try:
         torch.manual_seed(731)
         rows, experts, top_k, vocab = 7, 256, 6, 37
         spec = MoeRouterOpSpec(experts, top_k, torch.float32, True, True,
                                "hash_sqrt_softplus" if use_hash else "sqrt_softplus", rows + 5)
-        provider = resolve_moe_router_provider(spec, device_index=0)
+        # This portable kernel preserves subnormal scores and Torch tie order.
+        # External providers have their own numerical and selection contracts.
+        provider = SqrtSoftplusRouterProvider.bind(spec, current_platform.get_device_caps(0))
         logits = torch.randn((rows, experts), device="cuda", dtype=torch.float32) * 3
         logits[0].zero_()
         logits[1].fill_(-99.)

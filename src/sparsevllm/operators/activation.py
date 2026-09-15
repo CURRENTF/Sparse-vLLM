@@ -64,7 +64,7 @@ class SiluAndMulProvider:
 
 SILU_AND_MUL_REGISTRY: OpRegistry[SiluAndMulSpec, SiluAndMulProvider] = OpRegistry(
     "SiLU-and-multiply",
-    portfolio=PortfolioPolicy(repo_nonstandard=("triton_clipped",), repo_portable=("triton", "torch")),
+    portfolio=PortfolioPolicy(upstream_standard=("vllm_clipped",), repo_nonstandard=("triton_clipped",), repo_portable=("triton", "torch")),
 )
 
 
@@ -149,6 +149,42 @@ class TritonClippedSiluAndMulProvider(SiluAndMulProvider):
         from sparsevllm.kernels.triton.silu_and_mul import clipped_swiglu
         output = x.new_empty((x.shape[0], x.shape[1] // 2))
         clipped_swiglu(x, output, limit=self.spec.swiglu_limit)
+        return output
+
+
+@SILU_AND_MUL_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
+class VllmClippedSiluAndMulProvider(SiluAndMulProvider):
+    name = "vllm_clipped"
+
+    def __init__(self, *, op_spec: SiluAndMulSpec):
+        from sparsevllm.kernels.external.vllm_moe import clipped_swiglu_op
+        self.spec = op_spec
+        self._op = clipped_swiglu_op()
+
+    @classmethod
+    def supports(cls, spec, caps):
+        if spec.swiglu_limit is None:
+            return SupportResult.unsupported("requires clipped SwiGLU")
+        if caps.platform != PlatformEnum.CUDA:
+            return SupportResult.unsupported("requires CUDA")
+        if spec.activation_dtype != torch.bfloat16 or spec.input_ndim != 2 or not spec.contiguous:
+            return SupportResult.unsupported("requires contiguous rank-2 BF16 inputs")
+        from sparsevllm.kernels.external.vllm_moe import clipped_swiglu_op
+        if clipped_swiglu_op() is None:
+            return SupportResult.unsupported("optional vLLM stable-ABI library is unavailable")
+        return SupportResult.yes()
+
+    def binding_metadata(self):
+        return {"kernel_path": "vllm_stable_abi._C.silu_and_mul_with_clamp",
+                "interface": "raw stable-ABI kernel; no vLLM engine dispatcher"}
+
+    def __call__(self, x):
+        _validate_bound_input(x, self.spec)
+        if not x.is_cuda:
+            raise ValueError("Clipped SwiGLU requires a CUDA input.")
+        output = x.new_empty((x.shape[0], x.shape[1] // 2))
+        if output.numel():
+            self._op(output, x, self.spec.swiglu_limit, 1.0, 0.0)
         return output
 
 
