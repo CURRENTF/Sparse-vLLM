@@ -95,9 +95,13 @@ Prefer the smallest path that can express the required computation:
   layouts, or performance cannot be reached cleanly with a JIT path.
 
 Do not replace a mature upstream provider solely because another DSL looks
-promising. Promote a faster local implementation for a standard operation
-through an exact, reproducible profile overlay rather than narrowing or
-reordering the broad atomic portfolio.
+promising. Distinguish algorithmic improvements from device/shape tuning. An improvement
+in computation, data movement, or parallelism may become a default across its
+actual compatible domain after representative correctness and performance
+checks. Explain why it generalizes; do not gate it on measured batch, length,
+TP, or device-name lists. Use exact reproducible profiles for tuning-dependent
+winners or specialized dispatch schedules. Keep performance claims scoped to
+measurements and preserve actual hardware, dtype, layout, and compiler limits.
 
 ### 4. Establish Correctness
 
@@ -174,7 +178,8 @@ Require all applicable gates before calling the work complete:
 7. Commands, Git state, environment, selected provider, and artifacts are
    recorded.
 
-Mark any unrun gate explicitly. Preserve the mature upstream default and the
-portable baseline. Do not promote a repository-owned standard candidate beyond
-its measured profile, but do not call an upstream-supported atomic contract
-unverified merely because Sparse-vLLM lacks every upstream-supported GPU.
+Mark unrun validation explicitly. Keep a compatible baseline for contracts the
+new implementation cannot execute. Algorithmic default promotion does not need
+an exhaustive device/shape/TP matrix: validation records describe observed
+coverage, not an enablement whitelist. Tuning-dependent profile overrides remain
+limited to their recorded domain. Do not claim unmeasured performance wins.

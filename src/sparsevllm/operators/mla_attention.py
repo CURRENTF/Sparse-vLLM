@@ -35,6 +35,7 @@ from sparsevllm.operators.registry import (
     ProfileMatch,
     ProviderRole,
     SupportResult,
+    operator_binding_report,
 )
 from sparsevllm.operators.attention_capabilities import (
     AttentionKernelCapabilities,
@@ -218,6 +219,28 @@ class MlaTritonProvider(MlaAttentionProvider):
         ] | None = None
         self._runtime_kernel_path_counts: dict[str, dict[str, int]] = {}
         self._runtime_fallback_reasons: dict[str, int] = {}
+        self._prefill = None
+        if (
+            self.device.type == "cuda"
+            and type(self).run_prefill_chunk is MlaTritonProvider.run_prefill_chunk
+        ):
+            from sparsevllm.operators.mla_prefill_attention import resolve_mla_prefill
+
+            caps = platforms.current_platform.get_device_caps(self.device.index)
+            self._prefill = resolve_mla_prefill(self.spec, caps)
+
+    def run_prefill_chunk(self, q, k, v, cu_q, cu_k, max_q, max_k, *, causal):
+        if self._prefill is None:
+            raise RuntimeError("MLA prefill was not prepared on a CUDA device")
+        self._record_runtime_kernel_path(self._prefill.kernel_path)
+        return self._prefill(
+            q, k, v, cu_q, cu_k, max_q, max_k,
+            scale=self.spec.softmax_scale, causal=causal,
+        )
+
+    def prefill_workspace_bytes(self, **shape):
+        # Upstream FA3 owns its opaque workspace; startup profiling includes it.
+        return 0 if self._prefill is None else self._prefill.workspace_bytes(**shape)
 
     @classmethod
     def bind(
@@ -240,6 +263,10 @@ class MlaTritonProvider(MlaAttentionProvider):
             "implementation_kind": "atomic_provider",
             "implementation_source": "repo_triton",
             "decode_kernel_path": "triton_mla_stage1_stage2",
+            "prefill": (
+                operator_binding_report(self._prefill).as_dict()
+                if self._prefill is not None else None
+            ),
             "launch_config_source": (
                 "explicit_config" if self._fixed_launch_config is not None else
                 "sm_per_request_v1" if self._sm_count is not None else "portable_default"

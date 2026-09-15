@@ -116,9 +116,12 @@ graph architecture.
   provider and its maintained dispatcher across the upstream-declared support
   domain when it satisfies the Sparse-vLLM operator contract.
 - Keep repository-owned standard Triton or other local implementations as
-  portable production fallbacks, correctness baselines, or exact-profile
-  overrides. Do not make them the broad default merely because they perform
-  well on the limited hardware available to this repository.
+  portable production fallbacks, correctness baselines, or algorithmic defaults.
+  Computation, data-movement, or parallelism improvements may enter the default
+  portfolio across their real compatible domain with a generalization rationale
+  and representative validation. Do not demand a measured shape/batch/TP/device
+  whitelist. Use exact profiles for tuning-dependent winners and specialized
+  schedules; a local win alone does not establish a general algorithmic gain.
 - Concentrate repository-owned production kernels on sparse or otherwise
   non-standard semantics that upstream providers cannot express, such as
   score production, custom cache layouts, state mutation, selection,

@@ -42,8 +42,10 @@ provider、伪造默认输出或掩盖失败。确认某项不兼容后，应优
 
 Atomic eligibility 与验证、性能证据必须分开。实际验证过的设备、shape、dtype、
 graph mode 和结果应写入可复现的 benchmark 或 validation artifact，不能根据 provider
-role 自动推导。缺少记录不自动缩小 portable support。相反，性能 profile、默认性能
-优先级和跨系统性能结论必须严格限制在可复现的实测范围内。一个 kernel 可以在较宽
+role 自动推导。缺少记录不自动缩小 portable support。调参 profile 和性能结论仍须
+限制在可复现的实测范围内；计算、访存或并行方式的算法改进，在说明泛化依据并通过
+代表性正确性和性能验证后，可以按实际兼容范围进入默认 portfolio。已测 shape、
+batch、TP 和 GPU 型号是覆盖记录，不是启用白名单。一个 kernel 可以在较宽
 设备范围内允许尝试，但只能在已有证据的范围内声称正确性已验证或性能占优。
 
 Repo-owned nonstandard kernel 应遵循**乐观可移植、保守声明证据**的原则。当一种
@@ -106,8 +108,8 @@ atomic/profile 判断和 provider metadata。它只解释实现为何被选中�
 ## Ownership Rule
 
 标准算子优先复用上游 atomic provider，repo 只维护 adapter 和 portable
-baseline。只有新增稀疏语义或上游无法表达的 runtime contract，才新增
-repo-owned production kernel。本地 profile 只能覆盖默认选择，不能缩小上游
+baseline。新增稀疏语义、上游无法表达的 runtime contract，或具有明确泛化依据的
+算法改进，都可以成为新增 repo-owned production kernel 的理由。本地 profile 只能覆盖默认选择，不能缩小上游
 支持域。Repo-owned nonstandard kernel 应优先写成可移植的 Triton/TileLang
 实现；它的语义可以非标准，但硬件支持范围不应被有限的本地机器资源人为缩窄。
 

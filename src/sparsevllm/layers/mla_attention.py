@@ -326,6 +326,7 @@ class MLAAttention:
                     hidden_size=self.hidden_size,
                     projection_chunk_size=self.projection_chunk_size,
                     score_request=request,
+                    kernel_workspace_bytes=self.chunked_prefill.kernel_workspace_bytes(plan),
                 )
                 if required > self.prefill_workspace_bytes:
                     raise MemoryError(

@@ -24,7 +24,8 @@ class PrefillPlan:
 
 
 def estimate_mla_prefill_workspace_bytes(
-    *, plan, spec, chunk_size, hidden_size, projection_chunk_size, score_request=None
+    *, plan, spec, chunk_size, hidden_size, projection_chunk_size, score_request=None,
+    kernel_workspace_bytes=0
 ):
     """Modeled live tensors; opaque provider workspaces remain startup-profiled.
 
@@ -73,6 +74,7 @@ def estimate_mla_prefill_workspace_bytes(
         + metadata
         + score_bytes
         + projection_output
+        + kernel_workspace_bytes
     )
 
 
@@ -84,6 +86,22 @@ class ChunkedMlaPrefill:
         self.chunk_size = int(chunk_size)
         self.plan = None
         self.partial = getattr(provider, "run_prefill_chunk", None)
+        self._partial_workspace = getattr(provider, "prefill_workspace_bytes", None)
+
+    def kernel_workspace_bytes(self, plan):
+        if self._partial_workspace is None:
+            return 0
+        queries = tuple(b - a for a, b in zip(plan.query_starts, plan.query_starts[1:]))
+        maximum = max(queries)
+        required = self._partial_workspace(
+            tokens=plan.query_starts[-1], batch=len(queries), max_q=maximum, max_k=maximum,
+        )
+        for request, _, length, _ in plan.history_chunks:
+            qn = queries[request]
+            required = max(required, self._partial_workspace(
+                tokens=qn, batch=1, max_q=qn, max_k=length,
+            ))
+        return required
 
     def clear(self):
         self.plan = None

@@ -61,7 +61,8 @@ provider binding.
 - When a standard upstream provider already exposes a graph-stable lifecycle,
   adapt that lifecycle instead of cloning its kernel. Use a repository-owned
   fixed-grid provider for missing Sparse-vLLM semantics, portable fallback, or
-  an exact measured override—not as an automatic replacement for upstream.
+  an algorithmic improvement supported by representative validation, or an exact
+  measured tuning override. Choose defaults deliberately through the portfolio.
 - Fail unsupported capacity or layout before cache mutation. Once bound, do not
   switch provider, allocate a larger workspace, or fall back after execution
   begins.

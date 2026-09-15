@@ -352,9 +352,12 @@ def test_mla_materializes_actual_keys_for_permuted_slots() -> None:
     torch.testing.assert_close(actual, expected)
 
 
-def test_chunked_prefill_budget_fails_before_projection():
+@pytest.mark.parametrize("split_scratch", [0, 2 * 1024 * 1024])
+def test_chunked_prefill_budget_fails_before_projection(split_scratch):
     # A deliberately small cap must reject before allocating expanded KV.
-    attention = _attention(budget=1)
+    attention = _attention(budget=1024 * 1024 if split_scratch else 1)
+    # The base tensors fit 1 MiB; provider scratch alone must trigger rejection.
+    attention.chunked_prefill._partial_workspace = lambda **shape: split_scratch
     view = _view(
         torch.empty(2, 1, 512, dtype=torch.bfloat16),
         torch.empty(2, 1, 64, dtype=torch.bfloat16),

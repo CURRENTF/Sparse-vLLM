@@ -51,8 +51,11 @@ Keep atomic eligibility separate from validation and performance evidence.
 Record tested devices, shapes, dtypes, graph modes, and results in reproducible
 benchmark or validation artifacts rather than deriving them from provider roles.
 Missing evidence does not automatically narrow a portable support domain. In
-contrast, performance profiles, default performance preferences, and cross-system
-performance claims must stay within reproducible measured evidence. A kernel may
+contrast, exact tuning profiles and performance claims must stay within
+reproducible measured evidence. Algorithmic improvements may enter the default
+portfolio across their real compatible domain after representative validation
+and an explanation of why the computational change generalizes. Tested shapes,
+batches, TP counts, and GPU models are coverage records, not enablement lists. A kernel may
 be eligible to run broadly while claiming validated correctness or superior
 performance only where evidence exists.
 
@@ -147,8 +150,8 @@ validation artifacts, with scope no broader than the tested contract.
 
 For standard operations, prefer upstream atomic providers and maintain only the
 adapter plus a portable repository baseline. Add a repository-owned production
-kernel only for new sparse semantics or a runtime contract that upstream cannot
-express. Local profiles can override default selection; they cannot narrow
+kernel for new sparse semantics, a runtime contract upstream cannot express,
+or an algorithmic improvement with a documented generalization rationale. Local profiles can override default selection; they cannot narrow
 upstream support. Prefer portable Triton or TileLang implementations for
 repository-owned nonstandard kernels: their semantics may be nonstandard, but
 limited local hardware access must not artificially narrow their hardware

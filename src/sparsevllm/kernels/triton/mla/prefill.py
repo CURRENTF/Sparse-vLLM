@@ -10,18 +10,25 @@ from sparsevllm.platforms import device_runtime
 
 
 @lru_cache(maxsize=None)
-def _launch_config(device_index, head_dim):
+def _launch_config(device_index, head_dim, short_query):
     from sparsevllm.kernels.triton.context_flashattention_nopad import (
         _device_max_shared_memory,
         select_context_attention_launch_config,
     )
 
     # Reuse the existing prefill tiles and shared-memory compatibility bound.
-    return select_context_attention_launch_config(
+    max_shared_memory = _device_max_shared_memory(device_index)
+    config = select_context_attention_launch_config(
         head_dim,
-        max_shared_memory=_device_max_shared_memory(device_index),
+        max_shared_memory=max_shared_memory,
         is_tesla="Tesla" in device_runtime.optional_device_name(device_index),
     )
+    if short_query:
+        # The HD256 32x64 three-stage partial uses 151,552 shared bytes
+        # with Triton 3.6; SM120 allows only 101,376 bytes per block.
+        stages = 1 if head_dim == 256 and max_shared_memory < 151552 else 3
+        return 32, 64, 4, stages
+    return config
 
 
 @triton.jit
@@ -52,8 +59,9 @@ def _attention(
     ks, ke = tl.load(CK + batch), tl.load(CK + batch + 1)
     qi = block * M + tl.arange(0, M)
     di = tl.arange(0, D)
+    # Packed ragged tensors can exceed 2**31 elements even with int32 cu_seqlens.
     q = tl.load(
-        Q + (qs + qi[:, None]) * q0 + head * q1 + di[None, :], qi[:, None] < qe - qs, 0
+        Q + (qs.to(tl.int64) + qi[:, None]) * q0 + head * q1 + di[None, :], qi[:, None] < qe - qs, 0
     )
     maximum = tl.full((M,), -float("inf"), tl.float32)
     denominator = tl.zeros((M,), tl.float32)
@@ -67,7 +75,7 @@ def _attention(
     for start in range(0, end, N):
         ki = start + tl.arange(0, N)
         k = tl.load(
-            K + (ks + ki[None, :]) * k0 + head * k1 + di[:, None],
+            K + (ks.to(tl.int64) + ki[None, :]) * k0 + head * k1 + di[:, None],
             ki[None, :] < ke - ks,
             0,
         )
@@ -81,7 +89,7 @@ def _attention(
         p = tl.exp2(z - safe[:, None])
         alpha = tl.exp2(maximum - safe)
         v = tl.load(
-            V + (ks + ki[:, None]) * v0 + head * v1 + di[None, :],
+            V + (ks.to(tl.int64) + ki[:, None]) * v0 + head * v1 + di[None, :],
             ki[:, None] < ke - ks,
             0,
         )
@@ -91,7 +99,7 @@ def _attention(
         maximum = updated
     out = acc / tl.where(denominator > 0, denominator, 1.0)[:, None]
     tl.store(
-        O + ((qs + qi[:, None]) * H + head) * D + di[None, :],
+        O + ((qs.to(tl.int64) + qi[:, None]) * H + head) * D + di[None, :],
         out,
         qi[:, None] < qe - qs,
     )
@@ -103,11 +111,11 @@ def _attention(
 def attention_partial(q, k, v, cu_q, cu_k, max_q, max_k, *, scale, causal):
     output = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     lse = torch.empty((q.shape[1], q.shape[0]), device=q.device, dtype=torch.float32)
-    block_m, block_n, num_warps, num_stages = _launch_config(q.device.index, q.shape[2])
     # Observation-window chunks have few queries but can scan long history.
-    # Retain the original narrow, pipelined tile for these small batches.
-    if max_q < 1024:
-        block_m, block_n, num_warps, num_stages = 32, 64, 4, 3
+    # Resolve the narrow tile within the same device-resource bound.
+    block_m, block_n, num_warps, num_stages = _launch_config(
+        q.device.index, q.shape[2], max_q < 1024
+    )
     _attention[(triton.cdiv(max_q, block_m), q.shape[1], cu_q.numel() - 1)](
         q,
         k,

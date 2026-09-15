@@ -15,6 +15,34 @@ from sparsevllm.operators.mla_attention import MlaAttentionOpSpec, MlaSglFa3Prov
 from sparsevllm.operators.mla_prefill import ChunkedMlaPrefill
 
 
+def partial_provider(backend, spec, device, batch_size):
+    if backend == "triton":
+        return SimpleNamespace()
+    if backend == "prepared":
+        if torch.cuda.get_device_capability(device)[0] < 8:
+            pytest.skip("pipelined MLA requires Ampere or newer")
+        from sparsevllm import platforms
+        from sparsevllm.operators.mla_prefill_attention import resolve_mla_prefill
+
+        prepared = resolve_mla_prefill(spec, platforms.current_platform.get_device_caps(device.index))
+
+        def partial(q, k, v, cu_q, cu_k, max_q, max_k, *, causal):
+            return prepared(
+                q, k, v, cu_q, cu_k, max_q, max_k,
+                scale=spec.softmax_scale, causal=causal,
+            )
+
+        return SimpleNamespace(
+            run_prefill_chunk=partial, prefill_workspace_bytes=prepared.workspace_bytes,
+        )
+    from sparsevllm.kernels.external.sgl.fa3 import sgl_fa3_device_support
+
+    supported, reason = sgl_fa3_device_support(device.index)
+    if not supported:
+        pytest.skip(reason)
+    return MlaSglFa3Provider(op_spec=spec, device=device, max_batch_size=batch_size)
+
+
 def test_reused_mla_plan_tracks_current_layer_score_request():
     # Adjacent full layers share packing but only the final one may observe
     # scores for a sparse successor. Single-view numerical tests miss this.
@@ -173,6 +201,11 @@ def test_main_attention_max_scores_reuse_output_and_match_full_qk():
 @pytest.mark.parametrize(
     "mode,full_normalizer,backend",
     [
+        ("logits", False, "triton"),
+        ("probability", False, "triton"),
+        ("logits", False, "prepared"),
+        ("probability", False, "prepared"),
+        ("probability", True, "prepared"),
         ("logits", False, "fa3"),
         ("probability", False, "fa3"),
         ("probability", True, "triton"),
@@ -185,11 +218,7 @@ def test_chunked_attention_and_scores_match_explicit_oracle(
     # Independent full softmax protects masks, global normalization, physical
     # slot indirection, and score reductions across uneven history/query blocks.
     spec, q, view, cu, project, absorb = make_case()
-    provider = (
-        MlaSglFa3Provider(op_spec=spec, device="cuda:0", max_batch_size=3)
-        if backend == "fa3"
-        else SimpleNamespace()
-    )
+    provider = partial_provider(backend, spec, q.device, 3)
     runner = ChunkedMlaPrefill(spec, provider, 19)
     contexts, starts = view.meta.context_lens.tolist(), cu.tolist()
     ranges = tuple(
@@ -241,9 +270,10 @@ def test_chunked_attention_and_scores_match_explicit_oracle(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("mode", [None, "logits", "probability"])
-def test_chunk_size_preserves_outputs_and_bounds_history_projection(mode):
+@pytest.mark.parametrize("backend", ["triton", "fa3", "prepared"])
+def test_chunk_size_preserves_outputs_and_bounds_history_projection(mode, backend):
     spec, q, view, cu, project, absorb = make_case(contexts=(171, 53), queries=(35, 5))
-    provider = MlaSglFa3Provider(op_spec=spec, device="cuda:0", max_batch_size=2)
+    provider = partial_provider(backend, spec, q.device, 2)
     # Scoring must not re-project historical KV after the attention pass.
     request = PrefillScoreRequest(((166, 171), (48, 53)), mode, 3, 4) if mode else None
     outputs = []
@@ -316,11 +346,12 @@ def test_history_budget_is_bounded_and_plan_released():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_multi_tile_observations_and_empty_candidates():
+@pytest.mark.parametrize("backend", ["triton", "fa3", "prepared"])
+def test_multi_tile_observations_and_empty_candidates(backend):
     # H2O can observe more than one 32-query tile. Entire candidate blocks may
     # be causally masked; they must contribute zero probability, never NaN.
     spec, q, view, cu, project, absorb = make_case((239,), (137,), heads=20)
-    provider = MlaSglFa3Provider(op_spec=spec, device="cuda:0", max_batch_size=1)
+    provider = partial_provider(backend, spec, q.device, 1)
     runner = ChunkedMlaPrefill(spec, provider, 53)
     req = PrefillScoreRequest(((102, 239),), "probability", 130, 3)
     _, _, scores = runner.run(q, view, cu, object(), project, absorb, req)

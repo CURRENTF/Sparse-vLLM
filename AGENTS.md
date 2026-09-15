@@ -96,12 +96,21 @@ use the documented Nsight diagnostic for kernel-timeline attribution.
    default across its declared compatible domain. Keep repository-owned Triton
    or other portable implementations as correctness baselines and fallbacks for
    unsupported contracts or absent optional dependencies; an installed but
-   broken compatible dependency must fail explicitly.
+   broken compatible dependency must fail explicitly. Algorithmic improvements
+   may enter the default portfolio across their actual compatible domain when
+   the computation, memory traffic, or parallelism change explains generalization
+   and representative correctness/performance checks support the choice. Do not
+   require a whitelist of measured shapes, batch sizes, TP counts, or GPU models.
+   Retain real dtype, layout, hardware-feature, and known compiler constraints.
 3. A matched local performance profile may override the upstream default only
    for its exact recorded device, contract, shape or runtime bucket, topology,
    graph mode, and toolchain. A profile miss returns to the upstream-first
-   default; it must not select Triton merely because that setting was unmeasured
+   default (including adopted algorithmic improvements); it must not select
+   Triton merely because that setting was unmeasured
    or because FlashInfer or SGL did not win every benchmarked setting.
+   Reserve exact profiles for device/toolchain/shape tuning or specialized
+   dispatch schedules. Validation artifacts describe tested coverage; they are
+   not enablement whitelists. Performance claims still require measurements.
 4. Do not narrow an upstream provider's correctness domain because local
    hardware or shape coverage is incomplete. Validate the adapter and the
    Sparse-vLLM-specific boundary, and record upstream-declared support separately
