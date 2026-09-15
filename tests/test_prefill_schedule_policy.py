@@ -48,6 +48,12 @@ from sparsevllm.method_registry import (
 
 
 class FakeMemoryOracle:
+    def step_resource_budgets(self, *, is_prefill):
+        return {}
+
+    def step_resource_costs(self, seq, scheduled_tokens, *, is_prefill):
+        return {}
+
     def prefill_private_slots_for(self, seq):
         return 0
 

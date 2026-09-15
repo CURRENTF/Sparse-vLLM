@@ -217,7 +217,14 @@ class MlaLatentPayload:
     rope_cache: torch.Tensor
 
 
-AttentionPayload = ExplicitKVPayload | MlaLatentPayload
+@dataclass(frozen=True)
+class SharedKVPayload:
+    """A single vector is both key and value in native indexed attention."""
+
+    cache: torch.Tensor
+
+
+AttentionPayload = ExplicitKVPayload | MlaLatentPayload | SharedKVPayload
 
 
 @dataclass(frozen=True)
@@ -270,7 +277,14 @@ class MlaLatentWrite:
     rope: torch.Tensor
 
 
-AttentionCacheWrite = ExplicitKVWrite | MlaLatentWrite
+@dataclass(frozen=True)
+class SharedKVWrite:
+    values: torch.Tensor
+    # Negative positions suppress non-boundary compression outputs on replay.
+    positions: torch.Tensor | None = None
+
+
+AttentionCacheWrite = ExplicitKVWrite | MlaLatentWrite | SharedKVWrite
 
 
 @dataclass(frozen=True)
@@ -458,6 +472,11 @@ class CacheManager(ABC):
         if sparse_method not in SUPPORTED_SPARSE_METHODS:
             raise ValueError(f"Unsupported sparse_method={sparse_method!r}.")
         from sparsevllm.method_registry import QUANTIZED_KV_METHODS
+
+        if sparse_method == "deepseek_v4":
+            from .methods.deepseek_v4_manager import DeepseekV4CacheManager
+
+            return create_manager(DeepseekV4CacheManager)
 
         if sparse_method in QUANTIZED_KV_METHODS:
             from .quantized import QuantizedCacheManager
@@ -804,6 +823,10 @@ class CacheManager(ABC):
     @abstractmethod
     def get_layer_batch_states(self, layer_idx: int) -> LayerBatchStates:
         raise NotImplementedError
+
+    def native_attention_executions(self):
+        """Typed native cache operations and batch views in transformer-layer order."""
+        raise TypeError("This cache representation does not provide native indexed shared-KV execution.")
 
     @abstractmethod
     def get_layer_kv_cache(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1633,6 +1656,14 @@ class CacheManager(ABC):
     def decode_step_reservation_cost(self, seq: Sequence) -> int:
         """Scheduler-side capacity consumed by scheduling one decode token."""
         return 1
+
+    def step_resource_budgets(self, *, is_prefill: bool) -> dict[str, int]:
+        """Additional independent physical pools, beyond the scalar token budget."""
+        return {}
+
+    def step_resource_costs(self, seq: Sequence, scheduled_tokens: int, *, is_prefill: bool) -> dict[str, int]:
+        """Per-pool append cost; must be nondecreasing in scheduled_tokens."""
+        return {}
 
     def prompt_admission_free_slots(self) -> int:
         """Slots pool used to decide whether a new prompt can be admitted."""

@@ -11,6 +11,7 @@ from ..base import AttentionCacheWrite, AttentionPayload
 class CacheLayout(str, Enum):
     EXPLICIT_KV = "explicit_kv"
     MLA_LATENT = "mla_latent"
+    SHARED_KV = "shared_kv"
 
 
 @runtime_checkable

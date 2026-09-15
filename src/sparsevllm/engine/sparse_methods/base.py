@@ -171,6 +171,9 @@ class SparseMethodRuntime(ABC):
     def decode_graph_keepalive_tensors(self) -> list[torch.Tensor]:
         return []
 
+    def select_compressed_index(self, query, weights, view, *, out):
+        raise TypeError("This sparse runtime does not select native compressed keys.")
+
     def reset_decode_attn_scores_for_graph(
         self,
         refs: dict[int, dict[str, object]],
