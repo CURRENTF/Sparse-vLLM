@@ -9,6 +9,7 @@ def _snapshot_window(
     Cache, Rows, Cu, Starts, SourceRequests, DestinationRows, Ends,
     WINDOW: tl.constexpr, DIM: tl.constexpr, TEMP_OFFSET: tl.constexpr,
     DECODE: tl.constexpr, BLOCK: tl.constexpr,
+    PACKED: tl.constexpr, PAGE_STRIDE: tl.constexpr,
 ):
     snapshot = tl.program_id(0)
     destination = tl.load(DestinationRows + snapshot)
@@ -27,16 +28,26 @@ def _snapshot_window(
             source_slot = old_slot
         else:
             source_slot = tl.where(position >= start, TEMP_OFFSET + packed_start + position - start, old_slot)
-        value = tl.load(Cache + source_slot * DIM + dim, (index < WINDOW * DIM) & (position >= 0), other=0)
         target_slot = destination * WINDOW + ring_slot
-        tl.store(Cache + target_slot * DIM + dim, value, index < WINDOW * DIM)
+        if PACKED:
+            # A slot's 576 data bytes and eight scale bytes live in separate
+            # regions. Copy only owned slot bytes, never neighboring page slots.
+            source = source_slot // 64 * PAGE_STRIDE + tl.where(
+                dim < 576, source_slot % 64 * 576 + dim, 64 * 576 + source_slot % 64 * 8 + dim - 576)
+            target = target_slot // 64 * PAGE_STRIDE + tl.where(
+                dim < 576, target_slot % 64 * 576 + dim, 64 * 576 + target_slot % 64 * 8 + dim - 576)
+        else:
+            source, target = source_slot * DIM + dim, target_slot * DIM + dim
+        value = tl.load(Cache + source, (index < WINDOW * DIM) & (position >= 0), other=0)
+        tl.store(Cache + target, value, index < WINDOW * DIM)
 
 
-def snapshot_window(cache, request_rows, cu_seqlens, starts, snapshots, *, window_size, temporary_offset, decode):
+def snapshot_window(cache, request_rows, cu_seqlens, starts, snapshots, *, window_size, temporary_offset, decode,
+                    packed=False):
     if snapshots.destination_rows.numel():
         dim = cache.shape[-1]
         _snapshot_window[(snapshots.destination_rows.numel(), tr.cdiv(window_size * dim, 256))](
             cache, request_rows, cu_seqlens, starts, snapshots.source_requests,
             snapshots.destination_rows, snapshots.ends, window_size, dim,
-            temporary_offset, decode, 256,
+            temporary_offset, decode, 256, packed, cache.stride(0),
         )

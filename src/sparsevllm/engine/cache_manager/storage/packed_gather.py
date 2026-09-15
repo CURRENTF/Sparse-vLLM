@@ -1,11 +1,21 @@
 """Cache-owned active-page materialization shared by sequential native layers."""
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 import torch
 
 from .packed_shared_kv import HEAD_DIM, PAGE_SIZE
+
+
+@lru_cache(maxsize=1)
+def _remap_op():
+    def remap(indices, page_map):
+        pages = page_map[(indices.clamp_min(0) // PAGE_SIZE).long()]
+        torch._assert_async(((indices < 0) | (pages >= 0)).all(), "Active KV page is missing from the gather plan")
+        indices.copy_(torch.where(indices >= 0, pages * PAGE_SIZE + indices % PAGE_SIZE, -1))
+    return torch.compile(remap, fullgraph=True, dynamic=True)
 
 
 @dataclass
@@ -65,3 +75,9 @@ class PackedSharedKVGather:
         if plan.active_pages:
             storage.gather(layer_idx, out, plan.block_table, plan.length)
         return out[0, :, None], plan.page_map
+
+    def attention_view(self, storage, ratio, indices):
+        from ..native_attention import IndexedSharedKVView
+        values, page_map = self.materialize(storage, ratio)
+        _remap_op()(indices, page_map)
+        return IndexedSharedKVView(values, indices)

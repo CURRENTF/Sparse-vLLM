@@ -5,6 +5,7 @@ import torch
 
 from sparsevllm.engine.cache_manager.methods.deepseek_v4 import CompressionChunk, StateSnapshot
 from sparsevllm.engine.cache_manager.storage.native_layer import NativeAttentionLayerStorage
+from sparsevllm.engine.cache_manager.storage.packed_gather import PackedSharedKVGather
 from sparsevllm.engine.cache_manager.storage.shared_kv_views import SharedKVRegions
 from sparsevllm.operators.compression import CompressionOpSpec, prepare_compression
 from sparsevllm.operators.workspace import close_workspace_manager, lock_workspace_manager
@@ -12,7 +13,8 @@ from sparsevllm.operators.workspace import close_workspace_manager, lock_workspa
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("ratio", [0, 4, 128])
-def test_native_prefix_snapshot_restore_and_graph(ratio):
+@pytest.mark.parametrize("packed_kv", [False, True])
+def test_native_prefix_snapshot_restore_and_graph(ratio, packed_kv):
     # Early snapshots need old carry; later snapshots need an intermediate
     # chunk tail that the ordinary commit would overwrite. Both active
     # requests advance beyond every saved boundary before either is restored.
@@ -20,8 +22,15 @@ def test_native_prefix_snapshot_restore_and_graph(ratio):
     rows, capacity, dim, total = 12, 535, 512, 400
     columns = total // ratio if ratio else 0
     slots = torch.arange(rows * columns, device="cuda", dtype=torch.int32).view(rows, columns) if ratio else None
-    cache = NativeAttentionLayerStorage(regions=SharedKVRegions(rows, 128, rows * columns, capacity),
-                                       head_dim=dim, ratio=ratio, compressed_slots=slots, device="cuda")
+    regions = SharedKVRegions(rows, 128, rows * columns, capacity)
+    gather = None
+    if packed_kv:
+        from sparsevllm.kernels.external.vllm_cache import shared_kv_cache_ops
+        if shared_kv_cache_ops() is None:
+            pytest.skip("optional vLLM cache kernels are unavailable")
+        gather = PackedSharedKVGather({ratio: (regions.num_slots + 63) // 64}, device="cuda")
+    cache = NativeAttentionLayerStorage(regions=regions, head_dim=dim, ratio=ratio,
+                                       compressed_slots=slots, device="cuda", packed_kv=packed_kv, gather=gather)
     cache.kv.cache.fill_(71.)
     histories = {row: torch.randn((total, 1, dim), device="cuda", dtype=torch.bfloat16) for row in (0, 1)}
     projections, providers, apes = {}, {}, {}
@@ -56,8 +65,19 @@ def test_native_prefix_snapshot_restore_and_graph(ratio):
         return result
 
     def assert_snapshot(source, end, destination):
-        window = cache.kv.cache[0, destination*128:(destination+1)*128]
-        torch.testing.assert_close(window, expected_ring(histories[source], end, 128), rtol=0, atol=0)
+        expected = expected_ring(histories[source], end, 128)
+        if packed_kv:
+            window = torch.empty(1, 128, dim, dtype=torch.bfloat16, device="cuda")
+            table = torch.tensor([[destination * 2, destination * 2 + 1]], device="cuda", dtype=torch.int32)
+            cache.kv.gather(0, window, table, torch.tensor([128], device="cuda", dtype=torch.int32))
+            window = window[0, :, None]
+            groups = expected[:, 0, :448].float().reshape(128, 7, 64)
+            scale = torch.exp2(torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(1e-4) / 448)))
+            rounded = (groups / scale[..., None]).to(torch.float8_e4m3fn).float() * scale[..., None]
+            expected[:, 0, :448] = rounded.flatten(1).bfloat16()
+        else:
+            window = cache.kv.cache[0, destination*128:(destination+1)*128]
+        torch.testing.assert_close(window, expected, rtol=0, atol=0)
         for name, values in projections.items():
             view = getattr(cache, "carry" if name == "compression" else "index_carry")
             for tensor, history in zip(view.accounting_tensors(), values[source]):

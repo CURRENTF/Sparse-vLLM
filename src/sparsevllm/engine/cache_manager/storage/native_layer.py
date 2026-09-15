@@ -6,7 +6,9 @@ import torch
 
 from ..base import SharedKVWrite
 from ..methods.deepseek_v4 import CompressionPlan
-from ..native_attention import CompressedIndexView, CompressionBatchView, NativeStateSnapshots, SharedKVWindowBatch
+from ..native_attention import (CompressedIndexView, CompressionBatchView, IndexedPackedSharedKVView,
+                                NativeStateSnapshots, SharedKVWindowBatch)
+from .packed_shared_kv import PackedSharedKVStorage
 from .shared_kv import CompressionCarryStorage, SharedKVStorage
 from .shared_kv_views import SharedKVRegions
 
@@ -31,7 +33,8 @@ class NativeAttentionBatch:
 
 
 class NativeAttentionLayerStorage:
-    def __init__(self, *, regions: SharedKVRegions, head_dim, ratio, compressed_slots, device, index_dim=128):
+    def __init__(self, *, regions: SharedKVRegions, head_dim, ratio, compressed_slots, device, index_dim=128,
+                 packed_kv=False, gather=None):
         if ratio not in (0, 4, 128):
             raise ValueError("Native attention storage requires ratio 0, 4 or 128.")
         if ratio and (compressed_slots is None or compressed_slots.ndim != 2
@@ -40,7 +43,10 @@ class NativeAttentionLayerStorage:
         if not ratio and compressed_slots is not None:
             raise ValueError("Window-only layers do not have compressed slots.")
         self.regions, self.ratio, self.compressed_slots = regions, ratio, compressed_slots
-        self.kv = SharedKVStorage(head_dim=head_dim)
+        if packed_kv and (head_dim != 512 or gather is None):
+            raise ValueError("Packed native layers require dimension 512 and a cache-owned gather workspace.")
+        self.packed_kv, self.gather = packed_kv, gather
+        self.kv = PackedSharedKVStorage() if packed_kv else SharedKVStorage(head_dim=head_dim)
         self.kv.allocate(num_layers=1, num_slots=regions.num_slots, device=device)
         self.device = self.kv.cache.device
         self.carry = self.index_carry = self.index = None
@@ -152,7 +158,8 @@ class NativeAttentionLayerStorage:
             from sparsevllm.kernels.triton.deepseek_v4.window_snapshot import snapshot_window
             snapshot_window(self.kv.layer_payload(0).cache, batch.request_rows, batch.cu_seqlens, batch.start_positions,
                             batch.state_snapshots, window_size=self.regions.window_size,
-                            temporary_offset=self.regions.temporary_offset, decode=batch.window.chunk_starts is None)
+                            temporary_offset=self.regions.temporary_offset, decode=batch.window.chunk_starts is None,
+                            packed=self.packed_kv)
 
     def restore_state_rows(self, source_rows, destination_rows):
         """Restore private mutable state; the parent separately attaches shared compressed slots."""
@@ -173,12 +180,15 @@ class NativeAttentionLayerStorage:
         self.index.store(0, batch.index_write_slots, SharedKVWrite(values[:, None], positions))
 
     def attention_view(self, batch, selected=None):
-        if self.ratio == 128:
-            return self.regions.attention_view(self.kv.layer_payload(0).cache, batch.window, batch.attention_indices,
-                                               compressed=self.compressed_slots, compressed_lengths=batch.compressed_lengths,
-                                               compressed_per_request=True)
+        kwargs = dict(compressed=self.compressed_slots, compressed_lengths=batch.compressed_lengths,
+                      compressed_per_request=True) if self.ratio == 128 else dict(compressed=selected)
+        if self.packed_kv:
+            indices = self.regions.attention_indices(batch.window, batch.attention_indices, **kwargs)
+            if batch.window.chunk_starts is None:
+                return IndexedPackedSharedKVView(self.kv.layer_payload(0), indices)
+            return self.gather.attention_view(self.kv, self.ratio, indices)
         return self.regions.attention_view(self.kv.layer_payload(0).cache, batch.window, batch.attention_indices,
-                                           compressed=selected)
+                                           **kwargs)
 
     def finish_window(self, batch, values):
         if batch.window.chunk_starts is not None:

@@ -10,6 +10,8 @@ from ..methods.deepseek_v4 import CompressionChunk, StateSnapshot
 from ..native_attention import SharedKVWindowBatch
 from .native_layer import NativeAttentionLayerStorage
 from .native_capacity import NativeCacheGeometry
+from .packed_gather import PackedSharedKVGather
+from .packed_shared_kv import PAGE_SIZE
 from .shared_kv_views import SharedKVRegions
 
 
@@ -86,7 +88,7 @@ class NativeDecodeState:
 
 class NativeCachePool:
     def __init__(self, *, ratios, live_rows, snapshot_rows, max_model_len, prefill_capacity,
-                 compressed_capacities, device, head_dim=512, index_dim=128, window_size=128):
+                 compressed_capacities, device, head_dim=512, index_dim=128, window_size=128, packed_kv=False):
         if (not ratios or any(r not in (0, 4, 128) for r in ratios)
                 or min(live_rows, max_model_len, prefill_capacity) <= 0 or snapshot_rows < 0):
             raise ValueError("Native pools require valid layer ratios and positive live/token capacities.")
@@ -97,7 +99,12 @@ class NativeCachePool:
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
         self.max_model_len, self.prefill_capacity = max_model_len, prefill_capacity
-        self.geometry = NativeCacheGeometry(tuple(ratios), max_model_len, prefill_capacity, head_dim, index_dim, window_size)
+        self.geometry = NativeCacheGeometry(tuple(ratios), max_model_len, prefill_capacity,
+                                             head_dim, index_dim, window_size, packed_kv)
+        self.gather = PackedSharedKVGather(
+            self.geometry.gather_page_capacities(live_rows, snapshot_rows, compressed_capacities),
+            device=self.device,
+        ) if packed_kv else None
         self.free_live_rows = deque(range(live_rows))
         self.free_snapshot_rows = deque(range(live_rows, live_rows + snapshot_rows))
         self.live = {}
@@ -111,11 +118,12 @@ class NativeCachePool:
             regions=SharedKVRegions(live_rows + snapshot_rows, window_size,
                                     compressed_capacities.get(ratio, 0), prefill_capacity),
             head_dim=head_dim, ratio=ratio, compressed_slots=self.tables.get(ratio),
-            device=self.device, index_dim=index_dim,
+            device=self.device, index_dim=index_dim, packed_kv=packed_kv, gather=self.gather,
         ) for ratio in ratios)
 
     def accounting_tensors(self):
-        return (*self.tables.values(), *(tensor for layer in self.layers for tensor in layer.accounting_tensors()))
+        return (*self.tables.values(), *(tensor for layer in self.layers for tensor in layer.accounting_tensors()),
+                *(() if self.gather is None else self.gather.accounting_tensors()))
 
     def allocated_bytes(self):
         return sum(t.numel() * t.element_size() for t in self.accounting_tensors())
@@ -165,6 +173,19 @@ class NativeCachePool:
                     changes["index_view"] = replace(template.index_view, keys=layer.index.cache[0, :, 0])
                 batches.append(replace(template, **changes))
         return tuple(batches)
+
+    def _prepare_gather(self, chunks):
+        # Existing host tables include newly reserved compressed slots. Build a
+        # superset once per ratio, before query-dependent selection on the GPU.
+        for ratio, regions in {layer.ratio: layer.regions for layer in self.layers}.items():
+            tokens = sum(chunk.length for chunk in chunks)
+            slots = [np.arange(regions.temporary_offset, regions.temporary_offset + tokens, dtype=np.int32)]
+            for chunk in chunks:
+                row = chunk.request_row
+                slots.append(np.arange(row * regions.window_size, (row + 1) * regions.window_size, dtype=np.int32))
+                if ratio:
+                    slots.append(regions.compressed_offset + self._row_slots(ratio, row, chunk.start + chunk.length))
+            self.gather.prepare(ratio, np.concatenate(slots) // PAGE_SIZE)
 
     def reserve_prefill(self, requests, *, snapshot_ends=None):
         """Reserve a complete mixed step atomically before any model state is changed.
@@ -219,6 +240,8 @@ class NativeCachePool:
                     if carry is not None:
                         carry.clear_rows(rows)
         chunks, plan = tuple(chunks), tuple(plan)
+        if self.gather is not None:
+            self._prepare_gather(chunks)
         batches = self._layer_batches(lambda layer: layer.make_prefill_batch(chunks, snapshots=plan))
         return NativePoolStep(reservation, ids, chunks, tuple(snapshots), plan, batches)
 

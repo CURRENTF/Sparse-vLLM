@@ -73,7 +73,8 @@ class DeepseekV4CacheManager(CacheManager):
         self.pool = NativeCachePool(ratios=geometry.ratios, live_rows=self.max_buffer_rows, snapshot_rows=snapshot_rows,
                                     max_model_len=self.max_model_len, prefill_capacity=geometry.prefill_capacity,
                                     compressed_capacities=plan.compressed_capacities, device=self.device,
-                                    head_dim=geometry.head_dim, index_dim=geometry.index_dim, window_size=geometry.window_size)
+                                    head_dim=geometry.head_dim, index_dim=geometry.index_dim, window_size=geometry.window_size,
+                                    packed_kv=geometry.packed_kv)
         self.config.num_kvcache_slots = min((capacity * ratio for ratio, capacity in plan.compressed_capacities.items()),
                                            default=self.max_buffer_rows * self.max_model_len)
 

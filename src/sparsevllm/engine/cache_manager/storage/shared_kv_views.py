@@ -44,9 +44,15 @@ class SharedKVRegions:
 
     def attention_view(self, kv, batch: SharedKVWindowBatch, indices, *, compressed=None,
                        compressed_lengths=None, compressed_per_request=False):
-        n, device = self._validate_batch(batch)
-        if kv.ndim != 3 or kv.shape[:2] != (self.num_slots, 1) or kv.device != device:
+        if kv.ndim != 3 or kv.shape[:2] != (self.num_slots, 1) or kv.device != batch.positions.device:
             raise ValueError("Shared KV payload does not match the prepared physical regions.")
+        self.attention_indices(batch, indices, compressed=compressed, compressed_lengths=compressed_lengths,
+                               compressed_per_request=compressed_per_request)
+        return IndexedSharedKVView(kv, indices)
+
+    def attention_indices(self, batch, indices, *, compressed=None, compressed_lengths=None,
+                          compressed_per_request=False):
+        n, device = self._validate_batch(batch)
         capacity = 0
         if compressed is not None:
             expected_rows = self.num_request_rows if compressed_per_request else n
@@ -68,7 +74,7 @@ class SharedKVRegions:
         shared_kv_indices(batch, compressed, compressed_lengths, indices, window_size=self.window_size,
                           window_offset=0, temporary_offset=self.temporary_offset,
                           compressed_offset=self.compressed_offset, compressed_per_request=compressed_per_request)
-        return IndexedSharedKVView(kv, indices)
+        return indices
 
     def commit_slots(self, batch: SharedKVWindowBatch, out):
         n, device = self._validate_batch(batch)

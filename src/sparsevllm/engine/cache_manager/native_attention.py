@@ -42,6 +42,14 @@ class PackedSharedKVPayload:
 
 
 @dataclass(frozen=True)
+class IndexedPackedSharedKVView:
+    """Decode reads packed physical pages directly with token-slot indices."""
+
+    payload: PackedSharedKVPayload
+    indices: torch.Tensor
+
+
+@dataclass(frozen=True)
 class NativeStateSnapshots:
     """Copy exact prefix-end state into cache-owned, disjoint snapshot rows.
 

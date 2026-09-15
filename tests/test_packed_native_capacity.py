@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from sparsevllm.engine.cache_manager.storage.native_capacity import NativeCacheGeometry
+from sparsevllm.engine.cache_manager.storage.native_pool import NativeCachePool
 from sparsevllm.engine.cache_manager.storage.packed_gather import PackedSharedKVGather
 from sparsevllm.engine.cache_manager.storage.packed_shared_kv import PackedSharedKVStorage
 from sparsevllm.engine.cache_manager.storage.shared_kv import CompressionCarryStorage, SharedKVStorage
@@ -39,6 +40,9 @@ def test_packed_capacity_matches_physical_allocations(ratios, capacities):
     geometry = NativeCacheGeometry(ratios, 512, 33, packed_kv=True)
     actual = _physical_bytes(ratios, 5, 33, capacities, 512)
     assert geometry.allocation_bytes(3, 2, capacities) == actual
+    pool = NativeCachePool(ratios=ratios, live_rows=3, snapshot_rows=2, max_model_len=512,
+                           prefill_capacity=33, compressed_capacities=capacities, device="cpu", packed_kv=True)
+    assert pool.allocated_bytes() == actual
 
 
 def test_packed_admission_finds_largest_capacity_across_page_rounding():
