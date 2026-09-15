@@ -24,6 +24,7 @@ class MoeDispatch:
     hidden_states: torch.Tensor
     local_rows: int
     capacity: int
+    routing_metadata: torch.Tensor | None = None
 
 
 class MoeCommunication:
@@ -34,11 +35,15 @@ class MoeCommunication:
     model's router and compatible local expert provider.
     """
 
-    def _run(self, hidden_states, *, route, experts, chunk_size, capacity):
-        dispatch = self.dispatch(hidden_states, capacity=capacity)
+    def _run(self, hidden_states, *, route, experts, chunk_size, capacity, routing_metadata=None):
+        dispatch = self.dispatch(hidden_states, capacity=capacity, routing_metadata=routing_metadata)
         outputs = []
-        for chunk in dispatch.hidden_states.split(chunk_size, dim=0):
-            ids, weights = route(chunk)
+        for index, chunk in enumerate(dispatch.hidden_states.split(chunk_size, dim=0)):
+            if dispatch.routing_metadata is None:
+                ids, weights = route(chunk)
+            else:
+                metadata = dispatch.routing_metadata[index * chunk_size:index * chunk_size + len(chunk)]
+                ids, weights = route(chunk, metadata)
             outputs.append(experts(chunk, ids, weights))
         output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
         return self.combine(output, dispatch)
@@ -46,13 +51,19 @@ class MoeCommunication:
     def _finish(self, output):
         return output
 
-    def run(self, hidden_states, *, shared_experts=None, capacity=None, **kwargs):
+    def run(self, hidden_states, *, shared_experts=None, capacity=None, routing_metadata=None, **kwargs):
+        if routing_metadata is not None and (
+            routing_metadata.ndim != 2 or routing_metadata.shape[0] != len(hidden_states)
+            or routing_metadata.shape[1] == 0 or routing_metadata.device != hidden_states.device
+            or routing_metadata.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError("MoE routing metadata must be integer rows aligned with local tokens.")
         if capacity is None:
             capacity = get_context().moe_token_capacity
             if capacity is None:
                 # Startup warmup/capture uses identical shapes on every replica.
                 capacity = hidden_states.shape[0]
-        output = self._run(hidden_states, capacity=capacity, **kwargs)
+        output = self._run(hidden_states, capacity=capacity, routing_metadata=routing_metadata, **kwargs)
         if shared_experts is not None and len(hidden_states):
             output = output + shared_experts(hidden_states)
         return self._finish(output)
@@ -69,10 +80,10 @@ class AllReduceMoeCommunication(MoeCommunication):
         self._reduce = reduce
 
     def dispatch(
-        self, hidden_states: torch.Tensor, *, capacity: int | None = None
+        self, hidden_states: torch.Tensor, *, capacity: int | None = None, routing_metadata=None
     ) -> MoeDispatch:
         return MoeDispatch(
-            hidden_states, hidden_states.shape[0], hidden_states.shape[0]
+            hidden_states, hidden_states.shape[0], hidden_states.shape[0], routing_metadata
         )
 
     def combine(
@@ -91,7 +102,7 @@ class AllGatherReduceScatterMoeCommunication(MoeCommunication):
 
     def __init__(
         self, parallel_context: ParallelContext, *, max_rows=None, hidden_size=None,
-        dtype=None, reduce=None,
+        dtype=None, reduce=None, reduction_dtype=None,
     ):
         if parallel_context.moe_tp_size != 1:
             raise ValueError("AG/RS currently requires MoE TP=1 (EP=world size).")
@@ -100,7 +111,9 @@ class AllGatherReduceScatterMoeCommunication(MoeCommunication):
         self.max_rows = max_rows
         self.hidden_size = hidden_size
         self.dtype = dtype
+        self.reduction_dtype = reduction_dtype or dtype
         self.op = None
+        self.reduction_op = None
         self.closed = False
 
     def _finish(self, output):
@@ -119,8 +132,16 @@ class AllGatherReduceScatterMoeCommunication(MoeCommunication):
             self.group, max_rows=self.max_rows, hidden_size=self.hidden_size,
             dtype=self.dtype, device_index=device_index,
         )
+        if self.reduction_dtype != self.dtype:
+            self.reduction_op = prepare_parallel_agrs(
+                self.group, max_rows=self.max_rows, hidden_size=self.hidden_size,
+                dtype=self.reduction_dtype, device_index=device_index,
+            )
 
     def close(self):
+        if self.reduction_op is not None:
+            self.reduction_op.close()
+            self.reduction_op = None
         if self.op is not None:
             self.op.close()
             self.op = None
@@ -138,7 +159,7 @@ class AllGatherReduceScatterMoeCommunication(MoeCommunication):
             and capacity <= self.max_rows
         )
 
-    def dispatch(self, hidden_states: torch.Tensor, *, capacity: int) -> MoeDispatch:
+    def dispatch(self, hidden_states: torch.Tensor, *, capacity: int, routing_metadata=None) -> MoeDispatch:
         rows, hidden = hidden_states.shape
         if capacity < rows or capacity <= 0:
             raise ValueError(
@@ -156,7 +177,16 @@ class AllGatherReduceScatterMoeCommunication(MoeCommunication):
             gathered.copy_(local)
         else:
             dist.all_gather_into_tensor(gathered, local, group=self.group.process_group)
-        return MoeDispatch(gathered, rows, capacity)
+        gathered_metadata = None
+        if routing_metadata is not None:
+            local_metadata = routing_metadata.new_full((capacity, routing_metadata.shape[1]), -1)
+            local_metadata[:rows].copy_(routing_metadata)
+            gathered_metadata = routing_metadata.new_empty((capacity * self.group.size, routing_metadata.shape[1]))
+            if self.group.size == 1:
+                gathered_metadata.copy_(local_metadata)
+            else:
+                dist.all_gather_into_tensor(gathered_metadata, local_metadata, group=self.group.process_group)
+        return MoeDispatch(gathered, rows, capacity, gathered_metadata)
 
     def combine(self, output: torch.Tensor, dispatch: MoeDispatch) -> torch.Tensor:
         if output.shape[0] != dispatch.capacity * self.group.size:
@@ -165,7 +195,7 @@ class AllGatherReduceScatterMoeCommunication(MoeCommunication):
             )
         local = output.new_empty((dispatch.capacity, output.shape[1]))
         if self._use_prepared(dispatch.capacity):
-            self.op.reduce_scatter(local, output.contiguous())
+            (self.reduction_op or self.op).reduce_scatter(local, output.contiguous())
         elif self.group.size == 1:
             local.copy_(output)
         else:

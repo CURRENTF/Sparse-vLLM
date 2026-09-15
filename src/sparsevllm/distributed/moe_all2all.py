@@ -25,13 +25,13 @@ class AllToAllMoeCommunication(MoeCommunication):
             self.spec, group=self.group, device_index=device_index
         )
 
-    def _run(self, hidden_states, *, route, experts, chunk_size, capacity):
+    def _run(self, hidden_states, *, route, experts, chunk_size, capacity, routing_metadata=None):
         if self.op is None:
             raise RuntimeError("All-to-all transport is not prepared.")
         # Even an idle owner participates. Received rows may belong to any
         # other rank, and local expert chunking never inserts more collectives.
         if len(hidden_states):
-            ids, weights = route(hidden_states)
+            ids, weights = route(hidden_states) if routing_metadata is None else route(hidden_states, routing_metadata)
         else:
             ids = hidden_states.new_empty((0, self.spec.top_k), dtype=torch.int64)
             weights = hidden_states.new_empty((0, self.spec.top_k), dtype=torch.float32)

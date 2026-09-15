@@ -173,6 +173,7 @@ class ParallelCollectiveRuntime:
         moe_max_rows: int,
         hidden_size: int,
         dtype: torch.dtype,
+        moe_reduction_dtype: torch.dtype | None = None,
     ) -> DecodeParallelCollectives:
         attention = self._request_all_reduce(
             "attention",
@@ -186,13 +187,13 @@ class ParallelCollectiveRuntime:
             self.parallel_context.world,
             max_rows=moe_max_rows,
             hidden_size=hidden_size,
-            dtype=dtype,
+            dtype=moe_reduction_dtype or dtype,
         )
         return DecodeParallelCollectives(attention=attention, moe=moe)
 
     def request_moe_collectives(
         self, *, attention_max_rows, moe_max_rows, max_local_tokens,
-        hidden_size, dtype, backend, num_experts, top_k,
+        hidden_size, dtype, backend, num_experts, top_k, moe_reduction_dtype=None,
     ):
         """Prepare transport from token ownership; models supply tensor contracts."""
         if self.parallel_context.attn_dp_size > 1:
@@ -201,27 +202,31 @@ class ParallelCollectiveRuntime:
                 max_local_tokens=max(attention_max_rows, max_local_tokens),
                 hidden_size=hidden_size, dtype=dtype, backend=backend,
                 num_experts=num_experts, top_k=top_k,
+                moe_reduction_dtype=moe_reduction_dtype,
             )
         return self.request_decode_collectives(
             attention_max_rows=attention_max_rows, moe_max_rows=moe_max_rows,
             hidden_size=hidden_size, dtype=dtype,
+            moe_reduction_dtype=moe_reduction_dtype,
         )
 
     def request_dp_collectives(
         self, *, max_rows, hidden_size, dtype, backend="agrs",
-        max_local_tokens=None, num_experts=None, top_k=None,
+        max_local_tokens=None, num_experts=None, top_k=None, moe_reduction_dtype=None,
     ):
         if self.state is not ParallelCollectiveState.OPEN or self._moe_transport is not None:
             raise RuntimeError("DP collectives must be requested once before preparation.")
         if self.parallel_context.attn_dp_size <= 1:
             raise ValueError("DP collectives require the DP attention topology.")
+        if backend == "deepepv1" and moe_reduction_dtype not in (None, dtype):
+            raise ValueError("DeepEP v1 transport requires expert output dtype to match activations.")
         attention = self._request_all_reduce(
             "attention", self.parallel_context.attn_tp,
             max_rows=max_rows, hidden_size=hidden_size, dtype=dtype,
         )
         moe = self._request_all_reduce(
             "moe", self.parallel_context.attn_tp,
-            max_rows=max_rows, hidden_size=hidden_size, dtype=dtype,
+            max_rows=max_rows, hidden_size=hidden_size, dtype=moe_reduction_dtype or dtype,
         )
         if backend == "agrs":
             self._moe_transport = AllGatherReduceScatterMoeCommunication(
@@ -229,6 +234,7 @@ class ParallelCollectiveRuntime:
                 max_rows=max(max_rows, max_local_tokens or max_rows),
                 hidden_size=hidden_size,
                 dtype=dtype,
+                reduction_dtype=moe_reduction_dtype,
                 reduce=moe.run,
             )
         elif backend == "deepepv1":
