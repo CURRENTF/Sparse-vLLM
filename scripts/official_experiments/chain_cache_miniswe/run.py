@@ -7,6 +7,7 @@ different hosts. All subprocesses use argv arrays and explicit environment bins.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import math
@@ -16,6 +17,7 @@ import signal
 import shlex
 import socket
 import subprocess
+import sys
 import time
 import urllib.request
 
@@ -47,6 +49,7 @@ def get(url):
 
 def prepare(args):
     setting = read(args.setting)
+    setting["backend"] = getattr(args, "backend", "sparsevllm")
     # Each concurrency has an immutable root; methods are never silently retuned.
     concurrency = args.concurrency
     if not 1 <= concurrency <= 256:
@@ -87,7 +90,21 @@ def prepare(args):
         "protocol": setting["protocol"], "prepared_at": time.time(),
     })
     for method, overrides in setting["methods"].items():
-        write(root / method / "engine.json", {**setting["engine"], **overrides})
+        config = {**setting["engine"], **overrides}
+        if setting["backend"] == "vllm" and method == "vanilla-prefix":
+            config = {
+                "backend": "vllm", "sparse_method": "vanilla",
+                **{key: config[key] for key in (
+                    "tensor_parallel_size", "data_parallel_size", "expert_parallel_size",
+                    "gpu_memory_utilization", "max_model_len", "max_num_batched_tokens",
+                    "enable_prefix_caching",
+                )},
+                "max_num_seqs": engine_concurrency,
+                "enable_chunked_prefill": True, "enforce_eager": not config["decode_graph"],
+                "all2all_backend": "allgather_reducescatter",
+                "reasoning_parser": "glm45", "tool_call_parser": "glm47",
+            }
+        write(root / method / "engine.json", config)
     print(f"Prepared {root}; server and benchmark commands are in README.md")
 
 
@@ -152,7 +169,7 @@ def run_logged(argv, env, directory, name, timeout, process_record=None):
                 "exit_code": code,
             }
             if requested:
-                result["stop_reason"] = "requested_after_benchmark"
+                result["stop_reason"] = read(stop_record).get("reason", "requested_by_operator")
         except subprocess.TimeoutExpired:
             result = {"status": "timeout", "timeout_seconds": timeout}
         except BaseException:
@@ -193,11 +210,36 @@ def serve(args):
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", args.port))
     hardware = idle_pair(args.gpus)
-    command = [python, "-m", "sparsevllm.entrypoints.openai.api_server", "--model", str(model),
+    backend = read(args.root / "setting.json").get("backend", "sparsevllm")
+    if backend == "vllm":
+        if args.method != "vanilla-prefix":
+            raise ValueError("The upstream vLLM comparison only supports vanilla-prefix")
+        world = config["tensor_parallel_size"] * config["data_parallel_size"]
+        if config["expert_parallel_size"] not in (1, world):
+            raise ValueError("vLLM expert parallel size must be 1 or TP * DP")
+        command = [python, "-m", "vllm.entrypoints.openai.api_server",
+                   "--model", str(model), "--served-model-name", advertised,
+                   "--host", "127.0.0.1", "--port", str(args.port),
+                   "--dtype", "bfloat16", "--generation-config", "vllm",
+                   "--enable-auto-tool-choice", "--enable-prompt-tokens-details",
+                   "--middleware", "scripts.official_experiments.chain_cache_miniswe.request_logging.RequestLoggingMiddleware"]
+        for key in ("tensor_parallel_size", "data_parallel_size", "gpu_memory_utilization",
+                    "max_model_len", "max_num_batched_tokens", "max_num_seqs",
+                    "all2all_backend", "reasoning_parser", "tool_call_parser"):
+            command.extend(["--" + key.replace("_", "-"), str(config[key])])
+        for key in ("enable_prefix_caching", "enable_chunked_prefill", "enforce_eager"):
+            command.append(("--" if config[key] else "--no-") + key.replace("_", "-"))
+        if config["expert_parallel_size"] > 1:
+            command.append("--enable-expert-parallel")
+        env["MINISWE_REQUEST_LOG_DIR"] = str((directory / "server_requests").resolve())
+    else:
+        command = [python, "-m", "sparsevllm.entrypoints.openai.api_server", "--model", str(model),
                "--served-model-name", advertised, "--host", "127.0.0.1", "--port", str(args.port),
                "--engine-kwargs", str((args.root / args.method / "engine.json").resolve()),
                "--request-log-dir", str((directory / "server_requests").resolve())]
     write(directory / "server_manifest.json", {
+        "backend": backend,
+        "backend_version": capture([python, "-c", "import vllm; print(vllm.__version__)"]) if backend == "vllm" else None,
         "command": shlex.join(command), "model_path": str(model), "served_model_name": advertised,
         "cuda_visible_devices": args.gpus, "server_port": args.port, "engine_kwargs": config,
         "git_commit": capture(["git", "rev-parse", "HEAD"], REPO),
@@ -235,7 +277,8 @@ def stop_server(args):
         raise RuntimeError("Server PID identity changed; refusing to signal it")
     if int(record["process_group"]) != pid:
         raise RuntimeError("Recorded server is not the leader of its private process group")
-    write(result_path, {"status": "stop_requested", "pid": pid, "stopped_at": time.time()})
+    write(result_path, {"status": "stop_requested", "pid": pid, "stopped_at": time.time(),
+                        "reason": getattr(args, "reason", "requested_by_operator")})
     try:
         os.killpg(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -277,14 +320,17 @@ def benchmark(args):
         write(directory / "slow_baseline_decision.json", decision)
         if decision["status"] == "skipped_by_policy":
             print(json.dumps(decision, indent=2))
-            return
+            return decision
     python, env = environment(args.python)
     server_manifest = args.server_manifest or directory / "server_manifest.json"
     frozen = read(args.root / args.method / "engine.json")
     if read(server_manifest)["engine_kwargs"] != frozen:
         raise ValueError("Server manifest and frozen method settings differ")
     if args.stage in {"prepare", "generate", "all"}:
-        get(args.api_base.removesuffix("/v1") + "/readyz")
+        # /models is JSON on both servers and checks the actual advertised model.
+        models = get(args.api_base.rstrip("/") + "/models")
+        if f"glm47-{args.method}" not in {item["id"] for item in models["data"]}:
+            raise ValueError("Server does not advertise the prepared model")
     agent = setting["agent"].copy()
     if args.phase == "smoke":
         agent.update(mini_workers=1, eval_workers=1, batch_size=1)
@@ -306,6 +352,148 @@ def benchmark(args):
         command.extend(["--slice", "0:1" if args.phase == "smoke" else f"0:{pilot_count}"])
     # No hidden downloading, concurrency reduction, cache fallback, or retries.
     run_logged(command, env, directory, args.stage, args.timeout)
+
+
+def detached_benchmark(args):
+    """Start once, then query a worker-owned stage independently of SSH."""
+    directory = args.root.resolve() / args.method / args.phase
+    directory.mkdir(parents=True, exist_ok=True)
+    result_path = directory / f"{args.stage}.detached.result.json"
+    marker = directory / f"{args.stage}.detached.json"
+    session = "miniswe-" + hashlib.sha256(str(marker).encode()).hexdigest()[:20]
+    with (directory / f"{args.stage}.detached.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if result_path.exists():
+            return read(result_path)
+        if marker.exists():
+            running = subprocess.run(
+                ["tmux", "has-session", "-t", "=" + session],
+                capture_output=True,
+            ).returncode == 0
+            if not running:
+                # Recheck after has-session: completion and tmux exit can race.
+                if result_path.exists():
+                    return read(result_path)
+                raise RuntimeError(f"Detached stage vanished without a result: {marker}")
+            # A live worker owns its stage until it publishes a terminal result.
+            # A separate HTTP probe can fail while inference keeps progressing.
+            return {"status": "running", "session": session}
+        if not marker.exists():
+            if args.stage in {"prepare", "generate"}:
+                try:
+                    models = get(args.api_base.rstrip("/") + "/models")
+                    if f"glm47-{args.method}" not in {item["id"] for item in models["data"]}:
+                        raise ValueError("Server does not advertise the prepared model")
+                except (OSError, ValueError) as exc:
+                    return {"status": "waiting_for_server", "api_ready": False,
+                            "error": f"{type(exc).__name__}: {exc}"}
+            command = [args.python, str(HERE / "run.py"), "bench",
+                       "--root", str(args.root.resolve()), "--method", args.method,
+                       "--phase", args.phase, "--stage", args.stage,
+                       "--python", args.python, "--timeout", str(args.timeout),
+                       "--swe-bench-dir", str(args.swe_bench_dir.resolve()),
+                       "--api-base", args.api_base, "--detached-child"]
+            if args.server_manifest:
+                command += ["--server-manifest", str(args.server_manifest.resolve())]
+            # Record before launching: a lost SSH reply must not start a duplicate.
+            write(marker, {"session": session, "command": command, "started": time.time()})
+            tmux = ["tmux", "new-session", "-d", "-s", session, "-c", str(REPO)]
+            for key in ("PATH", "HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE",
+                        "LITELLM_LOCAL_MODEL_COST_MAP"):
+                if key in os.environ:
+                    tmux += ["-e", key + "=" + os.environ[key]]
+            log = directory / f"{args.stage}.detached.log"
+            tmux += [shlex.join(command) + " > " + shlex.quote(str(log)) + " 2>&1"]
+            subprocess.run(tmux, check=True, capture_output=True)
+        return {"status": "running", "session": session}
+
+
+def detached_child(args):
+    directory = args.root / args.method / args.phase
+    result = {"status": "failed", "exit_code": 1}
+    try:
+        benchmark_result = benchmark(args)
+        if benchmark_result is None:
+            result = {"status": "success", "exit_code": 0}
+        elif benchmark_result["status"] == "skipped_by_policy":
+            result = {**benchmark_result, "exit_code": 0}
+        else:
+            raise ValueError(f"Unknown benchmark terminal state: {benchmark_result}")
+    except BaseException as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        # Publish atomically: status polling must never read a partial JSON file.
+        path = directory / f"{args.stage}.detached.result.json"
+        temporary = path.with_suffix(".tmp")
+        write(temporary, {**result, "finished": time.time()})
+        temporary.replace(path)
+
+
+def wait_remote(args):
+    """Retry transport/status checks, never the benchmark itself."""
+    directory = args.root / args.method / args.phase
+    directory.mkdir(parents=True, exist_ok=True)
+    ssh = shlex.split(args.ssh_command)
+    worker = shlex.split(args.worker_command)
+    if not ssh or not worker or "--detach" not in worker:
+        raise ValueError("Supply SSH argv and a worker command invoking bench --detach")
+    command = ssh + [shlex.join(worker)]
+    started = time.monotonic()
+    unhealthy_since = None
+    failed_probes = 0
+    outcome = {"status": "failed"}
+    write(directory / f"{args.stage}.remote.invocation.json", {
+        "command": command, "recovery_timeout": args.recovery_timeout,
+        "reconnect_attempts": args.reconnect_attempts,
+        "timeout": args.timeout, "started": time.time(),
+    })
+    try:
+        with (directory / f"{args.stage}.remote.events.jsonl").open("x", buffering=1) as log:
+            while time.monotonic() - started < args.timeout:
+                try:
+                    response = subprocess.run(command, capture_output=True, text=True, timeout=30)
+                    if response.returncode not in (0, 255):
+                        raise RuntimeError(f"Remote stage control failed: {response.stderr}")
+                    state = (json.loads(response.stdout) if response.returncode == 0 else
+                             {"status": "disconnected", "error": response.stderr})
+                except subprocess.TimeoutExpired:
+                    state = {"status": "disconnected", "error": "SSH status probe timed out"}
+                log.write(json.dumps({"time": time.time(), **state}) + "\n")
+                status = state["status"]
+                if status in {"success", "skipped_by_policy"}:
+                    outcome = state
+                    return
+                if status == "failed":
+                    outcome = state
+                    raise RuntimeError(f"Remote benchmark failed: {state}")
+                if status not in {"running", "waiting_for_server", "disconnected"}:
+                    raise ValueError(f"Unknown remote stage state: {state}")
+                # Accept older workers' api_ready field as diagnostic only.
+                # Running confirms control recovery, independently of HTTP health.
+                if status == "running":
+                    unhealthy_since = None
+                    failed_probes = 0
+                else:
+                    failed_probes += 1
+                    if unhealthy_since is None:
+                        unhealthy_since = time.monotonic()
+                    # The first failed probe detects an outage; allow N further
+                    # connection attempts, resetting after confirmed running state.
+                    if failed_probes > args.reconnect_attempts:
+                        outcome = {"status": "reconnect_exhausted", "last_state": state,
+                                   "reconnect_attempts": args.reconnect_attempts}
+                        raise ConnectionError("Remote reconnect attempts exhausted; task state may be unknown")
+                    if time.monotonic() - unhealthy_since >= args.recovery_timeout:
+                        outcome = {"status": "recovery_timeout", "last_state": state}
+                        raise TimeoutError("Remote connectivity recovery deadline expired; task state may be unknown")
+                time.sleep(args.poll_interval)
+            outcome = {"status": "timeout"}
+            raise TimeoutError("Remote stage wall-time deadline expired")
+    finally:
+        write(directory / f"{args.stage}.remote.result.json", {
+            **outcome, "elapsed_seconds": time.monotonic() - started,
+        })
 
 
 def collect(args):
@@ -393,13 +581,14 @@ def main():
     p = sub.add_parser("prepare")
     p.add_argument("--root", type=Path, required=True)
     p.add_argument("--setting", type=Path, default=HERE / "setting.json")
+    p.add_argument("--backend", choices=("sparsevllm", "vllm"), default="sparsevllm")
     p.add_argument("--concurrency", type=int, default=64,
                    help="Target concurrent MiniSWE agents; use a fresh root for each value")
     p.add_argument("--engine-concurrency", type=int,
                    help="Server prefill/decode sequence limit; defaults to --concurrency")
     p.add_argument("--engine-resident-concurrency", type=int,
                    help="Resident sequence rows; defaults to --engine-concurrency")
-    for action in ("serve", "bench", "collect", "stop"):
+    for action in ("serve", "bench", "collect", "stop", "wait-remote"):
         p = sub.add_parser(action)
         p.add_argument("--root", type=Path, required=True)
         p.add_argument("--method", choices=list(read(HERE / "setting.json")["methods"]), required=True)
@@ -416,11 +605,36 @@ def main():
             p.add_argument("--stage", choices=("prepare", "generate", "evaluate", "summarize"), required=True)
             p.add_argument("--api-base", default="http://127.0.0.1:18147/v1")
             p.add_argument("--server-manifest", type=Path)
+            mode = p.add_mutually_exclusive_group()
+            mode.add_argument("--detach", action="store_true", help="Start/query a persistent worker tmux stage")
+            mode.add_argument("--detached-child", action="store_true", help=argparse.SUPPRESS)
+        elif action == "wait-remote":
+            p.add_argument("--stage", choices=("prepare", "generate", "evaluate", "summarize"), required=True)
+            p.add_argument("--ssh-command", required=True, help="Shell-quoted SSH argv ending in the worker host")
+            p.add_argument("--worker-command", required=True, help="Activated worker launcher command with --detach")
+            p.add_argument("--timeout", type=int, default=43200)
+            p.add_argument("--recovery-timeout", type=int, default=1800)
+            p.add_argument("--reconnect-attempts", type=int, default=30)
+            p.add_argument("--poll-interval", type=float, default=10)
+        elif action == "stop":
+            p.add_argument("--reason", choices=("requested_by_operator", "generation_completed",
+                                               "coordinator_failure", "recovery_timeout"),
+                           default="requested_by_operator")
     args = parser.parse_args()
     if hasattr(args, "timeout") and args.timeout <= 0:
         parser.error("--timeout must be positive")
+    if args.action == "wait-remote" and (
+        args.recovery_timeout <= 0 or args.poll_interval <= 0 or args.reconnect_attempts <= 0
+    ):
+        parser.error("recovery timeout, reconnect attempts and poll interval must be positive")
+    if args.action == "bench" and args.detach:
+        print(json.dumps(detached_benchmark(args)))
+        return
+    if args.action == "bench" and args.detached_child:
+        detached_child(args)
+        return
     {"prepare": prepare, "serve": serve, "bench": benchmark,
-     "collect": collect, "stop": stop_server}[args.action](args)
+     "collect": collect, "stop": stop_server, "wait-remote": wait_remote}[args.action](args)
 
 
 if __name__ == "__main__":

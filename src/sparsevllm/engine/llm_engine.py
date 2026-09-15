@@ -82,13 +82,16 @@ def _moe_workspace_warmup_token_counts(config: Config) -> tuple[int, ...]:
 
 
 class _ThroughputIntervalLogger:
-    def __init__(self, interval_s: float):
+    def __init__(self, interval_s: float, rank: int = 0):
         self._interval_s = float(interval_s)
+        self._rank = int(rank)
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._prefill_tokens = 0
         self._decode_tokens = 0
+        self._prefill_steps = 0
+        self._decode_batch_counts: dict[int, int] = {}
         self._running_seqs = 0
         self._prefill_seqs = 0
         self._decode_seqs = 0
@@ -122,8 +125,11 @@ class _ThroughputIntervalLogger:
         with self._lock:
             if num_tokens > 0:
                 self._prefill_tokens += int(num_tokens)
+                self._prefill_steps += 1
             else:
                 self._decode_tokens += int(-num_tokens)
+                batch_size = int(-num_tokens)
+                self._decode_batch_counts[batch_size] = self._decode_batch_counts.get(batch_size, 0) + 1
 
     def record_state(
         self,
@@ -154,6 +160,10 @@ class _ThroughputIntervalLogger:
             with self._lock:
                 prefill_tokens = self._prefill_tokens
                 decode_tokens = self._decode_tokens
+                prefill_steps = self._prefill_steps
+                decode_batch_counts = self._decode_batch_counts
+                self._prefill_steps = 0
+                self._decode_batch_counts = {}
                 running_seqs = self._running_seqs
                 prefill_seqs = self._prefill_seqs
                 decode_seqs = self._decode_seqs
@@ -172,13 +182,15 @@ class _ThroughputIntervalLogger:
             prefill_tp = prefill_tokens / dt
             decode_tp = decode_tokens / dt
             logger.info(
-                "Avg TP (last {dt:.1f}s): prefill_tp={prefill_tp:.0f} tok/s, decode_tp={decode_tp:.0f} tok/s "
+                "Avg TP (last {dt:.1f}s): dp_rank={rank} prefill_tp={prefill_tp:.0f} tok/s, decode_tp={decode_tp:.0f} tok/s "
                 "| seq(run/prf/dc)={running_seqs}/{prefill_seqs}/{decode_seqs} "
                 "| prf(chunked/full/raw_offload)={prefill_chunked_seqs}/{prefill_full_seqs}/{prefill_raw_offload_seqs} "
                 "dc(L/S)={decode_long_seqs}/{decode_short_seqs} "
                 "| last_batch={last_batch} "
+                "| prefill_steps={prefill_steps} decode_batch_steps={decode_batch_counts} "
                 "(prefill_tokens={prefill_tokens}, decode_tokens={decode_tokens})",
                 dt=dt,
+                rank=self._rank,
                 prefill_tokens=prefill_tokens,
                 prefill_tp=prefill_tp,
                 decode_tokens=decode_tokens,
@@ -192,6 +204,8 @@ class _ThroughputIntervalLogger:
                 decode_long_seqs=decode_long_seqs,
                 decode_short_seqs=decode_short_seqs,
                 last_batch=last_batch,
+                prefill_steps=prefill_steps,
+                decode_batch_counts=dict(sorted(decode_batch_counts.items())),
             )
 
 def _resolve_eos_token_ids(model_path, hf_config, tokenizer_eos_token_id):
@@ -298,7 +312,7 @@ class LLMEngine:
         self.scheduler = self._create_scheduler()
         
         self._exited = False
-        self._throughput_logger = _ThroughputIntervalLogger(config.throughput_log_interval_s)
+        self._throughput_logger = _ThroughputIntervalLogger(config.throughput_log_interval_s, rank=replica_rank)
         self.last_step_token_outputs: list[tuple[int, list[int]]] = []
         self.last_step_prompt_cache_hits: list[tuple[int, int]] = []
         self.last_step_logprob_outputs: list[

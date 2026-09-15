@@ -62,6 +62,32 @@ are exceptions. These are useful operating points, not equal-quality algorithms.
 
 ## Preparation and execution
 
+### Upstream vLLM baseline
+
+`vanilla-prefix` normally means **Sparse-vLLM dense attention**, not upstream
+vLLM. For an upstream comparison, prepare a separate root with
+`prepare --backend vllm --concurrency C --engine-concurrency S` and a setting
+copy containing the requested TP/DP/EP topology. Then use the same `serve`,
+`bench`, and `collect` commands with an activated vLLM environment for `serve`.
+Only `vanilla-prefix` is supported by this backend. The manifest identifies
+the backend, installed version, exact command, and effective engine settings.
+
+For TP1/DP2/EP2 with 16 client agents, `--engine-concurrency 8` maps to
+vLLM `max_num_seqs=8` per replica. vLLM uses its native prefix cache, chunked
+prefill, and CUDA Graph scheduling. Sparse-vLLM resident rows, decode reservation,
+fixed prefill chunk size, and explicit decode Graph buckets are not vLLM knobs
+and are omitted from its effective config. Batch token budget, context limit,
+memory fraction, model dtype, and all client sampling settings remain explicit.
+These engine differences must be retained when interpreting comparisons.
+
+The vLLM launcher enables prompt token details and an ASGI middleware that saves
+unaltered non-streaming requests/responses for `collect`. Request time includes
+server queueing and response delivery; it is not isolated GPU execution time.
+Probe `/v1/models` for readiness and `/metrics` for vLLM queue, cache, and
+preemption diagnostics. Sparse-vLLM `/v1/worker/load` does not exist on vLLM.
+
+### Shared workflow
+
 All paths below are supplied by the operator. Use a persistent data disk for
 `RUN_ROOT`, check free space (including Docker storage), and record the choice.
 Use another persistent data disk if the preferred disk has insufficient space. Do not download
@@ -159,11 +185,44 @@ cleanup_server() {
 trap cleanup_server EXIT INT TERM
 ```
 
-For a remote Docker worker, keep this trap in the GPU-host coordinator around
-the SSH command that runs the remote benchmark. A trap on the Docker worker
-cannot stop a process on the GPU host. Confirm `server.result.json` records
-`stop_reason=requested_after_benchmark` and both selected GPUs have no task-owned
-compute processes before advancing to the next phase.
+For a remote Docker worker, keep the trap in the GPU-host coordinator, but wrap
+`wait-remote` below, **not a foreground SSH benchmark command**. SSH exit 255 is
+a transport failure, not evidence that the remote task finished. A worker-side
+trap cannot stop the GPU-host server. Stop after confirmed generation success
+with `stop --reason generation_completed`; use `--reason coordinator_failure`
+in the failure trap. `server.result.json` records the supplied reason; a successful
+requested stop does not prove benchmark success. Confirm both selected GPUs have
+no task-owned compute processes before advancing to the next phase.
+
+When launching from a service-hosted terminal or coding agent, put the existing
+coordinator script in an independent user systemd service. A newly started tmux
+server or `setsid` process can still inherit the launching service's cgroup;
+restarting that service can terminate the entire experiment.
+
+```bash
+systemd-run --user --unit "$RUN_UNIT" --property=Type=exec \
+  --property=KillMode=mixed --property=TimeoutStopSec=1800 \
+  --property=Restart=no --property=RuntimeMaxSec=100000 \
+  --working-directory "$REPO_ROOT" --setenv="PATH=$PATH" \
+  /bin/bash "$COORDINATOR_SCRIPT"
+systemctl --user show "$RUN_UNIT" -p MainPID -p ControlGroup -p ActiveState
+```
+
+The coordinator still activates its conda environment and invokes this recipe;
+this changes process ownership only. Use a unique unit and fresh artifact root
+for each attempt. Check `/proc/<pid>/cgroup` for the coordinator, both model ranks,
+and tunnel: they must belong to the experiment unit, outside the calling service.
+`KillMode=mixed` gives the coordinator's TERM trap time to clean up its children;
+size the stop timeout to cover bounded cleanup and artifact-transfer retries.
+Keep run/status/result files on the data disk, since the unit may be unloaded
+after exit. Remote benchmark stages retain their worker-owned tmux sessions.
+
+For unattended user services, also verify `loginctl show-user "$USER" -p Linger`.
+Enable lingering for the experiment account with `loginctl enable-linger "$USER"`
+when permitted, then verify `Linger=yes` before launch. An independent unit alone
+does not keep its user service manager alive after the final login session ends.
+Lingering does not protect against explicitly stopping the user manager, killing
+the experiment, or rebooting the machine; preserve interrupted runs as failures.
 
 `GPU_PAIR` must contain two distinct idle indices. The launcher checks compute
 PIDs, used memory and utilization, and refuses an occupied port. Recheck ownership
@@ -206,6 +265,104 @@ each run. Do not start a second GPU server remotely. Copy benchmark artifacts
 back beside the original server logs before `collect`. Server readiness alone is
 insufficient: verify both rank logs, actual Graph execution, and at least two
 successful turns with nonzero reuse for the enabled cache modes.
+
+### Remote connection recovery
+
+Use an installed `autossh` for the task-owned tunnel. Keepalive settings detect
+disconnects; plain `ssh -N -R` does not reconnect. Keep the autossh PID in the
+coordinator's exit cleanup, and do not reuse or stop another task's tunnel:
+
+```bash
+AUTOSSH_GATETIME=0 autossh -M 0 -N \
+  -o BatchMode=yes -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+  -R "127.0.0.1:$REMOTE_PORT:127.0.0.1:$SERVER_PORT" \
+  "$WORKER" > "$RUN_ROOT/tunnel.log" 2>&1 &
+tunnel_pid=$!
+```
+
+Add the site's SSH port/jump-host options when required. With autossh, use
+`-o ProxyJump=...` rather than `-J ...`: older autossh argument parsers may reject
+the latter even when the installed ssh supports it. On the worker, use the
+same activated-environment launcher for `bench`, accepting a stage and forwarding
+the remaining arguments (including `--detach`):
+
+```bash
+stage=${1:?stage required}
+shift
+# Activate the worker conda environment before this existing entrypoint.
+python "$RECIPE" bench --root "$REMOTE_ROOT" --method "$METHOD" --phase "$PHASE" \
+  --python "$(command -v python)" --swe-bench-dir "$SWE_BENCH_DIR" \
+  --api-base "http://127.0.0.1:$REMOTE_PORT/v1" \
+  --stage "$stage" --timeout "$STAGE_TIMEOUT" "$@"
+```
+
+`bench --detach` starts the stage once in a worker-owned tmux session; subsequent
+calls query that same stage. It writes `*.detached.json`, `*.detached.log` and an
+atomic `*.detached.result.json`, including preflight failures. A lost launch reply
+cannot start a second benchmark. Existing failed stages are never automatically
+rerun. Keep the stage-specific pilot timeout from the slow-baseline policy.
+
+The GPU-host coordinator waits through transient control/tunnel failures:
+
+```bash
+python "$RECIPE" wait-remote --root "$RUN_ROOT" --method "$METHOD" --phase "$PHASE" \
+  --stage "$STAGE" --ssh-command "$SSH_COMMAND" \
+  --worker-command "bash $REMOTE_LAUNCHER $STAGE --detach" \
+  --reconnect-attempts 30 --poll-interval 10 --recovery-timeout 1800 --timeout 45000
+```
+
+`SSH_COMMAND` is shell-quoted SSH argv including the destination and required
+options; `worker-command` is likewise shell-quoted argv. These are parsed as
+arguments, not local shell programs. Use `wait-remote` for each stage. It logs all
+polls to `*.remote.events.jsonl` and retries SSH exit 255/probe timeout. Worker-side
+API readiness gates only the initial prepare/generate launch; a failed startup
+probe records its exception and waits within the recovery budget. Once launched,
+polls check the worker session and terminal result without probing the API.
+HTTP readiness failure does not establish task failure: inference may still be
+progressing. A `running` reply resets the connection budget even if an older
+worker includes `api_ready=false` in that reply.
+
+A confirmed task failure fails immediately; connectivity loss preserves the
+local server while this command waits. Each control-connection outage permits
+30 further attempts, spaced 10 seconds apart. It exits nonzero after actual
+control retries are exhausted, startup readiness/recovery expires, or the total
+stage deadline expires, allowing the coordinator to clean up its server. A running
+worker remains subject to that total deadline. Record the failure and inspect
+remaining worker tasks/containers; a deadline with unknown remote state is not
+completion. Never add API-health-triggered cleanup while the worker is running.
+
+After generate succeeds, stop the server, then run evaluate/summarize through the
+same detached path (these stages do not require a live API). Copy results back
+before collect; an interrupted artifact transfer may be repeated without rerunning
+generation. Reconnection cannot rescue already disconnected HTTP requests, so
+continue counting cancellations, HTTP 410 and full-history recovery work.
+
+## Throughput diagnostics
+
+For a diagnostic run, set `engine.throughput_log_interval_s` to a positive
+interval in the setting file before `prepare`; the API server otherwise disables
+these periodic logs. The log reports computed prefill tokens, decode tokens,
+prefill step count and `decode_batch_steps` (executed batch size to step count),
+alongside queue lengths. A decode queue of 40 does not prove execution at batch 40.
+Both token rates use the entire wall-clock interval, including other stages and
+idle periods; they are not isolated prefill/decode execution throughput.
+
+`engine.enable_profiler=true` adds aggregate host-observed section timings.
+Keep `SPARSEVLLM_SYNC_DEVICE` and `CUDA_SYNC_SVLLM` disabled for ordinary serving
+measurements. Nested profiler sections overlap and asynchronous CUDA work is not
+fully attributed by host timings. Correlate these diagnostics with timestamped
+GPU activity/power, worker load, request logs and task timing; use a separate GPU
+timeline capture when kernel or communication attribution is required. Record
+diagnostic settings and restart the task-owned server between phases.
+
+For a separately labelled DP-attention diagnostic, supply a setting file with
+`tensor_parallel_size=1`, `data_parallel_size=2`, `expert_parallel_size=2` and
+`moe_backend=agrs`. Engine sequence limits apply per DP replica: for 16 agent
+workers and an execution limit of 8 per replica, prepare with `--concurrency 16
+--engine-concurrency 8`. Resident-row capacity is also per replica. Keep sampling
+settings unchanged and record this topology separately from the frozen TP2/EP2
+comparison. Changing topology or concurrency requires a new prepared root.
 
 ## Slow baseline policy and failures
 
