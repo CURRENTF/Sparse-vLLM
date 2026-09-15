@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from sparsevllm.distributed import get_parallel_context
-from sparsevllm.layers.grouped_linear import GroupedLinear
+from sparsevllm.layers.inverse_rotary_grouped_linear import InverseRotaryGroupedLinear
 from sparsevllm.layers.layernorm import RMSNorm
 from sparsevllm.layers.linear import ColumnParallelLinear, ReplicatedLinear, RowParallelLinear
 from sparsevllm.layers.rotary_embedding import _compute_rope_parameters
@@ -34,8 +34,6 @@ class DeepseekV4Attention(nn.Module):
         self.wkv = ReplicatedLinear(config.hidden_size, config.head_dim, quantization=quantization)
         self.kv_norm_weight = nn.Parameter(torch.empty(config.head_dim, dtype=torch.float32), requires_grad=False)
         self.attn_sink = nn.Parameter(torch.empty(self.num_heads, dtype=torch.float32), requires_grad=False)
-        self.wo_a = GroupedLinear(self.num_groups, self.num_heads * config.head_dim // self.num_groups,
-                                  config.o_lora_rank, max_num_tokens=max_num_tokens)
         self.wo_b = RowParallelLinear(config.o_groups * config.o_lora_rank, config.hidden_size,
                                       quantization=quantization, reduce_results=False)
         self.compressor = self.indexer = None
@@ -58,8 +56,9 @@ class DeepseekV4Attention(nn.Module):
             NativeRotarySpec(config.head_dim, config.qk_rope_head_dim, "weighted_fp32", config.rms_norm_eps, quantize_nope=True),
             device_index=device_index,
         )
-        self.inverse_rotary = prepare_native_rotary(
-            NativeRotarySpec(config.head_dim, config.qk_rope_head_dim, inverse=True), device_index=device_index,
+        self.wo_a = InverseRotaryGroupedLinear(
+            self.num_groups, self.num_heads, config.head_dim, config.o_lora_rank, inv_freq=inv_freq,
+            max_num_tokens=max_num_tokens, max_positions=max_model_len, device_index=device_index,
         )
         compressed_capacity = 512 if self.ratio == 4 else max(1, max_model_len // self.ratio) if self.ratio else 0
         self.attention = prepare_indexed_shared_kv_attention(IndexedSharedKVAttentionSpec(
@@ -89,9 +88,7 @@ class DeepseekV4Attention(nn.Module):
         view = cache.attention_view(batch, selected)
         output = self.attention.run(query, view, self.attn_sink)
         cache.finish_window(batch, kv)
-        self.inverse_rotary.run(output, positions, self.inv_freq, out=output)
-        grouped = output.view(len(x), self.num_groups, self.num_heads * self.head_dim // self.num_groups)
-        result = self.wo_b(self.wo_a(grouped).flatten(1))
+        result = self.wo_b(self.wo_a(output, positions).flatten(1))
         if self.parallel.attn_tp_size > 1:
             result = self.parallel.attn_tp.all_reduce(result.float()).bfloat16()
         return result
