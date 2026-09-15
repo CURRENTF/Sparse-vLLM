@@ -19,12 +19,26 @@ from sparsevllm.kernels.external.support import (
     KernelFamilyState,
 )
 from sparsevllm.kernels.triton.moe import fused_moe, moe_align_block_size
+from sparsevllm.kernels.moe import MoeAlignment
 from sparsevllm.kernels.triton.sgl_fused_moe import (
     sgl_fused_moe,
     sgl_glm47_moe_profile_support,
     sgl_moe_profile_support,
 )
 from sparsevllm.operators.moe import _sgl_moe_align_block_size
+
+
+@pytest.mark.parametrize("short_buffer", ["sorted", "cumsum"])
+def test_prepared_alignment_rejects_short_buffers_before_launch(short_buffer):
+    # Three local experts and the invalid bucket each need one padded block.
+    ids = torch.tensor([[0, 1, 2, -1]], dtype=torch.int32)
+    alignment = MoeAlignment(torch.empty(63 if short_buffer == "sorted" else 64, dtype=torch.int32),
+                             torch.empty(4, dtype=torch.int32), torch.empty(1, dtype=torch.int32),
+                             16, False)
+    prefix = torch.empty(4 if short_buffer == "cumsum" else 5, dtype=torch.int32)
+    with pytest.raises(ValueError, match="Prepared SGL"):
+        sgl_moe_align_block_size(ids, block_size=16, num_experts=3,
+                                alignment=alignment, cumsum_buffer=prefix)
 
 
 def _torch_local_moe(

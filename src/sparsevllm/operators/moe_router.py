@@ -23,6 +23,7 @@ class MoeRouterOpSpec:
     norm_topk_prob: bool
     cuda_graph: bool
     routing_method: str = "softmax"
+    max_num_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if self.num_experts <= 0:
@@ -37,7 +38,7 @@ class MoeRouterOpSpec:
                 "MoE router activations must be floating point, "
                 f"got {self.activation_dtype}."
             )
-        if self.routing_method not in {"softmax", "biased_sigmoid"}:
+        if self.routing_method not in {"softmax", "biased_sigmoid", "sqrt_softplus", "hash_sqrt_softplus"}:
             raise ValueError(f"Unsupported MoE routing method {self.routing_method!r}.")
 
 
@@ -69,6 +70,7 @@ MOE_ROUTER_REGISTRY: OpRegistry[MoeRouterOpSpec, MoeRouterProvider] = OpRegistry
             "triton_glm_biased_sigmoid",
             "triton_minimax_biased_sigmoid",
             "triton",
+            "sqrt_softplus",
         )
     ),
 )
@@ -226,6 +228,92 @@ class MiniMaxBiasedSigmoidRouterProvider(MoeRouterProvider):
             correction_bias,
             top_k=spec.top_k,
         )
+
+
+@MOE_ROUTER_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
+class SqrtSoftplusRouterProvider(MoeRouterProvider):
+    name = "sqrt_softplus"
+
+    @classmethod
+    def supports(cls, spec, caps):
+        if spec.routing_method not in ("sqrt_softplus", "hash_sqrt_softplus"):
+            return SupportResult.unsupported("requires sqrt-softplus or hash sqrt-softplus routing")
+        if caps.platform != PlatformEnum.CUDA or not caps.supports_triton:
+            return SupportResult.unsupported("requires CUDA and Triton")
+        if spec.activation_dtype != torch.float32 or not spec.norm_topk_prob:
+            return SupportResult.unsupported("requires FP32 logits and normalized route weights")
+        if spec.max_num_tokens is None or spec.max_num_tokens <= 0:
+            return SupportResult.unsupported("requires a positive prepared token capacity")
+        if spec.cuda_graph and not caps.supports_graph_capture:
+            return SupportResult.unsupported("device does not support CUDA Graph capture")
+        return SupportResult.yes("native sqrt-softplus scores with Torch top-k or checkpoint hash indices")
+
+    @classmethod
+    def bind(cls, spec, caps):
+        return cls(spec, platforms.current_platform.get_device(caps.device_index))
+
+    def __init__(self, spec, device):
+        from sparsevllm.operators.workspace import get_workspace_manager
+        self.spec, self.device = spec, device
+        self._regions, offset = {}, 0
+        rows, k = spec.max_num_tokens, spec.top_k
+        regions = [("weights", rows * k, torch.float32), ("ids", rows * k, torch.int64),
+                   ("norms", rows, torch.float32)]
+        if spec.routing_method == "sqrt_softplus":
+            regions.append(("scores", rows * spec.num_experts, torch.float32))
+        for name, count, dtype in regions:
+            offset = (offset + 255) // 256 * 256
+            size = count * dtype.itemsize
+            self._regions[name] = offset, size, dtype
+            offset += size
+        self._lease = get_workspace_manager(device, create=True).reserve_bytes(
+            offset, label="sqrt_softplus_router", lane="sqrt_softplus_router",
+        )
+
+    def _view(self, name, rows, columns):
+        offset, size, dtype = self._regions[name]
+        return self._lease.buffer[offset:offset+size].view(dtype)[:rows * columns].view(rows, columns)
+
+    def run(self, spec, router_logits, correction_bias=None, *, routed_scaling_factor=1.0,
+            hash_indices=None, input_ids=None):
+        import math
+        if spec != self.spec:
+            raise ValueError("Router spec changed after preparation.")
+        if (router_logits.ndim != 2 or router_logits.shape[1] != spec.num_experts
+                or router_logits.shape[0] > spec.max_num_tokens or router_logits.dtype != torch.float32
+                or router_logits.device != self.device or not router_logits.is_contiguous()):
+            raise ValueError("Router logits do not match prepared FP32 capacity/layout.")
+        if not math.isfinite(routed_scaling_factor) or routed_scaling_factor <= 0:
+            raise ValueError("Routing scale must be finite and positive.")
+        rows = router_logits.shape[0]
+        weights, ids = self._view("weights", rows, spec.top_k), self._view("ids", rows, spec.top_k)
+        if rows == 0:
+            return weights, ids
+        from sparsevllm.kernels.triton.moe_sqrt_softplus import (
+            biased_sqrt_softplus_scores, gather_sqrt_softplus_scores, normalize_sqrt_softplus_weights,
+        )
+        if spec.routing_method == "hash_sqrt_softplus":
+            if (correction_bias is not None or hash_indices is None or input_ids is None
+                    or hash_indices.ndim != 2 or hash_indices.shape[1] != spec.top_k
+                    or input_ids.shape != (rows,)):
+                raise ValueError("Hash routing requires a token-to-expert table and original token IDs.")
+            if any(t.dtype not in (torch.int32, torch.int64) or t.device != self.device
+                   or not t.is_contiguous() for t in (hash_indices, input_ids)):
+                raise ValueError("Hash routing metadata must be contiguous integer tensors on the logits device.")
+        else:
+            if (hash_indices is not None or input_ids is not None or correction_bias is None
+                    or correction_bias.shape != (spec.num_experts,) or correction_bias.dtype != torch.float32
+                    or correction_bias.device != self.device or not correction_bias.is_contiguous()):
+                raise ValueError("Learned sqrt-softplus routing requires an FP32 correction bias.")
+            scores = self._view("scores", rows, spec.num_experts)
+            biased_sqrt_softplus_scores(router_logits, correction_bias, scores)
+            # Public Torch top-k preserves the reference's selection and tie behavior.
+            torch.topk(scores, spec.top_k, dim=-1, out=(weights, ids))
+        gather_sqrt_softplus_scores(router_logits, ids, weights, table=hash_indices, token_ids=input_ids)
+        norms = self._view("norms", rows, 1)
+        torch.sum(weights, dim=-1, keepdim=True, out=norms)
+        normalize_sqrt_softplus_weights(weights, norms, ids, routed_scaling_factor)
+        return weights, ids
 
 
 def resolve_moe_router_provider(

@@ -47,6 +47,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+deepseek-v4 = [
+    "flashinfer-python>=0.6.18.post1,<0.7",
+    "flashinfer-cubin>=0.6.18.post1,<0.7",
+    "setuptools>=61.0",
+    "wheel",
+    "fast-hadamard-transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git@e7706faf8d1c3b9f241e36860640ad1dac644ede",
+]
 deepepv1 = [
     "deep-ep @ git+https://github.com/deepseek-ai/DeepEP.git@9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee",
     "nvidia-ml-py>=12",
@@ -82,6 +89,7 @@ sparsevllm = [
 testpaths = ["tests"]
 
 [tool.uv]
+no-build-isolation-package = ["fast-hadamard-transform"]
 conflicts = [
     [
         { extra = "cu129" },
@@ -95,6 +103,21 @@ torch = [
     { index = "pytorch-cu130", extra = "cu130" },
 ]
 flashinfer-cubin = { index = "flashinfer" }
+
+# The pinned Git package imports torch during metadata generation. Supplying
+# its static metadata lets uv install build dependencies before building it.
+[[tool.uv.dependency-metadata]]
+name = "fast-hadamard-transform"
+version = "1.1.0"
+requires-dist = ["torch", "packaging", "ninja"]
+requires-python = ">=3.7"
+
+# uv resolves unselected extras too; this pinned package also imports torch
+# before producing metadata, although DeepSeek V4 uses the AGRS backend.
+[[tool.uv.dependency-metadata]]
+name = "deep-ep"
+version = "1.2.1+9af0e0d"
+requires-dist = []
 
 [[tool.uv.index]]
 name = "pytorch-cu129"

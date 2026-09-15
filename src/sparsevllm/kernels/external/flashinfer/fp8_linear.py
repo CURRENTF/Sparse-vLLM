@@ -94,11 +94,13 @@ def flashinfer_fp8_blockscale_gemm_sm90(
     weight_scale: torch.Tensor,
     *,
     out_dtype: torch.dtype,
+    input_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     function, _ = _sm90_fp8_linear_op()
     return function(
         input,
         weight,
+        input_scale=input_scale,
         weight_scale=weight_scale,
         out_dtype=out_dtype,
     )

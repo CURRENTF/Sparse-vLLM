@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from sparsevllm.kernels.triton.fp8_ue8m0 import round_ue8m0_scale
 
 
 FP8_BLOCK_SIZE = 128
@@ -29,6 +30,7 @@ def _fp8_blockwise_matmul_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ROUND_SCALES: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -48,6 +50,8 @@ def _fp8_blockwise_matmul_kernel(
             other=0.0,
         ).to(tl.float32)
         x_scale = tl.max(tl.abs(x_raw), axis=1) / 448.0
+        if ROUND_SCALES:
+            x_scale = round_ue8m0_scale(tl.max(tl.abs(x_raw), axis=1))
         x_quant = (x_raw / tl.maximum(x_scale[:, None], 1.0e-12)).to(
             tl.float8e4nv
         )
@@ -85,7 +89,10 @@ def fp8_blockwise_matmul(
     weight_scale_inv: torch.Tensor,
     *,
     output_dtype: torch.dtype | None = None,
+    scale_fmt: str | None = None,
 ) -> torch.Tensor:
+    if scale_fmt not in (None, "ue8m0"):
+        raise ValueError(f"Unsupported FP8 scale_fmt={scale_fmt!r}.")
     if not x.is_cuda or not weight.is_cuda or not weight_scale_inv.is_cuda:
         raise ValueError("Triton block-FP8 matmul requires CUDA tensors.")
     if x.device != weight.device or x.device != weight_scale_inv.device:
@@ -150,6 +157,7 @@ def fp8_blockwise_matmul(
         BLOCK_M=block_m,
         BLOCK_N=FP8_BLOCK_SIZE,
         BLOCK_K=FP8_BLOCK_SIZE,
+        ROUND_SCALES=scale_fmt == "ue8m0",
         num_warps=4,
         num_stages=3,
     )

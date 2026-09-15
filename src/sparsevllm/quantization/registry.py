@@ -45,4 +45,6 @@ class QuantizationRegistry:
             weight_layout_id=("tensor_scales_in_block_grid"
                               if quantization.checkpoint_scale_layout == "per_tensor"
                               else "block_128x128_nt_k_major"),
+            scale_fmt=quantization.scale_fmt,
+            max_num_tokens=quantization.max_num_tokens,
         )

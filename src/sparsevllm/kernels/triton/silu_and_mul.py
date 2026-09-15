@@ -2,6 +2,7 @@ import torch
 
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
 
 @triton.jit(do_not_specialize=["size_m"])
@@ -110,3 +111,41 @@ def silu_and_mul_fwd(
         **launch_kwargs,
     )
     return output
+
+
+@triton.jit
+def _weighted_swiglu(Packed, Ids, Weights, Out,
+                     WIDTH: tl.constexpr, START: tl.constexpr, END: tl.constexpr,
+                     LIMIT: tl.constexpr, ROUTED: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    valid = col < WIDTH
+    if ROUTED:
+        expert = tl.load(Ids + row)
+        valid &= (expert >= START) & (expert < END)
+    gate = tl.load(Packed + row * 2 * WIDTH + col, valid, 0.0).to(tl.float32)
+    up = tl.load(Packed + row * 2 * WIDTH + WIDTH + col, valid, 0.0).to(tl.float32)
+    route_weight = tl.load(Weights + row) if ROUTED else 1.0
+    gate = tl.minimum(gate, LIMIT)
+    up = tl.maximum(tl.minimum(up, LIMIT), -LIMIT)
+    # Approximate exp/div can cross a BF16 tie before down-projection FP8
+    # quantization, changing an entire output row. Match the FP32 SiLU path.
+    result = tl.div_rn(gate, 1.0 + libdevice.exp(-gate)) * up * route_weight
+    tl.store(Out + row * WIDTH + col, tl.where(valid, result, 0.0), col < WIDTH)
+
+
+def weighted_clipped_swiglu(packed, ids, weights, out, *, local_start, local_end, limit):
+    """Apply routing weights in FP32 before BF16 rounding and down quantization."""
+    _weighted_swiglu[(out.shape[0], triton.cdiv(out.shape[1], 256))](
+        packed, ids, weights, out, out.shape[1], local_start, local_end, limit, True, 256,
+        enable_fp_fusion=False,
+    )
+
+
+def clipped_swiglu(packed, out, *, limit):
+    """Clip and multiply in FP32 before a single output dtype rounding."""
+    if out.numel():
+        _weighted_swiglu[(out.shape[0], triton.cdiv(out.shape[1], 256))](
+            packed, None, None, out, out.shape[1], 0, 0, limit, False, 256,
+            enable_fp_fusion=False,
+        )

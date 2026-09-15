@@ -16,6 +16,9 @@ class QuantizationConfig:
     model_name: str = "qwen3_5"
     activation_dtype: str = "bfloat16"
     checkpoint_scale_layout: str = "block_128x128"
+    scale_fmt: str | None = None
+    # Execution capacity, supplied by the model's runtime preparation; not HF metadata.
+    max_num_tokens: int | None = None
 
     @classmethod
     def disabled(
@@ -62,6 +65,8 @@ class QuantizationConfig:
             payload["is_checkpoint_fp8_serialized"] = True
         elif self.weight_block_size is not None:
             payload["weight_block_size"] = list(self.weight_block_size)
+        if self.scale_fmt is not None:
+            payload["scale_fmt"] = self.scale_fmt
         return payload
 
     @classmethod
@@ -72,6 +77,7 @@ class QuantizationConfig:
         required_fp8: bool = False,
         model_name: str = "qwen3_5",
         activation_dtype: Any = "bfloat16",
+        max_num_tokens: int | None = None,
     ) -> "QuantizationConfig":
         normalized_activation_dtype = cls._normalize_activation_dtype(
             activation_dtype
@@ -161,6 +167,13 @@ class QuantizationConfig:
             config_get(value, key, None) is None
             for key in ("weight_block_size", "weight_block_shape", "block_size")
         )
+        scale_fmt = config_get(value, "scale_fmt", None)
+        if scale_fmt not in (None, "ue8m0"):
+            raise ValueError(f"Unsupported FP8 scale_fmt={scale_fmt!r}.")
+        if per_tensor and scale_fmt is not None:
+            raise ValueError("UE8M0 activation scaling requires block-scaled weights.")
+        if max_num_tokens is not None and max_num_tokens <= 0:
+            raise ValueError("Quantized Linear max_num_tokens must be positive.")
 
         return cls(
             enabled=True,
@@ -171,4 +184,6 @@ class QuantizationConfig:
             model_name=model_name,
             activation_dtype=normalized_activation_dtype,
             checkpoint_scale_layout="per_tensor" if per_tensor else "block_128x128",
+            scale_fmt=scale_fmt,
+            max_num_tokens=max_num_tokens,
         )
