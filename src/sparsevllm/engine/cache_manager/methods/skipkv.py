@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import torch
 
@@ -93,6 +93,38 @@ class SkipKVCacheManager(RKVCacheManager):
         )
         self._append_decode_gen_indices(seqs)
         return result
+
+    def snapshot_chain_method_state(self, seq_id: int):
+        snapshot = super().snapshot_chain_method_state(seq_id)
+        state = self._skipkv_seq_states.get(seq_id)
+        sentences = []
+        if state is not None:
+            if state.open_embedding_sum is not None:
+                snapshot.tensors["open_embedding"] = state.open_embedding_sum
+            for index, sentence in enumerate(state.sentences):
+                snapshot.tensors[f"sentence/{index}"] = sentence.embedding
+                sentences.append(replace(sentence, embedding=None, cache_ranges=dict(sentence.cache_ranges)))
+            state = replace(state, open_embedding_sum=None, sentences=sentences)
+        indices = {
+            layer: list(self._skipkv_row_gen_indices[layer][self.seq_id_to_row[layer][seq_id]])
+            for layer in self.kv_transformer_layer_indices()
+        }
+        snapshot.metadata = (state, indices)
+        return snapshot
+
+    def restore_chain_method_state(self, seq_id: int, snapshot) -> None:
+        super().restore_chain_method_state(seq_id, snapshot)
+        state, indices = snapshot.metadata
+        if state is not None:
+            sentences = [replace(sentence,
+                embedding=snapshot.tensors[f"sentence/{index}"].to(self.device, non_blocking=True),
+                cache_ranges=dict(sentence.cache_ranges))
+                for index, sentence in enumerate(state.sentences)]
+            opened = snapshot.tensors.get("open_embedding")
+            self._skipkv_seq_states[seq_id] = replace(state, sentences=sentences,
+                open_embedding_sum=None if opened is None else opened.to(self.device, non_blocking=True))
+        for layer, values in indices.items():
+            self._skipkv_row_gen_indices[layer][self.seq_id_to_row[layer][seq_id]] = list(values)
 
     def free_seq(self, seq_id: int):
         seq_id = int(seq_id)

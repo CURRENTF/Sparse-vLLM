@@ -44,13 +44,48 @@ shared-memory command buffer，worker rank 也不会复制 driver token 历史�
 为 `seq.num_tokens - 1`；该 token 属于下一轮 suffix。服务端检测到 text stop
 时会使 chain 失效：隐藏 stop text 可能包含已经处理、但不在 client-visible
 continuation 中的 token，而通用路径无法回滚已压缩的物理布局。Disconnect、
-failure、preemption、cancellation 和 parse failure 同样会使 chain 失效并释放
-全部 payload。
+failure、cancellation 和 parse failure 同样会使 chain 失效并释放全部 payload。
+Scheduler 抢占是暂时的：保留逻辑请求和 chain 身份，释放运行时 KV/recurrent
+state，再通过 recompute replay 重建。恢复期间 chain 仍为 ACTIVE，不能交给
+另一位 writer。
 
-LRU 只考虑 IDLE chain，并按 `(last_access, chain_id)` 排序。ACTIVE chain
-保持 pinned。Rank 0 通过 TP RPC path 提供准确 victim plan，各 rank 执行并
-检查相同生命周期结果。Admission plan 还会在 prefill allocation 前预留逐
-layer 物理峰值与 resident row，避免并发排队的 chain 重复承诺同一批 free slot。
+LRU 只考虑 IDLE chain，并按 `(last_access, chain_id)` 排序。Decode 窗口预留
+不足时，scheduler 先按此顺序回收 GPU 驻留的 IDLE chain，每次在所有 rank
+完成释放后重新检查预留；满足需求即停止回收，仍不足才考虑抢占。有效的
+offload 快照保留 chain 身份，可供后续恢复。Admission LRU
+不会淘汰 ACTIVE chain；这不禁止 scheduler 发起临时抢占。Rank 0 通过 TP RPC path 提供准确 victim plan，各 rank 执行并
+检查相同生命周期结果。Chain admission 预留恢复与 suffix prefill 容量，
+不再预留请求的最大输出长度。未来 decode 与普通请求统一使用
+`decode_reservation_tokens` 窗口。Admission 在选择 IDLE victim 前扣除尚未
+使用的 decode 额度；rank 0 的计划携带这些额度供各 rank 本地验证。Prefill
+完成后释放对应的准入预留，物理 KV 仍按执行进度分配。
+
+## 整轮 CPU 快照
+
+启用 prefix offload 后，轮次完成就安排整条快照，不等待 GPU 容量压力。
+Cache manager 的 `ChainOffloadController` 持有有界 pinned tensor 和传输
+event；coordinator 选择 LRU host victim，区分 GPU 降级与逻辑淘汰。CPU-only
+record 保留各层物理长度作为恢复需求，但 `resident_rows=0`。Admission 预留
+这些长度、suffix prefill 增长以及一行，rank 0 的计划分别携带降级和淘汰列表。
+
+与不可变 radix block 不同，chain 每轮都会重新被修改。下一位 writer 开始前
+先等待上一轮 D2H，再使 CPU 快照失效。形状相同时可以复用 host 分配，但仍
+重新复制全部保留 tensor。只有有效快照完成后才能释放 GPU payload。H2D 在
+admission 边界完成，decode 不增加逐步同步。失败、失效和 warmup reset 必须
+先结束相关传输，再释放资源。
+
+快照包括逐层 KV（或 latent/RoPE）、H2O score、R-KV query window 与位置、
+SkipKV sentence tensor 和 metadata。恢复时重新分配 row 和 slot，逻辑 token
+身份仍由 index 持有。Host tensor 预算按 rank 计算；driver 的 token 历史
+容量额外增加 `floor(host_bytes / 4)`，允许 CPU-only chain 数量超过 GPU row
+数量。Python metadata 与逻辑历史不计入 pinned tensor 预算。
+
+每轮传输成本正比于保留的 payload 字节数，而非逻辑上下文长度：
+`sum_layer(length * (key_bytes + value_bytes)) + method_bytes`。复用 SGL
+逐层传输接口，直接使用 device slot index；MLA 两组不同 token 宽度分别传输。
+vLLM 的 `swap_blocks` 需要 CPU block mapping，会引入 index 回读和另一套
+runtime 依赖，因此未使用。不新增 kernel 或 attention provider。临时 device
+存储包括 slot index 和冻结的方法 tensor，保留至 D2H completion event。
 
 ## HTTP 与路由契约
 

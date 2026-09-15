@@ -219,6 +219,7 @@ RECOVERABLE_TP_CONTROL_RPC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
 TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "chain_admission_plan",
     "chain_apply_admission",
+    "chain_reclaim_idle",
     "chain_finish",
     "chain_invalidate",
     "chain_validate_admission_plan",
@@ -1116,13 +1117,11 @@ class ModelRunner:
         chain_id: str,
         seq_id: int,
         token_ids: list[int],
-        generation_tokens: int = 0,
     ) -> ChainAdmissionPlan:
         return self.runtime_state.chain_admission_plan(
             chain_id,
             seq_id,
             token_ids,
-            generation_tokens,
         )
 
     def chain_apply_admission(
@@ -1136,14 +1135,17 @@ class ModelRunner:
         plan: ChainAdmissionPlan,
         input_token_count: int,
         input_prefix_digest: bytes,
-        generation_tokens: int = 0,
     ) -> ChainAdmissionPlan:
         return self.runtime_state.chain_validate_admission_plan(
             plan,
             input_token_count,
             input_prefix_digest,
-            generation_tokens,
         )
+
+    def chain_reclaim_idle(
+        self, chain_id: str, expected_seq_id: int, demote: bool,
+    ) -> dict[str, object]:
+        return self.runtime_state.chain_reclaim_idle(chain_id, expected_seq_id, demote)
 
     def chain_finish(
         self,

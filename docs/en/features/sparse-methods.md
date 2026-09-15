@@ -39,12 +39,51 @@ can lower decode TPS, especially when all requests already fit on GPU.
 
 Prefill acceleration is selected separately with `prefill_sparse_method`.
 Sparse-vLLM currently supports `h2o_prefill` for intermediate-chunk KV
-compaction and `flashprefill_v2` for sparse prefill attention computation. They
+compaction, `flashprefill_v2` for sparse prefill attention computation, and
+`omnikv_prefill` for chunked prefill with cross-layer history selection. They
 are alternatives on one axis and can each be combined with a compatible
 cache/decode method. See
 [runtime parameter semantics](../configuration/runtime-parameter-semantics.md#prefill-sparsity)
 for the H2O prefill/decode combination matrix and the omitted-versus-empty
 compatibility rule.
+
+`omnikv_prefill` can pair with vanilla (`sparse_method=""`) or OmniKV decode.
+It retains full KV storage and changes only prefill attention reads. Set
+`omnikv_prefill_full_attention_layers="auto"` (the default) to use a prefill-specific
+profile when registered, or reuse the model's OmniKV decode profile, filtered to
+global KV layers. An unregistered model fails
+explicitly and needs calibration first. An explicit list can override it and
+must include the first global KV layer. Sliding-window layers are excluded
+and always retain their normal attention. These layers and the following budgets are
+independent of the decode configuration:
+
+| Parameter | Meaning |
+|---|---|
+| `omnikv_prefill_keep_tokens` | Selected historical tokens, excluding sink, recent and current chunk; default 4096. |
+| `omnikv_prefill_sink_keep_tokens` | Always retained leading tokens; default 8. |
+| `omnikv_prefill_recent_keep_tokens` | Always retained history immediately before the current chunk; default 128. |
+
+The entire current chunk remains visible with causal masking. The method uses
+full-chunk raw-QK scoring in float32: explicit KV averages over queries then
+takes the head maximum; MLA takes the maximum over both queries and heads.
+`sparse_prefill_score_mode` does not change it. `engine_prefill_chunk_size` affects both quality and saved
+history-attention work. One full-prompt chunk has no historical work to prune.
+Sparse prefill can affect quality even with vanilla decode.
+
+Explicit KV, MLA latent storage, and Gemma 4 global attention (including shared-KV
+consumer layers) are supported. Gemma 4 sliding-window layers neither score nor
+consume OmniKV prefill selections. Contiguous explicit KV and MLA can use OmniKV
+CPU KV backing with `enable_omnikv_offload=true`, including independent prefill
+and decode full-attention layer lists. Heterogeneous Gemma 4 KV storage retains
+its existing offload restriction.
+
+With `enable_prefix_caching=true`, `prefix_cache_mode="auto"` selects `chain`;
+explicit `chain` is also accepted. Send the complete logical context and returned
+`chain_id` to continue the same completed turn. Chain reuse preserves the actual
+computed KV; it does not recompute earlier turns under a new chunk partition.
+Chunk-wide query selection can change a shared prefix's KV, so `radix` is rejected.
+Keep `enable_prefix_cache_offload=false`: idle chain snapshots do not support
+this shared slot layout. `enable_omnikv_offload` remains available independently.
 
 > [!NOTE]
 > The two score-free decode contracts have different paper provenance. The
@@ -115,7 +154,8 @@ compressed or quantized row metadata.
 
 `enable_prefix_caching=true` supports two deliberately separate layouts.
 `prefix_cache_mode=auto` chooses radix for vanilla/OmniKV/QuEST and a linear
-chain for SnapKV/H2O/PyramidKV/R-KV/SkipKV. `radix` and `chain` can be
+chain for SnapKV/H2O/PyramidKV/R-KV/SkipKV. Selecting `omnikv_prefill` changes
+vanilla/OmniKV to chain mode. `radix` and `chain` can be
 requested explicitly, but incompatible method/mode pairs fail fast.
 GLM-4.7-Flash latent QuEST supports radix prefix caching (including CPU offload)
 with decode CUDA Graph. Prefix blocks must match `quest_chunk_size`. Page selection
@@ -126,7 +166,7 @@ Existing vanilla/OmniKV radix trees can be physically compacted with the
 SnapKV- or KVzip-scored maintenance API described in
 [Prefix cache pruning](prefix-cache-pruning.md); QuEST trees reject pruning.
 
-The chain layout keeps one resident `seq_id` across turns and never branches.
+The chain layout keeps one owner `seq_id` across turns and never branches.
 Callers send the complete logical context plus the returned `chain_id`; only
 the suffix after the verified processed boundary is forwarded. Method KV and
 metadata remain in the cache manager. Idle chains are reclaimed by strict
@@ -134,6 +174,34 @@ LRU, while active writers are pinned. Rank 0 keeps the processed logical token
 IDs in compact 32-bit storage so text continuations preserve the resident BPE
 tokenization. This CPU history is bounded by
 `max_model_len * max_num_seqs_in_gpu` and reclaimed with the chain.
+
+### Chain CPU offload
+
+Set `enable_prefix_cache_offload=true` with `enable_prefix_caching=true`,
+`prefix_cache_mode="chain"` (or `auto`), and an explicit
+`prefix_cache_host_size_gb`. This uses the existing offload configuration for
+StreamingLLM, SnapKV, H2O, PyramidKV, R-KV, and SkipKV on their supported model
+paths with TP=1 or TP=2. Contiguous explicit KV and MLA latent/RoPE storage are
+supported; models with recurrent/linear layers are rejected at initialization.
+Pinned host memory, device streams, and the installed SGL cache-transfer APIs
+are required.
+
+Every completed turn asynchronously copies the entire retained cache and method
+state to CPU. The GPU copy remains available for a quick continuation. Under
+GPU capacity pressure, an idle chain with a completed CPU snapshot can release
+its GPU slots and row without losing its ID. A CPU-only continuation restores
+the full snapshot before processing the suffix. A new writer first waits for
+any previous copy to finish and invalidates that CPU snapshot; the next turn
+completion refreshes it, including changes to old tokens and scores.
+
+The host size limits snapshot tensor bytes **per rank**. Under host pressure,
+LRU CPU copies are reclaimed; chains whose GPU copy still exists retain their
+ID, while CPU-only victims become `chain_gone`. A single snapshot larger than
+the budget fails explicitly at turn completion. Logical token history and
+Python metadata are separate from the snapshot tensor budget; offload extends
+the driver's bounded token-history allowance by one token per four configured
+host bytes. CUDA Graph execution uses the same restored storage; transfers and
+allocation happen outside capture/replay.
 
 `Config` resolves `None`, empty string, and `auto` to the registry default. An
 explicit policy that does not match the method default fails fast so experiments

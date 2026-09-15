@@ -129,6 +129,52 @@ path.
 The runtime hierarchy is deliberately shallow and organized by shared
 mechanics:
 
+For `omnikv_prefill`, the factory wraps the existing vanilla/OmniKV runtime
+in `PrefillOverrideRuntime`. The wrapper binds an `OmniKVPrefillRuntime` for
+prefill and retains the original runtime for decode. It returns to decode state
+at `finish_step`, before graph replay restores captured references without
+running `prepare_step`. This exclusive delegation is deliberately limited to
+decoders without prefill score/compaction obligations.
+
+Chain mode retains Standard/OmniKV's shared physical slot pool across turns.
+Its per-layer residency counts repeat the shared allocation length; admission
+uses the maximum reserved count rather than summing independent pools. The chain
+fingerprint includes prefill observers, budgets and chunk limits. Radix remains
+invalid because a chunk's later queries can affect earlier tokens' deeper-layer KV.
+OmniKV offload reuses its existing prefill gather: selected history comes from
+host backing and the complete current chunk comes directly from GPU tensors.
+Selection tables keep current tokens at the tail, preserving that gather contract.
+
+The prefill runtime reuses `context_attention_fwd`'s causal raw-QK sums, takes
+the maximum over heads after dividing by query count, and performs an attention
+TP MAX reduction before selecting history. `build_omnikv_keep_and_slots` builds
+the shared logical view; full physical KV remains untouched. The operator's
+optional-score contract prepares scored and unscored providers before execution,
+keeping ordinary attention on the upstream-first portfolio. The inspected SGL
+context kernel and vLLM FA attention interface do not expose this per-head
+raw-QK sum; attention output/LSE alone does not satisfy that score contract.
+
+MLA instead uses the existing chunked prefill raw-QK query/head maximum scorer.
+The view's float32 `[B, L]` output becomes a full-current-query score request;
+history scoring reuses each bounded block's expanded K and resets the shared
+atomic-max buffer to negative infinity between observers. Gemma 4 uses its
+existing per-head raw-QK scorer only on global layers. Eligibility follows
+logical KV consumers, including shared-KV aliases, and skips sliding-window
+layers without resetting the preceding global observer. Sliding layers therefore
+retain their full position domain and need no sparse window-mask adaptation.
+
+For batch `B`, local query heads `H`, context `L`, chunk `C`, selected history
+budget `K`, and head dimension `D`, each observation costs `O(B H C L D)`
+attention work plus reduction/selection over `B H L` scores. Following layers
+read at most `sink + K + recent + C` tokens. A shared float32 score buffer costs
+`4 B H L` bytes; reduced scores cost `4 B L`, and each observation interval retains
+two int32 selection tables of at most `8 B (sink + K + recent + C)` bytes total,
+plus row lengths and top-k workspace. For `B=8, H=32, L=32768`, the shared score
+buffer is 32 MiB. Startup prefill profiling includes these allocations. Scores
+are reset between observations and released at the step boundary; no full QK
+matrix or new persistent KV pool is allocated. Long-context savings depend on
+the number of observation layers and chunk/budget settings and require measurement.
+
 | Runtime mechanism | Current methods | Meaning |
 | --- | --- | --- |
 | `PassThroughRuntime` | vanilla, QuEST | Controller selection is full; any native query-aware physical view remains cache-manager/provider owned. |

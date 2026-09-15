@@ -70,6 +70,8 @@ def _build_engine_hyper_params(args) -> dict[str, Any]:
     }
 
     hyper_params.update(_load_json_arg(args.hyper_params))
+    from sparsevllm.config import Config
+    hyper_params.setdefault("decode_reservation_tokens", Config.decode_reservation_tokens)
 
     return hyper_params
 

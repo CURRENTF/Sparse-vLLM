@@ -81,6 +81,44 @@ def test_non_profile_methods_resolve_auto_to_no_full_layers():
     assert config.full_attention_layers == []
 
 
+def test_prefill_auto_uses_catalog_independently_and_excludes_sliding_layers():
+    # Dense decode and an explicit decode override must both leave prefill's
+    # catalog resolution intact; sliding entries cannot become score observers.
+    profile = _profiles(_entry(layers=[0, 1, 3]))[0]
+    for decode_layers in ("auto", [2]):
+        config = SimpleNamespace(
+            model="Model-X", sparse_method="", full_attention_layers=decode_layers,
+            prefill_sparse_method="omnikv_prefill", omnikv_prefill_full_attention_layers="auto",
+            outer_hf_config=SimpleNamespace(), runtime_layout=None,
+            hf_config=SimpleNamespace(num_hidden_layers=4,
+                layer_types=["sliding_attention", "full_attention"] * 2),
+        )
+        with patch("sparsevllm.configs.full_attention_profiles.load_full_attention_layer_profiles", return_value=(profile,)):
+            resolve_auto_full_attention_layers(config)
+        assert config.omnikv_prefill_full_attention_layers == [1, 3]
+        assert config.full_attention_layers == ([] if decode_layers == "auto" else [2])
+
+
+def test_prefill_auto_rejects_missing_profile_instead_of_using_decode_layers():
+    config = SimpleNamespace(
+        model="Unknown", sparse_method="omnikv", full_attention_layers=[0, 2],
+        prefill_sparse_method="omnikv_prefill", omnikv_prefill_full_attention_layers="auto",
+        outer_hf_config=SimpleNamespace(), hf_config=SimpleNamespace(),
+    )
+    with patch("sparsevllm.configs.full_attention_profiles.load_full_attention_layer_profiles", return_value=()):
+        with pytest.raises(ValueError, match="No automatic"):
+            resolve_auto_full_attention_layers(config)
+
+
+def test_prefill_specific_calibration_does_not_replace_decode_profile():
+    decode = _entry("decode", layers=[0, 2])
+    prefill = _entry("prefill", layers=[1, 3])
+    prefill["sparse_methods"] = ["omnikv_prefill"]
+    profiles = _profiles(decode, prefill)
+    assert resolve_full_attention_layer_profile("Model-X", "omnikv", profiles=profiles).profile_id == "decode"
+    assert resolve_full_attention_layer_profile("Model-X", "omnikv_prefill", profiles=profiles).profile_id == "prefill"
+
+
 def test_packaged_profile_catalog_satisfies_schema_contract():
     profiles = load_full_attention_layer_profiles()
 

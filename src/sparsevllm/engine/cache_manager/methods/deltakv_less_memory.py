@@ -1346,9 +1346,39 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         )
         return len(centers)
 
+    def decode_window_budgets(self) -> dict[str, int]:
+        budgets = super().decode_window_budgets()
+        if self._full_layer_kivi_enabled():
+            budgets["full_layer_kivi_blocks"] = int(self._num_free_slots_full_layer_kivi)
+        elif self._full_layer_quant_enabled():
+            budgets["full_layer_latent"] = int(self._num_free_slots_full_layer_latent)
+        return budgets
+
+    def decode_window_costs(self, seq: Sequence, tokens: int) -> dict[str, int]:
+        costs = super().decode_window_costs(seq, tokens)
+        row = self.seq_id_to_row[seq.seq_id]
+        end = int(self.row_seq_lens[row]) + int(tokens)
+        if self._full_layer_kivi_enabled():
+            group = self._full_layer_kivi_group_size()
+            done = max(0, int(self.row_full_layer_kivi_quantized_lens[row])
+                       - int(self.config.sink_keep_tokens)) // group
+            residual = int(getattr(self.config, "full_layer_kivi_residual_length", group) or group)
+            resident = int(self.row_seq_lens[row]) - done * group
+            # Quantization frees whole groups after attention. Reserve the
+            # append-before-quantize peak, including one slot if eviction is overdue.
+            raw_peak = int(self.config.sink_keep_tokens) + residual + group
+            costs["full_layers"] = min(int(tokens), max(1, raw_peak - resident))
+            costs["full_layer_kivi_blocks"] = max(
+                0, self._estimate_full_layer_kivi_blocks_for_total_len(end) - done)
+        elif self._full_layer_quant_enabled():
+            costs["full_layer_latent"] = max(
+                0, end - int(self.config.sink_keep_tokens)
+                - int(self.row_full_layer_compressed_lens[row]))
+        return costs
+
     def prompt_admission_cost(self, seq: Sequence) -> int:
         if self._full_layer_kivi_enabled():
-            total_len = int(seq.num_prompt_tokens + (getattr(seq, "max_tokens", 0) or 0))
+            total_len = int(seq.num_prompt_tokens)
             resident = int(self.config.sink_keep_tokens) + int(
                 getattr(self.config, "full_layer_kivi_residual_length", self._full_layer_kivi_group_size())
                 or self._full_layer_kivi_group_size()
@@ -1356,23 +1386,27 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             return min(total_len, max(1, resident))
         if not self._full_layer_quant_enabled():
             return super().prompt_admission_cost(seq)
-        total_len = int(seq.num_prompt_tokens + (getattr(seq, "max_tokens", 0) or 0))
+        total_len = int(seq.num_prompt_tokens)
         resident = min(total_len, int(self.config.sink_keep_tokens) + int(self.config.recent_keep_tokens))
         return resident + self._estimate_full_layer_centers_for_total_len(total_len)
 
     def prompt_admission_budgets(self, waiting_seqs, engine_prefill_chunk_size: int) -> dict[str, int]:
         budgets = super().prompt_admission_budgets(waiting_seqs, engine_prefill_chunk_size)
-        latent_reserved = int(getattr(self, "_deltakv_latent_reserved_total", 0) or 0)
-        budgets["deltakv_latent"] = max(
-            0,
-            int(getattr(self, "deltakv_latent_num_slots", 0) or 0) - latent_reserved,
+        latent_reserved = sum(
+            max(0, reserved - (int(self.row_deltakv_compressed_lens[self.seq_id_to_row[seq_id]])
+                              if seq_id in self.seq_id_to_row else 0))
+            for seq_id, reserved in self._deltakv_latent_reserved_by_seq.items()
         )
+        budgets["deltakv_latent"] = max(0, self._num_free_slots_deltakv_latent - latent_reserved)
         if self._full_layer_kivi_enabled():
-            kivi_reserved = int(getattr(self, "_full_layer_kivi_reserved_total", 0) or 0)
-            budgets["full_layer_kivi_blocks"] = max(
-                0,
-                int(self.full_layer_kivi_num_blocks) - kivi_reserved,
+            group = self._full_layer_kivi_group_size()
+            kivi_reserved = sum(
+                max(0, reserved - (max(0, int(self.row_full_layer_kivi_quantized_lens[self.seq_id_to_row[seq_id]])
+                                           - int(self.config.sink_keep_tokens)) // group
+                                   if seq_id in self.seq_id_to_row else 0))
+                for seq_id, reserved in self._full_layer_kivi_reserved_by_seq.items()
             )
+            budgets["full_layer_kivi_blocks"] = max(0, self._num_free_slots_full_layer_kivi - kivi_reserved)
         return budgets
 
     def _estimate_full_layer_kivi_blocks_for_total_len(self, total_len: int) -> int:
@@ -1385,7 +1419,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
 
     def prompt_admission_costs(self, seq: Sequence) -> dict[str, int]:
         costs = super().prompt_admission_costs(seq)
-        total_len = int(seq.num_prompt_tokens + (getattr(seq, "max_tokens", 0) or 0))
+        total_len = int(seq.num_prompt_tokens)
         costs["deltakv_centers"] = self._estimate_deltakv_centers_for_total_len_exact(total_len)
         costs["deltakv_latent"] = self._estimate_deltakv_latent_slots_for_total_len(total_len)
         if self._full_layer_kivi_enabled():

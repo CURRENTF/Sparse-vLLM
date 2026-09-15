@@ -1,4 +1,4 @@
-"""Freeze a two-file MLA profile rerun, then replace its one affected curve."""
+"""Prepare an MLA profile rerun, then replace its one affected curve."""
 from __future__ import annotations
 
 import argparse
@@ -9,7 +9,6 @@ import json
 from pathlib import Path
 import subprocess
 import sys
-import tarfile
 
 from plot_decode_capacity import validate_measurement, without_source_fingerprints
 
@@ -44,7 +43,6 @@ def selected_bindings(value):
 
 def prepare(args):
     base = read(args.base_plot)
-    names = subprocess.check_output(["git", "ls-files", "-z"], cwd=args.repo).decode().split("\0")
     if RULE not in (args.repo / "src/sparsevllm/kernels/tilelang/mla/runtime.py").read_text():
         raise ValueError("Selected source does not contain the requested rule")
     if not args.scratch_root.is_absolute() or len(str(args.scratch_root)) > 65:
@@ -55,17 +53,6 @@ def prepare(args):
     config["scratch_root"] = str(args.scratch_root)
     write(args.run_root / "config.json", config)
     write(args.run_root / "base_plot.json", base)
-    with tarfile.open(args.run_root / "source.tar.gz", "w:gz") as archive:
-        for name in sorted(n for n in names if n and (args.repo / n).is_file()):
-            archive.add(args.repo / name, arcname=name, recursive=False)
-    source_dir = args.run_root / "source"
-    source_dir.mkdir()
-    for name in CHANGED:
-        dest = source_dir / name
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes((args.repo / name).read_bytes())
-    diff = subprocess.check_output(["git", "diff", "--", *sorted(CHANGED)], cwd=args.repo)
-    (args.run_root / "profile.patch").write_bytes(diff)
     write(args.run_root / "manifest.json", {
         "status": "prepared", "rule": RULE,
         "formula": "nearest by absolute distance to SM_count / (batch * head_tiles)",
@@ -205,16 +192,6 @@ def export(args):
         for item in portable["curves"]:
             for point in item["points"]:
                 writer.writerow({"model": item["model"], "lane": item["lane"], **point})
-    recipe = root / "recipe"
-    recipe.mkdir()
-    package = Path(__file__).parent
-    recipe_names = ("update_mla_profile_results.py", "run_sm_parallel_profile.sh",
-                    "sweep_decode_capacity.py", "decode_capacity_guard.py", "plot_decode_capacity.py",
-                    "config.omnikv-total2048.json", "palettes/fresh_modern.json")
-    for name in recipe_names:
-        dest = recipe / name
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes((package / name).read_bytes())
     manifest.update(status="completed", accepted_points=sum(len(c["points"]) for c in curves),
                     reused_curves=len(curves)-1, rerun_points=len(curve["points"]),
                     output=str(output))

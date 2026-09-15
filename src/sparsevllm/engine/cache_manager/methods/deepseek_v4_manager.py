@@ -97,6 +97,17 @@ class DeepseekV4CacheManager(CacheManager):
     def prompt_logical_reservation_cost(self, seq):
         return int(seq.seq_id not in self.pool.live)
 
+    def decode_window_budgets(self):
+        return self.step_resource_budgets(is_prefill=False)
+
+    def decode_window_costs(self, seq, tokens):
+        return self.step_resource_costs(seq, tokens, is_prefill=False)
+
+    def prefill_capacity_after_decode_reservations(self, free_slots, reserved, *, admission):
+        # Request rows and temporary prefill rows are independent of compressed
+        # history. RuntimeState deducts reservations from the named pools.
+        return int(free_slots)
+
     def step_resource_budgets(self, *, is_prefill):
         if not is_prefill and self.prefix is not None:
             costs = {ratio: sum((row.length + 1) // ratio - row.length // ratio for row in self.pool.live.values())

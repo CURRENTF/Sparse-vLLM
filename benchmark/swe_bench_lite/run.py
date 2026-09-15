@@ -440,6 +440,8 @@ def render_mini_config(
     max_tokens: int,
     temperature: float,
     top_p: float,
+    enable_thinking: bool,
+    preserve_thinking: bool,
     api_base: str | None,
 ) -> str:
     lines = [
@@ -456,6 +458,11 @@ def render_mini_config(
         f"    max_tokens: {max_tokens}",
         f"    temperature: {temperature}",
         f"    top_p: {top_p}",
+        "    extra_body:",
+        f"      enable_thinking: {str(enable_thinking).lower()}",
+        f"      preserve_thinking: {str(preserve_thinking).lower()}",
+        "      chat_template_kwargs:",
+        f"        clear_thinking: {str(not preserve_thinking).lower()}",
     ]
     if api_base:
         lines.append(f"    api_base: {json.dumps(api_base)}")
@@ -763,6 +770,13 @@ class SweBenchLiteRunner:
             )
         if getattr(args, "chain_cache", None) is None:
             args.chain_cache = _env_truthy("SPARSEVLLM_CHAIN_CACHE")
+        if args.preserve_thinking is None:
+            args.preserve_thinking = bool(args.chain_cache)
+        if args.chain_cache and not args.preserve_thinking:
+            raise RunnerError(
+                "--chain-cache requires --preserve-thinking for append-only prompts; "
+                "--no-preserve-thinking is incompatible."
+            )
         self.args = args
         self.repo_root = Path(__file__).resolve().parents[2]
         self.swe_bench_dir = (
@@ -1076,6 +1090,8 @@ class SweBenchLiteRunner:
             "max_tokens": self.args.max_tokens,
             "temperature": self.args.temperature,
             "top_p": self.args.top_p,
+            "enable_thinking": self.args.enable_thinking,
+            "preserve_thinking": self.args.preserve_thinking,
             "chain_cache": bool(self.args.chain_cache),
             "prefix_prune": (
                 {
@@ -1153,6 +1169,8 @@ class SweBenchLiteRunner:
             max_tokens=self.args.max_tokens,
             temperature=self.args.temperature,
             top_p=self.args.top_p,
+            enable_thinking=self.args.enable_thinking,
+            preserve_thinking=self.args.preserve_thinking,
             api_base=self.args.api_base,
         )
         if (
@@ -1728,6 +1746,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument(
+        "--enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable or disable model thinking through the chat template.",
+    )
+    parser.add_argument(
+        "--preserve-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Keep prior assistant reasoning in multi-turn chat prompts. "
+            "Defaults to enabled with chain cache, disabled otherwise; "
+            "chain cache rejects --no-preserve-thinking."
+        ),
+    )
     parser.add_argument(
         "--chain-cache",
         action=argparse.BooleanOptionalAction,

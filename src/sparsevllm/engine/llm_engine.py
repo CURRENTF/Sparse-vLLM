@@ -374,7 +374,27 @@ class LLMEngine:
                 if self.config.enable_prefix_caching
                 else None
             ),
+            decode_capacity_reclaimer=self._reclaim_idle_chains_for_decode,
         )
+
+    def _reclaim_idle_chains_for_decode(self, failure: Sequence) -> Sequence | None:
+        runtime = self.model_runner.runtime_state
+        coordinator = runtime.chain_cache_coordinator
+        if coordinator is None:
+            return failure
+        # Only the driver chooses victims. Complete the same physical release
+        # on every rank before retrying the scheduler's reservation decision.
+        for record in coordinator.index.idle_resident_lru():
+            demote = coordinator.offload is not None and record.seq_id in coordinator.offload.snapshots
+            self.model_runner.call("chain_reclaim_idle", record.chain_id, int(record.seq_id), demote)
+            logger.info(
+                "Reclaimed IDLE chain for decode capacity: chain_id={} seq_id={} demoted={} free_slots={}",
+                record.chain_id, record.seq_id, demote, runtime.num_free_slots,
+            )
+            failure = runtime.reserve_decode_windows(self.scheduler.decoding, self.scheduler.waiting)
+            if failure is None:
+                break
+        return failure
 
     def _run_startup_batch(
         self,
@@ -937,7 +957,6 @@ class LLMEngine:
                 normalized_chain_id,
                 int(seq.seq_id),
                 prompt,
-                int(sampling_params.max_tokens),
             )
         except ChainPrefixMismatchError as exc:
             if existing is None or chain_append_only:
@@ -962,7 +981,6 @@ class LLMEngine:
                 normalized_chain_id,
                 int(seq.seq_id),
                 prompt,
-                int(sampling_params.max_tokens),
             )
             recreated = True
         if plan.status == "resumed" and prompt_len <= int(plan.reused_tokens):
@@ -976,7 +994,6 @@ class LLMEngine:
             plan,
             prompt_len,
             stable_token_digest(prompt, count=int(plan.reused_tokens)),
-            int(sampling_params.max_tokens),
         )
         self.model_runner.call("chain_apply_admission", plan)
         chain_status = "recreated" if recreated else str(plan.status)
@@ -1586,27 +1603,32 @@ class LLMEngine:
                         "run", seqs, is_prefill
                     )
                 except Exception:
+                    if is_prefill:
+                        # Prefills leave waiting during selection. Restore
+                        # ownership until cleanup succeeds, including the first
+                        # chunk whose num_prefilled_tokens is still zero.
+                        self.scheduler.waiting.extendleft(reversed(seqs))
                     for seq in seqs:
-                        chain_seq = self._active_chain_sequences.pop(
-                            int(seq.seq_id), None
-                        )
-                        if chain_seq is None:
-                            continue
+                        chain_seq = self._active_chain_sequences.get(int(seq.seq_id))
                         try:
-                            self.model_runner.call(
-                                "chain_invalidate",
-                                str(chain_seq.chain_id),
-                                int(chain_seq.seq_id),
-                            )
-                            # Remove scheduler ownership after RuntimeState has
-                            # reclaimed the resident payload. A later serving
-                            # cleanup must not free the same sparse rows twice.
-                            self.scheduler.abort(int(chain_seq.seq_id))
+                            if chain_seq is None:
+                                self.model_runner.call("free_slots", int(seq.seq_id))
+                            else:
+                                self.model_runner.call(
+                                    "chain_invalidate",
+                                    str(chain_seq.chain_id),
+                                    int(chain_seq.seq_id),
+                                )
                         except Exception:
                             logger.exception(
-                                "Failed to invalidate chain {} after model failure.",
-                                chain_seq.chain_id,
+                                "Failed to reclaim seq_id={} after model failure.",
+                                seq.seq_id,
                             )
+                            continue
+                        # Commit removal only after the physical release. Keep
+                        # failed cleanup visible to the serving cancellation path.
+                        self._active_chain_sequences.pop(int(seq.seq_id), None)
+                        self.scheduler.abort(int(seq.seq_id))
                     raise
             token_logprobs, top_logprobs = (
                 logprob_outputs if logprob_outputs is not None else (None, None)

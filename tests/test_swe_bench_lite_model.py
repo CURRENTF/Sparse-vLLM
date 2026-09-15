@@ -12,7 +12,9 @@ import pytest
 
 
 class FakeFormatError(Exception):
-    pass
+    def __init__(self, message):
+        super().__init__(message)
+        self.messages = (message,) if isinstance(message, dict) else ()
 
 
 class FakeAPIError(Exception):
@@ -25,6 +27,7 @@ def _response(
     chain_id,
     *,
     content="answer",
+    reasoning_content=None,
     tool_calls=None,
     query_error=None,
     finish_reason="stop",
@@ -34,11 +37,12 @@ def _response(
         model_dump=lambda mode="json": {
             "role": "assistant",
             "content": content,
+            "reasoning_content": reasoning_content,
             "tool_calls": tool_calls,
             "provider_specific_fields": {"chain_id": chain_id},
         }
     )
-    return SimpleNamespace(
+    response = SimpleNamespace(
         chain_id=chain_id,
         chain_status=chain_status,
         choices=[
@@ -49,6 +53,12 @@ def _response(
         ],
         query_error=query_error,
     )
+    response.model_dump = lambda mode="json": {
+        "choices": [{"message": message.model_dump(), "finish_reason": finish_reason}],
+        "chain_id": chain_id,
+        "chain_status": chain_status,
+    }
+    return response
 
 
 def _load_model_module(monkeypatch, responses):
@@ -71,6 +81,8 @@ def _load_model_module(monkeypatch, responses):
             )
             query_error = getattr(response, "query_error", None)
             if query_error is not None:
+                if isinstance(query_error, FakeFormatError) and query_error.messages:
+                    query_error.messages[0].setdefault("extra", {})["response"] = response.model_dump()
                 raise query_error
             return {
                 "role": "assistant",
@@ -198,6 +210,56 @@ def test_chain_model_fails_when_server_omits_chain_id(monkeypatch):
     with pytest.raises(RuntimeError, match="without a chain_id"):
         model.query([{"role": "user", "content": "first"}])
 
+
+@pytest.mark.parametrize("source", ["config", "request"])
+@pytest.mark.parametrize("extra_body", [
+    {"preserve_thinking": False},
+    {"chat_template_kwargs": {"preserve_thinking": False}},
+    {"chat_template_kwargs": {"clear_thinking": True}},
+])
+def test_chain_rejects_reasoning_removal_before_api_call(monkeypatch, source, extra_body):
+    """Extra YAML and per-query overrides cannot bypass the runner's validation."""
+    module = _load_model_module(monkeypatch, [])
+    monkeypatch.setenv("SPARSEVLLM_CHAIN_CACHE", "1")
+    model = module.SparseVLLMLitellmModel()
+    kwargs = {}
+    if source == "config":
+        model.config.model_kwargs["extra_body"] = extra_body
+    else:
+        kwargs["extra_body"] = extra_body
+    with pytest.raises(ValueError, match="requires preserved thinking"):
+        model._query([{"role": "user", "content": "first"}], **kwargs)
+    assert not model.calls
+
+
+def test_chain_runner_config_matches_adapter_thinking_parameters(monkeypatch, tmp_path):
+    """Generated config and transmitted template controls describe the same run."""
+    import yaml
+    from benchmark.swe_bench_lite.run import (
+        SweBenchLiteRunner, build_parser, render_mini_config,
+    )
+
+    args = build_parser().parse_args([
+        "--stage", "summarize", "--run-dir", str(tmp_path), "--chain-cache",
+    ])
+    runner = SweBenchLiteRunner(args)
+    config = yaml.safe_load(render_mini_config(
+        step_limit=args.step_limit, cost_limit=args.cost_limit,
+        wall_time_limit_seconds=args.wall_time_limit_seconds,
+        cost_tracking=args.cost_tracking, max_tokens=args.max_tokens,
+        temperature=args.temperature, top_p=args.top_p,
+        enable_thinking=args.enable_thinking,
+        preserve_thinking=runner.args.preserve_thinking, api_base=args.api_base,
+    ))
+    module = _load_model_module(monkeypatch, [_response("chain-a")])
+    monkeypatch.setenv("SPARSEVLLM_CHAIN_CACHE", "1")
+    model = module.SparseVLLMLitellmModel()
+    model.config.model_kwargs = config["model"]["model_kwargs"]
+    model._query([{"role": "user", "content": "first"}])
+    sent = model.calls[0][1]["extra_body"]
+    assert {k: v for k, v in sent.items() if k != "chain_id"} == config["model"]["model_kwargs"]["extra_body"]
+    assert sent["chat_template_kwargs"]["clear_thinking"] is not sent["preserve_thinking"]
+
 def test_non_chain_model_does_not_send_chain_id(monkeypatch):
     module = _load_model_module(
         monkeypatch,
@@ -314,6 +376,116 @@ def test_chain_model_full_rerenders_after_length_finish(monkeypatch):
     second_extra = model.calls[1][1]["extra_body"]
     assert second_extra["chain_id"] == "chain-a"
     assert "chain_append_start" not in second_extra
+
+
+@pytest.mark.parametrize("chain_enabled", [False, True])
+@pytest.mark.parametrize("content", [None, "partial answer"])
+def test_length_format_error_retains_assistant_and_single_raw_response(
+    monkeypatch, chain_enabled, content
+):
+    error = FakeFormatError({"role": "user", "content": "Output was cut off; retry.", "extra": {}})
+    responses = [
+        _response("chain-a", content=content, reasoning_content="unfinished reasoning",
+                  finish_reason="length", query_error=error),
+        _response("chain-a", chain_status="resumed"),
+    ]
+    module = _load_model_module(monkeypatch, responses)
+    monkeypatch.setenv("SPARSEVLLM_CHAIN_CACHE", "1" if chain_enabled else "0")
+    model = module.SparseVLLMLitellmModel()
+    messages = [{"role": "user", "content": "first"}]
+
+    with pytest.raises(FakeFormatError) as raised:
+        model.query(messages)
+    assert raised.value is error
+    messages.extend(error.messages)  # DefaultAgent's actual recovery contract.
+    assert [message["role"] for message in messages] == ["user", "assistant", "user"]
+    assert messages[1]["reasoning_content"] == "unfinished reasoning"
+    assert messages[1]["content"] == content
+    assert sum("response" in message.get("extra", {}) for message in messages) == 1
+    assert messages[2]["extra"]["truncated_response_preserved"] is True
+    assert messages[2]["extra"]["response"]["choices"][0]["finish_reason"] == "length"
+    model.query(messages)
+    assert model.calls[1][0][1]["reasoning_content"] == "unfinished reasoning"
+    if chain_enabled:
+        extra = model.calls[1][1]["extra_body"]
+        assert extra["chain_id"] == "chain-a"
+        assert "chain_append_start" not in extra
+        assert model._force_new_chain_reason is None
+
+
+def test_length_recovery_rejects_dropping_preserved_response(monkeypatch):
+    error = FakeFormatError({"role": "user", "content": "retry", "extra": {}})
+    module = _load_model_module(monkeypatch, [
+        _response("chain-a", content=None, reasoning_content="partial",
+                  finish_reason="length", query_error=error),
+    ])
+    monkeypatch.setenv("SPARSEVLLM_CHAIN_CACHE", "1")
+    model = module.SparseVLLMLitellmModel()
+    first = [{"role": "user", "content": "first"}]
+    with pytest.raises(FakeFormatError):
+        model.query(first)
+    with pytest.raises(RuntimeError, match="not append-only"):
+        model.query([*first, error.messages[-1]])
+    assert len(model.calls) == 1
+
+
+def test_length_format_error_respects_server_invalidation(monkeypatch):
+    error = FakeFormatError({"role": "user", "content": "retry", "extra": {}})
+    module = _load_model_module(monkeypatch, [
+        _response("chain-a", finish_reason="length", chain_status="invalidated",
+                  query_error=error),
+        _response("chain-b"),
+    ])
+    monkeypatch.setenv("SPARSEVLLM_CHAIN_CACHE", "1")
+    model = module.SparseVLLMLitellmModel()
+    first = [{"role": "user", "content": "first"}]
+    with pytest.raises(FakeFormatError):
+        model.query(first)
+    model.query([*first, *error.messages])
+    assert model.calls[1][1]["extra_body"]["chain_id"] is None
+
+
+def test_length_format_error_does_not_insert_unmatched_tool_calls(monkeypatch):
+    error = FakeFormatError({"role": "user", "content": "Invalid arguments; retry", "extra": {}})
+    module = _load_model_module(monkeypatch, [
+        _response("chain-a", finish_reason="length", query_error=error,
+                  tool_calls=[{"id": "call-1", "type": "function",
+                               "function": {"name": "bash", "arguments": '{"command":'}}]),
+    ])
+    monkeypatch.setenv("SPARSEVLLM_CHAIN_CACHE", "1")
+    model = module.SparseVLLMLitellmModel()
+    with pytest.raises(FakeFormatError):
+        model.query([{"role": "user", "content": "first"}])
+    assert len(error.messages) == 1
+    assert error.messages[0]["role"] == "user"
+    assert model._force_new_chain_reason == "format_error"
+
+
+@pytest.mark.parametrize("chain_enabled", [False, True])
+def test_length_format_error_records_unexecuted_tool_results(monkeypatch, chain_enabled):
+    error = FakeFormatError({"role": "user", "content": "Missing command; retry", "extra": {}})
+    calls = [{"id": f"call-{i}", "type": "function",
+              "function": {"name": "bash", "arguments": "{}"}} for i in range(2)]
+    module = _load_model_module(monkeypatch, [
+        _response("chain-a", content=None, finish_reason="length", query_error=error,
+                  tool_calls=calls),
+        _response("chain-b", chain_status="recreated"),
+    ])
+    monkeypatch.setenv("SPARSEVLLM_CHAIN_CACHE", "1" if chain_enabled else "0")
+    model = module.SparseVLLMLitellmModel()
+    first = [{"role": "user", "content": "first"}]
+    with pytest.raises(FakeFormatError):
+        model.query(first)
+    assert [message["role"] for message in error.messages] == ["assistant", "tool", "tool", "user"]
+    assert error.messages[0]["tool_calls"] == calls
+    for call, result in zip(calls, error.messages[1:3]):
+        assert result["tool_call_id"] == call["id"]
+        assert "not executed" in result["content"]
+    model.query([*first, *error.messages])
+    if chain_enabled:
+        assert model.calls[1][1]["extra_body"]["chain_id"] == "chain-a"
+        assert "chain_append_start" not in model.calls[1][1]["extra_body"]
+        assert model._chain_id == "chain-b"
 
 
 def test_chain_model_starts_new_chain_after_invalidation(monkeypatch):

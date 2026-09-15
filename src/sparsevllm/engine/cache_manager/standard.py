@@ -137,6 +137,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
         self.enable_prefix_caching = bool(
             config.enable_prefix_caching and config.sparse_method in ("", "omnikv")
+            and getattr(config, "resolved_prefix_cache_mode", "radix") == "radix"
             and not getattr(getattr(config, "runtime_layout", None), "linear_attention_layer_indices", ())
         )
         self.prefix_cache_block_size = int(config.prefix_cache_block_size)
@@ -1284,6 +1285,11 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             controller.prefix_cache = self._require_prefix_cache()
 
     def reset_after_warmup(self) -> None:
+        if getattr(self.config, "resolved_prefix_cache_mode", "disabled") == "chain":
+            # TP workers do not own the scheduler's resident-sequence ledger.
+            # Reclaim their retained warmup chains from the local allocator.
+            for seq_id in sorted(self.seq_id_to_row):
+                self.free_seq(seq_id)
         if self.enable_prefix_caching and self.prefix_cache is not None:
             self.reset_prefix_cache()
             return
@@ -1832,6 +1838,45 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                     int(after_free),
                 )
             if log_level == 'DEBUG': logger.debug(f'free seq {row_idx} with {cur_len} tokens')
+
+    def chain_capacity_deficits(
+        self,
+        *,
+        suffix_tokens: int,
+        generation_tokens: int = 0,
+        existing_slots_by_layer: tuple[int, ...] = (),
+        outstanding_reserved_slots_by_layer: tuple[int, ...] = (),
+        outstanding_reserved_rows: int = 0,
+        needs_resident_row: bool,
+    ) -> tuple[tuple[int, ...], int, tuple[int, ...], int]:
+        # All KV layers share one slot allocator. Repeat its accounting along
+        # the chain's layer axis; never sum it as independent physical pools.
+        required = max(0, int(suffix_tokens)) + max(0, int(generation_tokens) - 1)
+        if needs_resident_row:
+            required += max(existing_slots_by_layer, default=0)
+        available = max(
+            0, self._num_free_slots - max(outstanding_reserved_slots_by_layer, default=0)
+        )
+        required_rows = int(needs_resident_row)
+        available_rows = max(0, len(self.free_rows) - outstanding_reserved_rows)
+        return (
+            (required,) * self.num_kv_layers,
+            required_rows,
+            (max(0, required - available),) * self.num_kv_layers,
+            max(0, required_rows - available_rows),
+        )
+
+    def chain_physical_residency(self, seq_id: int) -> tuple[int, ...]:
+        row = self.seq_id_to_row.get(int(seq_id))
+        if row is None:
+            raise RuntimeError(f"Missing chain row for seq_id={seq_id}.")
+        return (int(self.row_seq_lens[row]),) * self.num_kv_layers
+
+    def chain_has_residency(self, seq_id: int) -> bool:
+        return int(seq_id) in self.seq_id_to_row
+
+    def chain_physical_kv_len(self, layer_idx: int, seq_id: int) -> int:
+        return self.chain_physical_residency(seq_id)[self.kv_layer_index(layer_idx)]
 
     def debug_live_seq_slots(self) -> dict[int, int]:
         return {

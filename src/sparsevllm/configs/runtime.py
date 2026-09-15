@@ -65,6 +65,7 @@ class Config(
     max_model_len_auto: bool = field(default=False, init=False)
     # None preserves the legacy shared batch limit. Set explicitly to allow
     # decode and prefill to use different per-step sequence limits.
+    decode_reservation_tokens: int = 1024
     max_decoding_seqs: int | None = None
     max_num_seqs_in_gpu: int | None = None
 

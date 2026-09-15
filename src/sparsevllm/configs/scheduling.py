@@ -13,6 +13,9 @@ from sparsevllm.method_registry import (
 
 
 def normalize_scheduling(config) -> None:
+    window = config.decode_reservation_tokens
+    if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
+        raise ValueError("decode_reservation_tokens must be a positive integer.")
     config.max_num_seqs_in_batch = int(config.max_num_seqs_in_batch)
     if config.max_num_seqs_in_batch <= 0:
         raise ValueError(

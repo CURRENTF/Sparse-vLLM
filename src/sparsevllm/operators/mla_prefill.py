@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from sparsevllm.engine.cache_manager.base import AttentionViewMeta
+from sparsevllm.engine.cache_manager.base import AttentionViewMeta, PrefillScoreRequest
 from sparsevllm.kernels.triton.mla.prefill import attention_partial, merge_partial
 from sparsevllm.kernels.triton.mla.prefill_score import score_block
 from sparsevllm.utils.profiler import profiler
@@ -99,6 +99,8 @@ class ChunkedMlaPrefill:
             and old.meta.context_lens is meta.context_lens
             and old.cu_q is cu_q
         ):
+            # Packing is shared across layers; optional score outputs are not.
+            old.meta = meta
             return old
         contexts = tuple(int(x) for x in meta.context_lens.tolist())
         starts = tuple(int(x) for x in cu_q.tolist())
@@ -174,12 +176,30 @@ class ChunkedMlaPrefill:
             causal=causal,
         )
 
+    def score_request(
+        self, plan: PrefillPlan, cache_request: PrefillScoreRequest | None = None,
+    ) -> PrefillScoreRequest | None:
+        """Resolve full-query raw maxima requested through the attention view."""
+        if plan.meta.attn_score is None:
+            return cache_request
+        if cache_request is not None:
+            raise ValueError("MLA prefill cannot combine main-attention and cache score requests.")
+        return PrefillScoreRequest(
+            query_ranges=tuple(
+                (context - (b - a), context)
+                for context, a, b in zip(
+                    plan.contexts, plan.query_starts, plan.query_starts[1:]
+                )
+            ),
+            mode="logits",
+        )
+
     def run(self, q, view, cu_q, scope, project, absorb, score_request=None):
         plan = self.prepare(view, cu_q, scope)
         if plan.query_starts[-1] != q.shape[0]:
             raise ValueError("MLA query count differs from packed query metadata.")
         scorer = (
-            MlaPrefillScores(self, q, plan, score_request, absorb)
+            MlaPrefillScores(self, q, plan, score_request, absorb, output=view.meta.attn_score)
             if score_request
             else None
         )
@@ -216,7 +236,7 @@ class ChunkedMlaPrefill:
 
 
 class MlaPrefillScores:
-    def __init__(self, owner, q, plan, request, absorb):
+    def __init__(self, owner, q, plan, request, absorb, *, output=None):
         if request.mode not in {"logits", "probability"}:
             raise ValueError("Unsupported MLA prefill score mode.")
         if len(request.query_ranges) != len(plan.contexts):
@@ -226,12 +246,21 @@ class MlaPrefillScores:
         self.full_normalizer = (
             request.candidate_start == 0 and request.recent_keep_tokens == 0
         )
-        self.output = torch.full(
-            (len(plan.contexts), max(plan.contexts)),
-            -torch.inf if request.mode == "logits" else 0.0,
-            dtype=torch.float32,
-            device=q.device,
-        )
+        shape = (len(plan.contexts), max(plan.contexts))
+        fill = -torch.inf if request.mode == "logits" else 0.0
+        if output is None:
+            output = torch.full(shape, fill, dtype=torch.float32, device=q.device)
+        else:
+            if (
+                output.shape != shape or output.dtype != torch.float32
+                or output.device != q.device or output.stride(-1) != 1
+            ):
+                raise ValueError(
+                    "MLA prefill score output must be float32 [batch, max_context] "
+                    "with contiguous rows on the query device."
+                )
+            output.fill_(fill)
+        self.output = output
         self.queries, self.rope_queries, self.lse = [], [], []
         nope = owner.spec.qk_head_dim - owner.spec.rope_dim
         for i, (start, end) in enumerate(request.query_ranges):

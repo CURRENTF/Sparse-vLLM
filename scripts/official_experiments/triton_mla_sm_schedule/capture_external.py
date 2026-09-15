@@ -1,10 +1,9 @@
-"""Archive imported fork code and hash binaries without copying CUDA binaries."""
+"""Record external checkout versions, package locations, and model identity."""
 import argparse
 import hashlib
 import json
 from pathlib import Path
 import subprocess
-import tarfile
 
 
 def digest(path):
@@ -34,28 +33,16 @@ for name, package, checkout, environment in (
     dest = args.output_dir / name
     dest.mkdir()
     git = lambda *a: subprocess.check_output(["git", *a], cwd=checkout)
-    (dest / "checkout.patch").write_bytes(git("diff", "HEAD", "--binary"))
     packages = subprocess.check_output([
         str(environment / "bin/python"), "-c",
         "import importlib.metadata,json,sys; print(json.dumps({'python':sys.version,'packages':sorted([(d.metadata['Name'],d.version) for d in importlib.metadata.distributions()])},indent=2))",
     ])
     (dest / "environment.json").write_bytes(packages)
-    files = sorted(path for path in package.rglob("*") if path.is_file()
-                   and "__pycache__" not in path.parts and ".git" not in path.parts)
-    hashes = {str(path.relative_to(package)): digest(path) for path in files}
-    archive = dest / "imported-source.tar.gz"
-    # Keep every source/config file, but hash rather than commit large binaries.
-    with tarfile.open(archive, "w:gz") as handle:
-        for path in files:
-            if path.suffix in {".py", ".pyi", ".json", ".toml", ".yaml", ".yml", ".cpp", ".cu", ".h", ".hpp", ".cuh", ".c", ".md", ".txt"}:
-                handle.add(path, arcname=str(path.relative_to(package)))
     manifest["forks"][name] = {
         "imported_package": str(package.resolve()), "checkout": str(checkout.resolve()),
         "checkout_head": git("rev-parse", "HEAD").decode().strip(),
         "checkout_status": git("status", "--short").decode(),
-        "environment": str(environment.resolve()), "imported_files_sha256": hashes,
-        "source_archive_sha256": digest(archive),
-        "binary_policy": "Imported binaries are hashed, not included in the source-only archive.",
+        "environment": str(environment.resolve()),
     }
 for path in sorted(args.model.iterdir()):
     if path.is_file():

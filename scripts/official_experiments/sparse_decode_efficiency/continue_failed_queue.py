@@ -1,6 +1,6 @@
 """One-shot continuation of untouched lanes after a legacy fail-fast queue stops.
 
-Never retries a failed lane or changes the running queue's frozen source.
+Never retries a failed lane or changes the running queue's checkout.
 Linux pidfds keep reservation handoff signals bound to verified processes.
 """
 import argparse

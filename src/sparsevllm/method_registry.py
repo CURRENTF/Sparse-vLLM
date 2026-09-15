@@ -70,11 +70,13 @@ CANONICAL_PREFILL_SPARSE_METHODS = {
     "",
     "h2o_prefill",
     "flashprefill_v2",
+    "omnikv_prefill",
 }
 
 PREFILL_SPARSE_METHOD_COMPATIBILITY = {
     "": frozenset(CANONICAL_SPARSE_METHODS),
     "h2o_prefill": frozenset({"", "h2o"}),
+    "omnikv_prefill": frozenset({"", "omnikv"}),
     "flashprefill_v2": frozenset({"", "omnikv", "quest", "snapkv", "h2o"}),
 }
 
@@ -116,6 +118,17 @@ def resolve_cache_sparse_method(
     return normalized
 
 
+def omnikv_prefill_layer_indices(config) -> tuple[int, ...]:
+    """Logical KV consumers eligible for global cross-layer prefill selection."""
+    layout = getattr(config, "runtime_layout", None)
+    layer_types = getattr(config.hf_config, "layer_types", None)
+    return tuple(
+        layer for layer in range(config.hf_config.num_hidden_layers)
+        if (layout is None or layout.is_full_attention(layer))
+        and (layer_types is None or layer_types[layer] != "sliding_attention")
+    )
+
+
 def prefill_sparse_method_fingerprint(config) -> dict[str, object]:
     """Return prefill semantics that can change cached hidden-state-derived KV."""
 
@@ -124,6 +137,17 @@ def prefill_sparse_method_fingerprint(config) -> dict[str, object]:
         sparse_method=getattr(config, "sparse_method", ""),
     )
     payload: dict[str, object] = {"prefill_sparse_method": method}
+    if method == "omnikv_prefill":
+        for field_name in (
+            "omnikv_prefill_full_attention_layers",
+            "omnikv_prefill_keep_tokens",
+            "omnikv_prefill_sink_keep_tokens",
+            "omnikv_prefill_recent_keep_tokens",
+            "sparse_attn_score_dtype",
+            "engine_prefill_chunk_size",
+            "max_num_batched_tokens",
+        ):
+            payload[field_name] = getattr(config, field_name, None)
     if method == "flashprefill_v2":
         for field_name in (
             "flashprefill_v2_k_block_m",
@@ -176,6 +200,7 @@ class PrefillScoreCollectionKind(Enum):
     NONE = auto()
     METHOD_OWNED_POSTHOC_REDUCED = auto()
     MAIN_ATTENTION_REDUCED = auto()
+    MAIN_ATTENTION_PER_HEAD = auto()
 
 
 @dataclass(frozen=True)
@@ -183,6 +208,7 @@ class SparsePrefillAttentionContract:
     main_score_kind: AttentionScoreKind
     score_collection: PrefillScoreCollectionKind
     layer_varying_page_table: bool
+    optional_score_output: bool = False
 
 
 _PREFILL_POSTHOC_SCORE_METHODS = frozenset(
@@ -248,6 +274,13 @@ def sparse_prefill_attention_contract(
         prefill_sparse_method,
         sparse_method=normalized,
     )
+    if resolved_prefill_method == "omnikv_prefill":
+        return SparsePrefillAttentionContract(
+            main_score_kind=AttentionScoreKind.RAW_QK_PER_HEAD,
+            score_collection=PrefillScoreCollectionKind.MAIN_ATTENTION_PER_HEAD,
+            layer_varying_page_table=True,
+            optional_score_output=True,
+        )
     cache_method = resolve_cache_sparse_method(
         normalized,
         prefill_sparse_method=resolved_prefill_method,

@@ -83,6 +83,7 @@ class PrefillAttentionOpSpec:
     causal: bool = True
     page_size: int = 1
     score_output: AttentionScoreKind = AttentionScoreKind.NONE
+    optional_score_output: bool = False
     layer_varying_page_table: bool = False
     varlen: bool = True
     cuda_graph: bool = False
@@ -100,7 +101,11 @@ class PrefillAttentionOpSpec:
             raise ValueError("Prefill attention dimensions must be positive.")
         if self.softmax_scale <= 0:
             raise ValueError("Prefill attention softmax_scale must be positive.")
-        if self.prefill_sparse_method not in {"", "h2o_prefill", "flashprefill_v2"}:
+        if self.optional_score_output and self.score_output == AttentionScoreKind.NONE:
+            raise ValueError("Optional score output requires a non-NONE score kind.")
+        if self.prefill_sparse_method not in {
+            "", "h2o_prefill", "flashprefill_v2", "omnikv_prefill"
+        }:
             raise ValueError(
                 "Unknown prefill sparse method in operator spec: "
                 f"{self.prefill_sparse_method!r}."
@@ -1052,7 +1057,7 @@ def resolve_prefill_attention_provider(
 
 
 class PreparedPrefillAttentionOp:
-    """One prepared provider shared by all layers in one model runtime."""
+    """Prepared prefill dispatch shared by all layers in one model runtime."""
 
     def __init__(
         self,
@@ -1060,20 +1065,26 @@ class PreparedPrefillAttentionOp:
         provider: PrefillAttentionProvider,
         *,
         execution_spec: PrefillAttentionOpSpec | None = None,
+        unscored_op: PreparedPrefillAttentionOp | None = None,
     ) -> None:
         self.spec = spec
         self.execution_spec = execution_spec or spec
         self.provider = provider
+        self.unscored_op = unscored_op
         self._closed = False
 
     @property
     def name(self) -> str:
+        if self.unscored_op is not None:
+            return f"scored={self.provider.name},unscored={self.unscored_op.name}"
         return self.provider.name
 
     def run(self, q, view, **kwargs):
         if self._closed:
             raise RuntimeError("Prefill attention operator is closed.")
         actual_score = _view_score_kind(view)
+        if actual_score == AttentionScoreKind.NONE and self.unscored_op is not None:
+            return self.unscored_op.run(q, view, **kwargs)
         if actual_score is not self.spec.score_output:
             raise RuntimeError(
                 "Prefill attention view violates the resolved score contract: "
@@ -1085,6 +1096,8 @@ class PreparedPrefillAttentionOp:
         if self._closed:
             return
         self.provider.close()
+        if self.unscored_op is not None:
+            self.unscored_op.close()
         self._closed = True
 
 
@@ -1097,8 +1110,23 @@ def prepare_prefill_attention_op(
         spec, device_index=device_index
     )
     provider.prepare(execution_spec, device_index=device_index)
+    unscored_op = None
+    if spec.optional_score_output:
+        try:
+            unscored_op = prepare_prefill_attention_op(
+                replace(
+                    spec,
+                    score_output=AttentionScoreKind.NONE,
+                    optional_score_output=False,
+                ),
+                device_index=device_index,
+            )
+        except Exception:
+            provider.close()
+            raise
     return PreparedPrefillAttentionOp(
         spec,
         provider,
         execution_spec=execution_spec,
+        unscored_op=unscored_op,
     )

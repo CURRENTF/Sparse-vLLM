@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from sparsevllm.config import Config
 from sparsevllm.engine.cache_manager import CacheManager
-from sparsevllm.method_registry import resolve_cache_sparse_method
+from sparsevllm.method_registry import (
+    resolve_cache_sparse_method,
+    resolve_prefill_sparse_method,
+)
 
 from .base import SparseMethodRuntime
 from .deepseek_v4 import DeepseekV4Runtime
@@ -43,4 +46,15 @@ def create_sparse_method_runtime(
     runtime_cls = RUNTIME_BINDINGS.get(method)
     if runtime_cls is None:
         raise ValueError(f"Unsupported sparse_method={method!r}.")
-    return runtime_cls(config, cache_manager)
+    runtime = runtime_cls(config, cache_manager)
+    if resolve_prefill_sparse_method(
+        getattr(config, "prefill_sparse_method", None),
+        sparse_method=config.sparse_method,
+    ) == "omnikv_prefill":
+        if method not in {"", "omnikv"}:
+            raise ValueError("OmniKV prefill requires vanilla or OmniKV decode lifecycle.")
+        from .omnikv_prefill import OmniKVPrefillRuntime
+        from .phases import PrefillOverrideRuntime
+
+        return PrefillOverrideRuntime(OmniKVPrefillRuntime(config, cache_manager), runtime)
+    return runtime

@@ -57,7 +57,7 @@ Every arm receives ten warmup calls and six block-averaged CUDA-event samples in
 three balanced ABBA/BAAB rounds. Compilation/cold binding is recorded separately.
 Identical configurations are controls, not evidence of a policy improvement.
 
-Each run stores source snapshots/hashes, resolved profiles, environment/device
+Each run records Git commit/dirty status, resolved profiles, environment/device
 identity, raw samples, per-case numerical status and medians. The aggregate is
 an unweighted geometric mean over the sampled grid, **not** engine throughput
 or a production-workload-weighted speedup. GPU clocks are observed, not locked.
@@ -84,8 +84,8 @@ Ragged and BS256 supplemental heatmaps complete coverage of all sampled cases.
 Use `--confirmation "$CONFIRMATION_RUN/full"` to include extrema repeat evidence.
 The portable `data/{primary,repeat,confirmation}` directories contain everything
 needed to replot without the original output volume; use those paths directly
-instead of the corresponding `full` paths. Measured source snapshots are archival,
-not standalone entrypoints. Their normal package paths remain authoritative.
+instead of the corresponding `full` paths. Experiment configuration and measured
+profiles are retained; source code is read from the selected checkout.
 
 ## Optional CPU precompilation
 

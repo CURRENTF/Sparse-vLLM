@@ -2,7 +2,6 @@
 import argparse
 from dataclasses import asdict, replace
 import gc
-import hashlib
 import importlib.metadata
 import itertools
 import json
@@ -221,21 +220,11 @@ def main():
         if len(cases) != len(wanted):
             raise ValueError("Subset IDs are missing or duplicated")
     repo = Path(__file__).resolve().parents[3]
-    sources = [Path(__file__).resolve(), Path(__file__).with_name("run.py"), args.config.resolve(),
-               repo / "src/sparsevllm/kernels/tilelang/mla/runtime.py",
-               repo / "src/sparsevllm/kernels/tilelang/mla/decode.py"]
-    snapshot = args.output / "source"
-    snapshot.mkdir()
-    hashes = {}
-    for source in sources:
-        data = source.read_bytes()
-        hashes[str(source)] = hashlib.sha256(data).hexdigest()
-        (snapshot / source.name).write_bytes(data)
     versions = {name: importlib.metadata.version(name) for name in ["torch", "triton", "tilelang", "apache-tvm-ffi"]}
     manifest = {"command": sys.argv, "interpreter": sys.executable, "config": config,
                 "git_head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
                 "git_status": subprocess.check_output(["git", "status", "--short"], cwd=repo, text=True),
-                "source_sha256": hashes, "versions": versions, "cuda": torch.version.cuda,
+                "versions": versions, "cuda": torch.version.cuda,
                 "gpu": {"name": props.name, "sm_count": props.multi_processor_count,
                         "capability": list(torch.cuda.get_device_capability()),
                         "visible_devices": os.environ["CUDA_VISIBLE_DEVICES"]},
@@ -249,9 +238,6 @@ def main():
             print(f'START {index + 1}/{len(cases)} {case["id"]}', flush=True)
             try:
                 result = run_case(case, config, props.multi_processor_count, raw)
-                for source in sources:
-                    if hashlib.sha256(source.read_bytes()).hexdigest() != hashes[str(source)]:
-                        raise RuntimeError(f"Measured source changed during run: {source}")
             except Exception as exc:
                 out.write(json.dumps({**case, "status": "model_failed", "error": repr(exc), "traceback": traceback.format_exc()}) + "\n")
                 out.flush()

@@ -22,7 +22,7 @@ if str(SRC_ROOT) not in sys.path:
 import numpy as np
 import torch
 from tqdm import tqdm
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
 
 NO_CHAT_TEMPLATE_DATASETS = {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
 DEFAULT_OUTPUT_ROOT = Path(os.getenv("SPARSEVLLM_OUTPUT_DIR", "outputs")) / "omnikv_full_layer_calibration"
@@ -91,6 +91,9 @@ def attention_layer_indices_from_config(config) -> list[int]:
 
     text_config = text_model_config(config)
     indices = list(RuntimeLayout.from_config(text_config).full_attention_layer_indices)
+    layer_types = getattr(text_config, "layer_types", None)
+    if layer_types is not None:
+        indices = [i for i in indices if layer_types[i] != "sliding_attention"]
     if not indices:
         raise ValueError("Model layout does not contain any full-attention layer.")
     return indices
@@ -255,11 +258,17 @@ def topk_indices_from_decode_attentions(
     topk: int,
     sink_keep_tokens: int,
     recent_keep_tokens: int,
+    attention_layer_indices: list[int] | None = None,
 ) -> tuple[list[list[int]], int]:
     if not attentions:
         raise RuntimeError("Model did not return attentions for the decode point.")
     if topk <= 0:
         raise ValueError(f"topk must be > 0, got {topk}.")
+
+    if attention_layer_indices is not None and len(attentions) != len(attention_layer_indices):
+        if not attention_layer_indices or max(attention_layer_indices) >= len(attentions):
+            raise ValueError("Returned attentions do not cover the configured global layers.")
+        attentions = tuple(attentions[i] for i in attention_layer_indices)
 
     layer_topk: list[list[int]] = []
     k_eff: int | None = None
@@ -477,6 +486,7 @@ def collect_sample_topk(
             topk=topk,
             sink_keep_tokens=sink_keep_tokens,
             recent_keep_tokens=recent_keep_tokens,
+            attention_layer_indices=attention_layer_indices,
         )
         add_topk_to_pair_scores(pair_scores, layer_topk)
         record = asdict(point)
@@ -549,7 +559,12 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
         }
     elif requested_device.type == "cuda":
         model_kwargs["device_map"] = {"": str(requested_device)}
-    model = AutoModelForCausalLM.from_pretrained(
+    model_class = (
+        AutoModelForImageTextToText
+        if getattr(base_config, "model_type", "") == "gemma4"
+        else AutoModelForCausalLM
+    )
+    model = model_class.from_pretrained(
         str(model_path),
         **model_kwargs,
     )

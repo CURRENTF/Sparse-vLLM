@@ -415,8 +415,18 @@ class SparseVLLMLitellmModel(LitellmModel):
             **configured_extra_body,
             **request_extra_body,
             "chain_id": request_chain_id,
-            "preserve_thinking": True,
         }
+        template_kwargs = extra_body.get("chat_template_kwargs") or {}
+        if (
+            extra_body.get("preserve_thinking") is False
+            or template_kwargs.get("preserve_thinking") is False
+            or template_kwargs.get("clear_thinking") is True
+        ):
+            raise ValueError(
+                "Chain cache requires preserved thinking for append-only prompts: "
+                "preserve_thinking must not be false and clear_thinking must not be true."
+            )
+        extra_body["preserve_thinking"] = True
         if chain_append_start is not None:
             extra_body["chain_append_start"] = chain_append_start
         try:
@@ -489,14 +499,60 @@ class SparseVLLMLitellmModel(LitellmModel):
         )
         return response
 
-    def query(self, messages: list[dict[str, Any]], **kwargs):
-        if not self._chain_cache_enabled:
-            return super().query(messages, **kwargs)
+    @classmethod
+    def _preserve_truncated_response(cls, exc: FormatError) -> bool:
+        # MiniSWE adds only the correction on FormatError. Keep the truncated
+        # assistant turn too, so the next prompt does not discard cached output.
+        corrections = getattr(exc, "messages", ())
+        if not corrections or not isinstance(corrections[0], dict):
+            return False
+        response = corrections[0].get("extra", {}).get("response")
+        if not isinstance(response, dict):
+            return False
+        choices = response.get("choices") or []
+        if not choices or choices[0].get("finish_reason") != "length":
+            return False
+        assistant = choices[0].get("message") or {}
+        if assistant.get("role") != "assistant":
+            return False
+        tool_errors = []
+        for call in assistant.get("tool_calls") or []:
+            # Only retain calls the server can render. Never execute partial
+            # arguments; give every retained call an explicit failure result.
+            try:
+                arguments = json.loads(call["function"]["arguments"])
+            except (KeyError, TypeError, json.JSONDecodeError):
+                return False
+            if not call.get("id") or not isinstance(arguments, dict):
+                return False
+            tool_errors.append({
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "content": "Tool call was not executed because the response reached "
+                "the output token limit. Retry with complete arguments.",
+            })
+        assistant = cls._chain_message(assistant)
+        assistant.setdefault("content", None)
+        corrections[0]["extra"]["truncated_response_preserved"] = True
+        # Keep the raw response only on the correction, as upstream does, so
+        # trajectory usage aggregation does not count this request twice.
+        exc.messages = (assistant, *tool_errors, *corrections)
+        return True
 
+    def query(self, messages: list[dict[str, Any]], **kwargs):
         try:
             message = super().query(messages, **kwargs)
         except Exception as exc:
+            preserved = (
+                isinstance(exc, FormatError)
+                and self._preserve_truncated_response(exc)
+            )
+            if not self._chain_cache_enabled:
+                raise
             if self._pending_chain_state is not None:
+                if preserved:
+                    self._commit_chain_state()
+                    raise
                 self._recovery_chain_id = self._pending_chain_state[0]
                 self._force_new_chain_reason = (
                     "format_error"
@@ -506,6 +562,15 @@ class SparseVLLMLitellmModel(LitellmModel):
             self._pending_chain_state = None
             raise
 
+        if not self._chain_cache_enabled:
+            return message
+        reset_reason = self._commit_chain_state()
+        if reset_reason is not None and isinstance(message, dict):
+            extra = message.setdefault("extra", {})
+            extra["chain_reset_reason"] = reset_reason
+        return message
+
+    def _commit_chain_state(self) -> str | None:
         pending = self._pending_chain_state
         if pending is None:
             raise RuntimeError(
@@ -530,10 +595,7 @@ class SparseVLLMLitellmModel(LitellmModel):
         self._pending_chain_state = None
         self._recovery_chain_id = None
         self._force_new_chain_reason = None
-        if reset_reason is not None and isinstance(message, dict):
-            extra = message.setdefault("extra", {})
-            extra["chain_reset_reason"] = reset_reason
-        return message
+        return reset_reason
 
     def _prepare_messages_for_api(self, messages: list[dict]) -> list[dict]:
         cleaned = [

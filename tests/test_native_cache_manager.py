@@ -138,3 +138,41 @@ def test_native_startup_budget_covers_physical_rows_and_prefix_state(monkeypatch
     assert manager.pool.allocated_bytes() <= budget
     assert manager.pool.free_snapshot_rows
     assert all(allocator.free_count >= 64 // ratio for ratio, allocator in manager.pool.slots.items())
+
+
+def test_decode_reservations_use_compressed_capacity_without_consuming_request_rows(monkeypatch):
+    # After merging decode-window reservations, the generic scalar budget must
+    # not interpret native request rows as future token capacity.
+    from collections import deque
+    from sparsevllm.sampling_params import SamplingParams
+
+    config, manager = make_manager(monkeypatch)
+    runtime = RuntimeState(config, manager)
+    sequences = []
+    for index in range(config.max_num_seqs_in_gpu):
+        seq = Sequence([index] * 4, SamplingParams(max_tokens=8))
+        seq.current_chunk_size = 4
+        runtime.prepare_step([seq], True)
+        runtime.on_forward_end([seq], True)
+        seq.num_prefilled_tokens = 4
+        seq.append_token(99)
+        sequences.append(seq)
+    assert manager.prompt_admission_free_slots() == 0
+    assert runtime.reserve_decode_windows(deque(sequences), deque()) is None
+    scheduler = Scheduler(config, runtime)
+    scheduler.decoding.extend(sequences)
+    scheduled, is_prefill, preempted = scheduler.schedule()
+    assert scheduled == sequences and not is_prefill and not preempted
+    budgets = manager.decode_window_budgets()
+    reserved = runtime.decode_reservations.outstanding()
+    assert reserved and all(0 <= count <= budgets[name] for name, count in reserved.items())
+
+    runtime.free_seq(sequences[-1].seq_id)
+    assert runtime.prompt_admission_free_slots() == manager.prompt_admission_free_slots() == 1
+    assert runtime.prefill_step_free_slots() == manager.prefill_step_free_slots()
+    admission = runtime.prompt_admission_budgets(deque(), config.engine_prefill_chunk_size)
+    for name, count in runtime.decode_reservations.outstanding().items():
+        assert admission[name] + count == manager.decode_window_budgets()[name]
+    for seq in sequences[:-1]:
+        runtime.free_seq(seq.seq_id)
+    assert not runtime.decode_reservations.outstanding()

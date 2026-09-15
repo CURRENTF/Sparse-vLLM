@@ -220,7 +220,6 @@ def main():
 
     (args.output / 'plot_data.json').write_text(json.dumps(dict(quality=quality, efficiency32=data32,
         efficiency128=data128, boundary32=old, status='partial_preview'), indent=2)+'\n')
-    sources[str(Path(__file__).resolve())] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     (args.output / 'manifest.json').write_text(json.dumps(dict(command=sys.argv, source_sha256=sources,
         validation=f'{len(data32) + len(data128)} stage points revalidated from raw steps/full outputs; quality aggregates and boundary source hashes checked',
         outputs=outputs, matplotlib=matplotlib.__version__, seaborn=sns.__version__), indent=2)+'\n')

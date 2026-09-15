@@ -166,7 +166,7 @@ def main():
     if args.complete_from_capacity and (not args.probe_only or not args.completion_note):
         raise ValueError("Completing a partial curve requires probe-only and an explicit provenance note")
     REPO = args.repo.resolve()
-    # A relocated orchestration snapshot is not the benchmark package root.
+    # The orchestration script may live outside the selected benchmark checkout.
     # Validate the same statistics module used by raw-artifact checks before GPUs.
     sys.path.insert(0, str(REPO))
     from benchmark.efficiency import metrics

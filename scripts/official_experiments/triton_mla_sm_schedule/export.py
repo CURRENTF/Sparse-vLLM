@@ -11,7 +11,7 @@ import sys
 
 PACKAGE = Path(__file__).resolve().parents[1] / "sparse_decode_efficiency"
 sys.path.insert(0, str(PACKAGE))
-from plot_decode_capacity import validate_measurement
+from plot_decode_capacity import validate_measurement, without_source_fingerprints
 
 
 def read(path):
@@ -109,9 +109,7 @@ def main():
                 raise ValueError("External engine/method identity mismatch")
             if row["decode_warmup_steps_after_full"] != 32:
                 raise ValueError("External warmup does not match the original stage protocol")
-            identity = read(path.parent / "identity.json")
-            if identities and identity["source_sha256"] != identities[0]["source_sha256"]:
-                raise ValueError("Source changed inside the external sweep")
+            identity = without_source_fingerprints(read(path.parent / "identity.json"))
             identities.append(identity)
             if lane_root != args.external_root and row["measured_decode_steps_after_full"] < 2015:
                 raise ValueError("Extended-output point still lacks the requested full-batch decode window")
@@ -126,7 +124,6 @@ def main():
         public_provenance["external_backends"][lane] = {
             "engine": row["engine"], "backend_label": row["backend_label"],
             "version": row.get("sglang_version", row.get("vllm_version")),
-            "source_sha256": identities[0]["source_sha256"],
             "max_concurrency": boundary["max_concurrency"],
         }
         combined["curves"].append({"model": "glm4.7-flash", "lane": lane, "status": "unsupported",

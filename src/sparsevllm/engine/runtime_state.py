@@ -9,10 +9,13 @@ from typing import Protocol
 import torch
 
 from sparsevllm.config import Config
+from sparsevllm.engine.cache_manager.decode_reservation import DecodeReservations
 from sparsevllm.engine.chain_cache import (
     ChainAdmissionPlan,
+    ChainBusyError,
     ChainCacheCoordinator,
     ChainOwnerMismatchError,
+    ChainState,
 )
 from sparsevllm.engine.decode_graph_contract import (
     CacheDecodeGraphState,
@@ -30,6 +33,7 @@ class MemoryOracle(Protocol):
     @property
     def num_free_slots(self) -> int: ...
 
+    def reserve_decode_windows(self, decoding, waiting) -> Sequence | None: ...
     def prefill_batched_tokens_margin(self) -> int: ...
     def remaining_prefill_tokens(self, seq: Sequence) -> int: ...
     def prefill_execution_mode(self, seq: Sequence) -> str: ...
@@ -127,6 +131,42 @@ class RuntimeState:
         self.chain_cache_coordinator = chain_cache_coordinator
         self.decode_graph_participants = tuple(decode_graph_participants)
         self._resident_seq_ids: set[int] = set()
+        self.decode_reservations = DecodeReservations(
+            cache_manager,
+            getattr(config, "decode_reservation_tokens", Config.decode_reservation_tokens),
+        )
+        if chain_cache_coordinator is not None:
+            chain_cache_coordinator.decode_reservations = self.decode_reservations
+
+    def reserve_decode_windows(self, decoding, waiting) -> Sequence | None:
+        if not decoding:
+            return None
+        step = int(self.config.engine_prefill_chunk_size)
+        budgets = dict(self.cache_manager.decode_window_budgets())
+        prefill = self.cache_manager.prompt_admission_budgets(waiting, step)
+        scalar = int(self.reserved_prefill_slots(waiting, step))
+        pending = {
+            name: (
+                max(0, free - int(prefill[name])) if name in prefill
+                else scalar if name.startswith("layer_") else 0
+            )
+            for name, free in budgets.items()
+        }
+        extra = self._mixed_prefix_step_reclaimable_slots()
+        if extra > 0:
+            if "slots" not in budgets:
+                raise RuntimeError("Mixed prefix decode reservations require a slots budget.")
+            budgets["slots"] += extra
+            # A clamped physical budget can hide pending prefill demand when
+            # the remaining capacity is still held by reclaimable prefixes.
+            pending["slots"] = max(pending["slots"], scalar)
+        for seq in decoding:
+            if not self.decode_reservations.acquire(
+                seq, allow_short=len(decoding) == 1, prefill_reserve=pending,
+                budgets=budgets,
+            ):
+                return seq
+        return None
 
     @property
     def num_free_slots(self) -> int:
@@ -249,6 +289,12 @@ class RuntimeState:
 
     def on_forward_end(self, seqs: list[Sequence], is_prefill: bool) -> None:
         self.cache_manager.on_forward_end(seqs, is_prefill)
+        if is_prefill and self.chain_cache_coordinator is not None:
+            for seq in seqs:
+                if seq.chain_id and seq.num_prefilled_tokens + int(seq.current_chunk_size or 0) >= seq.num_prompt_tokens:
+                    record = self.chain_cache_coordinator.index.lookup(seq.chain_id)
+                    record.reserved_slots_by_layer = ()
+                    record.reserved_rows = 0
         if self.recurrent_state_manager is not None:
             self.recurrent_state_manager.on_forward_end(seqs, is_prefill)
         if self.prefix_cache_coordinator is not None:
@@ -262,6 +308,7 @@ class RuntimeState:
         self._free_seq_payload(seq_id)
 
     def _free_seq_payload(self, seq_id: int) -> None:
+        self.decode_reservations.release(seq_id)
         self.cache_manager.free_seq(seq_id)
         if self.prefix_cache_coordinator is not None:
             self.prefix_cache_coordinator.release_seq(seq_id)
@@ -274,7 +321,6 @@ class RuntimeState:
         chain_id: str,
         seq_id: int,
         token_ids: list[int],
-        generation_tokens: int = 0,
     ) -> ChainAdmissionPlan:
         if self.chain_cache_coordinator is None:
             raise RuntimeError("Chain prefix cache is not enabled for this runtime.")
@@ -282,7 +328,6 @@ class RuntimeState:
             chain_id=str(chain_id),
             seq_id=int(seq_id),
             token_ids=[int(token_id) for token_id in token_ids],
-            generation_tokens=int(generation_tokens),
         )
 
     def chain_validate_admission_plan(
@@ -290,7 +335,6 @@ class RuntimeState:
         expected: ChainAdmissionPlan,
         input_token_count: int,
         input_prefix_digest: bytes,
-        generation_tokens: int = 0,
     ) -> ChainAdmissionPlan:
         if self.chain_cache_coordinator is None:
             raise RuntimeError("Chain prefix cache is not enabled for this runtime.")
@@ -298,7 +342,6 @@ class RuntimeState:
             expected,
             input_token_count=int(input_token_count),
             input_prefix_digest=bytes(input_prefix_digest),
-            generation_tokens=int(generation_tokens),
         )
 
     def chain_apply_admission(self, plan: ChainAdmissionPlan) -> dict[str, object]:
@@ -309,13 +352,29 @@ class RuntimeState:
             record = self.chain_cache_coordinator.index.lookup(chain_id)
             local_victims.append((str(chain_id), int(record.seq_id)))
         record = self.chain_cache_coordinator.apply_admission(plan)
+        for chain_id in plan.demote_chain_ids:
+            victim = self.chain_cache_coordinator.index.lookup(chain_id)
+            self._resident_seq_ids.discard(int(victim.seq_id))
         for _chain_id, victim_seq_id in local_victims:
             self._free_seq_payload(victim_seq_id)
+        try:
+            self.chain_cache_coordinator.prepare_resumed_chain(record)
+        except Exception:
+            # A failed restore retains the CPU snapshot and must not leave an
+            # ACTIVE writer or an outstanding reservation that can never run.
+            if plan.status == "resumed":
+                record.state = ChainState.IDLE
+                record.reserved_slots_by_layer = ()
+                record.reserved_rows = 0
+            raise
+        if plan.status == "resumed":
+            self._resident_seq_ids.add(int(record.seq_id))
         return {
             "chain_id": record.chain_id,
             "seq_id": int(record.seq_id),
             "state": record.state.value,
             "victim_chain_ids": list(plan.victim_chain_ids),
+            "demote_chain_ids": list(plan.demote_chain_ids),
         }
 
     def chain_finish(
@@ -331,12 +390,21 @@ class RuntimeState:
             int(seq_id),
             int(processed_token_count),
         )
+        self.decode_reservations.release(seq_id)
         record = self.chain_cache_coordinator.finish_values(
             chain_id=str(chain_id),
             seq_id=int(seq_id),
             processed_token_digest=bytes(processed_token_digest),
             processed_token_count=int(processed_token_count),
         )
+        try:
+            self.chain_cache_coordinator.save_finished_chain(record)
+        except Exception:
+            # Do not publish a new processed boundary with an old driver token
+            # history when snapshot submission fails before completion RPC returns.
+            self.chain_cache_coordinator.invalidate(record.chain_id)
+            self._free_seq_payload(int(record.seq_id))
+            raise
         return {
             "chain_id": record.chain_id,
             "seq_id": int(record.seq_id),
@@ -344,6 +412,33 @@ class RuntimeState:
             "processed_token_count": int(record.processed_token_count),
             "physical_slots_by_layer": list(record.physical_slots_by_layer),
         }
+
+    def chain_reclaim_idle(
+        self, chain_id: str, expected_seq_id: int, demote: bool,
+    ) -> dict[str, object]:
+        coordinator = self.chain_cache_coordinator
+        if coordinator is None:
+            raise RuntimeError("Chain prefix cache is not enabled for this runtime.")
+        record = coordinator.index.lookup(chain_id)
+        if int(record.seq_id) != int(expected_seq_id):
+            raise ChainOwnerMismatchError(
+                f"Chain owner changed before reclaim: {chain_id!r}.", chain_id=chain_id,
+            )
+        if record.state is not ChainState.IDLE:
+            raise ChainBusyError("Cannot reclaim an ACTIVE chain.", chain_id=chain_id)
+        if record.resident_rows <= 0 or not self.cache_manager.chain_has_residency(record.seq_id):
+            raise RuntimeError(f"Chain {chain_id!r} has no resident KV to reclaim.")
+        if demote:
+            if coordinator.offload is None or not coordinator.offload.wait(record.seq_id).valid:
+                raise RuntimeError("Cannot demote a chain without a valid CPU snapshot.")
+        elif coordinator.offload is not None:
+            coordinator.offload.drop(record.seq_id)
+        self._free_seq_payload(int(record.seq_id))
+        if demote:
+            record.resident_rows = 0
+        else:
+            coordinator.index.evict(chain_id)
+        return {"chain_id": chain_id, "seq_id": int(record.seq_id), "demoted": bool(demote)}
 
     def chain_invalidate(
         self,
@@ -389,9 +484,12 @@ class RuntimeState:
 
     @torch.inference_mode()
     def reset_after_warmup(self) -> None:
+        self.decode_reservations.requests.clear()
         if self.prefix_cache_coordinator is not None:
             self.prefix_cache_coordinator.reset_after_warmup()
         if self.chain_cache_coordinator is not None:
+            if self.chain_cache_coordinator.offload is not None:
+                self.chain_cache_coordinator.offload.reset()
             resident_chain_seq_ids = sorted(
                 {
                     int(record.seq_id)
@@ -492,10 +590,13 @@ class RuntimeState:
         return True
 
     def prefill_step_free_slots(self) -> int:
-        return int(
-            self.cache_manager.prefill_step_free_slots()
-            + self._mixed_prefix_step_reclaimable_slots()
-        )
+        free_slots = int(self.cache_manager.prefill_step_free_slots())
+        reserved = self.decode_reservations.outstanding()
+        if reserved:
+            free_slots = self.cache_manager.prefill_capacity_after_decode_reservations(
+                free_slots, reserved, admission=False,
+            )
+        return max(0, free_slots + self._mixed_prefix_step_reclaimable_slots())
 
     def prefill_batched_tokens_margin(self) -> int:
         return int(self.cache_manager.prefill_batched_tokens_margin())
@@ -563,30 +664,44 @@ class RuntimeState:
         return int(self.cache_manager.decode_step_reservation_cost(seq))
 
     def prompt_admission_free_slots(self) -> int:
-        return int(
-            self.cache_manager.prompt_admission_free_slots()
-            + self._mixed_prefix_admission_reclaimable_slots()
-        )
+        free_slots = int(self.cache_manager.prompt_admission_free_slots())
+        reserved = self.decode_reservations.outstanding()
+        if reserved:
+            free_slots = self.cache_manager.prefill_capacity_after_decode_reservations(
+                free_slots, reserved, admission=True,
+            )
+        return max(0, free_slots + self._mixed_prefix_admission_reclaimable_slots())
 
     def prompt_admission_budgets(self, waiting_seqs, engine_prefill_chunk_size: int) -> dict[str, int]:
         budgets = dict(self.cache_manager.prompt_admission_budgets(waiting_seqs, engine_prefill_chunk_size))
+        extra = self._mixed_prefix_admission_reclaimable_slots()
+        if extra > 0:
+            if "slots" in budgets:
+                budgets["slots"] = int(budgets["slots"]) + extra
+            elif len(budgets) == 1:
+                key = next(iter(budgets))
+                budgets[key] = int(budgets[key]) + extra
+            else:
+                raise RuntimeError(
+                    "Mixed prefix admission accounting cannot add evictable slots to "
+                    f"multi-budget cache manager budgets={budgets}."
+                )
+        # Decode reservations may be backed by reclaimable prefix slots too.
+        # Add that capacity before subtracting reservations and clamping.
+        reserved = self.decode_reservations.outstanding()
+        for name in budgets:
+            if name == "slots" and reserved:
+                budgets[name] = max(
+                    0, self.cache_manager.prefill_capacity_after_decode_reservations(
+                        int(budgets[name]), reserved, admission=True,
+                    ),
+                )
+            else:
+                budgets[name] = max(0, int(budgets[name]) - reserved.get(name, 0))
         budgets["resident_seqs"] = max(
             0,
             int(self.config.max_num_seqs_in_gpu) - len(self._resident_seq_ids),
         )
-        extra = self._mixed_prefix_admission_reclaimable_slots()
-        if extra <= 0:
-            return budgets
-        if "slots" in budgets:
-            budgets["slots"] = int(budgets["slots"]) + extra
-        elif len(budgets) == 2 and "resident_seqs" in budgets:
-            key = next(key for key in budgets if key != "resident_seqs")
-            budgets[key] = int(budgets[key]) + extra
-        else:
-            raise RuntimeError(
-                "Mixed prefix admission accounting cannot add evictable slots to "
-                f"multi-budget cache manager budgets={budgets}."
-            )
         return budgets
 
     def prompt_admission_cost(self, seq: Sequence) -> int:
@@ -653,6 +768,7 @@ class RuntimeState:
 
     def free_slot_stats(self) -> dict[str, int]:
         stats = self.cache_manager.free_slot_stats()
+        stats["decode_reservation_tokens"] = self.decode_reservations.window
         stats["resident_sequences"] = int(len(self._resident_seq_ids))
         stats["resident_sequence_capacity"] = int(self.config.max_num_seqs_in_gpu)
         stats["free_resident_sequence_slots"] = max(

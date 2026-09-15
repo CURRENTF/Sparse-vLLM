@@ -53,6 +53,8 @@ class FakeMemoryOracle:
 
     def step_resource_costs(self, seq, scheduled_tokens, *, is_prefill):
         return {}
+    def reserve_decode_windows(self, decoding, waiting):
+        return None
 
     def prefill_private_slots_for(self, seq):
         return 0
@@ -3500,6 +3502,8 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         manager._deltakv_temp_full_reserve = 16_384
         manager._deltakv_centers_capacity = 10_000
         manager._deltakv_centers_reserved_total = 0
+        manager._deltakv_latent_reserved_by_seq = {}
+        manager._num_free_slots_deltakv_latent = 100_000
 
         seq = seq_with_len(8192)
         budgets = DeltaKVCacheManager.prompt_admission_budgets(manager, deque(), engine_prefill_chunk_size=2048)
@@ -3543,6 +3547,8 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         manager._full_layers_reserved_total = 0
         manager._full_layers_reserved_by_seq = {}
 
+        manager._num_free_slots_deltakv_latent = 100
+        manager.row_deltakv_compressed_lens = np.zeros((1,), dtype=np.int32)
         seq = seq_with_len(6)
         seq.max_tokens = 2
         costs = DeltaKVCacheManager.prompt_admission_costs(manager, seq)
@@ -3550,11 +3556,11 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         DeltaKVCacheManager.on_prompt_admitted(manager, seq, costs)
         DeltaKVCacheManager._allocate_full(manager, seq.seq_id, 2)
 
-        self.assertEqual(manager._full_layers_reserved_by_seq[seq.seq_id], 6)
-        self.assertEqual(manager._full_layers_reserved_total, 6)
+        self.assertEqual(manager._full_layers_reserved_by_seq[seq.seq_id], 4)
+        self.assertEqual(manager._full_layers_reserved_total, 4)
         seq.num_prefilled_tokens = 2
         budgets = DeltaKVCacheManager.prompt_admission_budgets(manager, deque([seq]), engine_prefill_chunk_size=2)
-        self.assertEqual(budgets["full_layers"], 4)
+        self.assertEqual(budgets["full_layers"], 6)
 
         DeltaKVCacheManager._release_prompt_admission_reservations(manager, seq.seq_id)
         self.assertNotIn(seq.seq_id, manager._full_layers_reserved_by_seq)

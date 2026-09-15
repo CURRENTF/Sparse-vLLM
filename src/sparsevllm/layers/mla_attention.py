@@ -316,7 +316,9 @@ class MLAAttention:
                     context.cu_seqlens_q,
                     context.attention_validation_scope,
                 )
-                request = cache_manager.prefill_score_request(layer_idx, context.seqs)
+                request = self.chunked_prefill.score_request(
+                    plan, cache_manager.prefill_score_request(layer_idx, context.seqs)
+                )
                 required = estimate_mla_prefill_workspace_bytes(
                     plan=plan,
                     spec=self.spec,

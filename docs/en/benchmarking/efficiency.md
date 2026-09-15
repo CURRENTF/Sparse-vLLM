@@ -193,8 +193,11 @@ Batch-only aggregates cannot recover request quantiles.
 
 Save commands, configuration, Git commit and dirty status, dependencies, model, trace
 hash, GPU/topology, and failures. Separate raw outputs, repetitions, and aggregates.
-Do not generate per-file source fingerprints or require source-hash equality for
-execution or reuse. Experimenters decide whether code changes require remeasurement.
+Unless explicitly requested, do not copy/archive source, save worktree patches,
+generate per-file source fingerprints, or require source-hash equality for
+execution, resumption, or reuse. Untracked source alone must not block a run.
+Keep configuration, input-data, model, and result validation. Experimenters decide
+whether code changes require remeasurement.
 A dirty flag does not make uncommitted source reconstructible from the commit alone.
 Aggregate throughput as total tokens / total time and retain dispersion.
 Maximum concurrency requires an integer boundary and max+1 capacity failure;

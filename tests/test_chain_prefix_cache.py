@@ -1058,7 +1058,6 @@ def test_chain_admission_reserves_capacity_before_prefill_allocation():
         chain_id="first",
         seq_id=1,
         token_ids=[1, 2, 3, 4],
-        generation_tokens=1,
     )
     coordinator.apply_admission(first)
 
@@ -1069,7 +1068,6 @@ def test_chain_admission_reserves_capacity_before_prefill_allocation():
             chain_id="second",
             seq_id=2,
             token_ids=[5, 6, 7, 8],
-            generation_tokens=1,
         )
 
 
@@ -1163,7 +1161,6 @@ def test_engine_chain_admission_reuses_resident_seq_and_logical_boundary():
     assert validation_args[1:] == (
         3,
         stable_token_digest([], count=0),
-        2,
     )
     with pytest.raises(ChainBusyError):
         engine.admit_request([1, 2, 3, 4], params, chain_id=first.chain_id)
@@ -1242,3 +1239,32 @@ def test_engine_abort_rejects_unsafe_chain_retain_disposition():
 
     with pytest.raises(ValueError, match="only supports 'invalidate'"):
         engine.abort_request(7, disposition="retain")
+
+
+def test_chain_rank_validation_protects_existing_decode_window():
+    config = _h2o_fingerprint_config(engine_prefill_chunk_size=4)
+
+    def coordinator(free):
+        manager = object.__new__(H2OCacheManager)
+        manager.config = config
+        manager.kv_transformer_layer_indices = lambda: [0]
+        manager._num_free_slots = [free]
+        manager.free_rows = [[0, 1]]
+        manager.seq_id_to_row = [{}]
+        return ChainCacheCoordinator(config, manager)
+
+    driver = coordinator(10)
+    driver.decode_reservations = SimpleNamespace(outstanding=lambda: {'layer_0': 4})
+    plan = driver.plan_admission(chain_id='new', seq_id=10, token_ids=[1, 2, 3, 4])
+    assert plan.decode_reserved_slots_by_layer == (4,)
+    worker = coordinator(10)
+    assert worker.validate_admission_plan(
+        plan, input_token_count=4, input_prefix_digest=stable_token_digest([], count=0),
+    ) == plan
+    # The worker has no scheduler ledger, but must still protect the driver's
+    # promise rather than admit into seven free slots with four already owed.
+    worker.cache_manager._num_free_slots = [7]
+    with pytest.raises(ChainCapacityError):
+        worker.validate_admission_plan(
+            plan, input_token_count=4, input_prefix_digest=stable_token_digest([], count=0),
+        )

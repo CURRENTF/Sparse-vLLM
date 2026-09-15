@@ -227,6 +227,24 @@ class RKVCacheManager(SnapKVCacheManager):
         probabilities.masked_fill_(~valid_rows[:, None, None], 0.0)
         return probabilities.mean(dim=0).amax(dim=0)
 
+    def snapshot_chain_method_state(self, seq_id: int):
+        state = super().snapshot_chain_method_state(seq_id)
+        if self._is_rkv_query_cache_enabled():
+            for layer in self.kv_transformer_layer_indices():
+                row = self.seq_id_to_row[layer][seq_id]
+                cache, positions = self._rkv_layer_query_cache(layer)
+                state.tensors[f"queries/{layer}"] = cache[row]
+                state.tensors[f"positions/{layer}"] = positions[row]
+        return state
+
+    def restore_chain_method_state(self, seq_id: int, state) -> None:
+        if self._is_rkv_query_cache_enabled():
+            for layer in self.kv_transformer_layer_indices():
+                row = self.seq_id_to_row[layer][seq_id]
+                cache, positions = self._rkv_layer_query_cache(layer)
+                cache[row].copy_(state.tensors[f"queries/{layer}"], non_blocking=True)
+                positions[row].copy_(state.tensors[f"positions/{layer}"], non_blocking=True)
+
     def free_seq(self, seq_id: int):
         row_by_layer = [
             self.seq_id_to_row[layer_idx].get(int(seq_id))

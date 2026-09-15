@@ -10,6 +10,7 @@ import shutil
 
 def load_run(root):
     manifest = json.loads((root / "run_manifest.json").read_text())
+    manifest.pop("source_sha256", None)
     rows = [json.loads(line) for line in (root / "cases.jsonl").read_text().splitlines()]
     raw = [json.loads(line) for line in (root / "raw_samples.jsonl").read_text().splitlines()]
     ids = [row["id"] for row in rows]
@@ -146,8 +147,8 @@ def main():
         if path is None:
             continue
         repeat_manifest, repeat_rows = load_run(path)
-        if manifest["source_sha256"] != repeat_manifest["source_sha256"] or manifest["versions"] != repeat_manifest["versions"]:
-            raise ValueError("Repeat source or toolchain differs from primary")
+        if manifest["versions"] != repeat_manifest["versions"]:
+            raise ValueError("Repeat toolchain differs from primary")
         reference = {r["id"]: r for r in rows}
         if any(r["id"] not in reference or r["configs"] != reference[r["id"]]["configs"] for r in repeat_rows):
             raise ValueError("Repeat plans differ or are absent from primary")
@@ -172,15 +173,11 @@ def main():
                 continue
             identity, _ = load_run(path)
             public = {k: identity[k] for k in ["status", "config", "git_head", "versions", "cuda", "gpu", "protocol", "cases"]}
-            public["source_sha256"] = {Path(k).name: v for k, v in identity["source_sha256"].items()}
-            if len(public["source_sha256"]) != len(identity["source_sha256"]):
-                raise ValueError("Source snapshot basename collision")
             target = args.export_data / name
             target.mkdir()
             (target / "run_manifest.json").write_text(json.dumps(public, indent=2) + "\n")
             for filename in ["cases.jsonl", "raw_samples.jsonl", "generated_profiles.json"]:
                 shutil.copy2(path / filename, target / filename)
-            shutil.copytree(path / "source", target / "source")
         for filename in ["summary.json", "points.csv"]:
             shutil.copy2(args.output / filename, args.export_data / filename)
     print(json.dumps({k: v for k, v in summary.items() if k not in ["worst", "best", "repeat"]}, indent=2))
