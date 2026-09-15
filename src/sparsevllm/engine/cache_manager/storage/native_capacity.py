@@ -4,6 +4,7 @@ from collections import Counter
 from dataclasses import dataclass
 
 from ..methods.deepseek_v4 import CompressionStateShape
+from .packed_shared_kv import HEAD_DIM, PAGE_BYTES, PAGE_SIZE, packed_shared_kv_bytes
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,17 @@ class NativeCacheGeometry:
     head_dim: int = 512
     index_dim: int = 128
     window_size: int = 128
+    packed_kv: bool = False
+
+    def __post_init__(self):
+        if self.packed_kv and self.head_dim != HEAD_DIM:
+            raise ValueError("Packed native cache requires head dimension 512.")
+
+    @property
+    def kv_slot_bytes(self):
+        # A lower bound for packed storage; allocation_bytes rounds each layer
+        # to whole physical pages before admission.
+        return PAGE_BYTES // PAGE_SIZE if self.packed_kv else self.head_dim * 2
 
     @classmethod
     def from_config(cls, config):
@@ -45,22 +57,49 @@ class NativeCacheGeometry:
 
     @property
     def compressed_slot_bytes(self):
-        return {ratio: count * 2 * (self.head_dim + (self.index_dim if ratio == 4 else 0))
+        return {ratio: count * (self.kv_slot_bytes + (2 * self.index_dim if ratio == 4 else 0))
                 for ratio, count in sorted(Counter(self.ratios).items()) if ratio}
 
     @property
     def row_bytes(self):
-        window = len(self.ratios) * self.window_size * self.head_dim * 2
+        """Linear row cost, a lower bound when physical pages need rounding."""
+        window = len(self.ratios) * self.window_size * self.kv_slot_bytes
+        return window + self.state_row_bytes
+
+    @property
+    def state_row_bytes(self):
         carry = sum(CompressionStateShape(ratio, self.head_dim).row_bytes for ratio in self.ratios if ratio)
         carry += self.ratios.count(4) * CompressionStateShape(4, self.index_dim).row_bytes
         tables = sum(4 * max(1, self.max_model_len // ratio) for ratio in self.compressed_slot_bytes)
-        return window + carry + tables
+        return carry + tables
 
     @property
     def temporary_bytes(self):
-        return len(self.ratios) * self.prefill_capacity * self.head_dim * 2
+        return len(self.ratios) * self.prefill_capacity * self.kv_slot_bytes
+
+    def gather_page_capacities(self, live_rows, snapshot_rows, compressed_capacities):
+        """Per-ratio page domains sharing one largest-domain BF16 gather buffer."""
+        if not self.packed_kv:
+            return {}
+        window_slots = (live_rows + snapshot_rows) * self.window_size
+        return {ratio: (window_slots + compressed_capacities.get(ratio, 0)
+                        + self.prefill_capacity + PAGE_SIZE - 1) // PAGE_SIZE
+                for ratio in sorted(set(self.ratios))}
 
     def allocation_bytes(self, live_rows, snapshot_rows, compressed_capacities):
+        if self.packed_kv:
+            rows = live_rows + snapshot_rows
+            main = sum(packed_shared_kv_bytes(rows * self.window_size + self.prefill_capacity
+                                             + compressed_capacities.get(ratio, 0))
+                       for ratio in self.ratios)
+            index = self.ratios.count(4) * compressed_capacities.get(4, 0) * self.index_dim * 2
+            pages = self.gather_page_capacities(live_rows, snapshot_rows, compressed_capacities)
+            # One shared materialization buffer; each ratio owns a page table,
+            # physical-to-gather map, and gather length. Storage owns FP32 RoPE.
+            gather = max(pages.values(), default=0) * PAGE_SIZE * self.head_dim * 2
+            metadata = sum(2 * count * 4 + 4 for count in pages.values())
+            rotary = len(self.ratios) * 64 * 4
+            return rows * self.state_row_bytes + main + index + gather + metadata + rotary
         return ((live_rows + snapshot_rows) * self.row_bytes + self.temporary_bytes
                 + sum(compressed_capacities[ratio] * size for ratio, size in self.compressed_slot_bytes.items()))
 
