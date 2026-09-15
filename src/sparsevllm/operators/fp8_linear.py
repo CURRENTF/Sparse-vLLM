@@ -432,8 +432,6 @@ class FlashInferSm90Fp8LinearProvider(Fp8LinearProvider):
 
     @classmethod
     def supports(cls, spec: Fp8LinearSpec, caps: DeviceCaps) -> SupportResult:
-        if spec.scale_fmt == "ue8m0":
-            return SupportResult.unsupported("native UE8M0 FFN requires projection precision preserved through requantization")
         if spec.block_shape != (128, 128):
             return SupportResult.unsupported(
                 f"requires block_shape=(128, 128), got {spec.block_shape}"
@@ -480,7 +478,39 @@ class FlashInferSm90Fp8LinearProvider(Fp8LinearProvider):
         )
 
         supported, reason = flashinfer_sm90_fp8_linear_support()
+        if supported and spec.scale_fmt == "ue8m0":
+            from sparsevllm.kernels.external.sgl.moe import _sgl_fp8_group_quant_op
+            _sgl_fp8_group_quant_op()
+            if not hasattr(torch, "float8_e8m0fnu"):
+                return SupportResult.unsupported("UE8M0 scale conversion requires Torch E8M0 dtype support")
         return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
+
+    def __init__(self, spec=None, caps=None):
+        super().__init__(spec, caps)
+        self._quant_lease = None
+        if spec is not None and spec.scale_fmt == "ue8m0":
+            from sparsevllm.operators.workspace import get_workspace_manager
+            device = platforms.current_platform.get_device(caps.device_index)
+            rows = (spec.max_num_tokens + 3) // 4 * 4
+            groups = (spec.input_features // 128 + 3) // 4 * 4
+            self._quant_sizes = (spec.max_num_tokens * spec.input_features,
+                                 rows * groups, rows * groups * 4)
+            self._quant_lease = get_workspace_manager(device, create=True).reserve_bytes(
+                sum(self._quant_sizes), label="fp8_ue8m0", lane="fp8_ue8m0",
+            )
+
+    def _quantize(self, inputs):
+        from sparsevllm.kernels.external.sgl.fp8_ue8m0 import sgl_quantize_fp8_ue8m0
+        spec = self.spec
+        if len(inputs) > spec.max_num_tokens:
+            raise ValueError("UE8M0 FP8 input exceeds the prepared token capacity.")
+        values, packed, scales = self._quant_lease.buffer.split(self._quant_sizes)
+        rows = (len(inputs) + 3) // 4 * 4
+        groups = (spec.input_features // 128 + 3) // 4 * 4
+        values = values[:inputs.numel()].view(torch.float8_e4m3fn).view_as(inputs)
+        packed = packed[:rows * groups].view(torch.int32).view(groups // 4, rows)
+        scales = scales[:rows * groups * 4].view(torch.float32).view(groups, rows).T
+        return sgl_quantize_fp8_ue8m0(inputs, values, packed, scales)
 
     def __call__(self, x, weight, weight_scale_inv, bias=None):
         self._validate_call(x, weight, weight_scale_inv)
@@ -496,11 +526,15 @@ class FlashInferSm90Fp8LinearProvider(Fp8LinearProvider):
         inputs = x.reshape(-1, x.shape[-1]).contiguous()
         if inputs.shape[0] == 0:
             return x.new_empty((*original_shape, weight.shape[0]))
+        input_scale = None
+        if self._quant_lease is not None:
+            inputs, input_scale = self._quantize(inputs)
         output = flashinfer_fp8_blockscale_gemm_sm90(
             inputs,
             weight,
             weight_scale_inv,
             out_dtype=torch.bfloat16,
+            input_scale=input_scale,
         )
         if bias is not None:
             output.add_(bias)
