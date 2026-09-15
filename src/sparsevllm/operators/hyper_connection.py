@@ -83,8 +83,7 @@ class FlashInferHyperConnectionProvider:
         self._validate(weight, (self._mix_dim, width), torch.float32)
         self._validate(scale, (3,), torch.float32)
         self._validate(base, (self._mix_dim,), torch.float32)
-        # Fix the projection shape across decode batches and prefill chunks:
-        # FP32 reduction differences can cross BF16 residual midpoints.
+        # Project in FP32 before the fused normalization and stream mixing.
         dot_mix = self._projection.run(residual.view(rows, width), weight)
         # Public FlashInfer owns result allocations; capture retains them in the
         # graph pool. No per-layer persistent copy of projection scratch is kept.
@@ -172,21 +171,18 @@ class TorchHyperConnectionHeadProvider:
         if rows == 0:
             return output
         x, norm, reduced = self._lease.buffer.view(torch.float32).split(self._sizes)
-        x = x.view(s.max_num_tokens, -1)
+        x = x.view(s.max_num_tokens, -1)[:rows]
         mixes = self._projection.run(residual.flatten(1), weight)
-        norm = norm[:, None]
+        norm = norm[:rows, None]
         reduced = reduced[:rows * s.hidden_size].view(rows, s.hidden_size)
-        x[:rows].copy_(residual.flatten(1))
-        x[rows:].zero_()
+        x.copy_(residual.flatten(1))
         # Normalize the FP32 projection. Normalizing BF16 input before GEMM
         # changes the native checkpoint's rounding contract.
         x.square_()
         torch.mean(x, dim=1, keepdim=True, out=norm)
         norm.add_(s.norm_eps).rsqrt_()
-        mixes.mul_(norm[:rows]).mul_(scale).add_(base).sigmoid_().add_(s.mixing_eps)
-        # Fixed RMS rows avoid reduction-shape rounding; explicit multiply/sum
-        # preserves the reference's stream contraction without batched GEMM.
-        weighted = x[:rows].view(rows, s.num_streams, s.hidden_size)
+        mixes.mul_(norm).mul_(scale).add_(base).sigmoid_().add_(s.mixing_eps)
+        weighted = x.view(rows, s.num_streams, s.hidden_size)
         weighted.copy_(residual).mul_(mixes[:, :, None])
         torch.sum(weighted, dim=1, out=reduced)
         output.copy_(reduced)

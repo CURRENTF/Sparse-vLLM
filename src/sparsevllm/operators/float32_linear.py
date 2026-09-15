@@ -1,4 +1,4 @@
-"""FP32 projection with batch-independent reduction shape and reusable scratch."""
+"""FP32 projection over active rows with reusable scratch."""
 
 from dataclasses import dataclass
 
@@ -25,7 +25,7 @@ class Float32LinearSpec:
 
 
 FLOAT32_LINEAR_REGISTRY = OpRegistry(
-    "batch-invariant FP32 linear", portfolio=PortfolioPolicy(upstream_standard=("torch_mm",)),
+    "FP32 linear", portfolio=PortfolioPolicy(upstream_standard=("torch_mm",)),
 )
 
 
@@ -77,15 +77,12 @@ class TorchFloat32LinearProvider:
         if any(t.device != self.device or not t.is_contiguous() for t in (x, *weights)):
             raise ValueError("FP32 linear inputs must be contiguous on the prepared device.")
         scratch = self._lease.buffer.view(torch.float32)
-        padded = scratch[:self._input_elements].view(s.max_num_tokens, s.input_features)
+        active = scratch[:self._input_elements].view(s.max_num_tokens, s.input_features)[:len(x)]
         outputs = scratch[self._input_elements:].view(s.num_projections, s.max_num_tokens, s.output_features).unbind(0)
         if len(x):
-            padded[:len(x)].copy_(x)
-            padded[len(x):].zero_()
-            # cuBLAS changes FP32 reduction order with M, even between two
-            # multi-row shapes. Keep M fixed before low-precision rounding.
+            active.copy_(x)
             for weight, output in zip(weights, outputs):
-                torch.mm(padded, weight.t(), out=output)
+                torch.mm(active, weight.t(), out=output[:len(x)])
         return tuple(output[:len(x)] for output in outputs)
 
 

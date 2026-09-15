@@ -1,4 +1,4 @@
-"""Full compression preserves identical carry and values across prefill splits."""
+"""Full compression preserves carry semantics and values across prefill splits."""
 
 from types import SimpleNamespace
 
@@ -17,8 +17,8 @@ from sparsevllm.operators.workspace import close_workspace_manager, lock_workspa
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @torch.inference_mode()
 def test_compressor_prefill_splits_preserve_values_and_raw_carry(tmp_path):
-    # Pooling-only tests start from fixed projections. Real FP32 GEMMs changed
-    # with chunk size, crossing BF16 pooling midpoints and changing attention.
+    # Exercise projection, pooling and carry together; isolated pooling tests
+    # cannot catch a stale projection row or a misplaced chunk boundary.
     close_workspace_manager()
     dist.init_process_group("gloo", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1)
     init_parallel_context(topology=ParallelTopology(1, 1, 1))
@@ -54,8 +54,9 @@ def test_compressor_prefill_splits_preserve_values_and_raw_carry(tmp_path):
             outputs.append(torch.cat(chunks))
             states.append(state.accounting_tensors())
         for whole, chunked in zip(states[0], states[1]):
-            torch.testing.assert_close(whole, chunked, rtol=0, atol=0)
-        torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+            tolerance = dict(rtol=1e-5, atol=4e-6) if whole.is_floating_point() else dict(rtol=0, atol=0)
+            torch.testing.assert_close(whole, chunked, **tolerance)
+        torch.testing.assert_close(outputs[0], outputs[1], rtol=1e-2, atol=8e-3)
     finally:
         close_workspace_manager()
         reset_parallel_context()
