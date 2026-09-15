@@ -29,6 +29,19 @@ class IndexedSharedKVView:
 
 
 @dataclass(frozen=True)
+class PackedSharedKVPayload:
+    """Opaque DSv4 FP8 pages in the FlashMLA view, with logical slot capacity.
+
+    cache is uint8 [pages, 64, 1, 584]. Its page stride includes padding;
+    data and scales occupy separate regions within each page. It must not be
+    flattened or treated as independently contiguous 584-byte token rows.
+    """
+
+    cache: torch.Tensor
+    slot_capacity: int
+
+
+@dataclass(frozen=True)
 class NativeStateSnapshots:
     """Copy exact prefix-end state into cache-owned, disjoint snapshot rows.
 
