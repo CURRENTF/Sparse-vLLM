@@ -17,10 +17,15 @@ def coordinate_dp_step(runner, seqs, is_prefill: bool) -> bool:
     )
     force_eager = getattr(runner.cache_manager, "decode_graph_force_eager", None)
     control = runner.dp_control_buffer
-    control[0] = max(rows, decode_capacity)
-    control[1] = bool(seqs and (is_prefill or (force_eager and force_eager())))
+    control.zero_()
+    dp_rank = runner.parallel_context.attn_dp_rank
+    control[dp_rank] = max(rows, decode_capacity)
+    control[-1] = bool(seqs and (is_prefill or (force_eager and force_eager())))
     dist.all_reduce(control, op=dist.ReduceOp.MAX, group=runner.dp_control_group)
-    capacity, eager = int(control[0]), bool(control[1])
-    get_context().moe_token_capacity = capacity
+    token_sizes = tuple(int(value) for value in control[:-1])
+    capacity, eager = max(token_sizes), bool(control[-1])
+    context = get_context()
+    context.moe_token_capacity = capacity
+    context.moe_token_sizes = token_sizes if eager else None
     graph_runner.dp_batch_capacity = None if eager else capacity
     return eager

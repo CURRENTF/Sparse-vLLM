@@ -325,7 +325,11 @@ class ModelRunner:
         self.dp_control_group = (
             dist.new_group(backend="gloo") if config.attn_dp_size > 1 else None
         )
-        self.dp_control_buffer = torch.empty(2, dtype=torch.int64, device="cpu") if config.attn_dp_size > 1 else None
+        self.dp_control_buffer = (
+            torch.empty(config.attn_dp_size + 1, dtype=torch.int64, device="cpu")
+            if config.attn_dp_size > 1
+            else None
+        )
         self.dp_idle_graphs = {}
         self.dp_idle_replay_count = 0
         self.dp_idle_eager_count = 0

@@ -91,9 +91,10 @@ class TritonGemma4MoeProvider(Gemma4MoeProvider):
         w2_scale_inv,
         *,
         local_expert_start,
+        tp_rank,
         ep_rank,
     ):
-        del ep_rank
+        del tp_rank, ep_rank
         if w13_scale_inv is not None or w2_scale_inv is not None:
             raise RuntimeError("Gemma 4 BF16 MoE does not accept expert scales.")
         from sparsevllm.kernels.triton.gemma4_moe import fused_gemma4_moe
@@ -192,9 +193,10 @@ class TorchGemma4MoeProvider(Gemma4MoeProvider):
         w2_scale_inv,
         *,
         local_expert_start,
+        tp_rank,
         ep_rank,
     ):
-        del ep_rank
+        del tp_rank, ep_rank
         if w13_scale_inv is not None or w2_scale_inv is not None:
             raise RuntimeError("Gemma 4 Torch MoE does not accept expert scales.")
         output = torch.zeros_like(hidden_states)

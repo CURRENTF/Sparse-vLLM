@@ -14,6 +14,7 @@ class Context:
         self.decode_mid_o_logexpsum = None
         self.multimodal_image_groups = None
         self.moe_token_capacity = None
+        self.moe_token_sizes = None
 
 
 _CONTEXT = Context()

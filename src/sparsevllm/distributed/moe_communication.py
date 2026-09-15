@@ -24,6 +24,7 @@ class MoeDispatch:
     hidden_states: torch.Tensor
     local_rows: int
     capacity: int
+    token_sizes: tuple[int, ...] | None = None
 
 
 class MoeCommunication:
@@ -144,6 +145,34 @@ class AllGatherReduceScatterMoeCommunication(MoeCommunication):
             raise ValueError(
                 f"MoE capacity {capacity} cannot hold {rows} local tokens."
             )
+        token_sizes = get_context().moe_token_sizes
+        if token_sizes is not None:
+            token_sizes = tuple(int(value) for value in token_sizes)
+            if len(token_sizes) != self.group.size:
+                raise ValueError(
+                    "DP token-size vector does not match the AG/RS group: "
+                    f"sizes={token_sizes} group_size={self.group.size}."
+                )
+            if token_sizes[self.group.rank] != rows:
+                raise ValueError(
+                    "DP token-size vector does not match the local model rows: "
+                    f"sizes={token_sizes} rank={self.group.rank} rows={rows}."
+                )
+            if max(token_sizes) != capacity:
+                raise ValueError(
+                    "DP token-size vector does not match the agreed capacity: "
+                    f"sizes={token_sizes} capacity={capacity}."
+                )
+            if (
+                len(set(token_sizes)) > 1
+                and self.op is not None
+                and self.op.supports_variable_sizes
+            ):
+                gathered = hidden_states.new_empty((sum(token_sizes), hidden))
+                self.op.all_gatherv(gathered, hidden_states.contiguous(), token_sizes)
+                return MoeDispatch(
+                    gathered, rows, capacity, token_sizes=token_sizes
+                )
         if rows == capacity:
             local = hidden_states.contiguous()
         else:
@@ -159,6 +188,16 @@ class AllGatherReduceScatterMoeCommunication(MoeCommunication):
         return MoeDispatch(gathered, rows, capacity)
 
     def combine(self, output: torch.Tensor, dispatch: MoeDispatch) -> torch.Tensor:
+        if dispatch.token_sizes is not None:
+            if output.shape[0] != sum(dispatch.token_sizes):
+                raise ValueError(
+                    "Variable AG/RS expert output does not match the dispatched token layout."
+                )
+            local = output.new_empty((dispatch.local_rows, output.shape[1]))
+            self.op.reduce_scatterv(
+                local, output.contiguous(), dispatch.token_sizes
+            )
+            return local
         if output.shape[0] != dispatch.capacity * self.group.size:
             raise ValueError(
                 "Local expert output does not match the dispatched token layout."

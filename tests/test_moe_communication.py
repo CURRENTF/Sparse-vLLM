@@ -98,7 +98,7 @@ def _prepared_agrs_worker(
     from sparsevllm.distributed.collective_runtime import ParallelCollectiveRuntime
     from sparsevllm.operators.agrs import FlashInferMixedAgRsProvider
     from sparsevllm.operators.registry import SupportResult
-    from sparsevllm.utils.context import reset_context, set_context
+    from sparsevllm.utils.context import get_context, reset_context, set_context
 
     if force_torch:
         FlashInferMixedAgRsProvider.supports = classmethod(
@@ -140,29 +140,35 @@ def _prepared_agrs_worker(
             ]
             source = sources[rank]
             set_context(rank == 0)
+            if force_torch:
+                get_context().moe_token_sizes = sizes
             dispatched = communication.dispatch(source, capacity=capacity)
-            expected = torch.zeros(
-                capacity * world_size, hidden_size, device="cuda", dtype=dtype
-            )
+            dispatched_rows = sum(sizes) if force_torch else capacity * world_size
+            expected = torch.zeros(dispatched_rows, hidden_size, device="cuda", dtype=dtype)
+            offset = 0
             for peer, value in enumerate(sources):
-                expected[peer * capacity : peer * capacity + len(value)].copy_(value)
+                start = offset if force_torch else peer * capacity
+                expected[start : start + len(value)].copy_(value)
+                offset += len(value)
             # Check AG ordering independently: paired inverse permutations in
             # AG/RS could otherwise pass an end-to-end additive expert oracle.
             torch.testing.assert_close(
                 dispatched.hidden_states, expected, atol=0, rtol=0
             )
             partial = (
-                torch.arange(capacity * world_size * hidden_size, device="cuda")
+                torch.arange(dispatched_rows * hidden_size, device="cuda")
                 .remainder(16)
-                .reshape(capacity * world_size, hidden_size)
+                .reshape(dispatched_rows, hidden_size)
                 .to(dtype)
             )
             result = communication.combine(partial * (rank + 1), dispatched)
-            reference = partial[rank * capacity : rank * capacity + sizes[rank]] * (
+            local_start = sum(sizes[:rank]) if force_torch else rank * capacity
+            reference = partial[local_start : local_start + sizes[rank]] * (
                 world_size * (world_size + 1) // 2
             )
             torch.testing.assert_close(result, reference, atol=0, rtol=0)
             set_context(False)
+            get_context().moe_token_sizes = None
 
             def forward(source=source, capacity=capacity):
                 # A nonlinear owner-local branch catches missing/doubled shared
@@ -243,7 +249,7 @@ def test_shared_expert_execution_uses_the_agreed_step_capacity(monkeypatch, step
 
 def _hybrid_agrs_worker(rank, rendezvous, cuda):
     from sparsevllm.distributed.collective_runtime import ParallelCollectiveRuntime
-    from sparsevllm.utils.context import reset_context, set_context
+    from sparsevllm.utils.context import get_context, reset_context, set_context
 
     device = torch.device("cuda", rank) if cuda else torch.device("cpu")
     if cuda:
@@ -272,6 +278,8 @@ def _hybrid_agrs_worker(rank, rendezvous, cuda):
             )
 
             capacity = max(sizes)
+            if not cuda:
+                get_context().moe_token_sizes = sizes
 
             def forward(source=source, capacity=capacity):
                 return transport.run_with_shared_experts(
@@ -286,6 +294,8 @@ def _hybrid_agrs_worker(rank, rendezvous, cuda):
             # Four expert partitions contribute 1+2+3+4; the two shared
             # shards contribute 1+2 once per replica, regardless of padding.
             torch.testing.assert_close(forward(), source * 13)
+            if not cuda:
+                get_context().moe_token_sizes = None
             if cuda:
                 stream = torch.cuda.Stream()
                 stream.wait_stream(torch.cuda.current_stream())

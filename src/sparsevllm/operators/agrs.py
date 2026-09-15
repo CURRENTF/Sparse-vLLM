@@ -39,6 +39,7 @@ class AgRsOpSpec:
 
 class TorchAgRsProvider:
     name = "torch_distributed_agrs"
+    supports_variable_sizes = True
 
     @classmethod
     def supports(cls, spec, caps):
@@ -46,7 +47,9 @@ class TorchAgRsProvider:
 
     def prepare(self, spec, *, group, rank, device_index):
         self.group = group
+        self.rank = rank
         self.size = spec.world_size
+        self.backend = spec.backend
 
     def all_gather(self, output, local):
         if self.size == 1:
@@ -59,6 +62,41 @@ class TorchAgRsProvider:
             output.copy_(partial)
         else:
             dist.reduce_scatter_tensor(output, partial, group=self.group)
+
+    def all_gatherv(self, output, local, sizes):
+        if self.size == 1:
+            output.copy_(local)
+            return
+        offset = 0
+        if self.backend != "nccl":
+            for root, rows in enumerate(sizes):
+                rows = int(rows)
+                if rows:
+                    segment = output[offset : offset + rows]
+                    if self.rank == root:
+                        segment.copy_(local)
+                    global_root = (
+                        root
+                        if self.group is None
+                        else dist.get_global_rank(self.group, root)
+                    )
+                    dist.broadcast(segment, src=global_root, group=self.group)
+                offset += rows
+            return
+        segments = []
+        for rows in sizes:
+            rows = int(rows)
+            segments.append(output[offset : offset + rows])
+            offset += rows
+        dist.all_gather(segments, local, group=self.group)
+
+    def reduce_scatterv(self, output, partial, sizes):
+        if self.size == 1:
+            output.copy_(partial)
+            return
+        dist.all_reduce(partial, group=self.group)
+        offset = sum(int(rows) for rows in sizes[: self.rank])
+        output.copy_(partial[offset : offset + int(sizes[self.rank])])
 
     def close(self):
         pass
@@ -97,6 +135,7 @@ def _mixed_comm_available():
 @AGRS_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
 class FlashInferMixedAgRsProvider:
     name = "flashinfer_mixed_comm_uc"
+    supports_variable_sizes = False
 
     @classmethod
     def supports(cls, spec, caps):
@@ -178,6 +217,10 @@ class PreparedAgRsOp:
     def name(self):
         return self.provider.name
 
+    @property
+    def supports_variable_sizes(self):
+        return bool(self.provider.supports_variable_sizes)
+
     def _validate(self, local, global_tensor):
         if self.closed:
             raise RuntimeError("AG/RS operator is closed.")
@@ -205,6 +248,45 @@ class PreparedAgRsOp:
     def reduce_scatter(self, output, partial):
         self._validate(output, partial)
         self.provider.reduce_scatter(output, partial)
+
+    def _validate_variable(self, local, global_tensor, sizes):
+        if self.closed:
+            raise RuntimeError("AG/RS operator is closed.")
+        sizes = tuple(int(value) for value in sizes)
+        if (
+            len(sizes) != self.spec.world_size
+            or any(value < 0 for value in sizes)
+            or local.ndim != 2
+            or global_tensor.ndim != 2
+            or local.shape[0] != sizes[self.provider.rank]
+            or global_tensor.shape != (sum(sizes), self.spec.hidden_size)
+            or local.shape[1] != self.spec.hidden_size
+            or local.dtype != self.spec.dtype
+            or global_tensor.dtype != local.dtype
+            or local.device != global_tensor.device
+            or not local.is_contiguous()
+            or not global_tensor.is_contiguous()
+        ):
+            raise ValueError(
+                "Variable AG/RS tensors do not match the prepared sizes, dtype, device and layout."
+            )
+        return sizes
+
+    def all_gatherv(self, output, local, sizes):
+        if not self.supports_variable_sizes:
+            raise RuntimeError(
+                f"AG/RS provider {self.name!r} does not support variable token sizes."
+            )
+        sizes = self._validate_variable(local, output, sizes)
+        self.provider.all_gatherv(output, local, sizes)
+
+    def reduce_scatterv(self, output, partial, sizes):
+        if not self.supports_variable_sizes:
+            raise RuntimeError(
+                f"AG/RS provider {self.name!r} does not support variable token sizes."
+            )
+        sizes = self._validate_variable(output, partial, sizes)
+        self.provider.reduce_scatterv(output, partial, sizes)
 
     def close(self):
         if not self.closed:
