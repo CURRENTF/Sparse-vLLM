@@ -6,6 +6,7 @@ import torch
 
 from sparsevllm.engine.cache_manager.standard import StandardCacheManager
 from sparsevllm.engine.cache_manager.storage import (
+    CacheLayout,
     ExplicitKVStorage,
     HeterogeneousExplicitKVStorage,
     MlaLatentStorage,
@@ -68,14 +69,20 @@ def profile_prefill_history(runner):
     context_len = int(config.max_model_len) - 1
     chunk_lengths = profiling_prefill_chunk_lengths(config)
     prompt_lengths = (context_len, *chunk_lengths[1:])
-    config.sparse_method = ""
-    config.prefill_sparse_method = None
+    native = CacheLayout(config.attention_cache_layout) is CacheLayout.SHARED_KV
+    if not native:
+        config.sparse_method = ""
+        config.prefill_sparse_method = None
     config.enable_prefix_caching = False
     config.enable_prefix_cache_offload = False
     config.resolved_prefix_cache_mode = "disabled"
     config.startup_cache_phase = "profiling"
     config.num_kvcache_slots = sum(prompt_lengths)
-    manager = PrefillHistoryCacheManager(config, runner.parallel_context)
+    if native:
+        from .native_history import NativePrefillHistoryCacheManager
+        manager = NativePrefillHistoryCacheManager(config, runner.parallel_context)
+    else:
+        manager = PrefillHistoryCacheManager(config, runner.parallel_context)
     controller = SparseController(config, manager)
     runtime = RuntimeState(config, manager, runner.recurrent_state_manager)
     seqs = []

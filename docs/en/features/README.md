@@ -4,6 +4,7 @@ This directory collects the sparse-method docs that define Sparse-vLLM
 behavior.
 
 - [Supported Models](supported-models.md)
+- [DeepSeek-V4-Flash-0731 (experimental)](deepseek-v4.md)
 - [Core Sparse Methods](sparse-methods.md)
 - [FlashPrefill V2](flashprefill-v2.md)
 - [DeltaKV](deltakv.md)

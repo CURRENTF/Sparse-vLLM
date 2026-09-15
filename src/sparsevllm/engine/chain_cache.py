@@ -12,14 +12,10 @@ from dataclasses import replace
 from enum import Enum
 from typing import Any, Iterable
 
-from sparsevllm.method_registry import prefill_sparse_method_fingerprint
+from sparsevllm.method_registry import CHAIN_PREFIX_METHODS, RADIX_PREFIX_METHODS, prefill_sparse_method_fingerprint
 
 
 
-CHAIN_PREFIX_METHODS = frozenset(
-    {"streamingllm", "snapkv", "h2o", "pyramidkv", "rkv", "skipkv"}
-)
-RADIX_PREFIX_METHODS = frozenset({"", "omnikv", "quest"})
 PREFIX_CACHE_MODES = frozenset({"auto", "radix", "chain"})
 
 

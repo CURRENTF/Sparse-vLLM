@@ -27,6 +27,7 @@ from sparsevllm.distributed import (
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.models.qwen2 import Qwen2ForCausalLM
 from sparsevllm.models.llama import LlamaForCausalLM
+from sparsevllm.models.deepseek_v4.model import DeepseekV4ForCausalLM
 from sparsevllm.layers.sampler import Sampler
 from sparsevllm.kernels.external.required import (
     validate_required_cuda_kernel_families,
@@ -430,7 +431,6 @@ class ModelRunner:
         warmup_moe = getattr(self.model, "warmup_moe", None)
         if callable(warmup_moe):
             warmup_moe()
-        lock_workspace_manager()
         
         self.sampler = Sampler()
         self._tokenizer_metadata: tuple[tuple[int, ...], tuple[int, ...] | None] | None = None
@@ -480,6 +480,9 @@ class ModelRunner:
             profiling_config,
             allocation_budget_bytes=self.profiling_kv_budget_bytes,
         )
+        # Sparse-runtime providers also reserve operator scratch. Freeze only
+        # after both model and runtime bindings exist, before any graph capture.
+        lock_workspace_manager()
         self.cache_runtime_phase = "profiling"
 
         # Uninstall the construction-only DeviceContext. Setting "cpu" keeps

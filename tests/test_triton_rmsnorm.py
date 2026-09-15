@@ -64,6 +64,27 @@ def test_rmsnorm_does_not_mask_broken_flashinfer_installation():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("norm_cls", [RMSNorm, GemmaRMSNorm])
+def test_flashinfer_rmsnorm_idle_dp_owner(monkeypatch, norm_cls):
+    # An idle DP owner still traverses normalization before joining EP
+    # collectives. The upstream CuTe kernel rejects a zero-row launch.
+    monkeypatch.setenv("SPARSEVLLM_RMSNORM_PROVIDER", "flashinfer")
+    layernorm._resolve_rmsnorm_ops.cache_clear()
+    try:
+        norm = norm_cls(1024).cuda().bfloat16()
+        empty = torch.empty((0, 1024), device="cuda", dtype=torch.bfloat16)
+        residual = torch.empty_like(empty)
+        assert norm(empty).shape == empty.shape
+        output, returned_residual = norm(empty, residual)
+        assert output is empty and returned_residual is residual
+        x = torch.randn((3, 1024), device="cuda", dtype=torch.bfloat16)
+        torch.testing.assert_close(norm(x), _reference(x, norm.weight, norm.eps,
+                                   zero_centered_weight=norm.zero_centered_weight), rtol=1e-2, atol=3e-2)
+    finally:
+        layernorm._resolve_rmsnorm_ops.cache_clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("norm_cls", [RMSNorm, GemmaRMSNorm])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("hidden_size", [128, 3072, 6144])
 def test_triton_rmsnorm_matches_fp32_reference(

@@ -174,6 +174,11 @@ _DECODE_GRAPH_COUNTERS = (
 )
 
 
+def _decode_graph_snapshots(llm) -> dict[int, dict[str, Any]]:
+    return {int(state["world_rank"]): state["decode_graph"]
+            for state in llm.debug_sparse_state_summaries()}
+
+
 def _decode_graph_counter_delta(
     before: dict[str, Any],
     after: dict[str, Any],
@@ -713,7 +718,8 @@ def run_sparsevllm_probe(
                             request_count=bs,
                             vary_output_lengths=False,
                         )
-                        graph_before = llm.debug_sparse_state_summaries()[0]["decode_graph"]
+                        graphs_before = _decode_graph_snapshots(llm)
+                        graph_before = graphs_before[0]
                         t_start = time.perf_counter()
 
                         seq_to_request: dict[int, Any] = {}
@@ -782,7 +788,8 @@ def run_sparsevllm_probe(
                             raise RuntimeError("Wave workload ended before all requests were admitted")
 
                         elapsed_s = time.perf_counter() - t_start
-                        graph_after = llm.debug_sparse_state_summaries()[0]["decode_graph"]
+                        graphs_after = _decode_graph_snapshots(llm)
+                        graph_after = graphs_after[0]
                         timing_metrics = _request_phase_metrics_from_timestamps(
                             arrival_times=arrival_times,
                             first_token_times=first_token_times,
@@ -861,6 +868,12 @@ def run_sparsevllm_probe(
                             "decode_cuda_graph_counter_delta": _decode_graph_counter_delta(
                                 graph_before, graph_after
                             ),
+                            "decode_cuda_graph_per_rank_before": graphs_before,
+                            "decode_cuda_graph_per_rank_after": graphs_after,
+                            "decode_cuda_graph_per_rank_counter_delta": {
+                                rank: _decode_graph_counter_delta(graphs_before[rank], state)
+                                for rank, state in graphs_after.items()
+                            },
                         }
                         iter_records.append(rec)
                         with open(raw_samples_file, "a", encoding="utf-8") as f:
@@ -1022,9 +1035,8 @@ def run_sparsevllm_churn(
                     try:
                         for iteration in range(args.num_iters):
                             profiler.reset()
-                            graph_before = llm.debug_sparse_state_summaries()[0][
-                                "decode_graph"
-                            ]
+                            graphs_before = _decode_graph_snapshots(llm)
+                            graph_before = graphs_before[0]
                             trace = _trace_for_iteration(
                                 args,
                                 model_specs,
@@ -1086,9 +1098,8 @@ def run_sparsevllm_churn(
                                     finished_times[seq_id] = now
                                     generated_counts[seq_id] = len(token_ids)
                             elapsed_s = time.perf_counter() - started
-                            graph_after = llm.debug_sparse_state_summaries()[0][
-                                "decode_graph"
-                            ]
+                            graphs_after = _decode_graph_snapshots(llm)
+                            graph_after = graphs_after[0]
 
                             expected_seq_ids = set(seq_to_request)
                             for name, observed in (
@@ -1156,6 +1167,12 @@ def run_sparsevllm_churn(
                                 "decode_cuda_graph_counter_delta": (
                                     _decode_graph_counter_delta(graph_before, graph_after)
                                 ),
+                                "decode_cuda_graph_per_rank_before": graphs_before,
+                                "decode_cuda_graph_per_rank_after": graphs_after,
+                                "decode_cuda_graph_per_rank_counter_delta": {
+                                    rank: _decode_graph_counter_delta(graphs_before[rank], state)
+                                    for rank, state in graphs_after.items()
+                                },
                                 "request_throughput_rps": request_count / elapsed_s,
                                 "output_token_throughput_tps": total_output / elapsed_s,
                                 **phase_metrics,

@@ -92,6 +92,68 @@ def test_agrs_uneven_idle_and_graph_replay(tmp_path: Path):
     )
 
 
+def _mixed_precision_metadata_worker(rank, rendezvous):
+    from sparsevllm.distributed.collective_runtime import ParallelCollectiveRuntime
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", init_method=rendezvous, rank=rank, world_size=2)
+    parallel = init_parallel_context(topology=ParallelTopology(1, 2, 2))
+    runtime = ParallelCollectiveRuntime(parallel, cuda_graph=True, device_index=rank)
+    collectives = runtime.request_moe_collectives(
+        attention_max_rows=8, moe_max_rows=16, max_local_tokens=8,
+        hidden_size=2048, dtype=torch.bfloat16, backend="agrs", num_experts=8, top_k=2,
+        moe_reduction_dtype=torch.float32,
+    )
+    runtime.prepare()
+    communication = collectives.moe_transport
+    try:
+        for sizes in ((3, 1), (0, 5), (5, 0)):
+            rows, capacity = sizes[rank], max(sizes)
+            source = torch.full((rows, 2048), rank + 1., device="cuda", dtype=torch.bfloat16)
+            metadata = (torch.arange(rows, device="cuda", dtype=torch.int64) + 11 * rank)[:, None]
+
+            def forward():
+                return communication.run(
+                    source, routing_metadata=metadata, capacity=capacity, chunk_size=2,
+                    route=lambda x, token_ids: (token_ids, None),
+                    experts=lambda x, ids, weights: x.float() * (rank + 1) + ids.float() / 1024 + 0.000123,
+                )
+
+            def check(result):
+                assert result.dtype == torch.float32
+                expected = source.float() * 3 + metadata.float() / 512 + 0.000246
+                torch.testing.assert_close(result, expected, atol=1e-6, rtol=1e-7)
+
+            check(forward())
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                forward()
+            stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                captured = forward()
+            for _ in range(2):
+                metadata.add_(3)
+                source.add_(0.5)
+                graph.replay()
+                check(captured)
+            del graph
+    finally:
+        torch.cuda.synchronize()
+        runtime.close()
+        reset_parallel_context()
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+def test_agrs_preserves_integer_routing_metadata_and_fp32_expert_sums(tmp_path):
+    # BF16 communication previously rejected FP32 expert results; casting them
+    # to BF16 loses the small contribution this independent oracle retains.
+    mp.spawn(_mixed_precision_metadata_worker,
+             args=(f"file://{tmp_path / 'metadata-rendezvous'}",), nprocs=2, join=True)
+
+
 def _prepared_agrs_worker(
     rank, rendezvous, force_torch, world_size, hidden_size, dtype
 ):

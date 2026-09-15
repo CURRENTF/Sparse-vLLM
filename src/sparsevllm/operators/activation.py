@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.nn.functional as F
@@ -21,10 +22,13 @@ class SiluAndMulSpec:
     activation_dtype: torch.dtype
     input_ndim: int = 2
     contiguous: bool = True
+    swiglu_limit: float | None = None
 
     def __post_init__(self) -> None:
         if int(self.input_ndim) <= 0:
             raise ValueError("SiluAndMul input_ndim must be positive.")
+        if self.swiglu_limit is not None and (not math.isfinite(self.swiglu_limit) or self.swiglu_limit <= 0):
+            raise ValueError("SwiGLU limit must be finite and positive.")
 
 
 def _validate_input(x: torch.Tensor) -> None:
@@ -60,7 +64,7 @@ class SiluAndMulProvider:
 
 SILU_AND_MUL_REGISTRY: OpRegistry[SiluAndMulSpec, SiluAndMulProvider] = OpRegistry(
     "SiLU-and-multiply",
-    portfolio=PortfolioPolicy(repo_portable=("triton", "torch")),
+    portfolio=PortfolioPolicy(upstream_standard=("vllm_clipped",), repo_nonstandard=("triton_clipped",), repo_portable=("triton", "torch")),
 )
 
 
@@ -73,6 +77,8 @@ class TritonSiluAndMulProvider(SiluAndMulProvider):
 
     @classmethod
     def supports(cls, spec: SiluAndMulSpec, caps: DeviceCaps) -> SupportResult:
+        if spec.swiglu_limit is not None:
+            return SupportResult.unsupported("requires unclipped SwiGLU")
         if caps.platform != PlatformEnum.CUDA:
             return SupportResult.unsupported(f"requires CUDA, got {caps.platform.name}")
         if not caps.supports_triton:
@@ -104,7 +110,8 @@ class TorchSiluAndMulProvider(SiluAndMulProvider):
 
     @classmethod
     def supports(cls, spec: SiluAndMulSpec, caps: DeviceCaps) -> SupportResult:
-        del spec, caps
+        if spec.swiglu_limit is not None:
+            return SupportResult.unsupported("requires unclipped SwiGLU")
         return SupportResult.yes()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
@@ -118,11 +125,75 @@ class TorchSiluAndMulProvider(SiluAndMulProvider):
         return gate
 
 
+@SILU_AND_MUL_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
+class TritonClippedSiluAndMulProvider(SiluAndMulProvider):
+    name = "triton_clipped"
+
+    def __init__(self, *, op_spec: SiluAndMulSpec):
+        self.spec = op_spec
+
+    @classmethod
+    def supports(cls, spec, caps):
+        if spec.swiglu_limit is None:
+            return SupportResult.unsupported("requires clipped SwiGLU")
+        if caps.platform != PlatformEnum.CUDA or not caps.supports_triton:
+            return SupportResult.unsupported("requires CUDA and Triton")
+        if spec.activation_dtype != torch.bfloat16 or spec.input_ndim != 2 or not spec.contiguous:
+            return SupportResult.unsupported("requires contiguous rank-2 BF16 inputs")
+        return SupportResult.yes()
+
+    def __call__(self, x):
+        _validate_bound_input(x, self.spec)
+        if not x.is_cuda:
+            raise ValueError("Clipped SwiGLU requires a CUDA input.")
+        from sparsevllm.kernels.triton.silu_and_mul import clipped_swiglu
+        output = x.new_empty((x.shape[0], x.shape[1] // 2))
+        clipped_swiglu(x, output, limit=self.spec.swiglu_limit)
+        return output
+
+
+@SILU_AND_MUL_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
+class VllmClippedSiluAndMulProvider(SiluAndMulProvider):
+    name = "vllm_clipped"
+
+    def __init__(self, *, op_spec: SiluAndMulSpec):
+        from sparsevllm.kernels.external.vllm_moe import clipped_swiglu_op
+        self.spec = op_spec
+        self._op = clipped_swiglu_op()
+
+    @classmethod
+    def supports(cls, spec, caps):
+        if spec.swiglu_limit is None:
+            return SupportResult.unsupported("requires clipped SwiGLU")
+        if caps.platform != PlatformEnum.CUDA:
+            return SupportResult.unsupported("requires CUDA")
+        if spec.activation_dtype != torch.bfloat16 or spec.input_ndim != 2 or not spec.contiguous:
+            return SupportResult.unsupported("requires contiguous rank-2 BF16 inputs")
+        from sparsevllm.kernels.external.vllm_moe import clipped_swiglu_op
+        if clipped_swiglu_op() is None:
+            return SupportResult.unsupported("optional vLLM stable-ABI library is unavailable")
+        return SupportResult.yes()
+
+    def binding_metadata(self):
+        return {"kernel_path": "vllm_stable_abi._C.silu_and_mul_with_clamp",
+                "interface": "raw stable-ABI kernel; no vLLM engine dispatcher"}
+
+    def __call__(self, x):
+        _validate_bound_input(x, self.spec)
+        if not x.is_cuda:
+            raise ValueError("Clipped SwiGLU requires a CUDA input.")
+        output = x.new_empty((x.shape[0], x.shape[1] // 2))
+        if output.numel():
+            self._op(output, x, self.spec.swiglu_limit, 1.0, 0.0)
+        return output
+
+
 def resolve_silu_and_mul_provider(
     *,
     activation_dtype: torch.dtype,
     input_ndim: int = 2,
     contiguous: bool = True,
+    swiglu_limit: float | None = None,
     device_index: int | None = None,
 ) -> SiluAndMulProvider:
     platform = platforms.current_platform
@@ -133,6 +204,7 @@ def resolve_silu_and_mul_provider(
         activation_dtype=activation_dtype,
         input_ndim=int(input_ndim),
         contiguous=bool(contiguous),
+        swiglu_limit=swiglu_limit,
     )
     return OpResolver(SILU_AND_MUL_REGISTRY).resolve(
         spec,

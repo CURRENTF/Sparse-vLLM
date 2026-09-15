@@ -36,6 +36,24 @@ from sparsevllm.operators.mla_attention import (
 from sparsevllm.platforms.interface import DeviceCaps, PlatformEnum
 
 
+@pytest.mark.parametrize("supported", [True, False])
+def test_decode_graph_audit_checks_every_model_declared_provider(supported):
+    from sparsevllm.operators.decode_attention import validate_decode_graph_model
+
+    class NativeModel(torch.nn.Module):
+        def decode_attention_providers(self):
+            return (SimpleNamespace(supports_decode_graph=True),
+                    SimpleNamespace(supports_decode_graph=supported))
+
+    # Native attention is outside the explicit-KV Attention class. Its second
+    # layer must not bypass the provider's graph compatibility boundary.
+    if supported:
+        assert validate_decode_graph_model(NativeModel()) == 2
+    else:
+        with pytest.raises(RuntimeError, match="graph-stable attention provider"):
+            validate_decode_graph_model(NativeModel())
+
+
 def test_decode_graph_runner_blocks_replay_until_collectives_are_ready() -> None:
     runner = object.__new__(DecodeCudaGraphRunner)
     graph = SimpleNamespace(replay=Mock())

@@ -161,7 +161,8 @@ def test_flashinfer_groupwise_adapter_fixes_layout_contract() -> None:
     )
 
 
-def test_flashinfer_sm90_adapter_fixes_scale_contract() -> None:
+@pytest.mark.parametrize("prequantized", [False, True])
+def test_flashinfer_sm90_adapter_fixes_scale_contract(prequantized) -> None:
     gemm = Mock(return_value=object())
     _sm90_fp8_linear_op.cache_clear()
     try:
@@ -172,11 +173,13 @@ def test_flashinfer_sm90_adapter_fixes_scale_contract() -> None:
             inputs = torch.empty(2, 128)
             weight = torch.empty(128, 128)
             weight_scale = torch.empty(1, 1)
+            input_scale = torch.empty(2, 1) if prequantized else None
             result = flashinfer_fp8_blockscale_gemm_sm90(
                 inputs,
                 weight,
                 weight_scale,
                 out_dtype=torch.bfloat16,
+                input_scale=input_scale,
             )
     finally:
         _sm90_fp8_linear_op.cache_clear()
@@ -187,6 +190,7 @@ def test_flashinfer_sm90_adapter_fixes_scale_contract() -> None:
         weight,
         weight_scale=weight_scale,
         out_dtype=torch.bfloat16,
+        input_scale=input_scale,
     )
 
 

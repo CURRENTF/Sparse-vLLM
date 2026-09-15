@@ -33,8 +33,14 @@ class Fp8LinearSpec:
     scale_dtype: torch.dtype = torch.float32
     weight_layout_id: str = "block_128x128_nt_k_major"
     cuda_graph: bool = True
+    scale_fmt: str | None = None
+    max_num_tokens: int | None = None
 
     def __post_init__(self) -> None:
+        if self.scale_fmt not in (None, "ue8m0"):
+            raise ValueError(f"Unsupported FP8 scale_fmt={self.scale_fmt!r}.")
+        if self.scale_fmt == "ue8m0" and (self.max_num_tokens is None or self.max_num_tokens <= 0):
+            raise ValueError("UE8M0 Linear requires a positive max_num_tokens workspace bound.")
         if self.input_features <= 0 or self.output_features <= 0:
             raise ValueError("FP8 Linear feature sizes must be positive.")
         if any(int(value) <= 0 for value in self.block_shape):
@@ -107,6 +113,9 @@ class Fp8LinearProvider:
                 f"expected={expected_scale_shape}, got={tuple(weight_scale_inv.shape)}."
             )
         if self.spec is not None:
+            if (self.spec.max_num_tokens is not None
+                    and x.numel() // x.shape[-1] > self.spec.max_num_tokens):
+                raise ValueError("FP8 Linear token count exceeds prepared workspace capacity.")
             if x.dtype != self.spec.activation_dtype:
                 raise TypeError(
                     "Bound FP8 Linear activation dtype changed after preparation: "
@@ -155,6 +164,8 @@ class SglTensorFp8LinearProvider(Fp8LinearProvider):
 
     @classmethod
     def supports(cls, spec, caps):
+        if spec.scale_fmt is not None:
+            return SupportResult.unsupported("tensor-scaled quantizer does not support UE8M0 block scales")
         if spec.weight_layout_id != "tensor_scales_in_block_grid":
             return SupportResult.unsupported("requires tensor-scaled checkpoint weights")
         if caps.platform != PlatformEnum.CUDA or not caps.supports_native_fp8:
@@ -354,6 +365,8 @@ def _sm120_fp8_linear_profile_support(
     spec: Fp8LinearSpec,
     caps: DeviceCaps,
 ) -> ProfileMatch:
+    if spec.scale_fmt is not None:
+        return ProfileMatch.no("profile uses unrounded activation scales")
     payload, routes = _load_sm120_fp8_linear_profile()
     device = payload["device"]
     if (
@@ -465,7 +478,39 @@ class FlashInferSm90Fp8LinearProvider(Fp8LinearProvider):
         )
 
         supported, reason = flashinfer_sm90_fp8_linear_support()
+        if supported and spec.scale_fmt == "ue8m0":
+            from sparsevllm.kernels.external.sgl.moe import _sgl_fp8_group_quant_op
+            _sgl_fp8_group_quant_op()
+            if not hasattr(torch, "float8_e8m0fnu"):
+                return SupportResult.unsupported("UE8M0 scale conversion requires Torch E8M0 dtype support")
         return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
+
+    def __init__(self, spec=None, caps=None):
+        super().__init__(spec, caps)
+        self._quant_lease = None
+        if spec is not None and spec.scale_fmt == "ue8m0":
+            from sparsevllm.operators.workspace import get_workspace_manager
+            device = platforms.current_platform.get_device(caps.device_index)
+            rows = (spec.max_num_tokens + 3) // 4 * 4
+            groups = (spec.input_features // 128 + 3) // 4 * 4
+            self._quant_sizes = (spec.max_num_tokens * spec.input_features,
+                                 rows * groups, rows * groups * 4)
+            self._quant_lease = get_workspace_manager(device, create=True).reserve_bytes(
+                sum(self._quant_sizes), label="fp8_ue8m0", lane="fp8_ue8m0",
+            )
+
+    def _quantize(self, inputs):
+        from sparsevllm.kernels.external.sgl.fp8_ue8m0 import sgl_quantize_fp8_ue8m0
+        spec = self.spec
+        if len(inputs) > spec.max_num_tokens:
+            raise ValueError("UE8M0 FP8 input exceeds the prepared token capacity.")
+        values, packed, scales = self._quant_lease.buffer.split(self._quant_sizes)
+        rows = (len(inputs) + 3) // 4 * 4
+        groups = (spec.input_features // 128 + 3) // 4 * 4
+        values = values[:inputs.numel()].view(torch.float8_e4m3fn).view_as(inputs)
+        packed = packed[:rows * groups].view(torch.int32).view(groups // 4, rows)
+        scales = scales[:rows * groups * 4].view(torch.float32).view(groups, rows).T
+        return sgl_quantize_fp8_ue8m0(inputs, values, packed, scales)
 
     def __call__(self, x, weight, weight_scale_inv, bias=None):
         self._validate_call(x, weight, weight_scale_inv)
@@ -478,11 +523,18 @@ class FlashInferSm90Fp8LinearProvider(Fp8LinearProvider):
         )
 
         original_shape = x.shape[:-1]
+        inputs = x.reshape(-1, x.shape[-1]).contiguous()
+        if inputs.shape[0] == 0:
+            return x.new_empty((*original_shape, weight.shape[0]))
+        input_scale = None
+        if self._quant_lease is not None:
+            inputs, input_scale = self._quantize(inputs)
         output = flashinfer_fp8_blockscale_gemm_sm90(
-            x.reshape(-1, x.shape[-1]).contiguous(),
+            inputs,
             weight,
             weight_scale_inv,
             out_dtype=torch.bfloat16,
+            input_scale=input_scale,
         )
         if bias is not None:
             output.add_(bias)
@@ -497,6 +549,8 @@ class FlashInferGroupwiseSm120Fp8LinearProvider(Fp8LinearProvider):
 
     @classmethod
     def supports(cls, spec: Fp8LinearSpec, caps: DeviceCaps) -> SupportResult:
+        if spec.scale_fmt is not None:
+            return SupportResult.unsupported("SM120 activation quantizer does not implement UE8M0 scales")
         if spec.block_shape != (128, 128):
             return SupportResult.unsupported(
                 f"requires block_shape=(128, 128), got {spec.block_shape}"
@@ -662,6 +716,7 @@ class TritonFp8LinearProvider(Fp8LinearProvider):
             weight,
             weight_scale_inv,
             output_dtype=x.dtype,
+            scale_fmt=self.spec.scale_fmt if self.spec is not None else None,
         )
         if bias is not None:
             output.add_(bias)
@@ -789,6 +844,8 @@ def resolve_fp8_linear_provider(
     weight_layout_id: str = "block_128x128_nt_k_major",
     cuda_graph: bool = True,
     device_index: int | None = None,
+    scale_fmt: str | None = None,
+    max_num_tokens: int | None = None,
 ) -> Fp8LinearProvider:
     platform = platforms.current_platform
     if device_index is None:
@@ -804,6 +861,8 @@ def resolve_fp8_linear_provider(
             scale_dtype=scale_dtype,
             weight_layout_id=str(weight_layout_id),
             cuda_graph=bool(cuda_graph),
+            scale_fmt=scale_fmt,
+            max_num_tokens=max_num_tokens,
         ),
         caps,
     ).provider

@@ -14,6 +14,7 @@ class ModelSpec:
     requires_fp8: bool = False
     mixed_attention: bool = False
     allow_raw_config: bool = False
+    prefer_raw_config: bool = False
     supports_tiny_random: bool = True
     supports_quantized_tiny_random: bool = False
     tiny_random_requires_standard_head_shape: bool = True
@@ -23,6 +24,7 @@ class ModelSpec:
     deltakv_checkpoint_model_types: frozenset[str] = frozenset()
     runtime_class_name: str = ""
     attention_cache_layout: str = "explicit_kv"
+    moe_reduction_dtype: str | None = None
     attention_tp_fields: tuple[str, ...] = ()
     num_experts_field: str | None = None
     moe_tp_fields: tuple[str, ...] = ()
@@ -109,6 +111,14 @@ MODEL_SPECS = {
 }
 MODEL_SPECS.update(
     {
+        "deepseek_v4": ModelSpec(
+            "DeepSeek V4", requires_fp8=True, allow_raw_config=True, prefer_raw_config=True, supports_tiny_random=False,
+            supports_expert_parallel=True, supports_data_parallel=True,
+            runtime_class_name="DeepseekV4ForCausalLM", attention_cache_layout="shared_kv", moe_reduction_dtype="float32",
+            attention_tp_fields=("num_attention_heads", "o_groups", "vocab_size"),
+            num_experts_field="n_routed_experts", moe_tp_fields=("moe_intermediate_size",),
+            top_k_field="num_experts_per_tok",
+        ),
         "qwen3_5": ModelSpec(
             "Qwen3.5",
             mixed_attention=True,

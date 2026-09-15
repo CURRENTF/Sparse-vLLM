@@ -47,6 +47,10 @@ GLM 逐张量 FP8 加载支持 E4M3 权重以及每个量化投影对应的 BF16
 
 ## 稀疏方法支持
 
+DeepSeek-V4-Flash-0731 提供[实验性原生集成](deepseek-v4.md)，使用 FP8/MXFP4
+权重、attention TP=1 和 DP×EP。短输入和 4K 独立对照的数值误差与 vLLM 相近，
+输出可能不同。该模型使用自身的 `deepseek_v4` 方法，不使用下表中的其他方法。
+
 | 模型 | Vanilla | StreamingLLM | SnapKV | H2O | PyramidKV | OmniKV | QuEST | R-KV | SkipKV | DeltaKV |
 | --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | Qwen2.5 | ✅ | ✅ | ✅ | 实验性⁴ | ✅ | ✅ | ✅ | ✅ | 指定 checkpoint¹ | 需要 compressor² |

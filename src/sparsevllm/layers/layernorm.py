@@ -41,6 +41,8 @@ def _load_flashinfer_ops(*, zero_centered_weight: bool) -> _RMSNormOps:
         weight: torch.Tensor,
         eps: float,
     ) -> torch.Tensor:
+        if x.numel() == 0:
+            return torch.empty_like(x)
         return rmsnorm(x, weight, eps=eps)
 
     def run_fused_add_rmsnorm(
@@ -49,6 +51,8 @@ def _load_flashinfer_ops(*, zero_centered_weight: bool) -> _RMSNormOps:
         weight: torch.Tensor,
         eps: float,
     ) -> None:
+        if x.numel() == 0:
+            return
         fused_add_rmsnorm(x, residual, weight, eps=eps)
 
     return _RMSNormOps(

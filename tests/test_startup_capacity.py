@@ -256,6 +256,21 @@ def test_startup_batch_feasibility_uses_all_memory_oracle_budgets():
     assert not runtime.startup_batch_fits((16, 16, 16), max_tokens=2)
 
 
+def test_native_unified_graph_probes_use_nonempty_prompts():
+    # A method active from its first token previously generated zero-length
+    # startup prompts, rejected before the graph could be captured.
+    config = _config(sparse_method="deepseek_v4")
+
+    class Oracle:
+        def startup_batch_fits(self, prompt_lengths, *, max_tokens):
+            assert all(0 < length < config.max_model_len for length in prompt_lengths)
+            return True
+
+    plan = [(2, config.max_model_len, True)]
+    feasible, skipped = feasible_startup_graph_plan(config, plan, Oracle())
+    assert feasible == plan and not skipped
+
+
 @pytest.mark.parametrize("free_by_layer,expected", [([4, 4], True), ([4, 3], False)])
 def test_startup_decode_checks_all_h2o_layers_without_allocating(free_by_layer, expected):
     # A later layer can lack the fourth append even when the first layer fits.

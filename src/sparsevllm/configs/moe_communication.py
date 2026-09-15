@@ -13,6 +13,9 @@ def validate_moe_backend(config):
     if not dp and backend != "all-reduce":
         raise ValueError("AG/RS and DeepEP require DP attention (DP>1, EP=world size).")
     if backend == "deepepv1":
+        reduction_dtype = config.model_spec.moe_reduction_dtype
+        if reduction_dtype is not None and reduction_dtype != str(config.hf_config.dtype).removeprefix("torch."):
+            raise ValueError("DeepEP V1 requires expert reduction dtype to match activations; use agrs for this model.")
         if config.attn_tp_size != 1:
             raise ValueError("DeepEP V1 currently requires attention TP=1; use agrs for DP×TP.")
         if config.expert_parallel_size not in (2, 4, 8):

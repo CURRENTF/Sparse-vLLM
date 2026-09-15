@@ -224,6 +224,7 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 self._admission_defer_warned_seq_ids.discard(seq_id)
                 self.memory_oracle.reset_prefill_execution_state(seq_id)
+                self.memory_oracle.clear_prefix_cache_hit(seq)
                 return may_own_slots
         return False
 
@@ -300,6 +301,27 @@ class Scheduler:
         if min_final == 0 or remaining_after <= 0 or remaining_after >= min_final:
             return int(proposed_tokens)
         return max(0, int(remaining_prefill_tokens) - min_final)
+
+    def _fit_prefill_resources(self, seq, proposed_tokens, budgets, mode):
+        if not budgets:
+            return proposed_tokens
+
+        def fits(tokens):
+            costs = self.memory_oracle.step_resource_costs(seq, tokens, is_prefill=True)
+            return all(need <= budgets.get(name, 0) for name, need in costs.items())
+
+        if fits(proposed_tokens):
+            return proposed_tokens
+        if mode == PREFILL_EXECUTION_FULL or self.memory_oracle.requires_full_prefill_step(seq):
+            return 0
+        lower, upper = 0, proposed_tokens
+        while lower < upper:
+            middle = (lower + upper + 1) // 2
+            if fits(middle):
+                lower = middle
+            else:
+                upper = middle - 1
+        return lower
 
     def _raise_prompt_admission_failure(
         self,
@@ -464,6 +486,9 @@ class Scheduler:
             admission_budgets = {}
             margin_batched_tokens = 0
         decode_logical_free_count = max(0, int(self.memory_oracle.decode_step_free_slots()))
+        prefill_resources = dict(self.memory_oracle.step_resource_budgets(is_prefill=True)) if self.waiting else {}
+        decode_resources = dict(self.memory_oracle.step_resource_budgets(is_prefill=False))
+        blocked_prefill_resource_failure = None
         deferred_prompt_failure: tuple[Sequence, str, int, int] | None = None
         blocked_prefill_step_failure: tuple[Sequence, int, int] | None = None
         blocked_prefill_capacity_failure: tuple[Sequence, int, int, int] | None = None
@@ -527,6 +552,12 @@ class Scheduler:
                     num_batched_tokens=num_batched_tokens,
                     step_free_count=candidate_step_free_count,
                 )
+                resource_limited_tokens = self._fit_prefill_resources(seq, can_prefill_tokens, prefill_resources, target_mode)
+                if can_prefill_tokens > 0 and resource_limited_tokens == 0:
+                    blocked_prefill_resource_failure = (
+                        seq, self.memory_oracle.step_resource_costs(seq, can_prefill_tokens, is_prefill=True), dict(prefill_resources)
+                    )
+                can_prefill_tokens = resource_limited_tokens
                 can_prefill_tokens = self._respect_min_final_prefill_chunk(
                     seq,
                     remaining_prefill_tokens,
@@ -655,6 +686,8 @@ class Scheduler:
                     can_prefill_tokens,
                 )
                 step_free_count = max(0, step_free_count - int(prefill_reservation_cost))
+                for name, need in self.memory_oracle.step_resource_costs(seq, can_prefill_tokens, is_prefill=True).items():
+                    prefill_resources[name] -= need
                 seq.status = SequenceStatus.RUNNING
                 scheduled_seqs.append(seq)
                 if target_mode == PREFILL_EXECUTION_RAW_OFFLOAD:
@@ -704,7 +737,9 @@ class Scheduler:
                 int(self.memory_oracle.decode_step_free_slots_for(seq)),
             )
             decode_reservation_cost = int(self.memory_oracle.decode_step_reservation_cost(seq))
-            if candidate_decode_free < decode_reservation_cost:
+            resource_costs = self.memory_oracle.step_resource_costs(seq, 1, is_prefill=False)
+            resources_fit = all(need <= decode_resources.get(name, 0) for name, need in resource_costs.items())
+            if candidate_decode_free < decode_reservation_cost or not resources_fit:
                 if decode_logical_free_count > 0:
                     if blocked_decode_victim is None:
                         blocked_decode_victim = seq
@@ -733,6 +768,8 @@ class Scheduler:
             else:
                 # Reserve the cache-manager-specific decode capacity for this step.
                 decode_logical_free_count -= decode_reservation_cost
+                for name, need in resource_costs.items():
+                    decode_resources[name] -= need
                 num_batched_seqs += 1
                 scheduled_seqs.append(seq)
                 # logger.debug('Add a decode req.')
@@ -749,6 +786,12 @@ class Scheduler:
                     preempted_seqs,
                     physical_free_count=physical_free_count,
                     reserved_prefill=reserved_prefill,
+                )
+            if blocked_prefill_resource_failure is not None and not self.decoding:
+                seq, needs, budgets = blocked_prefill_resource_failure
+                raise RuntimeError(
+                    "No prefill candidate fits the remaining physical resource budgets. "
+                    f"seq_id={seq.seq_id} needs={needs} budgets={budgets}."
                 )
             if blocked_prefill_step_failure is not None and not self.decoding:
                 seq, need, free = blocked_prefill_step_failure

@@ -219,6 +219,15 @@ def profiling_kv_budget_bytes(config, num_slots: int) -> int:
         else CacheLayout(str(configured_layout))
     )
 
+    if cache_layout is CacheLayout.SHARED_KV:
+        from sparsevllm.engine.cache_manager.storage.native_capacity import NativeCacheGeometry
+
+        snapshots = int(config.enable_prefix_caching)
+        tokens = num_slots + snapshots * int(config.prefix_cache_block_size)
+        return NativeCacheGeometry.from_config(config).budget_for_tokens(
+            tokens, live_rows=int(config.max_num_seqs_in_gpu), snapshot_rows=snapshots,
+        )
+
     if cache_layout is CacheLayout.EXPLICIT_KV:
         local_shapes = layout.local_kv_shapes(tp_size)
         if not local_shapes:

@@ -37,6 +37,7 @@ METHOD_ALIASES = {
 QUANTIZED_KV_METHODS = frozenset({"kivi", "turboquant", "fp8_kv"})
 
 CANONICAL_SPARSE_METHODS = {
+    "deepseek_v4",
     "",
     "streamingllm",
     "snapkv",
@@ -161,19 +162,23 @@ def prefill_sparse_method_fingerprint(config) -> dict[str, object]:
             payload[field_name] = getattr(config, field_name, None)
     return payload
 
-PREFIX_CACHE_SUPPORTED_METHODS = {
-    "",
-    "streamingllm",
-    "omnikv",
-    "quest",
-    "snapkv",
-    "h2o",
-    "pyramidkv",
-    "rkv",
-    "skipkv",
-}
+CHAIN_PREFIX_METHODS = frozenset({"streamingllm", "snapkv", "h2o", "pyramidkv", "rkv", "skipkv"})
+RADIX_PREFIX_METHODS = frozenset({"", "omnikv", "quest", "deepseek_v4"})
+PREFIX_CACHE_SUPPORTED_METHODS = set(CHAIN_PREFIX_METHODS | RADIX_PREFIX_METHODS)
 
-H2O_SUPPORTED_MODEL_TYPES = frozenset(MODEL_SPECS) - {"gemma4"}
+H2O_SUPPORTED_MODEL_TYPES = frozenset(MODEL_SPECS) - {"gemma4", "deepseek_v4"}
+
+MODEL_NATIVE_SPARSE_METHODS = {"deepseek_v4": "deepseek_v4"}
+
+
+def resolve_model_sparse_method(model_type: str, method: str | None) -> str:
+    normalized = normalize_sparse_method(method)
+    native = MODEL_NATIVE_SPARSE_METHODS.get(model_type)
+    if native is None:
+        return normalized
+    if normalized not in ("", native):
+        raise ValueError(f"{model_type} requires its native {native!r} attention; got {normalized!r}.")
+    return native
 
 SKIPKV_ASSET_MODEL_NAMES = frozenset(
     {
@@ -226,6 +231,7 @@ _PREFILL_LAYER_VARYING_PAGE_TABLE = {
     "rkv": True,
     "skipkv": True,
     "deltakv": True,
+    "deepseek_v4": True,
 }
 if set(_PREFILL_LAYER_VARYING_PAGE_TABLE) != CANONICAL_SPARSE_METHODS:
     raise RuntimeError(
@@ -378,9 +384,9 @@ _MOE_SPARSE_METHODS = frozenset(
 )
 
 DENSE_MODEL_COMPATIBILITY = ModelRuntimeCompatibility(
-    sparse_methods=frozenset(CANONICAL_SPARSE_METHODS),
-    prefix_cache_methods=frozenset(PREFIX_CACHE_SUPPORTED_METHODS),
-    decode_graph_methods=frozenset(CANONICAL_SPARSE_METHODS),
+    sparse_methods=frozenset(CANONICAL_SPARSE_METHODS) - {"deepseek_v4"},
+    prefix_cache_methods=frozenset(PREFIX_CACHE_SUPPORTED_METHODS) - {"deepseek_v4"},
+    decode_graph_methods=frozenset(CANONICAL_SPARSE_METHODS) - {"deepseek_v4"},
 )
 
 QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
@@ -436,6 +442,8 @@ GEMMA4_COMPATIBILITY = ModelRuntimeCompatibility(
 )
 
 MODEL_RUNTIME_COMPATIBILITY = {
+    "deepseek_v4": ModelRuntimeCompatibility(frozenset({"deepseek_v4"}), frozenset({"deepseek_v4"}),
+                                             frozenset({"deepseek_v4"})),
     **{
         model_type: DENSE_MODEL_COMPATIBILITY
         for model_type in ("qwen2", "qwen3", "qwen3_5", "llama")
@@ -471,6 +479,8 @@ def decode_sparse_long_text_threshold(
 ) -> int:
     """Return the shared decode boundary between short and sparse graph families."""
     method = str(method or "")
+    if method == "deepseek_v4":
+        return 1
     if not method:
         return 0
     if method in {"streamingllm", "attention-sink", "attention_sink"}:
@@ -485,12 +495,15 @@ def decode_sparse_long_text_threshold(
 def decode_graph_path_id(method: str, is_long_text: bool) -> str:
     """Identify one graph-stable decode topology family."""
     method = str(method or "")
+    if method == "deepseek_v4":
+        return "unified"
     if not method:
         return "dense"
     return "long" if is_long_text else "short"
 
 
 _DEFAULT_PREFILL_POLICY_BY_METHOD = {
+    "deepseek_v4": PREFILL_POLICY_ALL_CHUNKED,
     **dict.fromkeys(QUANTIZED_KV_METHODS, PREFILL_POLICY_ALL_CHUNKED),
     "": PREFILL_POLICY_ALL_CHUNKED,
     "streamingllm": PREFILL_POLICY_ALL_CHUNKED,

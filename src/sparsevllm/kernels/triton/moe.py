@@ -47,6 +47,7 @@ def localize_expert_ids(
     local_expert_start: int,
     local_expert_end: int,
     remote_expert_id: int = -1,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Map global expert IDs to one EP shard and encode remote routes."""
 
@@ -64,7 +65,10 @@ def localize_expert_ids(
             "Invalid local expert range "
             f"[{local_expert_start}, {local_expert_end})."
         )
-    output = torch.empty_like(expert_ids, dtype=torch.int32)
+    output = torch.empty_like(expert_ids, dtype=torch.int32) if out is None else out
+    if (output.shape != expert_ids.shape or output.dtype != torch.int32
+            or output.device != expert_ids.device or not output.is_contiguous()):
+        raise ValueError("Expert ID localization output must be matching contiguous int32 storage.")
     block_size = 256
     _localize_expert_ids_kernel[
         (triton.cdiv(int(expert_ids.numel()), block_size),)
@@ -1166,6 +1170,7 @@ def moe_sum(
     local_expert_start: int,
     local_expert_end: int,
     output_dtype: torch.dtype | None = None,
+    filter_invalid_routes: bool = False,
 ) -> torch.Tensor:
     num_tokens, top_k, hidden_size = (int(dim) for dim in inputs.shape)
     block_m = 1 if num_tokens <= 4 else 8
@@ -1201,7 +1206,7 @@ def moe_sum(
         stride_om=output.stride(0),
         stride_on=output.stride(1),
         FILTER_REMOTE=(
-            local_expert_start != 0 or local_expert_end != int(num_experts)
+            filter_invalid_routes or local_expert_start != 0 or local_expert_end != int(num_experts)
         ),
         BLOCK_SIZE_M=block_m,
         BLOCK_SIZE_N=block_n,

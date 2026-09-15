@@ -84,9 +84,10 @@ def _rank_local_slice_for_tensor(
     if is_tensor_scale:
         # A checkpoint scalar is replicated even when its weight is TP-sharded.
         return None
-    is_scale = source_weight_name.endswith(".weight_scale_inv")
+    scale_suffix = getattr(model, "checkpoint_scale_suffix", ".weight_scale_inv")
+    is_scale = source_weight_name.endswith(scale_suffix)
     source_parameter_name = (
-        source_weight_name[: -len(".weight_scale_inv")] + ".weight"
+        source_weight_name[: -len(scale_suffix)] + ".weight"
         if is_scale
         else source_weight_name
     )
@@ -127,7 +128,8 @@ def _read_safetensors_shard(
                 continue
 
             scale_suffix = (
-                ".weight_scale" if key.endswith(".weight_scale") else ".weight_scale_inv"
+                ".weight_scale" if key.endswith(".weight_scale")
+                else getattr(model, "checkpoint_scale_suffix", ".weight_scale_inv")
             )
             is_scale = key.endswith(scale_suffix)
             source_parameter_name = (
@@ -151,7 +153,9 @@ def _read_safetensors_shard(
             if not key.endswith(".weight_scale"):
                 continue
             weight_key = key[: -len(".weight_scale")] + ".weight"
-            block_key = _scale_key_for_weight_key(weight_key)
+            block_key = _scale_key_for_weight_key(
+                weight_key, getattr(model, "checkpoint_scale_suffix", ".weight_scale_inv")
+            )
             if block_key in metadata:
                 raise ValueError(f"Checkpoint contains both tensor and block scales for {weight_key}.")
             metadata[block_key] = metadata.pop(key)
@@ -207,10 +211,10 @@ def _module_for_parameter(model: nn.Module, param_name: str) -> nn.Module:
     return model.get_submodule(module_name)
 
 
-def _scale_key_for_weight_key(weight_key: str) -> str:
+def _scale_key_for_weight_key(weight_key: str, scale_suffix: str = ".weight_scale_inv") -> str:
     if not weight_key.endswith(".weight"):
         raise ValueError(f"Expected a weight key ending in '.weight', got {weight_key!r}.")
-    return weight_key[: -len(".weight")] + ".weight_scale_inv"
+    return weight_key[: -len(".weight")] + scale_suffix
 
 
 def _target_weight_name_for_model(model: nn.Module, source_weight_name: str) -> str | None:
@@ -661,6 +665,7 @@ def load_model(
     files = sorted(glob(os.path.join(path, "*.safetensors")))
     assert len(files) > 0, f"No safetensors found in {path}"
     checkpoint_is_rank_local = False
+    scale_suffix = getattr(model, "checkpoint_scale_suffix", ".weight_scale_inv")
 
     # Some tensor-parallel converters emit one file per rank:
     #   model{tp_rank}-mp{tp_size}.safetensors
@@ -727,14 +732,14 @@ def load_model(
                     f"{duplicate_source_keys[:5]}."
                 )
             seen_source_keys.update(keys)
-            scale_keys = {key for key in keys if key.endswith(".weight_scale_inv")}
+            scale_keys = {key for key in keys if key.endswith(scale_suffix)}
             consumed_scale_keys: set[str] = set()
             for source_weight_name in keys:
-                if source_weight_name.endswith(".weight_scale_inv"):
+                if source_weight_name.endswith(scale_suffix):
                     continue
                 scale_key = None
                 if source_weight_name.endswith(".weight"):
-                    scale_key = _scale_key_for_weight_key(source_weight_name)
+                    scale_key = _scale_key_for_weight_key(source_weight_name, scale_suffix)
                 param_name = _target_weight_name_for_model(model, source_weight_name)
                 if param_name is None:
                     skipped_weight_hook = getattr(model, "record_skipped_weight", None)
@@ -828,7 +833,7 @@ def load_model(
                     module = _module_for_parameter(model, param_name)
                     loaded_scale = None
                     if source_weight_name.endswith(".weight"):
-                        scale_key = _scale_key_for_weight_key(source_weight_name)
+                        scale_key = _scale_key_for_weight_key(source_weight_name, scale_suffix)
                         loaded_scale = tensors.get(scale_key)
                     if loaded_scale is not None:
                         consumed_scale_keys.add(scale_key)

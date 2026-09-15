@@ -57,6 +57,11 @@ performance improvement over BF16; compare matched workloads before deployment.
 
 ## Sparse Method Support
 
+DeepSeek-V4-Flash-0731 has an [experimental native integration](deepseek-v4.md)
+with FP8/MXFP4 weights, attention TP=1 and DP×EP. Independent short/4K
+comparisons show vLLM-comparable numerical error; exact outputs can differ.
+It uses its own `deepseek_v4` method rather than the methods below.
+
 | Model | Vanilla | StreamingLLM | SnapKV | H2O | PyramidKV | OmniKV | QuEST | R-KV | SkipKV | DeltaKV |
 | --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | Qwen2.5 | ✅ | ✅ | ✅ | Experimental⁴ | ✅ | ✅ | ✅ | ✅ | Selected checkpoints¹ | Compressor required² |

@@ -48,6 +48,11 @@ from sparsevllm.method_registry import (
 
 
 class FakeMemoryOracle:
+    def step_resource_budgets(self, *, is_prefill):
+        return {}
+
+    def step_resource_costs(self, seq, scheduled_tokens, *, is_prefill):
+        return {}
     def reserve_decode_windows(self, decoding, waiting):
         return None
 

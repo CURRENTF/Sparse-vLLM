@@ -1737,6 +1737,14 @@ def validate_decode_graph_model(model: torch.nn.Module) -> int:
                 "MLA provider."
             )
         validated += 1
+    providers = getattr(model, "decode_attention_providers", None)
+    if callable(providers):
+        for provider in providers():
+            if not bool(getattr(provider, "supports_decode_graph", False)):
+                raise RuntimeError(
+                    f"decode CUDA Graph requires a graph-stable attention provider, got {type(provider).__name__}."
+                )
+            validated += 1
     if validated == 0:
         raise RuntimeError(
             "decode CUDA Graph found no validated decode operator."

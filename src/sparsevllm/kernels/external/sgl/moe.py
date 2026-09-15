@@ -108,6 +108,8 @@ def sgl_moe_align_block_size(
     *,
     block_size: int,
     num_experts: int,
+    alignment: MoeAlignment | None = None,
+    cumsum_buffer: torch.Tensor | None = None,
 ) -> MoeAlignment:
     """Group local expert assignments with the SGL CUDA kernel."""
 
@@ -121,21 +123,28 @@ def sgl_moe_align_block_size(
         max_num_tokens_padded = (
             num_assignments + (num_experts + 1) * (int(block_size) - 1)
         )
-    sorted_token_ids = torch.empty(
-        max_num_tokens_padded,
-        dtype=torch.int32,
-        device=topk_ids.device,
-    )
-    expert_ids = torch.empty(
-        triton.cdiv(max_num_tokens_padded, int(block_size)),
-        dtype=torch.int32,
-        device=topk_ids.device,
-    )
-    num_tokens_post_padded = torch.empty(
-        1,
-        dtype=torch.int32,
-        device=topk_ids.device,
-    )
+    if alignment is None:
+        sorted_token_ids = torch.empty(max_num_tokens_padded, dtype=torch.int32, device=topk_ids.device)
+        expert_ids = torch.empty(triton.cdiv(max_num_tokens_padded, int(block_size)),
+                                 dtype=torch.int32, device=topk_ids.device)
+        num_tokens_post_padded = torch.empty(1, dtype=torch.int32, device=topk_ids.device)
+    else:
+        sorted_token_ids = alignment.sorted_token_ids
+        expert_ids = alignment.expert_ids
+        num_tokens_post_padded = alignment.num_tokens_post_padded
+        if (alignment.naive or alignment.block_size != block_size or sorted_token_ids is None
+                or sorted_token_ids.numel() < max_num_tokens_padded
+                or expert_ids.numel() < triton.cdiv(max_num_tokens_padded, block_size)
+                or num_tokens_post_padded.numel() != 1):
+            raise ValueError("Prepared SGL alignment does not cover the requested assignment capacity.")
+        if any(t.dtype != torch.int32 or t.device != topk_ids.device or not t.is_contiguous()
+               for t in (sorted_token_ids, expert_ids, num_tokens_post_padded)):
+            raise ValueError("Prepared SGL alignment requires contiguous int32 tensors on the input device.")
+    if cumsum_buffer is not None and (
+        cumsum_buffer.numel() < num_experts + 2 or cumsum_buffer.dtype != torch.int32
+        or cumsum_buffer.device != topk_ids.device or not cumsum_buffer.is_contiguous()
+    ):
+        raise ValueError("Prepared SGL prefix workspace must cover num_experts + 2 int32 values.")
     from sparsevllm.kernels.triton.sgl_moe_align import (
         SMALL_NUMEL_LIMIT,
         sgl_moe_align_small_numel,
@@ -157,11 +166,8 @@ def sgl_moe_align_block_size(
             block_size=int(block_size),
             naive=False,
         )
-    cumsum_buffer = torch.empty(
-        num_experts + 2,
-        dtype=torch.int32,
-        device=topk_ids.device,
-    )
+    if cumsum_buffer is None:
+        cumsum_buffer = torch.empty(num_experts + 2, dtype=torch.int32, device=topk_ids.device)
     from sgl_kernel import moe_align_block_size
 
     # The +1 bucket maps filtered expert -1 to a skipped expert block.
