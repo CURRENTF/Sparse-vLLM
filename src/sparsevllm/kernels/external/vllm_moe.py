@@ -57,3 +57,11 @@ def clipped_swiglu_op():
         "stable-ABI clipped SwiGLU", "_C_stable_libtorch.abi3.so",
         "_C", "silu_and_mul_with_clamp", ("result", "input", "limit", "alpha", "beta"),
     )
+
+
+@lru_cache(maxsize=1)
+def hash_inputs_op():
+    def prepare(input_ids, vocab_size, index_dtype):
+        return input_ids.to(index_dtype), (input_ids < 0) | (input_ids >= vocab_size)
+
+    return torch.compile(prepare, fullgraph=True, dynamic=True)

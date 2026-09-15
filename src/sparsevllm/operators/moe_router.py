@@ -323,14 +323,16 @@ class VllmSqrtSoftplusRouterProvider(MoeRouterProvider):
 
     @classmethod
     def supports(cls, spec, caps):
-        if spec.routing_method != "sqrt_softplus":
-            return SupportResult.unsupported("requires learned sqrt-softplus routing")
+        if spec.routing_method not in ("sqrt_softplus", "hash_sqrt_softplus"):
+            return SupportResult.unsupported("requires learned or hash sqrt-softplus routing")
         if caps.platform != PlatformEnum.CUDA or spec.activation_dtype != torch.float32:
             return SupportResult.unsupported("requires CUDA FP32 logits")
         if not spec.norm_topk_prob or spec.max_num_tokens is None or spec.max_num_tokens <= 0:
             return SupportResult.unsupported("requires normalized weights and prepared token capacity")
         if spec.cuda_graph and not caps.supports_graph_capture:
             return SupportResult.unsupported("requires CUDA Graph support")
+        if spec.routing_method == "hash_sqrt_softplus" and not caps.supports_torch_compile:
+            return SupportResult.unsupported("hash input preparation requires torch.compile")
         from sparsevllm.kernels.external.vllm_moe import sqrt_softplus_op
         if sqrt_softplus_op() is None:
             return SupportResult.unsupported("optional vLLM MoE library is not installed or configured")
@@ -345,6 +347,10 @@ class VllmSqrtSoftplusRouterProvider(MoeRouterProvider):
         from sparsevllm.operators.workspace import get_workspace_manager
         self.spec, self.device = spec, device
         self._op = sqrt_softplus_op()
+        self._hash_inputs = None
+        if spec.routing_method == "hash_sqrt_softplus":
+            from sparsevllm.kernels.external.vllm_moe import hash_inputs_op
+            self._hash_inputs = hash_inputs_op()
         self._elements = spec.max_num_tokens * spec.top_k
         self._lease = get_workspace_manager(device, create=True).reserve_bytes(
             12 * self._elements, label="vllm_sqrt_softplus", lane="sqrt_softplus_router",
@@ -357,15 +363,26 @@ class VllmSqrtSoftplusRouterProvider(MoeRouterProvider):
     def run(self, spec, router_logits, correction_bias=None, *, routed_scaling_factor=1.0,
             hash_indices=None, input_ids=None):
         import math
-        if spec != self.spec or hash_indices is not None or input_ids is not None:
-            raise ValueError("Prepared vLLM router requires learned routing with an unchanged spec.")
+        if spec != self.spec:
+            raise ValueError("Prepared vLLM router requires an unchanged spec.")
         rows = len(router_logits)
         if router_logits.shape != (rows, spec.num_experts) or rows > spec.max_num_tokens:
             raise ValueError("Router logits do not match prepared capacity/layout.")
-        if correction_bias is None or correction_bias.shape != (spec.num_experts,):
+        use_hash = spec.routing_method == "hash_sqrt_softplus"
+        if use_hash:
+            if (correction_bias is not None or hash_indices is None or input_ids is None
+                    or hash_indices.ndim != 2 or hash_indices.shape[1] != spec.top_k
+                    or len(hash_indices) == 0 or input_ids.shape != (rows,)):
+                raise ValueError("Hash routing requires a token-to-expert table and original token IDs.")
+            if any(t.dtype not in (torch.int32, torch.int64) or t.device != self.device
+                   or not t.is_contiguous() for t in (hash_indices, input_ids)):
+                raise ValueError("Hash routing metadata must be contiguous integer tensors on the logits device.")
+        elif (hash_indices is not None or input_ids is not None or correction_bias is None
+              or correction_bias.shape != (spec.num_experts,)):
             raise ValueError("Learned sqrt-softplus routing requires an expert correction bias.")
+        floating_inputs = (router_logits,) if use_hash else (router_logits, correction_bias)
         if any(t.dtype != torch.float32 or t.device != self.device or not t.is_contiguous()
-               for t in (router_logits, correction_bias)):
+               for t in floating_inputs):
             raise ValueError("Router logits and bias must be contiguous FP32 on the prepared device.")
         if not math.isfinite(routed_scaling_factor) or routed_scaling_factor <= 0:
             raise ValueError("Routing scale must be finite and positive.")
@@ -373,8 +390,13 @@ class VllmSqrtSoftplusRouterProvider(MoeRouterProvider):
         weights = parts[0].view(torch.float32)[:rows * spec.top_k].view(rows, spec.top_k)
         ids, token_experts = (part[:rows * spec.top_k].view(rows, spec.top_k) for part in parts[1:])
         if rows:
+            tokens = padding = None
+            if use_hash:
+                # The external kernel checks padding before reading the table
+                # and requires IDs and table entries to use the same dtype.
+                tokens, padding = self._hash_inputs(input_ids, len(hash_indices), hash_indices.dtype)
             self._op(weights, ids, token_experts, router_logits, True, routed_scaling_factor,
-                     correction_bias, None, None, None)
+                     correction_bias, tokens, hash_indices, padding)
         return weights, ids
 
 
