@@ -27,7 +27,7 @@ def _quantize_dequantize_activation(x):
             * scales[..., None]).flatten(-2)
 
 
-def _oracle(x, ids, weights, logical, local_start, limit):
+def _oracle(x, ids, weights, logical, local_start, limit, *, quantized_activations=True):
     output = torch.zeros_like(x, dtype=torch.float32)
     host_ids = ids.cpu()
     for expert in range(logical[0][0].shape[0]):
@@ -36,11 +36,15 @@ def _oracle(x, ids, weights, logical, local_start, limit):
             continue
         tokens, routes = tokens.to(x.device), routes.to(x.device)
         w1, w3, w2 = (_dequantize_weight(w[expert], s[expert]) for w, s in logical)
-        a = _quantize_dequantize_activation(x[tokens])
+        a = _quantize_dequantize_activation(x[tokens]) if quantized_activations else x[tokens].float()
         gate = (a @ w1.T).bfloat16().float().clamp(max=limit)
         up = (a @ w3.T).bfloat16().float().clamp(-limit, limit)
-        activated = (F.silu(gate) * up * weights[tokens, routes, None]).bfloat16()
-        down = (_quantize_dequantize_activation(activated) @ w2.T).bfloat16().float()
+        if quantized_activations:
+            activated = (F.silu(gate) * up * weights[tokens, routes, None]).bfloat16()
+            down = (_quantize_dequantize_activation(activated) @ w2.T).bfloat16().float()
+        else:
+            activated = (F.silu(gate) * up).bfloat16().float()
+            down = (activated @ w2.T) * weights[tokens, routes, None]
         output.index_add_(0, tokens, down)
     return output
 

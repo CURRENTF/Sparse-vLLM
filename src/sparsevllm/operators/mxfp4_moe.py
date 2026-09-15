@@ -1,6 +1,5 @@
-"""Routed MXFP4 experts with UE8M0 activations and pre-down routing weights."""
+"""Routed MXFP4 experts with clipped SwiGLU and FP32 local expert sums."""
 
-from dataclasses import dataclass
 import math
 
 import torch
@@ -12,43 +11,108 @@ from sparsevllm.platforms import current_platform
 from sparsevllm.platforms.interface import PlatformEnum
 
 
-@dataclass(frozen=True)
-class Mxfp4MoeSpec:
-    hidden_size: int
-    intermediate_size: int
-    num_experts: int
-    num_local_experts: int
-    local_expert_start: int
-    top_k: int
-    max_num_tokens: int
-    swiglu_limit: float
-    cuda_graph: bool = True
-
-    def __post_init__(self):
-        if min(self.hidden_size, self.intermediate_size, self.num_local_experts, self.max_num_tokens) <= 0:
-            raise ValueError("MXFP4 MoE dimensions and capacity must be positive.")
-        if self.hidden_size % 128 or self.intermediate_size % 128:
-            raise ValueError("MXFP4 MoE feature dimensions must be aligned to 128.")
-        if not 0 <= self.local_expert_start < self.local_expert_start + self.num_local_experts <= self.num_experts:
-            raise ValueError("MXFP4 MoE local expert interval must lie within the global expert set.")
-        if not 1 <= self.top_k <= self.num_experts:
-            raise ValueError("MXFP4 MoE top_k must lie within the global expert count.")
-        if not math.isfinite(self.swiglu_limit) or self.swiglu_limit <= 0:
-            raise ValueError("MXFP4 MoE requires a finite positive SwiGLU limit.")
+from sparsevllm.operators.mxfp4_moe_contract import Mxfp4MoeSpec, Mxfp4ExpertWeights, _validate_inputs
+from sparsevllm.operators.mxfp4_marlin import VllmMarlinMxfp4MoeProvider
 
 
-@dataclass(frozen=True)
-class Mxfp4ExpertWeights:
-    gate_up: torch.Tensor
-    down: torch.Tensor
-    gate_up_scale: torch.Tensor
-    down_scale: torch.Tensor
+class FlashInferMxfp4MoeProvider:
+    name = "flashinfer_cutlass_w4a16"
+    weight_layout_id = "flashinfer_sm90_mxfp4_up_gate"
+
+    @classmethod
+    def supports(cls, spec, caps):
+        if caps.platform != PlatformEnum.CUDA or caps.compute_capability != (9, 0):
+            return SupportResult.unsupported("FlashInfer W4A16 MoE requires SM90")
+        if not caps.supports_bfloat16 or (spec.cuda_graph and not caps.supports_graph_capture):
+            return SupportResult.unsupported("requires BF16 and requested CUDA Graph support")
+        if spec.num_experts % spec.num_local_experts or spec.local_expert_start % spec.num_local_experts:
+            return SupportResult.unsupported("requires equal contiguous EP partitions")
+        from sparsevllm.kernels.external.flashinfer.mxfp4_moe import mxfp4_moe_ops
+        mxfp4_moe_ops()
+        return SupportResult.yes()
+
+    @classmethod
+    def bind(cls, spec, caps):
+        return cls(spec, current_platform.get_device(caps.device_index))
+
+    def __init__(self, spec, device):
+        from sparsevllm.kernels.external.flashinfer.mxfp4_moe import mxfp4_moe_ops
+        self._run, workspace_size, self._pack, self._pack_scale = mxfp4_moe_ops()
+        self.spec, self.device = spec, device
+        self._options = dict(
+            ep_size=spec.num_experts // spec.num_local_experts,
+            ep_rank=spec.local_expert_start // spec.num_local_experts,
+            use_w4_group_scaling=True, use_fused_finalize=False,
+        )
+        size = workspace_size(
+            spec.max_num_tokens, spec.hidden_size, spec.intermediate_size,
+            spec.num_experts, spec.top_k, x_dtype=torch.bfloat16,
+            weight_dtype=torch.uint8, output_dtype=torch.bfloat16,
+            device=device, **self._options,
+        )
+        self._lease = get_workspace_manager(device, create=True).reserve_bytes(
+            size, label="flashinfer_mxfp4_moe", lane="mxfp4_moe",
+        )
+        self._alpha = torch.ones(spec.num_local_experts, device=device, dtype=torch.float32)
+        self._beta = torch.zeros_like(self._alpha)
+        self._limit = torch.full_like(self._alpha, spec.swiglu_limit)
+
+    def allocate_weights(self):
+        s = self.spec
+        def weight(n, k):
+            return torch.empty((s.num_local_experts, n, k // 2), device=self.device, dtype=torch.uint8)
+        def scale(n, k):
+            return torch.empty((s.num_local_experts, n // 64, k // 128, 16, 16),
+                               device=self.device, dtype=torch.uint8)
+        return Mxfp4ExpertWeights(
+            weight(2 * s.intermediate_size, s.hidden_size),
+            weight(s.hidden_size, s.intermediate_size),
+            scale(2 * s.intermediate_size, s.hidden_size),
+            scale(s.hidden_size, s.intermediate_size),
+        )
+
+    def load_projection(self, storage, local_expert, projection, weight, scale):
+        s = self.spec
+        if not 0 <= local_expert < s.num_local_experts:
+            raise ValueError("MXFP4 checkpoint expert index lies outside local storage.")
+        if projection == "down":
+            n, k = s.hidden_size, s.intermediate_size
+            target, scale_target = storage.down[local_expert], storage.down_scale[local_expert]
+        elif projection in ("gate", "up"):
+            n, k = s.intermediate_size, s.hidden_size
+            # CUTLASS consumes [up, gate]; checkpoint projections remain logical.
+            offset = n if projection == "gate" else 0
+            target = storage.gate_up[local_expert, offset:offset + n]
+            scale_target = storage.gate_up_scale[local_expert, offset // 64:(offset + n) // 64]
+        else:
+            raise ValueError(f"Unknown MXFP4 logical projection {projection!r}.")
+        if weight.dtype not in (torch.int8, torch.uint8, torch.float4_e2m1fn_x2) or scale.dtype not in (torch.uint8, torch.float8_e8m0fnu):
+            raise TypeError("MXFP4 checkpoint loading requires packed FP4 and E8M0 bytes.")
+        if weight.shape != (n, k // 2) or scale.shape != (n, k // 32):
+            raise ValueError("MXFP4 checkpoint projection does not match prepared storage.")
+        target.copy_(self._pack(weight.view(torch.uint8).to(self.device).contiguous()[None], "fp4")[0])
+        scale_target.copy_(self._pack_scale(scale.view(torch.uint8).to(self.device).contiguous()[None])[0])
+
+    def run(self, x, ids, route_weights, storage):
+        if not _validate_inputs(self.spec, self.device, x, ids, route_weights):
+            return x.new_empty((0, self.spec.hidden_size), dtype=torch.float32)
+        output = self._run(
+            x, ids.to(torch.int32), route_weights, storage.gate_up, storage.down,
+            torch.bfloat16, [storage.gate_up_scale.view(torch.int32), storage.down_scale.view(torch.int32)],
+            swiglu_alpha=self._alpha, swiglu_beta=self._beta, swiglu_limit=self._limit,
+            workspace_buffer=self._lease.buffer, **self._options,
+        )
+        # The public API returns its output in a one-element list.
+        return output[0].float()
 
 
 MXFP4_MOE_REGISTRY = OpRegistry(
-    "MXFP4 experts with UE8M0 activations and weighted clipped SwiGLU",
-    portfolio=PortfolioPolicy(repo_nonstandard=("triton_mxfp4_ue8m0",)),
+    "MXFP4 experts with clipped SwiGLU",
+    portfolio=PortfolioPolicy(upstream_standard=("flashinfer_cutlass_w4a16", "vllm_marlin_w4a16"),
+                              repo_nonstandard=("triton_mxfp4_ue8m0",)),
 )
+MXFP4_MOE_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)(FlashInferMxfp4MoeProvider)
+MXFP4_MOE_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)(VllmMarlinMxfp4MoeProvider)
 
 
 @MXFP4_MOE_REGISTRY.register_atomic(ProviderRole.REPO_NONSTANDARD)
@@ -139,17 +203,7 @@ class TritonMxfp4MoeProvider:
     def run(self, x, ids, route_weights, storage):
         """Return FP32 local expert sums for EP reduction and shared-expert addition."""
         s = self.spec
-        if x.ndim != 2 or x.shape[1] != s.hidden_size or x.dtype != torch.bfloat16:
-            raise ValueError("MXFP4 MoE requires [tokens, hidden_size] BF16 input.")
-        m = x.shape[0]
-        if m > s.max_num_tokens:
-            raise ValueError("MXFP4 MoE token count exceeds prepared workspace capacity.")
-        if ids.shape != (m, s.top_k) or route_weights.shape != ids.shape:
-            raise ValueError("MXFP4 MoE routing must match [tokens, top_k].")
-        if ids.dtype not in (torch.int32, torch.int64) or route_weights.dtype != torch.float32:
-            raise TypeError("MXFP4 MoE requires integer expert IDs and FP32 routing weights.")
-        if any(t.device != self.device or not t.is_contiguous() for t in (x, ids, route_weights)):
-            raise ValueError("MXFP4 MoE inputs must be contiguous on the prepared device.")
+        m = _validate_inputs(s, self.device, x, ids, route_weights)
         if not m:
             return x.new_empty((0, s.hidden_size), dtype=torch.float32)
         from sparsevllm.kernels.external.sgl.moe import sgl_moe_align_block_size
