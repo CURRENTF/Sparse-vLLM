@@ -1,5 +1,6 @@
 """Native attention and FFN sublayers with four-stream residual mixing."""
 
+import torch
 from torch import nn
 
 from sparsevllm.layers.layernorm import RMSNorm
@@ -10,11 +11,12 @@ from sparsevllm.models.deepseek_v4.moe import DeepseekV4Moe
 
 class DeepseekV4Block(nn.Module):
     def __init__(self, config, layer_id, *, quantization, max_model_len, max_num_tokens,
-                 max_num_requests, mlp_chunk_size, cuda_graph, parallel_collectives=None):
+                 max_num_requests, mlp_chunk_size, cuda_graph, parallel_collectives=None, cache_dtype=torch.bfloat16):
         super().__init__()
         self.attn = DeepseekV4Attention(
             config, layer_id, quantization=quantization, max_model_len=max_model_len,
             max_num_tokens=max_num_tokens, max_num_requests=max_num_requests,
+            cache_dtype=cache_dtype,
         )
         self.ffn = DeepseekV4Moe(
             config, layer_id, quantization=quantization, mlp_chunk_size=mlp_chunk_size,

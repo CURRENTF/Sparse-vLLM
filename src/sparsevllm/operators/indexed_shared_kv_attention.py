@@ -1,11 +1,11 @@
 """Sparse attention over shared K/V vectors with a zero-valued sink logit."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 
 import torch
 
-from sparsevllm.engine.cache_manager.native_attention import IndexedSharedKVView
+from sparsevllm.engine.cache_manager.native_attention import IndexedPackedSharedKVView, IndexedSharedKVView
 from sparsevllm.operators.registry import OpRegistry, OpResolver, PortfolioPolicy, ProviderRole, SupportResult
 from sparsevllm.platforms import current_platform
 from sparsevllm.platforms.interface import PlatformEnum
@@ -20,6 +20,7 @@ class IndexedSharedKVAttentionSpec:
     max_query_tokens: int
     activation_dtype: torch.dtype = torch.bfloat16
     cuda_graph: bool = True
+    cache_dtype: torch.dtype = torch.bfloat16
 
     def __post_init__(self):
         if min(self.num_heads, self.head_dim, self.selection_capacity, self.max_query_tokens) <= 0:
@@ -37,7 +38,7 @@ class IndexedSharedKVAttentionProvider:
 
 INDEXED_SHARED_KV_REGISTRY = OpRegistry(
     "indexed shared-KV attention",
-    portfolio=PortfolioPolicy(upstream_standard=("sgl_flashmla",)),
+    portfolio=PortfolioPolicy(upstream_standard=("sgl_flashmla_packed", "sgl_flashmla")),
 )
 
 
@@ -48,6 +49,8 @@ class SglIndexedSharedKVAttentionProvider(IndexedSharedKVAttentionProvider):
 
     @classmethod
     def supports(cls, spec, caps):
+        if spec.cache_dtype != torch.bfloat16:
+            return SupportResult.unsupported("requires BF16 physical cache storage")
         if caps.platform != PlatformEnum.CUDA or caps.compute_capability not in ((9, 0), (10, 0)):
             return SupportResult.unsupported("SGL sparse FlashMLA requires SM90 or SM100")
         if spec.cuda_graph and not caps.supports_graph_capture:
@@ -112,6 +115,72 @@ class SglIndexedSharedKVAttentionProvider(IndexedSharedKVAttentionProvider):
         # During capture these allocations are retained by the graph memory pool.
         return self._op(query, view.kv, indices, spec.softmax_scale,
                         d_v=spec.head_dim, attn_sink=sink)[0]
+
+
+@INDEXED_SHARED_KV_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
+class SglPackedIndexedSharedKVAttentionProvider(SglIndexedSharedKVAttentionProvider):
+    name = "sgl_flashmla_packed"
+
+    @classmethod
+    def supports(cls, spec, caps):
+        if spec.cache_dtype != torch.uint8:
+            return SupportResult.unsupported("requires packed FP8 physical cache storage")
+        supported = super().supports(replace(spec, cache_dtype=torch.bfloat16), caps)
+        if not supported.supported:
+            return supported
+        from sparsevllm.kernels.external.sgl.sparse_mla import packed_sparse_mla_ops
+        packed_sparse_mla_ops()
+        return supported
+
+    def __init__(self, spec, device_index):
+        super().__init__(spec, device_index)
+        from sparsevllm.kernels.external.sgl.sparse_mla import packed_sparse_mla_ops
+        self._decode, self._metadata = packed_sparse_mla_ops()
+        self._decode_states = {}
+
+    def binding_metadata(self):
+        return {"implementation_kind": "atomic_provider", "implementation_source": "sglang-kernel",
+                "kernel_path": "sgl_kernel.flash_mla.flash_mla_with_kvcache",
+                "cache_contract": "indexed_packed_fp8_shared_kv", "sink": "zero_value_logit",
+                "prefill": "cache_owned_bf16_active_page_gather"}
+
+    def run(self, query, view, sink):
+        if isinstance(view, IndexedSharedKVView):
+            return super().run(query, view, sink)
+        if not isinstance(view, IndexedPackedSharedKVView):
+            raise TypeError("Packed attention requires a typed packed decode or materialized prefill view.")
+        spec, cache = self.spec, view.payload.cache
+        rows = len(query)
+        if query.shape != (rows, spec.num_heads, spec.head_dim) or rows > spec.max_query_tokens:
+            raise ValueError("Packed attention query differs from the prepared shape/capacity.")
+        if query.dtype != spec.activation_dtype or query.device != self._device:
+            raise ValueError("Packed attention query differs from the prepared dtype/device.")
+        if (cache.ndim != 4 or cache.shape[1:] != (64, 1, 584) or cache.dtype != torch.uint8
+                or cache.stride() != (37440, 584, 584, 1)
+                or not 0 < view.payload.slot_capacity <= len(cache) * 64):
+            raise ValueError("Packed attention requires DSv4 FP8 pages and valid logical capacity.")
+        if view.indices.shape != (rows, 1, spec.selection_capacity) or view.indices.dtype != torch.int32:
+            raise ValueError("Packed attention indices differ from the prepared selection capacity.")
+        if sink.shape != (spec.num_heads,) or sink.dtype != torch.float32:
+            raise ValueError("Packed attention requires FP32 per-head sink logits.")
+        if cache.device != self._device or any(t.device != self._device or not t.is_contiguous()
+                                               for t in (query, view.indices, sink)):
+            raise ValueError("Packed attention inputs must be contiguous on the prepared device.")
+        if not rows:
+            return torch.empty_like(query)
+        indices = view.indices
+        if self._padded_indices is not None:
+            indices = self._padded_indices[:rows]
+            indices[:, :, :spec.selection_capacity].copy_(view.indices)
+        state = self._decode_states.get(rows)
+        if state is None:
+            state, _ = self._metadata()
+            self._decode_states[rows] = state
+        # Warmup creates upstream scheduling tensors per captured batch size.
+        # Keep each shape's metadata alive for the corresponding graph.
+        return self._decode(query[:, None], cache, None, None, spec.head_dim, state,
+                            softmax_scale=spec.softmax_scale, is_fp8_kvcache=True,
+                            indices=indices, attn_sink=sink)[0][:, 0]
 
 
 def prepare_indexed_shared_kv_attention(spec, *, device_index: int):

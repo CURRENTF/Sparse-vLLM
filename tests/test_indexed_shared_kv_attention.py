@@ -26,6 +26,8 @@ def test_unsupported_local_heads_rejected_before_loading_device_kernel():
     with pytest.raises(NoProviderError, match="SM90 or SM100"):
         OpResolver(INDEXED_SHARED_KV_REGISTRY).resolve(
             replace(spec, num_heads=64), replace(caps, compute_capability=(8, 0)))
+    with pytest.raises(NoProviderError, match="physical cache storage"):
+        OpResolver(INDEXED_SHARED_KV_REGISTRY).resolve(replace(spec, num_heads=64, cache_dtype=torch.float16), caps)
 
 
 def _reference(q, kv, indices, sink, scale):

@@ -16,7 +16,7 @@ from sparsevllm.utils.context import get_context
 
 class DeepseekV4Model(nn.Module):
     def __init__(self, config, *, quantization, max_model_len, max_num_tokens,
-                 max_num_requests, mlp_chunk_size, cuda_graph, parallel_collectives=None):
+                 max_num_requests, mlp_chunk_size, cuda_graph, parallel_collectives=None, cache_dtype=torch.bfloat16):
         super().__init__()
         self.hc_mult = config.hc_mult
         self.embed = nn.Embedding(config.vocab_size, config.hidden_size, dtype=torch.bfloat16)
@@ -24,6 +24,7 @@ class DeepseekV4Model(nn.Module):
             config, layer, quantization=quantization, max_model_len=max_model_len,
             max_num_tokens=max_num_tokens, max_num_requests=max_num_requests,
             mlp_chunk_size=mlp_chunk_size, cuda_graph=cuda_graph, parallel_collectives=parallel_collectives,
+            cache_dtype=cache_dtype,
         ) for layer in range(config.num_hidden_layers))
         self.hc_head = DeepseekV4HyperConnectionHead(config, max_num_tokens=max_num_tokens)
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps).bfloat16()
@@ -58,7 +59,7 @@ class DeepseekV4ForCausalLM(DeepseekV4Checkpoint, nn.Module):
         )
 
     def __init__(self, config, *, quantization, max_model_len, max_num_tokens,
-                 max_num_requests, mlp_chunk_size, cuda_graph, parallel_collectives=None):
+                 max_num_requests, mlp_chunk_size, cuda_graph, parallel_collectives=None, cache_dtype=torch.bfloat16):
         super().__init__()
         parallel = get_parallel_context()
         if parallel.attn_tp_size != 1:
@@ -73,6 +74,7 @@ class DeepseekV4ForCausalLM(DeepseekV4Checkpoint, nn.Module):
             config, quantization=quantization, max_model_len=max_model_len, max_num_tokens=max_num_tokens,
             max_num_requests=max_num_requests, mlp_chunk_size=mlp_chunk_size, cuda_graph=cuda_graph,
             parallel_collectives=parallel_collectives,
+            cache_dtype=cache_dtype,
         )
         # The checkpoint head is BF16, but the reference promotes its weights
         # and normalized activations before the final vocabulary projection.

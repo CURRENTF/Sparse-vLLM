@@ -15,7 +15,8 @@ from sparsevllm.operators.native_rope import NativeRotarySpec, prepare_native_ro
 
 
 class DeepseekV4Attention(nn.Module):
-    def __init__(self, config, layer_id, *, quantization, max_model_len, max_num_tokens, max_num_requests):
+    def __init__(self, config, layer_id, *, quantization, max_model_len, max_num_tokens, max_num_requests,
+                 cache_dtype=torch.bfloat16):
         super().__init__()
         if (not quantization.enabled or quantization.scale_fmt != "ue8m0"
                 or quantization.max_num_tokens is None or max_num_tokens > quantization.max_num_tokens):
@@ -64,6 +65,7 @@ class DeepseekV4Attention(nn.Module):
         self.attention = prepare_indexed_shared_kv_attention(IndexedSharedKVAttentionSpec(
             self.num_heads, config.head_dim, config.sliding_window + compressed_capacity,
             config.head_dim ** -.5, max_num_tokens,
+            cache_dtype=cache_dtype,
         ), device_index=device_index)
 
     def forward(self, x, cache, batch, index_selection=None):
