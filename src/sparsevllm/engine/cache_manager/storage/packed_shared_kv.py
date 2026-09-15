@@ -1,5 +1,7 @@
 """Physical DSv4 FP8 pages; logical slots and prefix ownership stay above storage."""
 
+from functools import lru_cache
+
 import torch
 
 from ..base import SharedKVWrite
@@ -14,6 +16,14 @@ DATA_BYTES = 576
 SCALE_BYTES = 8
 TOKEN_BYTES = DATA_BYTES + SCALE_BYTES
 PAGE_BYTES = (PAGE_SIZE * TOKEN_BYTES + DATA_BYTES - 1) // DATA_BYTES * DATA_BYTES
+
+
+@lru_cache(maxsize=1)
+def _write_metadata_op():
+    def prepare(slots, positions):
+        valid_slots = slots if positions is None else torch.where(positions >= 0, slots, -1)
+        return torch.stack((valid_slots, torch.zeros_like(slots))).long()
+    return torch.compile(prepare, fullgraph=True, dynamic=True)
 
 
 def packed_shared_kv_bytes(num_slots):
@@ -106,14 +116,12 @@ class PackedSharedKVStorage:
             raise RuntimeError("Numerical packed shared KV operations require CUDA kernels.")
         if not len(values):
             return
-        slots = slot_mapping.to(torch.int64)
-        if positions is not None:
-            slots = torch.where(positions >= 0, slots, -1)
+        metadata = _write_metadata_op()(slot_mapping, positions)
         # Values already include the model's normalization and rotary transform.
         # Identity rotary permits reuse of the upstream fused cache writer.
-        query = values.new_zeros((len(values), 1, HEAD_DIM))
-        identity_positions = torch.zeros(len(values), device=cache.device, dtype=torch.int64)
-        self._ops[0](query, values[:, 0], cache, slots, identity_positions,
+        # q_in is read-only and its normalized result is discarded. Reusing the
+        # KV input avoids allocating and clearing an otherwise unused query.
+        self._ops[0](values, values[:, 0], cache, metadata[0], metadata[1],
                      self._identity_rope, 8, 1e-6, PAGE_SIZE)
 
     def copy_slots(self, layer_idx, source_slots, destination_slots):
