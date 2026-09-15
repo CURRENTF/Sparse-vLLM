@@ -2,10 +2,43 @@
 
 import pytest
 import torch
+from types import SimpleNamespace
 
 from sparsevllm.engine.cache_manager.native_attention import CompressedIndexView
 from sparsevllm.operators.compressed_index import CompressedIndexSpec, prepare_compressed_index
 from sparsevllm.operators.workspace import close_workspace_manager, lock_workspace_manager
+from sparsevllm.engine.sparse_methods.native_index import NativeIndexSelection
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_query_batching_preserves_selection_and_request_isolation():
+    # Larger query batches change the persistent scoring grid. Protect causal
+    # lengths and physical request maps when reducing the number of launches.
+    close_workspace_manager()
+    try:
+        torch.manual_seed(731)
+        rows, capacity, heads, dim = 129, 1024, 16, 128
+        selectors = [NativeIndexSelection(num_heads=heads, head_dim=dim,
+            max_index_tokens=capacity, query_chunk_size=chunk, top_k=512,
+            parallel_context=SimpleNamespace(attn_tp_size=1), device_index=0)
+            for chunk in (7, rows)]
+        lock_workspace_manager()
+        query = torch.randn(rows, heads, dim, device="cuda", dtype=torch.bfloat16)
+        weights = torch.randn(rows, heads, device="cuda", dtype=torch.bfloat16)
+        keys = torch.randn(2 * capacity, dim, device="cuda", dtype=torch.bfloat16)
+        slots = torch.randperm(2 * capacity, device="cuda", dtype=torch.int32).view(2, capacity)
+        request_rows = torch.arange(rows, device="cuda", dtype=torch.int32) % 2
+        lengths = torch.linspace(0, capacity, rows, device="cuda").int()
+        view = CompressedIndexView(keys, slots, request_rows, lengths)
+        outputs = [torch.empty(rows, 512, device="cuda", dtype=torch.int32) for _ in selectors]
+        for _ in range(2):
+            for selector, output in zip(selectors, outputs):
+                selector.select_compressed_index(query, weights, view, out=output)
+            torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+            slots.copy_(slots.roll(1, 0))
+            query.mul_(.5)
+    finally:
+        close_workspace_manager()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
