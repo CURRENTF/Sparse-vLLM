@@ -31,6 +31,11 @@ This loads the kernel libraries without importing the vLLM engine or changing
 Sparse-vLLM's Torch installation. Without this optional library, the portable
 router and activation implementations remain available; an incompatible configured library fails at startup.
 
+On SM90, an optional DeepGEMM 2.6.1 build against the active Torch also enables
+the fused FP8 attention output projection. Keep the vLLM installation's Python
+source available. See the [build and compatibility notes](../../development/deepseek-v4-external-projection.md).
+This changes intermediate quantization; full-model validation of this path is pending.
+
 ## Four-GPU example
 
 This configuration has been exercised on four H100 80 GB GPUs. Set the model

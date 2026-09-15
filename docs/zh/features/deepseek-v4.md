@@ -27,6 +27,11 @@ uv sync --extra cu130 --extra deepseek-v4
 此方式只加载算子库，不导入 vLLM 引擎，也不更换 Sparse-vLLM 的 Torch 环境。
 未提供该可选库时仍可使用可移植路由与激活实现；配置了不兼容的库则在启动时明确报错。
 
+在 SM90 上，还可安装针对当前 Torch 构建的 DeepGEMM 2.6.1，启用融合 FP8
+注意力输出投影，并保留 vLLM 安装中的 Python 源码。参见
+[构建与兼容说明](../../development/deepseek-v4-external-projection.md)。
+此路径会改变中间量化，其整模型验证仍待完成。
+
 ## 四卡示例
 
 以下配置已在四张 H100 80 GB 上运行验证。启动前设置模型目录并选择四张可用 GPU：
