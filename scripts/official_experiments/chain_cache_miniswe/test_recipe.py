@@ -78,15 +78,19 @@ class RecipeContracts(unittest.TestCase):
             args = SimpleNamespace(
                 root=root, method="snapkv-chain", phase="smoke",
                 python=sys.executable, model=root / "model", gpus="4,5", port=0,
-                timeout=1)
+                timeout=1, compile_cache_root=root / "node-local")
             with patch.object(recipe, "environment", return_value=(sys.executable, {})), \
                     patch.object(recipe, "idle_pair", return_value={"gpus": "", "processes": ""}), \
                     patch.object(recipe, "capture", return_value="test-value"), \
-                    patch.object(recipe, "run_logged"):
+                    patch.object(recipe, "run_logged") as launch:
                 recipe.serve(args)
             manifest = recipe.read(root / "snapkv-chain/smoke/server_manifest.json")
             self.assertIsInstance(manifest["command"], str)
             self.assertIn("sparsevllm.entrypoints.openai.api_server", manifest["command"])
+            for key, value in manifest["compiler_environment"].items():
+                self.assertEqual(launch.call_args.args[1][key], value)
+                self.assertTrue(Path(value).is_dir())
+                self.assertTrue(Path(value).is_relative_to(args.compile_cache_root))
 
     def test_timing_preserves_return_and_exception(self):
         with tempfile.TemporaryDirectory() as root:

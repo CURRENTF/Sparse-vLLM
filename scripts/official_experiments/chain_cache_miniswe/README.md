@@ -232,6 +232,17 @@ Record PID/UUID/start time. The foreground launcher owns only its child process
 group; interrupting it stops that server group. Stop it after each phase and
 start a fresh server for the next phase so pilot caches cannot warm full tasks.
 
+If the artifact root is network-mounted, pass `serve --compile-cache-root
+"$LOCAL_COMPILE_ROOT"` to place Triton/CUDA/FlashInfer caches and compiler
+temporary files on a verified node-local filesystem. Check the mount type,
+available space and write permission first; the runner does not choose a disk
+automatically. A task-owned tmpfs directory is also possible when RAM capacity
+is sufficient, but its contents are not durable across reboot. Keep results on
+the data disk. Effective compiler paths are saved in `server_manifest.json`.
+This removes network filesystem I/O from compilation; it does not by itself
+prevent new kernel specializations. Use a fresh run identity to deploy source
+or launch changes rather than modifying a running evaluation.
+
 Docker driver, in its activated environment, after `/readyz` returns success:
 
 ```bash
@@ -364,6 +375,25 @@ workers and an execution limit of 8 per replica, prepare with `--concurrency 16
 settings unchanged and record this topology separately from the frozen TP2/EP2
 comparison. Changing topology or concurrency requires a new prepared root.
 
+## Reverse SSH health
+
+An established SSH connection or a listening relay port does not establish
+end-to-end health. Probe the forwarded SSH banner and verify an authenticated
+worker command before launching the model server. If rebuilding the connection
+does not restore the banner, inspect the worker's SSH service and resource state;
+do not assume that further tunnel resets will repair it.
+
+`reverse_ssh_watchdog.py` is an optional relay-side probe for explicitly dedicated
+loopback reverse-SSH ports. It waits for three consecutive failed probes before
+terminating the listener's SSH session, with at most 30 rebuilds per continuous
+outage. The worker must already have a reconnect service. The helper records
+failures and rebuilds in `--state`; it does not restart benchmark samples.
+It refuses listeners with an unexpected owner, executable, or additional listening
+sockets and pins process identity before signalling. These checks cannot detect
+other experiments using channels through the same port: operators must establish
+exclusive use before enabling automatic resets. Keep only one recovery controller
+per connection. A healthy banner still requires authenticated/API verification.
+
 ## Slow baseline policy and failures
 
 Run SnapKV-no-chain last. For its **64-task pilot generation only**, use
@@ -386,6 +416,13 @@ slow-baseline skips, or zero-quality results. Preserve logs and move to other
 methods; report failures in the final campaign record. An idle-chain HTTP 410
 can use only the adapter's existing bounded recovery, which must be counted as
 recomputation. No new retry/fallback is enabled here.
+
+The Docker writable-layer monitor treats a container that disappears before
+agent cleanup as a failure of that sample. Valid size records for other
+containers are still checked; an exact `no such object` response must not fail
+the whole batch. Unattributed monitoring failures remain subject to bounded
+fail-closed handling. Failed container cleanup is recorded separately and must
+not terminate monitoring for other samples.
 
 ## Evidence and interpretation
 

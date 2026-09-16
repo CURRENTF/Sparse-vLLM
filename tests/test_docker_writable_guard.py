@@ -13,6 +13,52 @@ from benchmark.swe_bench_lite.docker_writable_guard import (
 
 
 class DockerWritableLayerGuardTest(unittest.TestCase):
+    @mock.patch("benchmark.swe_bench_lite.docker_writable_guard.subprocess.run")
+    def test_expired_container_does_not_kill_healthy_samples_or_skip_size_checks(self, run_mock):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            guard = self._guard(root)
+            expired = guard.register("expired", image="image")
+            healthy = guard.register("healthy", image="image")
+            over = guard.register("over", image="image")
+            run_mock.side_effect = [
+                subprocess.CompletedProcess([], 1, stdout="\n".join([
+                    json.dumps({"Id": "healthy", "SizeRw": 1024}),
+                    json.dumps({"Id": "over", "SizeRw": guard.limit_bytes + 1}),
+                ]), stderr="error: no such object: expired"),
+                subprocess.CompletedProcess([], 0, stdout="over", stderr=""),
+            ]
+            guard._poll_once()
+            healthy.raise_if_failed()
+            with self.assertRaisesRegex(DockerWritableLayerGuardError, "disappeared"):
+                expired.raise_if_failed()
+            with self.assertRaises(DockerWritableLayerLimitExceeded):
+                over.raise_if_failed()
+            self.assertEqual(set(guard._snapshot()), {"healthy"})
+            self.assertEqual([c.args[0] for c in run_mock.call_args_list[1:]], [["docker", "kill", "over"]])
+            events = [json.loads(l) for l in (root / "events.jsonl").read_text().splitlines()]
+            self.assertEqual({e["event"] for e in events}, {"container_missing", "limit_exceeded"})
+
+    def test_cleanup_timeout_does_not_interrupt_fail_closed_for_other_samples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            guard = self._guard(root)
+            states = [guard.register(name, image="image") for name in ("first", "second")]
+            with mock.patch.object(guard, "_kill", side_effect=[
+                subprocess.TimeoutExpired(["docker", "kill", "first"], 30), None,
+            ]) as kill:
+                guard._fail_closed(guard._snapshot(), "inspect timed out")
+            for state in states:
+                with self.assertRaises(DockerWritableLayerGuardError):
+                    state.raise_if_failed()
+            self.assertEqual([call.args[0] for call in kill.call_args_list], ["first", "second"])
+            self.assertEqual(guard._snapshot(), {})
+            events = [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()]
+            cleanup = [event for event in events if event["event"] == "container_cleanup_failed"]
+            self.assertEqual(len(cleanup), 1)
+            self.assertEqual(cleanup[0]["container_id"], "first")
+            self.assertTrue(cleanup[0]["container_may_still_be_running"])
+
     def _guard(self, root: Path, **kwargs) -> DockerWritableLayerGuard:
         return DockerWritableLayerGuard(
             executable="docker",

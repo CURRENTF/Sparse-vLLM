@@ -122,13 +122,14 @@ class DockerWritableLayerGuard:
             handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
 
     def _kill(self, container_id: str) -> None:
-        subprocess.run(
+        result = subprocess.run(
             [self.executable, "kill", container_id],
             check=False,
             capture_output=True,
             text=True,
             timeout=30,
         )
+        result.check_returncode()
 
     def _fail_state(
         self,
@@ -138,6 +139,7 @@ class DockerWritableLayerGuard:
         event_type: str,
         writable_bytes: int | None = None,
         detail: str | None = None,
+        container_exists: bool = True,
     ) -> None:
         newly_failed = state.fail(error, writable_bytes=writable_bytes)
         self._retire(state)
@@ -158,7 +160,18 @@ class DockerWritableLayerGuard:
         try:
             self._append_event(event)
         finally:
-            self._kill(state.container_id)
+            if container_exists:
+                try:
+                    self._kill(state.container_id)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    # The sample is already failed. A stalled Docker cleanup must
+                    # not terminate the monitor before it fails the other samples.
+                    self._append_event({
+                        **event,
+                        "event": "container_cleanup_failed",
+                        "detail": f"{type(exc).__name__}: {exc}",
+                        "container_may_still_be_running": True,
+                    })
 
     def _fail_closed(self, states: dict[str, GuardState], detail: str) -> None:
         for state in states.values():
@@ -208,8 +221,6 @@ class DockerWritableLayerGuard:
                     str(record.get("Id") or "") for record in records
                 }
                 missing_ids = set(states) - returned_ids
-                current_ids = set(self._snapshot())
-                stale_ids = missing_ids - current_ids
                 error_prefix = "error: no such object: "
                 error_lines = [
                     line.strip()
@@ -221,19 +232,35 @@ class DockerWritableLayerGuard:
                     for line in error_lines
                     if line.lower().startswith(error_prefix)
                 }
-                cleanup_race = (
+                missing_containers_only = (
                     result.returncode != 0
                     and bool(missing_ids)
-                    and stale_ids == missing_ids
+                    and returned_ids <= set(states)
+                    and len(returned_ids) == len(records)
                     and len(missing_object_ids) == len(error_lines)
                     and missing_object_ids == missing_ids
                 )
-                if not cleanup_race:
+                if not missing_containers_only:
                     detail = result.stderr.strip() or (
                         f"docker inspect returned {len(records)} of {len(states)} "
                         "containers"
                     )
                     raise RuntimeError(detail)
+                # A container can expire independently of the agent's cleanup.
+                # Fail that sample, while still checking valid sizes for others.
+                current_states = self._snapshot()
+                for container_id in missing_ids:
+                    state = current_states.get(container_id)
+                    if state is not None:
+                        self._fail_state(
+                            state,
+                            DockerWritableLayerGuardError(
+                                f"Sample container {container_id} disappeared before cleanup"
+                            ),
+                            event_type="container_missing",
+                            detail="docker inspect: no such object",
+                            container_exists=False,
+                        )
         except (OSError, subprocess.SubprocessError, json.JSONDecodeError, RuntimeError) as exc:
             self._monitor_failures += 1
             if self._monitor_failures >= self.max_monitor_failures:

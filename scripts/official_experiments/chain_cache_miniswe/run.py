@@ -203,6 +203,17 @@ def serve(args):
     python, env = environment(args.python)
     env["CUDA_VISIBLE_DEVICES"] = args.gpus
     env["LOG_LEVEL"] = "INFO"
+    # Keep compiler scratch and caches off a network-mounted results directory
+    # when an explicit node-local root is supplied. Never silently pick a disk.
+    if getattr(args, "compile_cache_root", None) is not None:
+        cache_root = args.compile_cache_root.resolve()
+        for key, subdir in {
+            "TRITON_CACHE_DIR": "triton", "CUDA_CACHE_PATH": "cuda",
+            "FLASHINFER_WORKSPACE_BASE": "flashinfer", "TMPDIR": "tmp",
+        }.items():
+            path = cache_root / subdir
+            path.mkdir(parents=True, exist_ok=True)
+            env[key] = str(path)
     model = args.model.resolve(strict=True)
     config = read(args.root / args.method / "engine.json")
     advertised = f"glm47-{args.method}"
@@ -242,6 +253,9 @@ def serve(args):
         "backend_version": capture([python, "-c", "import vllm; print(vllm.__version__)"]) if backend == "vllm" else None,
         "command": shlex.join(command), "model_path": str(model), "served_model_name": advertised,
         "cuda_visible_devices": args.gpus, "server_port": args.port, "engine_kwargs": config,
+        "compiler_environment": {key: env.get(key) for key in (
+            "TRITON_CACHE_DIR", "CUDA_CACHE_PATH", "FLASHINFER_WORKSPACE_BASE", "TMPDIR",
+        )},
         "git_commit": capture(["git", "rev-parse", "HEAD"], REPO),
         "git_dirty": capture(["git", "status", "--porcelain=v1"], REPO),
         "hardware": hardware, "model_config": read(model / "config.json"),
@@ -600,6 +614,8 @@ def main():
             p.add_argument("--model", type=Path, required=True)
             p.add_argument("--gpus", required=True)
             p.add_argument("--port", type=int, default=18147)
+            p.add_argument("--compile-cache-root", type=Path,
+                           help="Explicit node-local compiler cache/scratch directory; check mount and capacity first")
         elif action == "bench":
             p.add_argument("--swe-bench-dir", type=Path, required=True)
             p.add_argument("--stage", choices=("prepare", "generate", "evaluate", "summarize"), required=True)
