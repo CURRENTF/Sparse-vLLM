@@ -41,6 +41,31 @@ def test_decode_holds_then_switches_below_threshold(monkeypatch):
     assert s.schedule()[:2] == ([fresh], True)
 
 
+def test_decode_affinity_skips_prefill_queries_but_timeout_restores_them(monkeypatch):
+    # Existing phase tests checked the selected batch but missed the expensive
+    # prefill-capacity traversal performed before returning a decode batch.
+    from unittest.mock import Mock
+
+    oracle = FakeMemoryOracle()
+    s, clock = setup(monkeypatch, oracle=oracle)
+    active = decode(s)
+    fresh = request()
+    s.add(fresh)
+    oracle.prompt_admission_free_slots = Mock(wraps=oracle.prompt_admission_free_slots)
+    oracle.prefill_step_free_slots = Mock(wraps=oracle.prefill_step_free_slots)
+    oracle.prompt_admission_budgets = Mock(wraps=oracle.prompt_admission_budgets)
+    for _ in range(3):
+        assert s.schedule()[:2] == (active, False)
+    oracle.prompt_admission_free_slots.assert_not_called()
+    oracle.prefill_step_free_slots.assert_not_called()
+    oracle.prompt_admission_budgets.assert_not_called()
+    clock[0] = 60
+    assert s.schedule()[:2] == ([fresh], True)
+    assert oracle.prompt_admission_free_slots.called
+    assert oracle.prefill_step_free_slots.called
+    assert oracle.prompt_admission_budgets.called
+
+
 def test_timeout_survives_scans_and_partial_gets_new_wait(monkeypatch):
     s, clock = setup(monkeypatch)
     decode(s)

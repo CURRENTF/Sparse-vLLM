@@ -31,6 +31,8 @@ def normalize_scheduling(config) -> None:
         raise ValueError(
             f"max_decoding_seqs must be > 0, got {config.max_decoding_seqs}."
         )
+    if config.favor_min_decoding_seqs is None:
+        config.favor_min_decoding_seqs = (3 * config.max_decoding_seqs + 3) // 4
     favor = config.favor_min_decoding_seqs
     if isinstance(favor, bool) or not isinstance(favor, int) or not 0 <= favor <= config.max_decoding_seqs:
         raise ValueError("favor_min_decoding_seqs must be an integer between 0 and max_decoding_seqs.")

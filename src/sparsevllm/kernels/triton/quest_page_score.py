@@ -25,10 +25,10 @@ def _near_rounding_midpoint(value, error, DTYPE: tl.constexpr):
     return close, spacing
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["NUM_PAGES"])
 def _gqa_page_bounds(
     query, page_max, page_min, page_table, partial, repair,
-    NUM_PAGES: tl.constexpr, QUERY_HEADS: tl.constexpr,
+    NUM_PAGES, QUERY_HEADS: tl.constexpr,
     KV_HEADS: tl.constexpr, HEAD_DIM: tl.constexpr,
     GROUP_SIZE: tl.constexpr, HEAD_TILES: tl.constexpr,
     NUM_PARTS: tl.constexpr, BLOCK_P: tl.constexpr, BLOCK_D: tl.constexpr,
@@ -78,10 +78,10 @@ def _gqa_page_bounds(
     tl.store(repair + (row * NUM_PARTS + part) * NUM_PAGES + pages, needs_repair, pages < NUM_PAGES)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["NUM_PAGES"])
 def _vector_page_bounds(
     query, page_max, page_min, page_table, partial,
-    NUM_PAGES: tl.constexpr, QUERY_HEADS: tl.constexpr,
+    NUM_PAGES, QUERY_HEADS: tl.constexpr,
     KV_HEADS: tl.constexpr, HEAD_DIM: tl.constexpr,
     GROUP_SIZE: tl.constexpr, BLOCK_P: tl.constexpr, BLOCK_D: tl.constexpr,
 ):
@@ -107,9 +107,9 @@ def _vector_page_bounds(
     tl.store(partial + (row * KV_HEADS + kv_head) * NUM_PAGES + pages, best, pages < NUM_PAGES)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["NUM_PAGES"])
 def _max_head_bounds(
-    partial, output, NUM_PAGES: tl.constexpr,
+    partial, output, NUM_PAGES,
     NUM_PARTS: tl.constexpr, BLOCK_H: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -122,10 +122,10 @@ def _max_head_bounds(
     tl.store(output + row * NUM_PAGES + pages, tl.max(scores.to(tl.float32), 0), pages < NUM_PAGES)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["PAGES"])
 def _repair_and_merge_page_bounds(
     query, high, low, slots, repair, partial, output,
-    PAGES: tl.constexpr, HEADS: tl.constexpr, KV_HEADS: tl.constexpr,
+    PAGES, HEADS: tl.constexpr, KV_HEADS: tl.constexpr,
     DIM: tl.constexpr, PARTS: tl.constexpr, HEAD_TILES: tl.constexpr, BLOCK_D: tl.constexpr,
     BLOCK_P: tl.constexpr, BLOCK_H: tl.constexpr,
 ):

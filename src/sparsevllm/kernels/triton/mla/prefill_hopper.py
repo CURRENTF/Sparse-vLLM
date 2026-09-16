@@ -20,7 +20,7 @@ from sparsevllm.kernels.triton.mla.prefill_pipelined import (
 )
 
 
-@g.jit
+@g.jit(do_not_specialize=["TQ", "BLOCKS", "CHUNK"])
 def _attention(
     Q,
     K,
@@ -29,12 +29,12 @@ def _attention(
     L,
     CQ,
     CK,
-    q0: gl.constexpr,
-    q1: gl.constexpr,
-    k0: gl.constexpr,
-    k1: gl.constexpr,
-    v0: gl.constexpr,
-    v1: gl.constexpr,
+    q0,
+    q1,
+    k0,
+    k1,
+    v0,
+    v1,
     TQ,
     H: gl.constexpr,
     D: gl.constexpr,
@@ -42,9 +42,9 @@ def _attention(
     CAUSAL: gl.constexpr,
     M: gl.constexpr,
     N: gl.constexpr,
-    BLOCKS: gl.constexpr,
+    BLOCKS,
     SPLITS: gl.constexpr,
-    CHUNK: gl.constexpr,
+    CHUNK,
 ):
     (block, head, batch) = (gl.program_id(0), gl.program_id(1), gl.program_id(2))
     split = batch % SPLITS

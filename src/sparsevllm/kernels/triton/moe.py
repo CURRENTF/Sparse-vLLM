@@ -227,15 +227,15 @@ def _fill_local_assignments_kernel(
     tl.store(sorted_token_ids_ptr + positions, assignment_ids, mask=is_local)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_assignments", "num_tokens_post_padded"])
 def _prepare_naive_assignment_kernel(
     topk_ids_ptr,
     expert_ids_ptr,
     num_tokens_post_padded_ptr,
-    num_assignments: tl.constexpr,
+    num_assignments,
     local_expert_start: tl.constexpr,
     local_expert_end: tl.constexpr,
-    num_tokens_post_padded: tl.constexpr,
+    num_tokens_post_padded,
     BLOCK_SIZE: tl.constexpr,
 ):
     offsets = tl.arange(0, BLOCK_SIZE)

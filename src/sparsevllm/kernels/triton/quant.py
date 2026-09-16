@@ -239,21 +239,22 @@ def _pack_along_last_dim(
         packed = packed | element
     tl.store(code_ptr + offs_N * num_int_per_y_dim + yid, packed, mask=offs_N < N)
 
-@triton.jit
+@triton.jit(do_not_specialize=["total_elements", "N", "num_groups"])
 def _minmax_along_last_dim(
     x_ptr,
     mn_ptr, mx_ptr,
-    total_elements: tl.constexpr,
-    N: tl.constexpr,
-    num_groups: tl.constexpr,
+    total_elements,
+    N,
+    num_groups,
     group_size: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr
 ):
     bid = tl.program_id(axis=0)
     offsets_b = bid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offsets = offsets_b[:, None] * group_size + tl.arange(0, group_size)[None, :]
-    mask = offsets < total_elements
-    x = tl.load(x_ptr + offsets, mask=mask)
+    # Each row is a complete group; use one predicate for the whole row.
+    mask = offsets_b[:, None] < total_elements // group_size
+    x = tl.load(x_ptr + offsets, mask=mask, other=0)
     mx_val = tl.max(x, axis=1)
     mn_val = tl.min(x, axis=1)
     tl.store(mn_ptr+offsets_b, mn_val, mask=offsets_b<N*num_groups)

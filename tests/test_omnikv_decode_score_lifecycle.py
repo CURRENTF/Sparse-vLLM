@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+import pytest
 
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.sparse_controller import SparseController
@@ -171,3 +172,38 @@ def test_omnikv_decode_graph_reuses_selection_output_buffers():
         for tensor in controller.decode_graph_keepalive_tensors()
     }
     assert set(pointers[0]).issubset(keepalive_ptrs)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_gpu_runtime_scores_feed_real_selection_without_observer_alias(monkeypatch):
+    # Exercise runtime preparation -> bound score provider -> actual fused slot
+    # selection, not just an isolated kernel or a mocked selection callback.
+    original_states = _Manager.get_layer_batch_states
+    original_slots = _Manager.get_layer_buffer_req_to_token_slots
+
+    def gpu_states(self, layer):
+        state = original_states(self, layer)
+        state.context_lens = state.context_lens.cuda()
+        state.req_indices = state.req_indices.cuda()
+        return state
+
+    monkeypatch.setattr(_Manager, "device", torch.device("cuda", 0))
+    monkeypatch.setattr(_Manager, "get_layer_batch_states", gpu_states)
+    monkeypatch.setattr(
+        _Manager, "get_layer_buffer_req_to_token_slots",
+        lambda self, layer: original_slots(self, layer).cuda(),
+    )
+    controller = _make_controller()
+    states = controller.layer_batch_sparse_states
+    raw = states[0].attn_score
+    raw.copy_(torch.tensor([[[1., 2., 3., 4., 5., -7.], [2., 1., 4., 3., 6., -8.]]], device="cuda"))
+    expected = torch.softmax(raw[:, :, :5].double() * .5, dim=-1).amax(1)
+    controller.on_layer_end(0, SimpleNamespace(is_prefill=False))
+    first = states[0].attn_score.clone()
+    torch.testing.assert_close(first[:, :5].double(), expected, rtol=2e-5, atol=1e-8)
+    chosen = states[1].active_indices[0, :2].sort().values
+    torch.testing.assert_close(chosen, expected.topk(2).indices[0].sort().values.to(torch.int32))
+    raw.fill_(9.)
+    controller.on_layer_end(2, SimpleNamespace(is_prefill=False))
+    torch.testing.assert_close(states[0].attn_score, first, rtol=0, atol=0)
+    assert states[0].attn_score.data_ptr() != states[2].attn_score.data_ptr()

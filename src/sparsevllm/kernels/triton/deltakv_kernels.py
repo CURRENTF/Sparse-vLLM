@@ -85,7 +85,6 @@ def _full_layer_copy_raw_or_zero_kernel(
     stride_ovn,
     stride_ovh,
     stride_ovd,
-    total_tokens: tl.constexpr,
     head_dim: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
@@ -169,7 +168,6 @@ def full_layer_copy_raw_or_zero(
         out_v.stride(0),
         out_v.stride(1),
         out_v.stride(2),
-        total_tokens=total_tokens,
         head_dim=head_dim,
         BLOCK_D=block_d,
         num_warps=4,
@@ -1915,13 +1913,11 @@ def _batch_l2_distance_kernel(
     tl.store(out_ptrs, dist, mask=mask_n[:, None] & mask_m[None, :])
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["stride_ib", "stride_ob"])
 def _batch_gather_mean_kernel(
     Src,  # (num_centers, D) - 源数据
     Indices,  # (B, N, K) - 索引
     Out,  # (B, N, D) - 输出
-    B_size: tl.constexpr,
-    N: tl.constexpr,
     K: tl.constexpr,
     D: tl.constexpr,
     stride_sb, stride_sd,
@@ -2019,7 +2015,7 @@ def batch_gather_mean(
     
     _batch_gather_mean_kernel[grid](
         src, indices, out,
-        B, N, K, D,
+        K, D,
         src.stride(0), src.stride(1),
         indices.stride(0), indices.stride(1), indices.stride(2),
         out.stride(0), out.stride(1), out.stride(2),
@@ -3193,7 +3189,7 @@ def deltakv_materialize_sparse_view(
         postrope_mask = slot_to_pos
 
     block_tokens = max(1, int(block_tokens))
-    grid = (triton.cdiv(total, block_tokens), num_kv_heads)
+    grid = (triton.cdiv(width, block_tokens), num_kv_heads, batch)
     _deltakv_materialize_sparse_view_block_kernel[grid](
         active_slots,
         context_lens,
@@ -3222,7 +3218,6 @@ def deltakv_materialize_sparse_view(
         cos_sin.stride(0),
         cos_sin.stride(1),
         k_norm_weight.stride(0),
-        TOTAL=total,
         WIDTH=int(width),
         BLOCK_N=block_tokens,
         NUM_SLOTS=int(k_cache.shape[0]),
@@ -3236,7 +3231,7 @@ def deltakv_materialize_sparse_view(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["WIDTH", "stride_active_b", "stride_active_w"])
 def _deltakv_materialize_sparse_view_block_kernel(
     active_slots_ptr,
     context_lens_ptr,
@@ -3265,8 +3260,7 @@ def _deltakv_materialize_sparse_view_block_kernel(
     stride_cos_p,
     stride_cos_d,
     stride_norm_d,
-    TOTAL: tl.constexpr,
-    WIDTH: tl.constexpr,
+    WIDTH,
     BLOCK_N: tl.constexpr,
     NUM_SLOTS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -3278,10 +3272,11 @@ def _deltakv_materialize_sparse_view_block_kernel(
 ):
     pid_n = tl.program_id(0)
     head_id = tl.program_id(1)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    token_mask = offs_n < TOTAL
-    batch_ids = offs_n // WIDTH
-    cols = offs_n - batch_ids * WIDTH
+    # Separate request rows in the grid to avoid runtime integer division.
+    batch_ids = tl.program_id(2)
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_n = batch_ids * WIDTH + cols
+    token_mask = cols < WIDTH
 
     slots = tl.load(
         active_slots_ptr + batch_ids * stride_active_b + cols * stride_active_w,

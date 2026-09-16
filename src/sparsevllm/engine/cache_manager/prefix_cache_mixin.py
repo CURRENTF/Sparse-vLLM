@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from weakref import WeakKeyDictionary
 
@@ -38,8 +39,32 @@ class PrefixLookupCacheEntry:
     token_ids: tuple[int, ...]
     usable_tokens: int
     block_ids: tuple[bytes, ...]
-    remove_epoch: int
     result: tuple[int, bytes | None, int]
+
+
+class PrefixLookupCache:
+    """Bounded request-ID memoization, including deserialized TP requests."""
+
+    def __init__(self, max_entries: int = 128):
+        if max_entries <= 0:
+            raise ValueError("Prefix lookup cache capacity must be positive.")
+        self.max_entries = max_entries
+        self.entries: OrderedDict[int, PrefixLookupCacheEntry] = OrderedDict()
+
+    def get(self, seq: Sequence) -> PrefixLookupCacheEntry | None:
+        entry = self.entries.get(seq.seq_id)
+        if entry is not None:
+            self.entries.move_to_end(seq.seq_id)
+        return entry
+
+    def __setitem__(self, seq: Sequence, entry: PrefixLookupCacheEntry) -> None:
+        self.entries[seq.seq_id] = entry
+        self.entries.move_to_end(seq.seq_id)
+        if len(self.entries) > self.max_entries:
+            self.entries.popitem(last=False)
+
+    def discard(self, seq_id: int) -> None:
+        self.entries.pop(seq_id, None)
 
 
 @dataclass(frozen=True)
@@ -56,7 +81,7 @@ class PrefixHitCapacityCacheEntry:
 
 def lookup_prefix_cache_hit(
     prefix_cache: RadixPrefixIndex,
-    cache: WeakKeyDictionary[Sequence, PrefixLookupCacheEntry],
+    cache: PrefixLookupCache,
     seq: Sequence,
     usable_tokens: int,
 ) -> tuple[int, bytes | None, int]:
@@ -64,12 +89,16 @@ def lookup_prefix_cache_hit(
     entry = cache.get(seq)
     if (
         entry is not None
-        and entry.token_ids is prompt_token_ids
+        and (entry.token_ids is prompt_token_ids or entry.token_ids == prompt_token_ids)
         and entry.usable_tokens == int(usable_tokens)
     ):
         hit_blocks = int(entry.result[2])
+        # Indexed paths are root-contiguous and deletion is leaf-only. If the
+        # last hit survives, all its ancestors survive too, even if unrelated
+        # branches were evicted. Reinserting the same logical ID is also safe:
+        # this memo contains IDs/counts, never payload objects.
         lookup_is_current = (
-            entry.remove_epoch == prefix_cache.remove_epoch
+            (hit_blocks == 0 or prefix_cache.has_block(entry.block_ids[hit_blocks - 1]))
             and (
                 hit_blocks == len(entry.block_ids)
                 or not prefix_cache.has_block(entry.block_ids[hit_blocks])
@@ -93,7 +122,6 @@ def lookup_prefix_cache_hit(
         token_ids=prompt_token_ids,
         usable_tokens=int(usable_tokens),
         block_ids=block_ids,
-        remove_epoch=prefix_cache.remove_epoch,
         result=result,
     )
     return result
@@ -174,9 +202,7 @@ class PrefixCacheMixin:
         self.seq_id_to_materialized_blocks: dict[int, list[PrefixCacheBlock]] = {}
         self.prefix_runtime_states: dict[int, PrefixRuntimeState] = {}
         self.pending_prefix_blocks: dict[int, list[PendingPrefixBlock]] = {}
-        self.prefix_lookup_cache: WeakKeyDictionary[
-            Sequence, PrefixLookupCacheEntry
-        ] = WeakKeyDictionary()
+        self.prefix_lookup_cache = PrefixLookupCache()
         self.prefix_hit_capacity_cache: WeakKeyDictionary[
             Sequence, PrefixHitCapacityCacheEntry
         ] = WeakKeyDictionary()

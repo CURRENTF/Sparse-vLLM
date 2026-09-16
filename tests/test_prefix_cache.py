@@ -1,4 +1,6 @@
 import math
+import pickle
+import random
 import tempfile
 from collections import deque
 from contextlib import nullcontext
@@ -20,6 +22,7 @@ from sparsevllm.configs.model import RuntimeLayout
 from sparsevllm.engine.cache_manager import MlaLatentPayload
 from sparsevllm.engine.cache_manager.methods.omnikv.manager import OmniKVCacheManager
 from sparsevllm.engine.cache_manager.standard import StandardCacheManager, StandardPrefixBlockPayload
+from sparsevllm.engine.cache_manager.prefix_cache_mixin import PrefixLookupCache
 from sparsevllm.engine.cache_manager.storage import MlaLatentStorage
 from sparsevllm.engine.cache_manager.prefix_offload import (
     QuestPrefixOffloadController,
@@ -1013,7 +1016,7 @@ def test_freeable_blocks_excludes_ancestors_of_referenced_descendant():
     assert root_id in index.blocks
 
 
-def test_freeable_block_ids_reuses_scan_until_index_mutates():
+def test_freeable_block_ids_updates_snapshot_without_rescanning_index():
     fp = build_prefix_cache_fingerprint(_cfg(), 2)
     index = RadixPrefixIndex(block_size=2, fingerprint=fp)
     root_id = _insert_tokens(index, [1, 2])
@@ -1029,11 +1032,11 @@ def test_freeable_block_ids_reuses_scan_until_index_mutates():
 
     index.acquire_block_ref(child)
     assert index.freeable_block_ids() == frozenset()
-    assert index.freeable_scans == 2
+    assert index.freeable_scans == 1
 
     index.release_block_ref(child)
     assert index.freeable_block_ids() == expected
-    assert index.freeable_scans == 3
+    assert index.freeable_scans == 1
 
 
 def test_freeable_block_ids_invalidates_for_priority_transfer_and_removal():
@@ -1057,55 +1060,254 @@ def test_freeable_block_ids_invalidates_for_priority_transfer_and_removal():
 
     assert index.evict_until_freeable(1) == [block]
     assert index.freeable_block_ids() == frozenset()
-    assert index.freeable_scans == 6
+    assert index.freeable_scans == 1
 
 
-def test_waiting_prefix_lookup_reuses_hash_chain_and_cached_result():
+def test_incremental_freeable_membership_matches_virtual_leaf_eviction():
+    """Catch stale ancestor capacity after interleaved branch mutations.
+
+    Existing one-chain tests cannot expose sibling blocker-count drift after
+    insertion, subtree priority changes, transfers and removal.
+    """
+    rng = random.Random(31)
+    index = RadixPrefixIndex(block_size=2, fingerprint=b"incremental-capacity")
+    prompts = {}
+    serial = 0
+
+    def insert():
+        nonlocal serial
+        serial += 1
+        candidates = [None, *index.blocks]
+        parent = rng.choice(candidates)
+        if parent is not None and index.blocks[parent].residency.host_present:
+            parent = None
+        tokens = ([] if parent is None else prompts[parent]) + [serial, -serial]
+        block_id = _insert_tokens(index, tokens)
+        prompts[block_id] = tokens
+
+    def oracle():
+        # Simulate actual leaf removals without any cached capacity metadata.
+        remaining = dict(index.blocks)
+        removed = set()
+        while True:
+            parents = {b.parent_block_id for b in remaining.values()}
+            leaves = {
+                key for key, b in remaining.items()
+                if key not in parents and b.ref_count == 0
+                and b.eviction_priority >= 0 and b.residency.transfer is None
+            }
+            if not leaves:
+                return removed
+            for key in leaves:
+                remaining.pop(key)
+            removed.update(leaves)
+
+    for _ in range(40):
+        insert()
+    for _ in range(300):
+        before = index.freeable_block_ids()
+        assert before == oracle()
+        block = rng.choice(list(index.blocks.values()))
+        operation = rng.randrange(6)
+        if operation == 0:
+            index.set_block_ref_count(block, rng.randrange(3))
+        elif operation == 1:
+            index.set_subtree_eviction_priority(prompts[block.stable_block_id], rng.choice([-1, 0, 3]))
+        elif operation == 2:
+            insert()
+        elif operation == 3:
+            index.evict_until_freeable(rng.randrange(1, 4))
+        elif block.residency.transfer == PrefixTransferKind.D2H:
+            if operation == 4:
+                index.abort_d2h(block)
+            else:
+                index.finish_d2h(block)
+        elif block.ref_count == 0 and not block.residency.host_present:
+            parent = index.get_block(block.parent_block_id)
+            if parent is None or parent.residency.host_present:
+                index.begin_d2h(block)
+        assert index.freeable_block_ids() == oracle()
+        assert len(index._blocked_freeable_children) == len(index.blocks)
+
+
+def test_incremental_freeable_membership_tracks_h2d_and_rollback():
+    """Warm capacity state must survive demote/promote/abort and leaf rollback."""
+    index = RadixPrefixIndex(block_size=2, fingerprint=b"incremental-transfers")
+    root = index.get_block(_insert_tokens(index, [1, 2]))
+    assert index.freeable_block_ids() == {root.stable_block_id}
+    index.begin_d2h(root)
+    assert not index.freeable_block_ids()
+    index.finish_d2h(root)
+    assert index.freeable_block_ids() == {root.stable_block_id}
+    index.demote_device_until_freeable(1)
+    index.begin_h2d(root)
+    assert not index.freeable_block_ids()
+    index.abort_h2d(root)
+    assert index.freeable_block_ids() == {root.stable_block_id}
+    index.begin_h2d(root)
+    index.finish_h2d(root)
+    assert index.freeable_block_ids() == {root.stable_block_id}
+    child = index.get_block(_insert_tokens(index, [1, 2, 3, 4]))
+    index.acquire_block_ref(child)
+    assert not index.freeable_block_ids()
+    index.release_block_ref(child)
+    snapshot = index.freeable_block_ids()
+    index.rollback_inserted_leaf(child)
+    assert index.freeable_block_ids() == {root.stable_block_id}
+    assert snapshot == {root.stable_block_id, child.stable_block_id}
+
+
+def test_incremental_freeable_deep_chain_reference_release():
+    """A long prompt must update ancestors without recursion or stale capacity."""
+    index = RadixPrefixIndex(block_size=2, fingerprint=b"deep-capacity")
+    leaf = _insert_tokens(index, list(range(2600)))
+    chain = index.get_chain(leaf, 1300)
+    all_ids = frozenset(index.blocks)
+    assert index.freeable_block_ids() == all_ids
+    index.acquire_block_ref(chain[-1])
+    assert not index.freeable_block_ids()
+    index.release_block_ref(chain[-1])
+    assert index.freeable_block_ids() == all_ids
+    for block in chain:
+        index.acquire_block_ref(block)
+    assert not index.freeable_block_ids()
+    # Normal request cleanup releases a whole prefix in root-to-leaf order.
+    for block in chain[:-1]:
+        index.release_block_ref(block)
+    assert not index.freeable_block_ids()
+    index.release_block_ref(chain[-1])
+    assert index.freeable_block_ids() == all_ids
+    assert index.freeable_scans == 1
+
+
+@pytest.mark.parametrize("serialized", [False, True])
+def test_waiting_prefix_lookup_reuses_hash_chain_and_cached_result(serialized):
     manager = _make_standard_manager_for_prefix(block_size=2)
     assert manager.prefix_cache is not None
     _insert_tokens(manager.prefix_cache, [1, 2])
     seq = Sequence([1, 2, 3, 4, 5])
 
-    manager.refresh_prefix_cache_hit(seq)
+    def refresh(seq):
+        # TP workers receive a new object on every control RPC.
+        if serialized:
+            seq = pickle.loads(pickle.dumps(seq))
+        manager.refresh_prefix_cache_hit(seq)
+        return seq
+
+    seq = refresh(seq)
     assert seq.prefix_cache_hit_len == 2
     assert manager.prefix_cache.block_id_generation_requests == 1
     assert manager.prefix_cache.lookup_requests == 1
 
-    manager.refresh_prefix_cache_hit(seq)
+    seq = refresh(seq)
     assert seq.prefix_cache_hit_len == 2
     assert manager.prefix_cache.block_id_generation_requests == 1
     assert manager.prefix_cache.lookup_requests == 1
 
     _insert_tokens(manager.prefix_cache, [11, 12])
-    manager.refresh_prefix_cache_hit(seq)
+    seq = refresh(seq)
     assert seq.prefix_cache_hit_len == 2
     assert manager.prefix_cache.block_id_generation_requests == 1
     assert manager.prefix_cache.lookup_requests == 1
 
     root = manager.prefix_cache.get_chain(seq.prefix_cache_hit_last_block_id, 1)[0]
     manager.prefix_cache.acquire_block_ref(root)
-    manager.refresh_prefix_cache_hit(seq)
+    seq = refresh(seq)
     manager.prefix_cache.release_block_ref(root)
     assert manager.prefix_cache.block_id_generation_requests == 1
     assert manager.prefix_cache.lookup_requests == 1
 
     _insert_tokens(manager.prefix_cache, [1, 2, 3, 4])
-    manager.refresh_prefix_cache_hit(seq)
+    seq = refresh(seq)
     assert seq.prefix_cache_hit_len == 4
     assert manager.prefix_cache.block_id_generation_requests == 1
     assert manager.prefix_cache.lookup_requests == 2
 
     _insert_tokens(manager.prefix_cache, [7, 8])
-    manager.refresh_prefix_cache_hit(seq)
+    seq = refresh(seq)
     assert seq.prefix_cache_hit_len == 4
     assert manager.prefix_cache.block_id_generation_requests == 1
     assert manager.prefix_cache.lookup_requests == 2
 
     changed_seq = Sequence([1, 2, 9, 4, 5])
-    manager.refresh_prefix_cache_hit(changed_seq)
+    changed_seq = refresh(changed_seq)
     assert changed_seq.prefix_cache_hit_len == 2
     assert manager.prefix_cache.block_id_generation_requests == 2
     assert manager.prefix_cache.lookup_requests == 3
+
+
+def test_serialized_prefix_lookup_invalidates_on_eviction_and_prompt_replacement():
+    """Stable IDs must not reuse a removed hit or an earlier chain turn's prompt."""
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    _insert_tokens(manager.prefix_cache, [1, 2, 3, 4])
+    seq = Sequence([1, 2, 3, 4, 5])
+    manager.refresh_prefix_cache_hit(pickle.loads(pickle.dumps(seq)))
+    manager.prefix_cache.evict_until_freeable(1)
+    restored = pickle.loads(pickle.dumps(seq))
+    manager.refresh_prefix_cache_hit(restored)
+    assert restored.prefix_cache_hit_len == 2
+    assert manager.prefix_cache.block_id_generation_requests == 1
+    assert manager.prefix_cache.lookup_requests == 2
+
+    changed = Sequence([7, 8, 3, 4, 5])
+    changed.seq_id = seq.seq_id
+    manager.refresh_prefix_cache_hit(changed)
+    assert changed.prefix_cache_hit_len == 0
+    assert manager.prefix_cache.block_id_generation_requests == 2
+
+
+@pytest.mark.parametrize("hit_tokens", [[], [1, 2], [1, 2, 3, 4]])
+def test_serialized_lookup_survives_unrelated_deletion_and_detects_path_changes(hit_tokens):
+    """Eviction in another branch must not invalidate every waiting TP request."""
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    index = manager.prefix_cache
+    if hit_tokens:
+        _insert_tokens(index, hit_tokens)
+    seq = Sequence([1, 2, 3, 4, 5])
+
+    def refresh():
+        restored = pickle.loads(pickle.dumps(seq))
+        manager.refresh_prefix_cache_hit(restored)
+        return restored.prefix_cache_hit_len
+
+    assert refresh() == len(hit_tokens)
+    lookups = index.lookup_requests
+    for i in range(8):
+        tokens = [100 + i, 200 + i]
+        _insert_tokens(index, tokens)
+        assert len(index.safe_delete_subtree(tokens).deleted_blocks) == 1
+        assert refresh() == len(hit_tokens)
+    assert index.lookup_requests == lookups
+
+    # Same-ID replacement is safe only for the ID/count memo, not payload caches.
+    if hit_tokens:
+        index.safe_delete_subtree([1, 2])
+        _insert_tokens(index, hit_tokens)
+        assert refresh() == len(hit_tokens)
+    _insert_tokens(index, [1, 2, 3, 4])
+    assert refresh() == 4
+    index.safe_delete_subtree([1, 2, 3, 4])
+    assert refresh() == 2
+    index.safe_delete_subtree([1, 2])
+    assert refresh() == 0
+
+
+def test_prefix_lookup_memo_is_bounded_and_evicted_requests_can_be_requeried():
+    """Cancelled waiting requests have no KV free call; memo retention stays bounded."""
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    manager.prefix_lookup_cache = PrefixLookupCache(max_entries=2)
+    _insert_tokens(manager.prefix_cache, [1, 2])
+    seqs = [Sequence([1, 2, i]) for i in range(3, 6)]
+    for seq in seqs:
+        manager.refresh_prefix_cache_hit(pickle.loads(pickle.dumps(seq)))
+        assert len(manager.prefix_lookup_cache.entries) <= 2
+    assert manager.prefix_lookup_cache.get(seqs[0]) is None
+    restored = pickle.loads(pickle.dumps(seqs[0]))
+    manager.refresh_prefix_cache_hit(restored)
+    assert restored.prefix_cache_hit_len == 2
+    assert manager.prefix_cache.block_id_generation_requests == 4
+    manager.prefix_lookup_cache.discard(restored.seq_id)
+    assert manager.prefix_lookup_cache.get(restored) is None
 
 
 def test_prefix_hit_admission_cost_reuses_chain_until_capacity_mutates():
@@ -1134,13 +1336,13 @@ def test_prefix_hit_admission_cost_reuses_chain_until_capacity_mutates():
     _insert_tokens(manager.prefix_cache, [7, 8])
     assert manager.prompt_admission_cost(seq) == 5
     assert get_chain_calls == 1
-    assert manager.prefix_cache.freeable_scans == 2
+    assert manager.prefix_cache.freeable_scans == 1
 
     referenced = original_get_chain(last_block_id, 2)[-1]
     manager.prefix_cache.acquire_block_ref(referenced)
     assert manager.prompt_admission_cost(seq) == 1
     assert get_chain_calls == 1
-    assert manager.prefix_cache.freeable_scans == 3
+    assert manager.prefix_cache.freeable_scans == 1
 
 
 def test_evictable_and_device_reclaimable_counts_reuse_epoch_cache():
@@ -1615,6 +1817,8 @@ def test_standard_attach_pins_prefix_slots_and_free_seq_keeps_cached_slots():
     seq.prefix_cache_block_size = 2
     seq.prefix_cache_method = ""
 
+    manager.refresh_prefix_cache_hit(seq)
+    assert manager.prefix_lookup_cache.get(seq) is not None
     manager._attach_prefix_cache_if_needed(seq)
     assert manager.row_seq_lens[0] == 2
     assert manager.buffer_req_to_token_slots[0, :2].tolist() == [10, 11]
@@ -1628,6 +1832,7 @@ def test_standard_attach_pins_prefix_slots_and_free_seq_keeps_cached_slots():
     assert manager._num_free_slots == 88
     assert block.ref_count == 0
     assert manager.seq_id_to_row == {}
+    assert manager.prefix_lookup_cache.get(seq) is None
 
 
 def test_standard_latent_prefix_restores_mla_payload_and_cleans_request_state():
@@ -2367,6 +2572,97 @@ def test_standard_scheduler_capacity_snapshot_reuses_freeable_tree_scan():
         assert freeable_block_ids.call_count == 2
 
 
+def test_standard_capacity_reuses_weights_across_passes_and_invalidates_compaction():
+    # The index already cached IDs, but each new scheduler pass still walked
+    # every payload. Also catch stale totals when IDs survive compaction.
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    index = manager.prefix_cache
+    leaf_id = _insert_tokens(index, [1, 2, 3, 4])
+    chain = index.get_chain(leaf_id, 2)
+    for block in chain:
+        block.payload = StandardPrefixBlockPayload(
+            token_slots=torch.tensor([10, 11], dtype=torch.int32)
+        )
+    with patch.object(manager, "_block_resident_tokens_or_full",
+                      wraps=manager._block_resident_tokens_or_full) as weight:
+        for _ in range(3):
+            index.touch_chain(chain)
+            with manager.scheduler_capacity_snapshot():
+                assert manager.prompt_admission_free_slots() == 94
+        assert weight.call_count == len(chain)
+
+        leaf = chain[-1]
+        leaf.payload.token_slots = leaf.payload.token_slots[:1]
+        leaf.payload.retained_offsets = (1,)
+        index.mark_payload_compacted([leaf])
+        assert manager.prompt_admission_free_slots() == 93
+
+        index.acquire_block_ref(leaf)
+        assert manager.prompt_admission_free_slots() == 90
+        index.release_block_ref(leaf)
+        assert manager.prompt_admission_free_slots() == 93
+        index.set_subtree_eviction_priority([1, 2, 3, 4], -1)
+        assert manager.prompt_admission_free_slots() == 90
+        index.set_subtree_eviction_priority([1, 2, 3, 4], 0)
+        assert manager.prompt_admission_free_slots() == 93
+        assert index.evict_until_freeable(1) == [leaf]
+        assert manager.prompt_admission_free_slots() == 92
+        _insert_tokens(index, [5, 6])
+        assert manager.prompt_admission_free_slots() == 94
+
+
+def test_standard_capacity_cache_does_not_cross_index_replacement():
+    # Equal epochs and IDs in a rebuilt index do not imply equal payload sizes.
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    first = manager.prefix_cache
+    block_id = _insert_tokens(first, [1, 2])
+    assert manager.prompt_admission_free_slots() == 92
+    replacement = RadixPrefixIndex(block_size=2, fingerprint=first.fingerprint)
+    assert _insert_tokens(replacement, [1, 2]) == block_id
+    replacement.get_block(block_id).payload = StandardPrefixBlockPayload(
+        token_slots=torch.tensor([10], dtype=torch.int32), retained_offsets=(0,)
+    )
+    assert replacement.capacity_epoch == first.capacity_epoch
+    manager.prefix_cache = replacement
+    assert manager.prompt_admission_free_slots() == 91
+
+
+def test_standard_cached_capacity_tracks_transfer_and_residency_changes():
+    # Offload queries share IDs but have different transfer eligibility; cached
+    # totals must not count a host-only block or a transfer as ready capacity.
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    index = manager.prefix_cache
+    manager.prefix_offload_controller = _FakePrefixOffloadController(index)
+    block = index.get_block(_insert_tokens(index, [1, 2]))
+    block.payload = StandardPrefixBlockPayload(
+        token_slots=torch.tensor([10], dtype=torch.int32), retained_offsets=(0,)
+    )
+
+    def capacity():
+        return manager._prefix_evictable_slots(), manager._prefix_step_reclaimable_slots()
+
+    assert capacity() == (0, 0)
+    index.begin_d2h(block)
+    assert capacity() == (0, 1)
+    index.abort_d2h(block)
+    assert capacity() == (0, 0)
+    index.begin_d2h(block)
+    index.finish_d2h(block)
+    assert capacity() == (1, 1)
+    with patch.object(index, "get_block", side_effect=AssertionError("repeated payload walk")):
+        for _ in range(3):
+            assert capacity() == (1, 1)
+    assert index.demote_device_until_freeable(1) == [block]
+    assert capacity() == (0, 0)
+    index.begin_h2d(block)
+    assert capacity() == (0, 0)
+    index.abort_h2d(block)
+    assert capacity() == (0, 0)
+    index.begin_h2d(block)
+    index.finish_h2d(block)
+    assert capacity() == (1, 1)
+
+
 def test_standard_capacity_skips_prefix_scan_with_physical_step_headroom():
     manager = _make_standard_manager_for_prefix(block_size=2)
     manager.config.max_num_batched_tokens = 16
@@ -2787,6 +3083,8 @@ def test_quest_attach_pins_pages_and_free_seq_keeps_cached_page():
     seq.prefix_cache_block_size = 2
     seq.prefix_cache_method = "quest"
 
+    manager.refresh_prefix_cache_hit(seq)
+    assert manager.prefix_lookup_cache.get(seq) is not None
     manager._attach_prefix_cache_if_needed(seq)
     assert manager.row_seq_lens[0] == 2
     assert manager.buffer_req_to_page_slots[0, 0].item() == 5
@@ -2800,6 +3098,7 @@ def test_quest_attach_pins_pages_and_free_seq_keeps_cached_page():
     manager.free_seq(seq.seq_id)
     assert manager._num_free_pages == 9
     assert block.ref_count == 0
+    assert manager.prefix_lookup_cache.get(seq) is None
 
     evicted = manager.prefix_cache.evict_until_freeable(1)
     manager._free_prefix_cache_blocks(evicted)

@@ -2,6 +2,7 @@
 
 import json
 import os
+import select
 from pathlib import Path
 import subprocess
 import sys
@@ -14,10 +15,15 @@ from sparsevllm.kernels.external.flashinfer import jit_cache
 @pytest.fixture(autouse=True)
 def isolated_cache_environment(monkeypatch, tmp_path):
     monkeypatch.setattr(jit_cache, "_configured_cache", None)
+    monkeypatch.setattr(jit_cache, "_cache_lease", None)
+    monkeypatch.setattr(jit_cache, "_cache_namespace", lambda: "test-toolchain")
     for variable in ("SPARSEVLLM_TRTLLM_DG_CACHE_ROOT", "TRTLLM_DG_CACHE_DIR"):
         monkeypatch.setenv(variable, "")
         monkeypatch.delenv(variable)
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    yield
+    if jit_cache._cache_lease is not None:
+        jit_cache._cache_lease.close()
 
 
 @pytest.mark.parametrize("explicit_root", [False, True])
@@ -100,21 +106,24 @@ path = configure_trtllm_cache(rank=int(sys.argv[2]), root=sys.argv[1])
 with (path / 'kernel.cubin').open('x') as artifact:
     artifact.write(str(os.getpid()))
 assert configure_trtllm_cache(rank=int(sys.argv[2])) == path
-print(json.dumps({'path': str(path), 'pid': os.getpid()}))
+print(json.dumps({'path': str(path), 'pid': os.getpid()}), flush=True)
+input()
 """
     processes = [
         subprocess.Popen(
             [sys.executable, "-c", script, str(root), str(rank)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         for rank in (0, 1, 0, 1)
     ]
     records = []
     try:
         for process in processes:
-            stdout, stderr = process.communicate(timeout=30)
+            assert select.select([process.stdout], [], [], 30)[0], "worker startup timed out"
+            records.append(json.loads(process.stdout.readline()))
+        for process in processes:
+            _, stderr = process.communicate(input="done\n", timeout=30)
             assert process.returncode == 0, stderr
-            records.append(json.loads(stdout))
     finally:
         for process in processes:
             if process.poll() is None:
@@ -125,3 +134,32 @@ print(json.dumps({'path': str(path), 'pid': os.getpid()}))
     for path, record in zip(paths, records):
         assert path.parent == root
         assert (path / "kernel.cubin").read_text() == str(record["pid"])
+
+
+def test_restart_reuses_exclusive_cache_artifact(tmp_path):
+    script = """
+import sys
+from sparsevllm.kernels.external.flashinfer.jit_cache import configure_trtllm_cache
+path = configure_trtllm_cache(0, sys.argv[1])
+artifact = path / 'test-artifact'
+if sys.argv[2] == 'write':
+    artifact.write_text('compiled')
+else:
+    assert artifact.read_text() == 'compiled'
+print(path)
+"""
+    outputs = [subprocess.check_output(
+        [sys.executable, "-c", script, str(tmp_path), mode], text=True, timeout=30,
+    ).strip() for mode in ("write", "read")]
+    assert outputs[0] == outputs[1]
+
+
+def test_namespace_change_does_not_reuse_old_artifacts(monkeypatch, tmp_path):
+    first, lease = jit_cache._lease_cache(tmp_path, 0)
+    lease.close()
+    monkeypatch.setattr(jit_cache, "_cache_namespace", lambda: "changed-toolchain")
+    second, lease = jit_cache._lease_cache(tmp_path, 0)
+    try:
+        assert second != first
+    finally:
+        lease.close()

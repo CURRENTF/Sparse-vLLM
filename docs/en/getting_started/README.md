@@ -171,10 +171,10 @@ Sparse knobs:
 
 ### Scheduler phase affinity
 
-Set `favor_min_decoding_seqs=4` with `max_decoding_seqs=8` to enable phase affinity.
-The soft threshold is a user-selected hyperparameter, not an automatic estimate.
-The default `0` preserves prefill priority; valid integers range from zero to
-`max_decoding_seqs`. Pass it as an LLM Python argument, as
+Phase affinity is enabled by default with `favor_min_decoding_seqs` set to
+`ceil(max_decoding_seqs * 0.75)`. Set an explicit integer from zero to
+`max_decoding_seqs` to override it; `0` restores strict prefill priority. Pass
+it as an LLM Python argument, as
 `--favor-min-decoding-seqs 4` to the OpenAI server, or via
 `--hyper-params '{"favor_min_decoding_seqs":4}'` to the efficiency probe.
 

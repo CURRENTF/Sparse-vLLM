@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
+import pytest
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from sparsevllm.engine.sequence import Sequence
@@ -322,6 +323,51 @@ class SamplerTest(unittest.TestCase):
         out = sampler(logits, temperatures=temperatures, top_ps=top_ps, top_ks=top_ks, all_greedy=False)
 
         self.assertEqual(out.tolist(), [1, 1])
+
+
+# Empirical distribution is an independent oracle: sorting changes which token
+# receives each RNG draw, so same-seed token equality is not the contract.
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_unfiltered_sampling_preserves_distribution_and_mixed_greedy(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.manual_seed(721)
+    rows = 32768
+    logits = torch.tensor([0.5, -0.8, 1.2, 0.0], device=device).repeat(rows + 1, 1)
+    temperatures = torch.full((rows + 1,), 0.7, device=device)
+    temperatures[-1] = 0.0
+    sampler = Sampler()
+    with patch("torch.sort", side_effect=AssertionError("unfiltered sampling must not sort")):
+        sampled = sampler(logits, temperatures, torch.ones_like(temperatures),
+                          all_unfiltered=True)
+    actual = torch.bincount(sampled[:-1], minlength=4).float() / rows
+    expected = (logits[0] / 0.7).softmax(-1)
+    torch.testing.assert_close(actual, expected, atol=0.015, rtol=0)
+    assert int(sampled[-1]) == 2
+
+
+def test_runner_selects_unfiltered_sampling_from_host_parameters():
+    from types import SimpleNamespace
+    from sparsevllm.engine.model_runner import ModelRunner
+
+    runner = object.__new__(ModelRunner)
+    runner.sampler = Sampler()
+    runner.prepare_sample = lambda seqs: (
+        torch.tensor([s.temperature for s in seqs]),
+        torch.tensor([s.top_p for s in seqs]),
+        torch.tensor([s.top_k for s in seqs]),
+    )
+    seqs = [SimpleNamespace(temperature=0.7, top_p=1.0, top_k=0)]
+    logits = torch.tensor([[0.0, 1.0, 2.0]])
+    with patch("torch.sort", side_effect=AssertionError("host selection missed the fast path")):
+        assert runner._sample_model_outputs(logits, seqs)[0] in range(3)
+    seqs[0].top_k = 1
+    assert runner._sample_model_outputs(logits, seqs) == [2]
+    seqs[0].top_k = 0
+    seqs[0].top_p = 0.01
+    assert runner._sample_model_outputs(logits, seqs) == [2]
 
 
 if __name__ == "__main__":

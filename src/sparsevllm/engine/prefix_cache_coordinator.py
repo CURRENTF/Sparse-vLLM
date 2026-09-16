@@ -26,7 +26,7 @@ from sparsevllm.platforms import device_runtime
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.cache_manager.prefix_cache_mixin import (
     PrefixHitCapacityCacheEntry,
-    PrefixLookupCacheEntry,
+    PrefixLookupCache,
     lookup_prefix_cache_hit,
     prefix_hit_capacity_counts,
 )
@@ -83,9 +83,7 @@ class PrefixCacheCoordinator:
         self.pending_duplicate_refs: dict[int, list[bytes]] = {}
         self.pending_block_ids: set[bytes] = set()
         self.pending_recurrent_bytes = 0
-        self.prefix_lookup_cache: WeakKeyDictionary[
-            Sequence, PrefixLookupCacheEntry
-        ] = WeakKeyDictionary()
+        self.prefix_lookup_cache = PrefixLookupCache()
         self.prefix_hit_capacity_cache: WeakKeyDictionary[
             Sequence, PrefixHitCapacityCacheEntry
         ] = WeakKeyDictionary()
@@ -1027,6 +1025,7 @@ class PrefixCacheCoordinator:
 
     def release_seq(self, seq_id: int) -> None:
         seq_id = int(seq_id)
+        self.prefix_lookup_cache.discard(seq_id)
         released_blocks = self.seq_id_to_prefix_blocks.pop(seq_id, [])
         released_blocks.extend(self.seq_id_to_materialized_blocks.pop(seq_id, []))
         prefix_cache = self._require_prefix_cache()
@@ -1087,7 +1086,7 @@ class PrefixCacheCoordinator:
         self.pending_duplicate_refs.clear()
         self.pending_block_ids.clear()
         self.pending_recurrent_bytes = 0
-        self.prefix_lookup_cache = WeakKeyDictionary()
+        self.prefix_lookup_cache = PrefixLookupCache()
         self.prefix_hit_capacity_cache = WeakKeyDictionary()
         self.capacity_limited_seq_ids.clear()
         self.skipped_capacity_blocks = 0

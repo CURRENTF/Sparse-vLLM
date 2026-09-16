@@ -28,6 +28,7 @@ from sparsevllm.engine.prefix_cache import (
     RadixPrefixIndex,
 )
 from sparsevllm.engine.prefix_cache_coordinator import MixedPrefixBlockPayload, PrefixCacheCoordinator
+from sparsevllm.engine.cache_manager.prefix_cache_mixin import PrefixLookupCache
 from sparsevllm.engine.recurrent_state_manager import (
     RecurrentPrefixPayload,
     RecurrentStateManager,
@@ -2314,6 +2315,7 @@ def test_mixed_offload_release_demotes_both_payloads_then_host_evicts():
     )
     coordinator.seq_id_to_prefix_blocks = {}
     coordinator.seq_id_to_materialized_blocks = {7: [block]}
+    coordinator.prefix_lookup_cache = PrefixLookupCache()
     coordinator.runtime_states = {}
     coordinator.pending_blocks = {}
     coordinator.pending_duplicate_refs = {}
@@ -2451,6 +2453,7 @@ def _make_pending_capacity_coordinator(*, max_recurrent_bytes: int):
     coordinator.cache_manager = cache_manager
     coordinator.recurrent_state_manager = recurrent_manager
     coordinator.prefix_cache = RadixPrefixIndex(block_size=4, fingerprint=b"test")
+    coordinator.prefix_lookup_cache = PrefixLookupCache()
     coordinator.runtime_states = {}
     coordinator.pending_blocks = {}
     coordinator.pending_duplicate_refs = {}

@@ -69,11 +69,32 @@ class Sampler(nn.Module):
         temperatures: torch.Tensor,
         top_ps: torch.Tensor,
         top_ks: torch.Tensor,
+        *,
+        all_unfiltered: bool = False,
+        max_top_k: int | None = None,
     ):
         logits = logits.float()
         greedy_mask = temperatures <= 1e-10
         safe_temperatures = torch.where(greedy_mask, torch.ones_like(temperatures), temperatures)
         sampled_logits = logits.div(safe_temperatures.unsqueeze(dim=1))
+
+        if all_unfiltered:
+            # The host already owns these sampling parameters; do not read a
+            # device tensor to select this path. No sort/cumsum is necessary.
+            probs = torch.softmax(sampled_logits, dim=-1)
+            sample_tokens = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(dim=-1)
+            return torch.where(greedy_mask, logits.argmax(dim=-1), sample_tokens)
+
+        if max_top_k is not None:
+            # Host-selected top-k-only batch; retain per-row truncation.
+            values, indices = torch.topk(sampled_logits, k=max_top_k, dim=-1)
+            positions = torch.arange(max_top_k, device=logits.device)
+            limits = torch.where(greedy_mask, max_top_k, top_ks)
+            values = values.masked_fill(positions[None, :] >= limits[:, None], -torch.inf)
+            probs = torch.softmax(values, dim=-1)
+            chosen = probs.div_(torch.empty_like(probs).exponential_(1).clamp_min_(1e-10)).argmax(-1)
+            tokens = indices.gather(1, chosen[:, None]).squeeze(1)
+            return torch.where(greedy_mask, logits.argmax(-1), tokens)
 
         sorted_logits, sorted_indices = torch.sort(sampled_logits, dim=-1, descending=True)
         vocab_size = sorted_logits.shape[-1]
@@ -105,6 +126,8 @@ class Sampler(nn.Module):
         top_ps: torch.Tensor | None = None,
         top_ks: torch.Tensor | None = None,
         all_greedy: bool = False,
+        all_unfiltered: bool = False,
+        max_top_k: int | None = None,
     ):
         if all_greedy:
             return logits.argmax(dim=-1)
@@ -114,4 +137,4 @@ class Sampler(nn.Module):
             raise ValueError("top_ps must be provided when all_greedy=False")
         if top_ks is None:
             top_ks = torch.zeros_like(temperatures, dtype=torch.int64)
-        return self._sample(logits, temperatures, top_ps, top_ks)
+        return self._sample(logits, temperatures, top_ps, top_ks, all_unfiltered=all_unfiltered, max_top_k=max_top_k)

@@ -3,13 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
-import struct
+import sys
 from array import array
 from collections import OrderedDict
 from dataclasses import dataclass
 from dataclasses import field
 from dataclasses import replace
 from enum import Enum
+from itertools import islice
 from typing import Any, Iterable
 
 from sparsevllm.method_registry import prefill_sparse_method_fingerprint
@@ -104,6 +105,17 @@ class ChainRecord:
     resident_rows: int = 1
     reserved_slots_by_layer: tuple[int, ...] = ()
     reserved_rows: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedChainTokens:
+    """Immutable rank-0 history prepared before the collective finish RPC."""
+
+    chain_id: str
+    seq_id: int
+    processed_token_count: int
+    processed_token_digest: bytes
+    token_bytes: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,19 +336,18 @@ def stable_token_digest(
     *,
     count: int | None = None,
 ) -> bytes:
-    hasher = hashlib.sha256()
-    seen = 0
-    for token_id in token_ids:
-        if count is not None and seen >= int(count):
-            break
-        hasher.update(struct.pack("<q", int(token_id)))
-        seen += 1
-    if count is not None and seen != int(count):
+    # Preserve the wire format (signed int64, little endian), but pack/hash in
+    # bulk instead of issuing a Python struct.pack + SHA update per token.
+    limit = None if count is None else int(count)
+    values = array("q", map(int, token_ids if limit is None else islice(token_ids, max(0, limit))))
+    if limit is not None and len(values) != limit:
         raise ChainPrefixMismatchError(
             "Input is shorter than the chain's processed token boundary: "
-            f"input_tokens={seen}, processed_tokens={int(count)}."
+            f"input_tokens={len(values)}, processed_tokens={limit}."
         )
-    return hasher.digest()
+    if sys.byteorder != "little":
+        values.byteswap()
+    return hashlib.sha256(values).digest()
 
 
 class ChainCacheIndex:
@@ -404,16 +415,13 @@ class ChainCacheIndex:
                 "processed_token_count must be >= 0, got "
                 f"{processed_token_count}."
             )
-        logical_tokens = array("I")
-        for index, raw_token_id in enumerate(token_ids):
-            token_id = int(raw_token_id)
-            if token_id < 0 or token_id > 0xFFFFFFFF:
-                raise ChainOwnerMismatchError(
-                    "Chain token IDs must fit unsigned 32-bit storage: "
-                    f"index={index}, token_id={token_id}.",
-                    chain_id=record.chain_id,
-                )
-            logical_tokens.append(token_id)
+        try:
+            logical_tokens = array("I", map(int, token_ids))
+        except OverflowError as exc:
+            raise ChainOwnerMismatchError(
+                "Chain token IDs must fit unsigned 32-bit storage.",
+                chain_id=record.chain_id,
+            ) from exc
         if len(logical_tokens) < processed_token_count:
             raise ChainOwnerMismatchError(
                 "Finished token sequence is shorter than the processed boundary: "
@@ -421,10 +429,14 @@ class ChainCacheIndex:
                 f"processed={processed_token_count}.",
                 chain_id=record.chain_id,
             )
+        self._check_token_history_capacity(record, len(logical_tokens))
+        return logical_tokens
+
+    def _check_token_history_capacity(self, record: ChainRecord, token_count: int) -> None:
         next_total = (
             self._token_history_tokens
             - len(record.token_ids)
-            + len(logical_tokens)
+            + token_count
         )
         if (
             self.max_token_history_tokens is not None
@@ -437,13 +449,13 @@ class ChainCacheIndex:
                 f"capacity_tokens={self.max_token_history_tokens}.",
                 chain_id=record.chain_id,
             )
-        return logical_tokens
 
     def _store_token_history(
         self,
         record: ChainRecord,
         logical_tokens: array,
     ) -> None:
+        self._check_token_history_capacity(record, len(logical_tokens))
         self._token_history_tokens -= len(record.token_ids)
         record.token_ids = logical_tokens
         self._token_history_tokens += len(logical_tokens)
@@ -1224,6 +1236,20 @@ class ChainCacheCoordinator:
         token_ids: list[int],
         processed_token_count: int,
     ) -> ChainRecord:
+        prepared = self.prepare_processed_tokens(
+            chain_id=chain_id, seq_id=seq_id, token_ids=token_ids,
+            processed_token_count=processed_token_count,
+        )
+        return self.remember_prepared_tokens(prepared)
+
+    def prepare_processed_tokens(
+        self,
+        *,
+        chain_id: str,
+        seq_id: int,
+        token_ids: Iterable[int],
+        processed_token_count: int,
+    ) -> PreparedChainTokens:
         record = self.index.lookup(str(chain_id))
         processed_token_count = int(processed_token_count)
         if int(record.seq_id) != int(seq_id):
@@ -1232,28 +1258,35 @@ class ChainCacheCoordinator:
                 f"resident_seq_id={record.seq_id}, finished_seq_id={int(seq_id)}.",
                 chain_id=str(chain_id),
             )
-        if record.state is not ChainState.IDLE:
-            raise ChainOwnerMismatchError(
-                f"Cannot remember tokens for non-IDLE chain {chain_id!r}.",
-                chain_id=str(chain_id),
-            )
         logical_tokens = self.index._prepare_token_history(
             record,
             token_ids,
             processed_token_count=processed_token_count,
         )
-        digest = stable_token_digest(
-            logical_tokens,
-            count=processed_token_count,
+        return PreparedChainTokens(
+            chain_id=str(chain_id), seq_id=int(seq_id),
+            processed_token_count=processed_token_count,
+            processed_token_digest=stable_token_digest(logical_tokens, count=processed_token_count),
+            token_bytes=logical_tokens.tobytes(),
         )
+
+    def remember_prepared_tokens(self, prepared: PreparedChainTokens) -> ChainRecord:
+        record = self.index.lookup(prepared.chain_id)
+        if record.seq_id != prepared.seq_id or record.state is not ChainState.IDLE:
+            raise ChainOwnerMismatchError(
+                "Prepared history requires its original owner in IDLE state.",
+                chain_id=prepared.chain_id,
+            )
         if (
-            processed_token_count != int(record.processed_token_count)
-            or digest != record.processed_token_digest
+            prepared.processed_token_count != int(record.processed_token_count)
+            or prepared.processed_token_digest != record.processed_token_digest
         ):
             raise ChainOwnerMismatchError(
                 "Finished logical tokens do not match the recorded chain boundary.",
-                chain_id=str(chain_id),
+                chain_id=prepared.chain_id,
             )
+        logical_tokens = array("I")
+        logical_tokens.frombytes(prepared.token_bytes)
         self.index._store_token_history(record, logical_tokens)
         return record
 

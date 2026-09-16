@@ -333,6 +333,7 @@ class LLMEngine:
             self._warmup()
         finally:
             self._startup_warmup_active = False
+        self.model_runner.call("arm_runtime_compilation_guard")
         if os.getenv("SPARSEVLLM_PROFILER_RESET_AFTER_WARMUP", "0") == "1":
             profiler.reset()
         self._throughput_logger.start()
@@ -1007,7 +1008,10 @@ class LLMEngine:
             "chain_validate_admission_plan",
             plan,
             prompt_len,
-            stable_token_digest(prompt, count=int(plan.reused_tokens)),
+            # Planning already checked the exact input prefix against this
+            # digest. Other ranks still validate it against their own records.
+            coordinator.index.lookup(normalized_chain_id).processed_token_digest
+            if plan.status == "resumed" else stable_token_digest((), count=0),
         )
         self.model_runner.call("chain_apply_admission", plan)
         chain_status = "recreated" if recreated else str(plan.status)
@@ -1686,7 +1690,7 @@ class LLMEngine:
                 finished_seq_ids = []
                 for seq in seqs:
                     if seq.is_finished:
-                        chain_seq = self._active_chain_sequences.pop(
+                        chain_seq = self._active_chain_sequences.get(
                             int(seq.seq_id), None
                         )
                         if chain_seq is None:
@@ -1694,16 +1698,6 @@ class LLMEngine:
                         else:
                             processed_token_count = max(
                                 0, int(chain_seq.num_tokens) - 1
-                            )
-                            self.model_runner.call(
-                                "chain_finish",
-                                str(chain_seq.chain_id),
-                                int(chain_seq.seq_id),
-                                stable_token_digest(
-                                    chain_seq.token_ids,
-                                    count=processed_token_count,
-                                ),
-                                processed_token_count,
                             )
                             coordinator = (
                                 self.model_runner.runtime_state
@@ -1714,12 +1708,21 @@ class LLMEngine:
                                     "Finished a chain request without a chain "
                                     "cache coordinator."
                                 )
-                            coordinator.remember_processed_tokens(
+                            prepared = coordinator.prepare_processed_tokens(
                                 chain_id=str(chain_seq.chain_id),
                                 seq_id=int(chain_seq.seq_id),
-                                token_ids=list(chain_seq.token_ids),
+                                token_ids=chain_seq.token_ids,
                                 processed_token_count=processed_token_count,
                             )
+                            self.model_runner.call(
+                                "chain_finish",
+                                prepared.chain_id,
+                                prepared.seq_id,
+                                prepared.processed_token_digest,
+                                prepared.processed_token_count,
+                            )
+                            coordinator.remember_prepared_tokens(prepared)
+                            self._active_chain_sequences.pop(int(seq.seq_id), None)
                         finished_outputs.append(
                             (
                                 seq.seq_id,

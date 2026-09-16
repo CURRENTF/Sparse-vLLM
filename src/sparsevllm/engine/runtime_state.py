@@ -25,6 +25,7 @@ from sparsevllm.engine.prefix_cache_coordinator import PrefixCacheCoordinator
 from sparsevllm.engine.recurrent_state_manager import RecurrentStateManager
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.sampling_params import SamplingParams
+from sparsevllm.utils.profiler import cpu_timing
 
 
 class MemoryOracle(Protocol):
@@ -136,8 +137,11 @@ class RuntimeState:
         if chain_cache_coordinator is not None:
             chain_cache_coordinator.decode_reservations = self.decode_reservations
 
+    @cpu_timing.timed
     def reserve_decode_windows(self, decoding, waiting) -> Sequence | None:
-        if not decoding:
+        # Capacity queries can traverse the entire prefix cache. Existing
+        # windows need no renewal budget, even when another prompt is waiting.
+        if not any(self.decode_reservations.needs_acquisition(seq) for seq in decoding):
             return None
         step = int(self.config.engine_prefill_chunk_size)
         budgets = dict(self.cache_manager.decode_window_budgets())
@@ -610,6 +614,7 @@ class RuntimeState:
     def complete_prefill_execution(self, seq: Sequence) -> None:
         self.cache_manager.complete_prefill_execution(seq)
 
+    @cpu_timing.timed
     def reserved_prefill_slots(self, waiting_seqs: deque[Sequence], engine_prefill_chunk_size: int) -> int:
         return int(self.cache_manager.reserved_prefill_slots(waiting_seqs, engine_prefill_chunk_size))
 

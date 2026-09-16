@@ -1268,3 +1268,59 @@ def test_chain_rank_validation_protects_existing_decode_window():
         worker.validate_admission_plan(
             plan, input_token_count=4, input_prefix_digest=stable_token_digest([], count=0),
         )
+
+
+@pytest.mark.parametrize("count", [None, 0, 1, 5])
+def test_bulk_token_digest_preserves_wire_format(count):
+    import hashlib
+    import struct
+
+    tokens = [-2**63, -1, 0, 2**32 - 1, 2**63 - 1]
+    expected = hashlib.sha256(b"".join(struct.pack("<q", t) for t in tokens[:count])).digest()
+    assert stable_token_digest(iter(tokens), count=count) == expected
+    with pytest.raises(ChainPrefixMismatchError):
+        stable_token_digest(tokens, count=len(tokens) + 1)
+
+
+def test_prepared_chain_history_is_owned_validated_and_immutable():
+    from sparsevllm.engine.chain_cache import ChainRecord
+
+    coordinator = object.__new__(ChainCacheCoordinator)
+    coordinator.index = ChainCacheIndex(max_token_history_tokens=8)
+    record = ChainRecord("prepared", 7, FINGERPRINT, ChainState.ACTIVE)
+    coordinator.index.records[record.chain_id] = record
+    tokens = [1, 2, 3, 9]
+    prepared = coordinator.prepare_processed_tokens(
+        chain_id=record.chain_id, seq_id=7, token_ids=tokens, processed_token_count=3,
+    )
+    tokens[0] = 99  # callers cannot mutate the snapshot between prepare and commit
+    with pytest.raises(ChainOwnerMismatchError):
+        coordinator.remember_prepared_tokens(prepared)
+    for invalid in ([1, -1, 3], [1, 2**32, 3], [1, 2]):
+        with pytest.raises(ChainOwnerMismatchError):
+            coordinator.prepare_processed_tokens(
+                chain_id=record.chain_id, seq_id=7, token_ids=invalid, processed_token_count=3,
+            )
+    assert not record.token_ids and coordinator.index._token_history_tokens == 0
+    coordinator.index.finish_digest(
+        record.chain_id, processed_token_digest=prepared.processed_token_digest,
+        processed_token_count=3, physical_slots_by_layer=(3,),
+    )
+    coordinator.remember_prepared_tokens(prepared)
+    assert list(record.token_ids) == [1, 2, 3, 9]
+    assert coordinator.index._token_history_tokens == 4
+    # A different owner/boundary must not accept a stale prepared completion.
+    record.seq_id = 8
+    with pytest.raises(ChainOwnerMismatchError):
+        coordinator.remember_prepared_tokens(prepared)
+    record.seq_id = 7
+    record.processed_token_count = 4
+    with pytest.raises(ChainOwnerMismatchError):
+        coordinator.remember_prepared_tokens(prepared)
+    record.processed_token_count = 3
+    # Capacity can change between preparation and completion of the RPC.
+    coordinator.index.max_token_history_tokens = 3
+    with pytest.raises(ChainCapacityError):
+        coordinator.remember_prepared_tokens(prepared)
+    assert list(record.token_ids) == [1, 2, 3, 9]
+    assert coordinator.index._token_history_tokens == 4

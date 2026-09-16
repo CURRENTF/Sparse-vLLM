@@ -25,7 +25,9 @@ from triton.experimental.gluon.language.nvidia.ampere import mma_v2, async_copy
 from .prefill_plan import select_prefill_splits
 
 
-@g.jit
+# Lengths are launch data, not kernel variants. In particular, each new chain
+# suffix changes TQ and CHUNK; specializing them compiles during serving.
+@g.jit(do_not_specialize=["TQ", "BLOCKS", "CHUNK"])
 def _attention(
     Q,
     K,
@@ -34,12 +36,12 @@ def _attention(
     L,
     CQ,
     CK,
-    q0: gl.constexpr,
-    q1: gl.constexpr,
-    k0: gl.constexpr,
-    k1: gl.constexpr,
-    v0: gl.constexpr,
-    v1: gl.constexpr,
+    q0,
+    q1,
+    k0,
+    k1,
+    v0,
+    v1,
     TQ,
     H: gl.constexpr,
     D: gl.constexpr,
@@ -47,9 +49,9 @@ def _attention(
     CAUSAL: gl.constexpr,
     M: gl.constexpr,
     N: gl.constexpr,
-    BLOCKS: gl.constexpr,
+    BLOCKS,
     SPLITS: gl.constexpr,
-    CHUNK: gl.constexpr,
+    CHUNK,
 ):
     (block, head, batch) = (gl.program_id(0), gl.program_id(1), gl.program_id(2))
     split = batch % SPLITS
@@ -147,17 +149,18 @@ def _attention(
     )
 
 
-@triton.jit
-def _merge_splits(P, PL, O, L, T: tl.constexpr, H: tl.constexpr, S: tl.constexpr, D: tl.constexpr):
+@triton.jit(do_not_specialize=["T"])
+def _merge_splits(P, PL, O, L, T, H: tl.constexpr, S: tl.constexpr, D: tl.constexpr):
     token, head = tl.program_id(0), tl.program_id(1)
     ss = tl.arange(0, S)
     dd = tl.arange(0, D)
-    lse = tl.load(PL + (ss * H + head) * T + token)
+    lse_offsets = (ss.to(tl.int64) * H + head) * T + token
+    lse = tl.load(PL + lse_offsets)
     maximum = tl.max(lse, 0)
     safe = tl.where(maximum == -float("inf"), 0.0, maximum)
     weight = tl.exp(lse - safe)
     denominator = tl.sum(weight, 0)
-    offsets = ((ss[:, None] * H + head) * T + token).to(tl.int64) * D
+    offsets = lse_offsets[:, None] * D
     vals = tl.load(P + offsets + dd[None, :])
     out = tl.sum(vals * weight[:, None], 0) / tl.where(denominator > 0, denominator, 1.0)
     tl.store(O + (token.to(tl.int64) * H + head) * D + dd, out)

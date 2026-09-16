@@ -185,3 +185,4 @@ class ObservabilityConfig:
     enable_profiler: bool = False
     validate_runtime_invariants: bool = False
     throughput_log_interval_s: float = 10.0
+    runtime_compilation_limit: int = 500

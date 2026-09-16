@@ -3244,16 +3244,24 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         slot_to_pos_len = int(self.deltakv_slot_to_pos.numel())
         out_of_range = (slots < 0) | (slots >= slot_to_pos_len)
         layer_text = "" if layer_idx is None else f" layer={layer_idx}"
-        if out_of_range.any():
+        # Clamp only the validation lookup, never the slots used by eviction.
+        # Collect both error flags in one transfer before any unsafe gather.
+        if slot_to_pos_len:
+            safe_slots = slots.to(torch.long).clamp(0, slot_to_pos_len - 1)
+            missing_pos = (self.deltakv_slot_to_pos[safe_slots] < 0) & ~out_of_range
+        else:
+            missing_pos = torch.zeros_like(out_of_range)
+        range_error, position_error = torch.stack(
+            (out_of_range.any(), missing_pos.any())
+        ).cpu().tolist()
+        if range_error:
             bad = slots[out_of_range][:16].detach().cpu().tolist()
             raise RuntimeError(
                 f"DeltaKV less-memory eviction {label} center slots are out of range before slot_to_pos lookup: "
                 f"row={row_idx}{layer_text} total_len={total_len} compressed_len={compressed_len} "
                 f"evict=({evict_start},{evict_end}) slot_to_pos_len={slot_to_pos_len} bad_slots={bad}."
             )
-        pos = self.deltakv_slot_to_pos[slots.to(torch.long)]
-        missing_pos = pos < 0
-        if missing_pos.any():
+        if position_error:
             bad_slots = slots[missing_pos][:16]
             bad = bad_slots.detach().cpu().tolist()
             debug = self._describe_deltakv_full_slots_for_debug(

@@ -1,5 +1,6 @@
 """Independent capacity/accounting oracles for window renewal and eviction."""
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -89,6 +90,61 @@ def test_pending_prefill_capacity_is_not_spent_by_decode():
     ledger = DecodeReservations(Pools(slots=6), 4)
     assert not ledger.acquire(request(), prefill_reserve={"slots": 3})
     assert ledger.requests == {}
+
+
+def test_runtime_reuses_live_windows_without_querying_prefix_capacity():
+    # The ledger's early return alone did not prevent its caller from scanning
+    # the radix tree first. Exercise that caller and renewal safety together.
+    from sparsevllm.engine.runtime_state import RuntimeState
+
+    pools = Pools(slots=12)
+    pools.prompt_admission_budgets = Mock(return_value={"slots": 9})
+    pools.reserved_prefill_slots = Mock(return_value=3)
+    pools.decode_window_budgets = Mock(wraps=pools.decode_window_budgets)
+    runtime = RuntimeState(SimpleNamespace(engine_prefill_chunk_size=4,
+                                          decode_reservation_tokens=4), pools)
+    a, b = request(), request()
+    waiting = [Sequence([1, 2, 3])]
+    assert runtime.reserve_decode_windows([a, b], waiting) is None
+    windows = dict(runtime.decode_reservations.requests)
+    pools.decode_window_budgets.reset_mock()
+    pools.prompt_admission_budgets.reset_mock()
+    pools.reserved_prefill_slots.reset_mock()
+    for _ in range(4):
+        assert runtime.reserve_decode_windows([a, b], waiting) is None
+    pools.decode_window_budgets.assert_not_called()
+    pools.prompt_admission_budgets.assert_not_called()
+    pools.reserved_prefill_slots.assert_not_called()
+    assert runtime.decode_reservations.requests == windows
+
+    # A's completed tokens consume real capacity. B's four-token reservation
+    # plus the waiting prompt leave insufficient headroom to renew A.
+    for _ in range(4):
+        a.append_token(4)
+        pools.free["slots"] -= 1
+    pools.prompt_admission_budgets.return_value = {"slots": 5}
+    assert runtime.reserve_decode_windows([a, b], waiting) is a
+    pools.decode_window_budgets.assert_called_once()
+    assert runtime.decode_reservations.requests == windows
+    pools.prompt_admission_budgets.return_value = {"slots": 8}
+    pools.reserved_prefill_slots.return_value = 0
+    assert runtime.reserve_decode_windows([a, b], []) is None
+    assert runtime.decode_reservations.requests[a.seq_id].end == a.num_completion_tokens + 4
+    assert runtime.decode_reservations.outstanding() == {"slots": 8}
+
+
+def test_runtime_finished_and_replay_rows_need_no_new_window_budget():
+    from sparsevllm.engine.runtime_state import RuntimeState
+
+    pools = Pools(slots=0)
+    pools.decode_window_budgets = Mock(side_effect=AssertionError("unused capacity query"))
+    runtime = RuntimeState(SimpleNamespace(decode_reservation_tokens=4), pools)
+    done = request(limit=1)
+    replay = request()
+    replay.start_recompute_replay()
+    assert runtime.reserve_decode_windows([done, replay], []) is None
+    assert runtime.decode_reservations.requests == {}
+    pools.decode_window_budgets.assert_not_called()
 
 
 @pytest.mark.parametrize('window', [1, 3, 7, 32])

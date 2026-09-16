@@ -154,6 +154,18 @@ class OmniKVRuntime(DynamicSelectionRuntime):
 
     def __init__(self, config, cache_manager):
         super().__init__(config, cache_manager)
+        from sparsevllm.operators.omnikv_score import OmniKVScoreSpec, prepare_omnikv_score_provider
+
+        dtype = config.hf_config.dtype
+        if isinstance(dtype, str):
+            dtype = getattr(torch, dtype.lower().removeprefix('torch.'), torch.float32)
+        if dtype not in (torch.float16, torch.bfloat16):
+            dtype = torch.float32
+        self._omnikv_score_provider = prepare_omnikv_score_provider(
+            OmniKVScoreSpec(self.num_sink, self.num_recent, self.attn_softmax_scale, dtype),
+            device=self.device,
+        )
+        logger.info("OmniKV decode score provider: {}", self._omnikv_score_provider.name)
         self._omnikv_decode_attn_score_buffer: torch.Tensor | None = None
         self._omnikv_decode_selection_buffers: dict[
             tuple[int, tuple[int, ...], int, int, str],
@@ -169,9 +181,10 @@ class OmniKVRuntime(DynamicSelectionRuntime):
     def clear_decode_attn_score_buffers(self) -> None:
         super().clear_decode_attn_score_buffers()
         self._omnikv_decode_attn_score_buffer = None
+        self._omnikv_score_provider.clear()
 
     def decode_graph_keepalive_tensors(self) -> list[torch.Tensor]:
-        tensors = []
+        tensors = self._omnikv_score_provider.keepalive_tensors()
         if self._omnikv_decode_attn_score_buffer is not None:
             tensors.append(self._omnikv_decode_attn_score_buffer)
         for buffers in self._omnikv_decode_selection_buffers.values():
@@ -204,6 +217,9 @@ class OmniKVRuntime(DynamicSelectionRuntime):
                 self._pending_decode_score_specs,
                 fill_value=-1e20,
             )
+            for layer_idx, *_ in self._pending_decode_score_specs:
+                state = self.layer_batch_sparse_states[layer_idx]
+                self._omnikv_score_provider.prepare(state.attn_score, slot=id(state))
 
     def _prepare_omnikv_decode_attn_score_buffer(
         self,
@@ -324,13 +340,8 @@ class OmniKVRuntime(DynamicSelectionRuntime):
         self,
         state: LayerBatchSparseState,
     ) -> torch.Tensor:
-        hist_lens = (state.context_lens - self.num_recent).clamp_min(
-            self.num_sink
-        )
-        return self._decode_softmax_token_scores(
-            state.attn_score,
-            candidate_start=self.num_sink,
-            candidate_lens=hist_lens - self.num_sink,
+        return self._omnikv_score_provider.run(
+            state.attn_score, state.context_lens, slot=id(state),
         )
 
     def _update_dynamic_indices(

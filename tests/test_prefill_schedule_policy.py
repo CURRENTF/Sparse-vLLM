@@ -979,7 +979,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         runner = object.__new__(ModelRunner)
         sampled_shapes = []
 
-        def sampler(logits, temperatures, top_ps, top_ks, *, all_greedy):
+        def sampler(logits, temperatures, top_ps, top_ks, *, all_greedy, all_unfiltered, max_top_k):
             sampled_shapes.append(tuple(logits.shape))
             self.assertTrue(all_greedy)
             return logits.argmax(dim=-1)

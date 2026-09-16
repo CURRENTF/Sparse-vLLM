@@ -67,7 +67,7 @@ class Config(
     # decode and prefill to use different per-step sequence limits.
     decode_reservation_tokens: int = 1024
     max_decoding_seqs: int | None = None
-    favor_min_decoding_seqs: int = 0
+    favor_min_decoding_seqs: int | None = None
     max_num_seqs_in_gpu: int | None = None
 
     engine_prefill_chunk_size: int | None = None
@@ -145,6 +145,9 @@ class Config(
         self.max_model_len = resolved
 
     def __post_init__(self):
+        from sparsevllm.utils.compilation_guard import validate_compilation_limit
+
+        validate_compilation_limit(self.runtime_compilation_limit)
         normalize_bootstrap(self)
         normalize_sparse_method_name(self)
         normalize_prefill_sparse_method(self)

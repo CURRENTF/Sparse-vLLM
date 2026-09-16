@@ -28,7 +28,7 @@ from sparsevllm.engine.sequence import Sequence
 from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
 from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.log import log_level, logger
-from sparsevllm.utils.profiler import profiler
+from sparsevllm.utils.profiler import cpu_timing, profiler
 
 from .base import (
     AttentionCacheWrite,
@@ -152,6 +152,9 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         self.seq_id_to_cached_ranges: dict[int, list[tuple[int, int]]] = {}
         self._scheduler_capacity_snapshot_depth = 0
         self._scheduler_freeable_block_ids: frozenset[bytes] | None = None
+        self._prefix_resident_slots_cache: tuple[
+            RadixPrefixIndex, int, dict[int, tuple[frozenset[bytes], int]]
+        ] | None = None
         self._scheduler_reclaimable_slots: int | None = None
         self._init_prefix_cache_runtime()
         self.prefix_offload_controller: PrefixOffloadController | None = None
@@ -393,6 +396,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
     def num_free_rows(self) -> int:
         return len(self.free_rows)
 
+    @cpu_timing.timed
     def prompt_admission_budgets(
         self,
         waiting_seqs: deque[Sequence],
@@ -510,15 +514,31 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         )
         return self._prefix_resident_slots_for_ids(block_ids)
 
-    def _prefix_resident_slots_for_ids(self, block_ids) -> int:
+    def _prefix_resident_slots_for_ids(self, block_ids: frozenset[bytes]) -> int:
         if self.prefix_cache is None:
             return 0
+        # Index capacity epochs cover membership, references, priority,
+        # transfers and payload compaction. Keep weighted totals across
+        # scheduler passes as well as the index's immutable ID sets.
+        cache = getattr(self, "_prefix_resident_slots_cache", None)
+        epoch = self.prefix_cache.capacity_epoch
+        if cache is None or cache[0] is not self.prefix_cache or cache[1] != epoch:
+            cache = (self.prefix_cache, epoch, {})
+            self._prefix_resident_slots_cache = cache
+        totals = cache[2]
+        # The index reuses these immutable sets within an epoch. Identity keys
+        # avoid linear equality checks between equal offload capacity views;
+        # retaining each set prevents object-ID reuse while it is cached.
+        key = id(block_ids)
+        if key in totals:
+            return totals[key][1]
         total = 0
         for block_id in block_ids:
             block = self.prefix_cache.get_block(block_id)
             if block is None or not block.residency.device_present:
                 continue
             total += self._block_resident_tokens_or_full(block)
+        totals[key] = (block_ids, int(total))
         return int(total)
 
     def _prefix_freeable_block_ids_for_capacity(self) -> frozenset[bytes]:
@@ -617,6 +637,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         # Tests and external index-only users may intentionally use metadata-only payloads.
         return int(self.prefix_cache_block_size)
 
+    @cpu_timing.timed
     def _prefix_hit_capacity_slots(self, seq: Sequence) -> tuple[int, int]:
         if self.prefix_cache is None:
             return 0, 0
@@ -661,6 +682,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
     def prompt_logical_reservation_cost(self, seq: Sequence) -> int:
         return int(self.prompt_admission_cost(seq))
 
+    @cpu_timing.timed
     def refresh_prefix_cache_hit(self, seq: Sequence) -> None:
         self._poll_prefix_offload()
         self.clear_prefix_cache_hit(seq)
@@ -1280,6 +1302,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         getattr(self, "_prefix_write_through_candidates", {}).clear()
 
     def _on_prefix_cache_reset(self) -> None:
+        self._prefix_resident_slots_cache = None
         controller = getattr(self, "prefix_offload_controller", None)
         if controller is not None:
             controller.prefix_cache = self._require_prefix_cache()
@@ -1295,6 +1318,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             return
         self._reset_prefix_cache_allocator_after_clear()
 
+    @cpu_timing.timed
     def _evict_prefix_cache_until_free(self, needed_slots: int) -> None:
         if not self.enable_prefix_caching or self.prefix_cache is None:
             return
@@ -1437,6 +1461,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
         for block in selected:
             pending.pop(block.stable_block_id, None)
 
+    @cpu_timing.timed
     def on_forward_end(self, seqs: list[Sequence], is_prefill: bool):
         self._poll_prefix_offload()
         return super().on_forward_end(seqs, is_prefill)
@@ -1789,6 +1814,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
         return select_indices, self.row_seq_lens[row_indices], row_indices
 
+    @cpu_timing.timed
     def free_seq(self, seq_id: int):
         with profiler.record("cache_free_seq"):
             self._poll_prefix_offload()
@@ -1821,6 +1847,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             self._schedule_write_through_prefix_blocks(released_prefix_blocks)
             self.prefix_runtime_states.pop(seq_id, None)
             self.pending_prefix_blocks.pop(seq_id, None)
+            self.prefix_lookup_cache.discard(seq_id)
             after_free = self._num_free_slots
 
             self.buffer_req_to_token_slots[row_idx, :] = 0

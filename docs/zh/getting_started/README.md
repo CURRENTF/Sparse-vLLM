@@ -153,9 +153,9 @@ Sparse-vLLM runtime 参数定义在 `src/sparsevllm/configs/groups.py` 和 `runt
 
 ### Scheduler 阶段亲和性
 
-设置 `favor_min_decoding_seqs=4`、`max_decoding_seqs=8` 可启用阶段亲和性。
-前者是用户指定的软阈值，不自动估算；默认 `0` 关闭亲和性并保留 prefill 优先。
-取值必须是 `0..max_decoding_seqs` 的整数。Python API 将它作为 LLM 参数；
+默认启用阶段亲和性，`favor_min_decoding_seqs` 取
+`ceil(max_decoding_seqs * 0.75)`。可显式设置 `0..max_decoding_seqs` 的整数覆盖默认值；
+设为 `0` 时恢复严格的 prefill 优先。Python API 将它作为 LLM 参数；
 OpenAI 服务 CLI 使用 `--favor-min-decoding-seqs 4`；效率 probe 使用
 `--hyper-params '{"favor_min_decoding_seqs":4}'`。
 

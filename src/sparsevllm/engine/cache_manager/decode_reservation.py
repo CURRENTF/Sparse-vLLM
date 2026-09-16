@@ -34,15 +34,18 @@ class DecodeReservations:
                     total[name] = total.get(name, 0) + int(cost)
         return total
 
+    def needs_acquisition(self, seq: Sequence) -> bool:
+        reservation = self.requests.get(seq.seq_id)
+        if reservation is not None and seq.num_completion_tokens < reservation.end:
+            return False
+        return seq.num_completion_tokens < seq.max_tokens and not seq.is_recompute_replay
+
     def acquire(self, seq: Sequence, *, allow_short: bool = False,
                 prefill_reserve: dict[str, int] | None = None,
                 budgets: dict[str, int] | None = None) -> bool:
-        reservation = self.requests.get(seq.seq_id)
-        if reservation is not None and seq.num_completion_tokens < reservation.end:
+        if not self.needs_acquisition(seq):
             return True
         remaining = seq.max_tokens - seq.num_completion_tokens
-        if remaining <= 0 or seq.is_recompute_replay:
-            return True
         tokens = min(self.window, remaining)
         if budgets is None:
             budgets = self.cache_manager.decode_window_budgets()

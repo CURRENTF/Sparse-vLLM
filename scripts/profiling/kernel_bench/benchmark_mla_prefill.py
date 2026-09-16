@@ -301,6 +301,8 @@ def main():
     baseline_group = parser.add_mutually_exclusive_group(required=True)
     baseline_group.add_argument("--baseline-ref")
     baseline_group.add_argument("--vllm", action="store_true")
+    parser.add_argument("--git-kernel", choices=("original", "pipelined"), default="original",
+                        help="Kernel family for baseline-ref/worktree comparison; pipelined enables split-KV")
     parser.add_argument("--candidate-module", help="Explicit experimental module:callable; overrides candidate-kernel")
     parser.add_argument(
         "--candidate-kernel",
@@ -326,21 +328,24 @@ def main():
     if args.warmup < 1 or args.rounds < 1:
         parser.error("warmup and rounds must be positive")
     if args.vllm:
+        if args.git_kernel != "original":
+            parser.error("git-kernel requires --baseline-ref")
         if args.heads != 20:
             parser.error("the matched GLM vLLM comparison requires 20 heads")
         return compare_vllm(args)
-    from sparsevllm.kernels.triton.mla import prefill
+    module_name = "prefill_pipelined" if args.git_kernel == "pipelined" else "prefill"
+    prefill = importlib.import_module(f"sparsevllm.kernels.triton.mla.{module_name}")
     from sparsevllm.kernels.triton.context_flashattention_nopad import context_attention_fwd
 
     root = args.output_dir
     root.mkdir(parents=True, exist_ok=True)
     if (root / "run_manifest.json").exists() or (root / "raw_samples.jsonl").exists():
         raise FileExistsError("Use a new output directory to preserve previous results")
-    path = "src/sparsevllm/kernels/triton/mla/prefill.py"
+    path = f"src/sparsevllm/kernels/triton/mla/{module_name}.py"
     source = git("show", f"{args.baseline_ref}:{path}") + "\n"
     baseline_path = root / "baseline_prefill.py"
     baseline_path.write_text(source)
-    spec = importlib.util.spec_from_file_location("mla_prefill_baseline", baseline_path)
+    spec = importlib.util.spec_from_file_location("sparsevllm.kernels.triton.mla.baseline_prefill", baseline_path)
     baseline = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(baseline)
     props = torch.cuda.get_device_properties(0)
@@ -349,6 +354,7 @@ def main():
         "repo": git("rev-parse", "--show-toplevel"), "head": git("rev-parse", "HEAD"),
         "branch": git("branch", "--show-current"), "git_status": git("status", "--short"),
         "baseline": git("rev-parse", args.baseline_ref),
+        "git_kernel": args.git_kernel,
         "gpu": props.name, "capability": [props.major, props.minor],
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "triton_cache_dir": os.environ.get("TRITON_CACHE_DIR"),
@@ -385,10 +391,11 @@ def main():
                 cu_q, cu_k = [torch.tensor(x, device="cuda", dtype=torch.int32) for x in (cq, ck)]
 
                 def call(module):
-                    return module.attention_partial(q, k, v, cu_q, cu_k, max(queries), max(keys), scale=0.0625, causal=causal)
+                    kwargs = {"split_kv": True} if args.git_kernel == "pipelined" else {}
+                    return module.attention_partial(q, k, v, cu_q, cu_k, max(queries), max(keys), scale=0.0625, causal=causal, **kwargs)
 
                 calls = {"pr_original": lambda: call(baseline), "candidate": lambda: call(prefill)}
-                if causal:
+                if causal and args.git_kernel == "original":
                     slots = torch.full((len(keys), max(keys)), -1, device="cuda", dtype=torch.int32)
                     for i, (a, b) in enumerate(zip(ck, ck[1:])):
                         slots[i, :b - a] = torch.arange(a, b, device="cuda", dtype=torch.int32)
@@ -415,7 +422,7 @@ def main():
                 torch.cuda.synchronize()
                 samples = {name: [] for name in calls}
                 pairs = [("pr_original", "candidate")]
-                if causal:
+                if causal and args.git_kernel == "original":
                     pairs.append(("legacy_causal", "candidate"))
                 for pair in pairs:
                     for iteration in range(args.rounds):

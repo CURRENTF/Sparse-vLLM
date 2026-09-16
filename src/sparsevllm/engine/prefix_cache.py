@@ -9,6 +9,7 @@ from enum import Enum
 from typing import Any, Callable, Protocol
 
 from sparsevllm.method_registry import prefill_sparse_method_fingerprint
+from sparsevllm.utils.profiler import cpu_timing
 
 
 
@@ -828,6 +829,8 @@ class RadixPrefixIndex:
         self._remove_epoch = 0
         self._freeable_cache_epoch = -1
         self._freeable_block_ids_cache: frozenset[bytes] = frozenset()
+        self._freeable_ids: set[bytes] | None = None
+        self._blocked_freeable_children: dict[bytes, int] = {}
         self._evictable_cache_epoch = -1
         self._evictable_block_ids_cache: frozenset[bytes] = frozenset()
         self._device_freeable_cache_epoch = -1
@@ -850,6 +853,7 @@ class RadixPrefixIndex:
         self.control_delete_requests = 0
         self.control_priority_updates = 0
         self.freeable_scans = 0
+        self.freeable_snapshot_builds = 0
         self.freeable_cache_hits = 0
         self.evictable_scans = 0
         self.evictable_cache_hits = 0
@@ -898,6 +902,30 @@ class RadixPrefixIndex:
         self._capacity_epoch += 1
         self._mark_mutated()
 
+    def _refresh_freeable_path(self, block_id: bytes | None) -> None:
+        """Update only ancestors whose subtree eviction eligibility changes."""
+        freeable = self._freeable_ids
+        if freeable is None:
+            return  # Build lazily on the first capacity query.
+        while block_id is not None:
+            block = self.blocks[block_id]
+            was_freeable = block_id in freeable
+            is_freeable = (
+                self._blocked_freeable_children[block_id] == 0
+                and int(block.ref_count) == 0
+                and int(block.eviction_priority) >= 0
+                and block.residency.transfer is None
+            )
+            if is_freeable == was_freeable:
+                break
+            if is_freeable:
+                freeable.add(block_id)
+            else:
+                freeable.remove(block_id)
+            block_id = block.parent_block_id
+            if block_id is not None:
+                self._blocked_freeable_children[block_id] += -1 if is_freeable else 1
+
     def mark_payload_compacted(self, blocks: list[PrefixCacheBlock]) -> None:
         """Invalidate capacity views after an in-place physical payload change."""
         if not blocks:
@@ -939,6 +967,7 @@ class RadixPrefixIndex:
             return
         block.ref_count = ref_count
         if (old_ref_count == 0) != (ref_count == 0):
+            self._refresh_freeable_path(block.stable_block_id)
             self._mark_capacity_mutated()
         else:
             self._mark_mutated()
@@ -1052,6 +1081,7 @@ class RadixPrefixIndex:
         block_ids = self.block_ids_for_tokens(token_ids, max_tokens=max_usable_tokens)
         return self.lookup_longest_block_ids(block_ids)
 
+    @cpu_timing.timed
     def lookup_longest_block_ids(
         self,
         block_ids: list[bytes] | tuple[bytes, ...],
@@ -1135,6 +1165,13 @@ class RadixPrefixIndex:
         block.last_access = self._tick()
         self.blocks[block.stable_block_id] = block
         self.backend.insert_child(block.parent_block_id, block.stable_block_id)
+        if self._freeable_ids is not None:
+            self._blocked_freeable_children[block.stable_block_id] = 0
+            # A new child is initially absent from the freeable set.
+            if block.parent_block_id is not None:
+                self._blocked_freeable_children[block.parent_block_id] += 1
+            self._refresh_freeable_path(block.stable_block_id)
+            self._refresh_freeable_path(block.parent_block_id)
         self.committed_blocks += 1
         self._record_routing_insert(block.stable_block_id)
         parent = (
@@ -1199,6 +1236,7 @@ class RadixPrefixIndex:
                 )
         block.residency.transfer = PrefixTransferKind.D2H
         block.residency.validate()
+        self._refresh_freeable_path(block.stable_block_id)
         self._mark_capacity_mutated()
 
     def finish_d2h(self, block: PrefixCacheBlock) -> None:
@@ -1213,6 +1251,7 @@ class RadixPrefixIndex:
         block.residency.host_present = True
         block.residency.transfer = None
         block.residency.validate()
+        self._refresh_freeable_path(block.stable_block_id)
         self._mark_capacity_mutated()
 
     def abort_d2h(self, block: PrefixCacheBlock) -> None:
@@ -1220,6 +1259,7 @@ class RadixPrefixIndex:
             raise RuntimeError("Cannot abort D2H without an active D2H prefix transfer.")
         block.residency.transfer = None
         block.residency.validate()
+        self._refresh_freeable_path(block.stable_block_id)
         self._mark_capacity_mutated()
 
     def begin_h2d(self, block: PrefixCacheBlock) -> None:
@@ -1241,6 +1281,7 @@ class RadixPrefixIndex:
         block.residency.device_present = True
         block.residency.transfer = PrefixTransferKind.H2D
         block.residency.validate()
+        self._refresh_freeable_path(block.stable_block_id)
         self._mark_capacity_mutated()
 
     def finish_h2d(self, block: PrefixCacheBlock) -> None:
@@ -1248,6 +1289,7 @@ class RadixPrefixIndex:
             raise RuntimeError("Cannot finish H2D without an active H2D prefix transfer.")
         block.residency.transfer = None
         block.residency.validate()
+        self._refresh_freeable_path(block.stable_block_id)
         self._mark_capacity_mutated()
 
     def abort_h2d(self, block: PrefixCacheBlock) -> None:
@@ -1258,6 +1300,7 @@ class RadixPrefixIndex:
         block.residency.device_present = False
         block.residency.transfer = None
         block.residency.validate()
+        self._refresh_freeable_path(block.stable_block_id)
         self._mark_capacity_mutated()
 
     def can_evict(self, block: PrefixCacheBlock) -> bool:
@@ -1484,6 +1527,7 @@ class RadixPrefixIndex:
     def evictable_blocks(self) -> int:
         return len(self.evictable_block_ids())
 
+    @cpu_timing.timed
     def evictable_block_ids(self) -> frozenset[bytes]:
         if self._evictable_cache_epoch == self._capacity_epoch:
             self.evictable_cache_hits += 1
@@ -1500,49 +1544,43 @@ class RadixPrefixIndex:
         self._evictable_cache_epoch = self._capacity_epoch
         return self._evictable_block_ids_cache
 
+    @cpu_timing.timed
     def freeable_block_ids(self) -> frozenset[bytes]:
         """Return blocks removable by repeated leaf eviction without mutating the tree."""
         if self._freeable_cache_epoch == self._capacity_epoch:
             self.freeable_cache_hits += 1
             return self._freeable_block_ids_cache
 
-        self.freeable_scans += 1
-        freeable: set[bytes] = set()
-        subtree_freeable: dict[int, bool] = {}
-        stack: list[tuple[RadixTreeNode, bool]] = [(self.backend.root, False)]
-
-        while stack:
-            node, visited = stack.pop()
-            node_key = id(node)
-            if not visited:
-                stack.append((node, True))
-                for child in node.children.values():
-                    stack.append((child, False))
-                continue
-
-            children_freeable = True
-            for child in node.children.values():
-                if not subtree_freeable.pop(id(child), False):
-                    children_freeable = False
-
-            suffix_freeable = children_freeable
-            for block_id in reversed(node.segment):
-                block = self.blocks.get(block_id)
-                locally_freeable = (
-                    block is not None
-                    and int(block.ref_count) == 0
-                    and int(block.eviction_priority) >= 0
-                    and block.residency.transfer is None
-                )
-                if locally_freeable and suffix_freeable:
-                    freeable.add(block_id)
-                    suffix_freeable = True
-                else:
-                    suffix_freeable = False
-
-            subtree_freeable[node_key] = suffix_freeable
-
-        self._freeable_block_ids_cache = frozenset(freeable)
+        self.freeable_snapshot_builds += 1
+        if self._freeable_ids is None:
+            self.freeable_scans += 1
+            # Initialize by virtual leaf removal once. Thereafter mutation
+            # paths maintain membership and immediate non-freeable child counts.
+            children = dict.fromkeys(self.blocks, 0)
+            for block in self.blocks.values():
+                if block.parent_block_id is not None:
+                    children[block.parent_block_id] += 1
+            pending = [block_id for block_id, count in children.items() if count == 0]
+            freeable: set[bytes] = set()
+            while pending:
+                block_id = pending.pop()
+                block = self.blocks[block_id]
+                if (
+                    int(block.ref_count) != 0
+                    or int(block.eviction_priority) < 0
+                    or block.residency.transfer is not None
+                ):
+                    continue
+                freeable.add(block_id)
+                parent = block.parent_block_id
+                if parent is not None:
+                    children[parent] -= 1
+                    if children[parent] == 0:
+                        pending.append(parent)
+            self._freeable_ids = freeable
+            self._blocked_freeable_children = children
+        # Preserve immutable snapshots used by scheduler admission accounting.
+        self._freeable_block_ids_cache = frozenset(self._freeable_ids)
         self._freeable_cache_epoch = self._capacity_epoch
         return self._freeable_block_ids_cache
 
@@ -1563,6 +1601,13 @@ class RadixPrefixIndex:
             raise RuntimeError("Cannot remove a prefix cache block with live children.")
         self.backend.remove_block(stable_block_id)
         del self.blocks[stable_block_id]
+        if self._freeable_ids is not None:
+            was_freeable = stable_block_id in self._freeable_ids
+            self._freeable_ids.discard(stable_block_id)
+            del self._blocked_freeable_children[stable_block_id]
+            if not was_freeable and block.parent_block_id is not None:
+                self._blocked_freeable_children[block.parent_block_id] -= 1
+                self._refresh_freeable_path(block.parent_block_id)
         self._record_routing_remove(stable_block_id)
         self._mark_removed()
         return block
@@ -1588,6 +1633,7 @@ class RadixPrefixIndex:
             lambda _block: 1,
         )
 
+    @cpu_timing.timed
     def evict_until_weight(
         self,
         needed_weight: int,
@@ -1824,6 +1870,8 @@ class RadixPrefixIndex:
                 if int(block.eviction_priority) != int(priority):
                     old_priority = int(block.eviction_priority)
                     block.eviction_priority = int(priority)
+                    if (old_priority < 0) != (int(priority) < 0):
+                        self._refresh_freeable_path(block_id)
                     changed = True
                     capacity_changed = capacity_changed or (
                         (old_priority < 0) != (int(priority) < 0)
@@ -1881,6 +1929,7 @@ class RadixPrefixIndex:
             "prefix_cache_insert_epoch": int(self.insert_epoch),
             "prefix_cache_remove_epoch": int(self.remove_epoch),
             "prefix_cache_freeable_scans": int(self.freeable_scans),
+            "prefix_cache_freeable_snapshot_builds": int(self.freeable_snapshot_builds),
             "prefix_cache_freeable_cache_hits": int(self.freeable_cache_hits),
             "prefix_cache_evictable_scans": int(self.evictable_scans),
             "prefix_cache_evictable_cache_hits": int(self.evictable_cache_hits),

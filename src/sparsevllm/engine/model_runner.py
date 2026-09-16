@@ -197,6 +197,7 @@ DECODE_GRAPH_HOST_STATUS_SYNC_METHODS = {
     "seal_decode_cuda_graph_startup_plan",
 }
 STARTUP_HOST_STATUS_SYNC_METHODS = {
+    "arm_runtime_compilation_guard",
     "begin_startup_memory_profile",
     "build_production_cache_runtime",
     "capture_startup_memory_snapshot",
@@ -748,8 +749,20 @@ class ModelRunner:
             }
         )
 
+    def arm_runtime_compilation_guard(self):
+        from sparsevllm.utils.compilation_guard import RuntimeCompilationGuard
+
+        if getattr(self, "_compilation_guard", None) is None:
+            self._compilation_guard = RuntimeCompilationGuard(
+                self.config.runtime_compilation_limit, self.rank,
+            )
+        self._compilation_guard.arm()
+
     def exit(self):
         """释放资源并注销分布式进程组"""
+        guard = getattr(self, "_compilation_guard", None)
+        if guard is not None:
+            guard.close()
         self.platform.set_device(self.device)
         # Graph replay is asynchronous on every rank. Drain and release captured
         # NCCL work before entering the shutdown barrier or destroying its group.
@@ -1793,24 +1806,36 @@ class ModelRunner:
 
     def prepare_sample(self, seqs: list[Sequence]):
         """准备采样超参数"""
-        temperatures = [seq.temperature for seq in seqs]
-        top_ps = [seq.top_p for seq in seqs]
-        top_ks = [seq.top_k for seq in seqs]
-        pin_memory = self.platform.supports_pin_memory()
-        return (
-            torch.tensor(temperatures, dtype=torch.float32, pin_memory=pin_memory).to(
-                device=self.device,
-                non_blocking=pin_memory,
-            ),
-            torch.tensor(top_ps, dtype=torch.float32, pin_memory=pin_memory).to(
-                device=self.device,
-                non_blocking=pin_memory,
-            ),
-            torch.tensor(top_ks, dtype=torch.int64, pin_memory=pin_memory).to(
-                device=self.device,
-                non_blocking=pin_memory,
-            ),
-        )
+        size = len(seqs)
+        buffers = getattr(self, "_sampling_buffers", None)
+        upload_done = getattr(self, "_sampling_upload_done", None)
+        if upload_done is not None:
+            upload_done.synchronize()
+        if buffers is None or buffers[0].shape[1] < size:
+            capacity = max(1, 1 << (size - 1).bit_length())
+            pin_memory = torch.device(self.device).type == "cuda" and self.platform.supports_pin_memory()
+            host_float = torch.zeros((2, capacity), dtype=torch.float32, pin_memory=pin_memory)
+            host_int = torch.empty(capacity, dtype=torch.int64, pin_memory=pin_memory)
+            buffers = (
+                host_float, host_int,
+                torch.empty_like(host_float, device=self.device),
+                torch.empty_like(host_int, device=self.device),
+            )
+            self._sampling_buffers = buffers
+        host_float, host_int, device_float, device_int = buffers
+        host_float.numpy()[0, :size] = [seq.temperature for seq in seqs]
+        host_float.numpy()[1, :size] = [seq.top_p for seq in seqs]
+        host_int.numpy()[:size] = [seq.top_k for seq in seqs]
+        non_blocking = host_float.is_pinned()
+        device_float.copy_(host_float, non_blocking=non_blocking)
+        device_int[:size].copy_(host_int[:size], non_blocking=non_blocking)
+        if non_blocking:
+            # The next call may overwrite host storage only after DMA completes.
+            if upload_done is None:
+                upload_done = torch.cuda.Event()
+                self._sampling_upload_done = upload_done
+            upload_done.record(torch.cuda.current_stream(self.device))
+        return device_float[0, :size], device_float[1, :size], device_int[:size]
 
     def _auto_capture_greedy_sampling(self, seqs: list[Sequence]) -> bool:
         if any(self._has_sampling_penalty(seq) for seq in seqs):
@@ -1880,7 +1905,9 @@ class ModelRunner:
         logits: torch.Tensor,
         seqs: list[Sequence],
         graph_token_ids: torch.Tensor | None = None,
-    ) -> list[int]:
+        *,
+        return_device_tokens: bool = False,
+    ) -> list[int] | torch.Tensor:
         """Sample only outputs that belong to live generation.
 
         Recompute replay forwards rebuild KV for already accepted tokens. Their
@@ -1893,13 +1920,13 @@ class ModelRunner:
         ]
         token_ids = [0] * len(seqs)
         if not publish_indices:
-            return token_ids
+            return torch.zeros(len(seqs), dtype=torch.long, device=logits.device) if return_device_tokens else token_ids
         if graph_token_ids is not None:
             if len(publish_indices) != len(seqs):
                 raise RuntimeError(
                     "CUDA graph sampling cannot mix recompute replay and live outputs."
                 )
-            return [int(token_id) for token_id in graph_token_ids.tolist()]
+            return graph_token_ids if return_device_tokens else [int(token_id) for token_id in graph_token_ids.tolist()]
 
         # Most batches publish every row. Advanced indexing would still copy
         # the entire vocabulary matrix and upload an index tensor each step.
@@ -1915,14 +1942,32 @@ class ModelRunner:
         top_ks = None
         if not all_greedy:
             temperatures, top_ps, top_ks = self.prepare_sample(publish_seqs)
+        stochastic_seqs = [seq for seq in publish_seqs if seq.temperature > 1e-10]
+        max_top_k = None
+        if stochastic_seqs and all(
+            seq.top_p == 1.0 and 0 < seq.top_k < publish_logits.shape[-1]
+            for seq in stochastic_seqs
+        ):
+            max_top_k = max(seq.top_k for seq in stochastic_seqs)
         sampled = self.sampler(
             publish_logits,
             temperatures,
             top_ps,
             top_ks,
             all_greedy=all_greedy,
-        ).tolist()
-        for idx, token_id in zip(publish_indices, sampled):
+            max_top_k=max_top_k,
+            all_unfiltered=not all_greedy and all(
+                seq.top_p == 1.0 and (seq.top_k == 0 or seq.top_k >= publish_logits.shape[-1])
+                for seq in stochastic_seqs
+            ),
+        )
+        if return_device_tokens:
+            if len(publish_indices) == len(seqs):
+                return sampled
+            result = torch.zeros(len(seqs), dtype=sampled.dtype, device=sampled.device)
+            result[publish_indices] = sampled
+            return result
+        for idx, token_id in zip(publish_indices, sampled.tolist()):
             token_ids[idx] = int(token_id)
         return token_ids
 
@@ -2061,14 +2106,14 @@ class ModelRunner:
     def _collect_logprobs(
         self,
         logits: torch.Tensor,
-        token_ids: list[int],
+        token_ids: list[int] | torch.Tensor,
         seqs: list[Sequence],
     ) -> tuple[list[float | None], list[dict[int, float] | None]] | tuple[None, None]:
         if not any(seq.logprobs is not None for seq in seqs):
             return None, None
 
         log_probs = torch.log_softmax(logits.float(), dim=-1)
-        token_tensor = torch.tensor(token_ids, device=log_probs.device, dtype=torch.long)
+        token_tensor = torch.as_tensor(token_ids, device=log_probs.device, dtype=torch.long)
         sampled = log_probs.gather(1, token_tensor.unsqueeze(1)).squeeze(1)
         sampled_logprobs: list[float | None] = sampled.detach().cpu().tolist()
 
@@ -2082,14 +2127,16 @@ class ModelRunner:
                 k=min(max_top_logprobs, log_probs.shape[-1]),
                 dim=-1,
             )
+            values_cpu = top_values.detach().cpu().tolist()
+            indices_cpu = top_indices.detach().cpu().tolist()
             top_logprobs = []
             for row, seq in enumerate(seqs):
                 requested = int(seq.logprobs or 0)
                 if requested <= 0:
                     top_logprobs.append(None)
                     continue
-                values = top_values[row, :requested].detach().cpu().tolist()
-                indices = top_indices[row, :requested].detach().cpu().tolist()
+                values = values_cpu[row][:requested]
+                indices = indices_cpu[row][:requested]
                 top_logprobs.append({int(token_id): float(value) for token_id, value in zip(indices, values)})
         return sampled_logprobs, top_logprobs
 
@@ -2132,12 +2179,13 @@ class ModelRunner:
                             sampling_logits,
                             seqs,
                             graph_token_ids=graph_token_ids,
+                            return_device_tokens=True,
                         )
                     logprob_outputs = self._mask_recompute_logprobs(
                         seqs,
                         self._collect_logprobs(sampling_logits, token_ids, seqs),
                     )
-                    return token_ids, logprob_outputs
+                    return token_ids.tolist(), logprob_outputs
                 finally:
                     reset_context()
 
@@ -2157,7 +2205,7 @@ class ModelRunner:
             with profiler.record("model_sampler"):
                 if self.parallel_context.attn_tp_rank == 0:
                     sampling_logits = self._apply_sampling_penalties(logits, seqs)
-                    token_ids = self._sample_model_outputs(sampling_logits, seqs)
+                    token_ids = self._sample_model_outputs(sampling_logits, seqs, return_device_tokens=True)
                 else:
                     sampling_logits = None
                     token_ids = None
@@ -2169,6 +2217,9 @@ class ModelRunner:
                 if self.parallel_context.attn_tp_rank == 0
                 else None
             )
+
+            if token_ids is not None:
+                token_ids = token_ids.tolist()
 
             # 5. 后置稀疏处理 (如 SnapKV 驱逐)
             self._post_sparse_forward(seqs, is_prefill)

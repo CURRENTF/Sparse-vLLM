@@ -1,7 +1,11 @@
 import time
 import os
+import json
+import math
+import threading
 from collections import defaultdict
 from contextlib import contextmanager
+from functools import wraps
 
 import torch
 import sparsevllm.platforms as platforms
@@ -87,3 +91,68 @@ class Profiler:
 
 # 全局单例
 profiler = Profiler()
+
+
+class CpuTiming:
+    """Opt-in inclusive host timings; never query or synchronize the device.
+
+    Thread CPU excludes sleep but can include driver polling. Wall time includes
+    waits; neither is GPU kernel time. Nested categories must not be summed.
+    """
+
+    def __init__(self, interval_s: float):
+        if not math.isfinite(interval_s) or interval_s < 0:
+            raise ValueError("CPU timing interval must be finite and nonnegative")
+        self.interval_ns = int(interval_s * 1e9)
+        self.local = threading.local()
+
+    def timed(self, function):
+        if not self.interval_ns:
+            return function
+        name = function.__qualname__
+
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            state = getattr(self.local, "state", None)
+            if state is None:
+                state = {"start": time.perf_counter_ns(), "depth": 0, "stats": {}}
+                self.local.state = state
+            state["depth"] += 1
+            wall_start = time.perf_counter_ns()
+            cpu_start = time.thread_time_ns()
+            failed = False
+            try:
+                return function(*args, **kwargs)
+            except BaseException:
+                failed = True
+                raise
+            finally:
+                cpu_ns = time.thread_time_ns() - cpu_start
+                end = time.perf_counter_ns()
+                wall_ns = end - wall_start
+                stats = state["stats"].setdefault(name, [0, 0, 0, 0, 0])
+                stats[0] += 1
+                stats[1] += cpu_ns
+                stats[2] += wall_ns
+                stats[3] = max(stats[3], wall_ns)
+                stats[4] += int(failed)
+                state["depth"] -= 1
+                if state["depth"] == 0 and end - state["start"] >= self.interval_ns:
+                    stages = {
+                        key: dict(calls=row[0], cpu_ms=row[1] / 1e6,
+                                  wall_ms=row[2] / 1e6, max_wall_ms=row[3] / 1e6,
+                                  errors=row[4])
+                        for key, row in sorted(state["stats"].items())
+                    }
+                    report = dict(pid=os.getpid(), rank=profiler.rank,
+                                  thread=threading.get_native_id(),
+                                  window_s=(end - state["start"]) / 1e9,
+                                  inclusive=True, stages=stages)
+                    state["stats"].clear()
+                    state["start"] = end
+                    logger.info("cpu_timing {}", json.dumps(report, separators=(",", ":")))
+
+        return wrapped
+
+
+cpu_timing = CpuTiming(float(os.environ.get("SPARSEVLLM_CPU_TIMING_INTERVAL_S", "0")))

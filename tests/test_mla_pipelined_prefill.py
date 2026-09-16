@@ -7,6 +7,59 @@ import torch
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("backend", ["pipelined", "hopper"])
 @pytest.mark.parametrize("split_kv", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+def test_new_lengths_reuse_compiled_partials(monkeypatch, record_property, backend, split_kv, causal):
+    # Regression: MiniSWE suffix lengths compiled thousands of MLA variants.
+    # Existing fixed-shape graph tests cannot detect a new binary per length.
+    from importlib import import_module
+
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("pipelined MLA requires Ampere or newer")
+    if backend == "hopper" and torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("TMA/WGMMA MLA requires Hopper")
+    module = import_module(f"sparsevllm.kernels.triton.mla.prefill_{backend}")
+    binaries = {"attention": set(), "merge": set()}
+
+    def track(kernel, name):
+        run = kernel.run
+
+        def launch(*args, **kwargs):
+            compiled = run(*args, **kwargs)
+            binaries[name].add(compiled.hash)
+            return compiled
+
+        monkeypatch.setattr(kernel, "run", launch)
+
+    track(module._attention, "attention")
+    track(module._merge_splits, "merge")
+    torch.manual_seed(719)
+    # Hold the structural split family fixed with the real split selector;
+    # vary exact lengths, alignment classes, grid size and transposed-Q stride.
+    for qn, kn in ((1, 4101), (16, 4223), (127, 4288), (129, 4377), (257, 4489), (385, 4601)):
+        q = (torch.randn(2, qn, 256, device="cuda", dtype=torch.bfloat16) * 0.2).transpose(0, 1)
+        k = torch.randn(kn, 2, 256, device="cuda", dtype=torch.bfloat16) * 0.2
+        v = torch.randn(kn, 2, 448, device="cuda", dtype=torch.bfloat16)[..., 192:]
+        cq = torch.tensor([0, qn], device="cuda", dtype=torch.int32)
+        ck = torch.tensor([0, kn], device="cuda", dtype=torch.int32)
+        out, lse = module.attention_partial(
+            q, k, v, cq, ck, qn, kn, scale=0.0625, causal=causal,
+            split_kv=split_kv, sm_count=1024,
+        )
+        z = torch.einsum("qhd,khd->hqk", q.float(), k.float()) * 0.0625
+        if causal:
+            valid = torch.arange(kn, device="cuda")[None] <= torch.arange(qn, device="cuda")[:, None] + kn - qn
+            z.masked_fill_(~valid[None], -torch.inf)
+        expected = torch.einsum("hqk,khd->qhd", z.softmax(-1), v.float())
+        torch.testing.assert_close(out.float(), expected, atol=0.015, rtol=0.03)
+        torch.testing.assert_close(lse, z.logsumexp(-1), atol=0.003, rtol=0.001)
+        assert len(binaries["attention"]) == 1, "new request length compiled another attention binary"
+        assert len(binaries["merge"]) == int(split_kv), "new request length compiled another merge binary"
+    record_property("compiled_binaries", {name: sorted(values) for name, values in binaries.items()})
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("backend", ["pipelined", "hopper"])
+@pytest.mark.parametrize("split_kv", [False, True])
 @pytest.mark.parametrize(
     "queries,keys,causal,magnitude",
     [

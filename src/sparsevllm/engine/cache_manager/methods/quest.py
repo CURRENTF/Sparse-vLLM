@@ -1689,6 +1689,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             self._schedule_write_through_prefix_blocks(released_prefix_blocks)
             self.prefix_runtime_states.pop(seq_id, None)
             self.pending_prefix_blocks.pop(seq_id, None)
+            self.prefix_lookup_cache.discard(seq_id)
 
             self.buffer_req_to_token_slots[row_idx, :] = 0
             self.buffer_req_to_page_slots[row_idx, :] = -1
