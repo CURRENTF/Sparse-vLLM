@@ -187,7 +187,7 @@ def test_production_graph_plan_skips_families_larger_than_final_kv():
     config.sink_keep_tokens = 2
     config.decode_keep_tokens = 8
     config.recent_keep_tokens = 6
-    plan = [(4, 32, True), (2, 32, True), (4, 16, False)]
+    plan = [(12, 32), (5, 32), (4, 32), (2, 32)]
 
     class AdmissionOracle:
         def startup_batch_fits(self, prompt_lengths, *, max_tokens):
@@ -201,8 +201,8 @@ def test_production_graph_plan_skips_families_larger_than_final_kv():
         AdmissionOracle(),
     )
 
-    assert feasible == [(4, 16, False)]
-    assert skipped == [(4, 32, True), (2, 32, True)]
+    assert feasible == [(4, 32), (2, 32)]
+    assert skipped == [(12, 32), (5, 32)]
 
 
 def test_explicit_budget_still_resolves_mixed_kv_and_recurrent_prefix_capacity():

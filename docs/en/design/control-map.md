@@ -65,7 +65,7 @@ flowchart TD
 | `src/sparsevllm/configs/groups.py`, `runtime.py` | Canonical runtime fields, validation, graph constraints, and method-normalized defaults. | Public and internal field names must stay identical; mirror knob behavior in `docs/en/configuration/runtime-parameter-semantics.md`. |
 | `src/sparsevllm/method_registry.py` | Sparse method aliases and default prefill policy. | New method strings and policy defaults start here. |
 | `src/sparsevllm/engine/llm_engine.py` | Public engine lifecycle, tokenizer, scheduler loop, warmup, throughput logging. | Should not grow method-specific runtime logic. |
-| `src/sparsevllm/engine/scheduler.py` | Prefill execution-mode batching, decode long/short separation, prompt admission, preemption. | Uses cache-manager mode and budget hooks instead of knowing method internals. |
+| `src/sparsevllm/engine/scheduler.py` | Prefill execution-mode batching, mixed-length decode batching, prompt admission, preemption. | Uses cache-manager mode and budget hooks instead of knowing method internals. |
 | `src/sparsevllm/engine/model_runner.py` | Model load, TP RPC, CUDA graph runners, prepare/run/sample orchestration. | Owns execution mechanics, not token-selection policy. |
 | `src/sparsevllm/engine/cache_manager/base.py` | Cache-manager interface and method routing. | Method-specific persistent state belongs behind this interface. |
 | `src/sparsevllm/engine/cache_manager/*.py` | Physical/logical KV state for each sparse method. | This is the primary place for persistent physical method implementation. |

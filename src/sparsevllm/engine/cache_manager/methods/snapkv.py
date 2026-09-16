@@ -3331,13 +3331,12 @@ class SnapKVCacheManager(CacheManager):
         if self.free_slots_stack_tensor is not None:
             ptrs = np.asarray([self._num_free_slots[layer_id] for layer_id in layer_ids], dtype=np.int64)
             slot_offsets = ptrs[:, None] - batch_size + np.arange(batch_size, dtype=np.int64)[None, :]
-            _slot_offsets_gpu, _rows_gpu, _cols_gpu = self._get_decode_static_index_buffers(batch_size)
             slot_offsets_active = torch.from_numpy(slot_offsets).to(device=self.device, dtype=torch.long)
-            selected_active = torch.gather(
-                self.free_slots_stack_tensor.index_select(0, kv_layer_indices),
-                1,
-                slot_offsets_active,
-            )
+            # Index both dimensions together: selecting layers first copies the
+            # entire cache-capacity stack to retrieve only one slot per request.
+            selected_active = self.free_slots_stack_tensor[
+                kv_layer_indices[:, None], slot_offsets_active
+            ]
             if slot_output is not None:
                 selected_slots = slot_output
                 active_rows = selected_slots.index_select(0, layer_index)

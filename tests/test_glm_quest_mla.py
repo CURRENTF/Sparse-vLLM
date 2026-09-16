@@ -168,7 +168,7 @@ def test_quest_mla_metadata_and_decode_view_keep_latent_payload_typed():
         payload.rope_cache[page_slots] = 0
         payload.latent_cache[page_slots, 0, 0] = logical_scores[logical_page]
 
-    set_context(True, cache_manager=manager, is_long_text=True)
+    set_context(True, cache_manager=manager)
     try:
         manager.on_kv_stored(
             0,
@@ -231,7 +231,7 @@ def test_quest_mla_metadata_and_decode_view_keep_latent_payload_typed():
         page_scores,
         torch.tensor([[-5.0, 10.0, 2.0]], dtype=torch.bfloat16),
     )
-    set_context(False, cache_manager=manager, is_long_text=True)
+    set_context(False, cache_manager=manager)
     try:
         view = manager.build_decode_compute_view(
             0,

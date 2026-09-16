@@ -76,10 +76,19 @@ def capacity_failure(error, log_path):
         # worker's explicit capacity diagnosis instead of inferring from SIGKILL.
         return True
     # Require a capacity skip for the exact missing graph, not another family.
-    missing = re.search(r"no startup-captured graph for batch_size=(\d+), path=['\"](long|short)['\"]", error)
+    missing = re.search(r"no startup-captured graph for batch_size=(\d+), path=['\"]([^'\"]+)['\"]", error)
     if missing is None:
         return False
     batch, path = missing.groups()
+    skipped = re.findall(
+        r"Startup CUDA Graph family exceeds KV capacity during prefill or decode preparation: batch=(\d+) path=['\"]([^'\"]+)['\"]\.",
+        log_path.read_text(),
+    )
+    if (batch, path) in skipped:
+        return True
+    # The runner can also target a checkout from before unified decode.
+    if path not in {"long", "short"}:
+        return False
     skipped = re.findall(
         r"Startup CUDA Graph family exceeds KV capacity during prefill or decode preparation: batch=(\d+) long=(True|False)\.",
         log_path.read_text(),

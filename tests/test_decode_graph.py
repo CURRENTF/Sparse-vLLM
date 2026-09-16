@@ -44,11 +44,10 @@ def test_decode_graph_runner_blocks_replay_until_collectives_are_ready() -> None
     runner.dp_batch_capacity = None
     runner.method = ""
     runner._select_graph_batch_size = lambda batch_size: batch_size
-    runner.is_long_text_batch = lambda seqs, is_prefill: False
-    runner._graph_path_id = lambda is_long_text: ""
-    runner._graph_path_capacity = lambda seqs, is_long_text: 128
+    runner._graph_path_id = lambda: ""
+    runner._graph_path_capacity = lambda seqs: 128
     runner._select_state = lambda **kwargs: state
-    runner._prepare_static_step = lambda state, seqs, is_long_text: (None, None)
+    runner._prepare_static_step = lambda state, seqs: (None, None)
     runner._restore_sparse_state_refs = lambda state: None
     runner.collective_runtime = SimpleNamespace(
         assert_cuda_graph_replayable=Mock(
@@ -88,10 +87,8 @@ def test_decode_graph_startup_plan_has_one_graph_per_batch_and_path() -> None:
         recent_keep_tokens=512,
     )
     assert build_decode_cuda_graph_startup_plan(config) == [
-        (4, 32768, True),
-        (4, 4672, False),
-        (1, 32768, True),
-        (1, 4672, False),
+        (4, 32768),
+        (1, 32768),
     ]
 
 
@@ -105,35 +102,32 @@ def test_decode_graph_state_identity_omits_context_capacity() -> None:
         method="quest",
         batch_size=4,
         context_capacity=32768,
-        is_long_text=True,
         capture_sampling=False,
-        graph_path_id="long",
+        graph_path_id="unified",
     )
     reused = runner._select_state(
         method="quest",
         batch_size=4,
         context_capacity=8192,
-        is_long_text=True,
         capture_sampling=False,
-        graph_path_id="long",
+        graph_path_id="unified",
     )
     assert reused is state
     assert state.capture_context_capacity == 32768
     assert state.decode_state is not None
     assert state.decode_state.contract == DecodeGraphContract(
         method="quest",
-        topology_path_id="long",
+        topology_path_id="unified",
         batch_capacity=4,
         context_capacity=32768,
     )
     assert state.decode_state.inputs.batch_capacity == 4
-    assert state.decode_state.contract.capability_level == "path_scoped"
+    assert state.decode_state.contract.capability_level == "strict"
 
     reused_with_default_path = runner._select_state(
         method="quest",
         batch_size=4,
         context_capacity=16384,
-        is_long_text=True,
         capture_sampling=False,
     )
     assert reused_with_default_path is state
@@ -143,9 +137,8 @@ def test_decode_graph_state_identity_omits_context_capacity() -> None:
             method="quest",
             batch_size=4,
             context_capacity=65536,
-            is_long_text=True,
             capture_sampling=False,
-            graph_path_id="long",
+            graph_path_id="unified",
         )
 
 

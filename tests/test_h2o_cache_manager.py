@@ -277,12 +277,12 @@ def test_h2o_decode_does_not_request_scores_or_run_eviction():
     decode = SparseStepContext(
         seqs=[],
         is_prefill=False,
-        forward_context=SimpleNamespace(is_prefill=False, is_long_text=True),
+        forward_context=SimpleNamespace(is_prefill=False),
     )
     prefill = SparseStepContext(
         seqs=[],
         is_prefill=True,
-        forward_context=SimpleNamespace(is_prefill=True, is_long_text=True),
+        forward_context=SimpleNamespace(is_prefill=True),
     )
 
     assert runtime.needs_attention_score(0, decode) is False
@@ -304,7 +304,7 @@ def test_h2o_flashprefill_uses_posthoc_scoring_and_preserves_eviction():
     prefill = SparseStepContext(
         seqs=[],
         is_prefill=True,
-        forward_context=SimpleNamespace(is_prefill=True, is_long_text=True),
+        forward_context=SimpleNamespace(is_prefill=True),
     )
 
     assert runtime.needs_attention_score(0, prefill) is False
@@ -493,7 +493,7 @@ def test_h2o_runtime_triggers_prefill_and_decode_boundaries_independently(
     step = SparseStepContext(
         seqs=[],
         is_prefill=True,
-        forward_context=SimpleNamespace(is_prefill=True, is_long_text=True),
+        forward_context=SimpleNamespace(is_prefill=True),
     )
 
     runtime.finish_step(step)
@@ -1086,7 +1086,7 @@ def test_h2o_mla_ragged_logits_fuse_updates_and_reuse_history(lengths, validate)
     # Graph score views can have spare batch capacity and non-contiguous strides.
     logits = torch.empty(2, 4, 258, device="cuda")[:, :2, ::2]
     scale = 128**-0.5
-    workspace = None
+    row_pointers = None
     for step in range(3):
         if step:
             for row_lengths in manager.row_seq_lens:
@@ -1111,17 +1111,14 @@ def test_h2o_mla_ragged_logits_fuse_updates_and_reuse_history(lengths, validate)
             assert manager.update_decode_attention_scores_all_layers(
                 [0, 1], seqs, logits, normalize_logits=True, softmax_scale=scale
             )
-        if step == 1:
-            assert manager._h2o_decode_score_workspace is workspace
-        if step == 2:
-            assert manager._h2o_decode_score_workspace is not workspace
-        workspace = manager._h2o_decode_score_workspace
+        current_pointers = {key: row.data_ptr() for key, row in manager._h2o_scores.items()}
+        if row_pointers is not None:
+            assert current_pointers == row_pointers
+        row_pointers = current_pointers
         logits.fill_(torch.nan)
         for key, reference in expected.items():
             torch.testing.assert_close(manager._h2o_scores[key], reference, atol=1e-6, rtol=1e-5)
-            assert manager._h2o_scores[key].untyped_storage().data_ptr() == (
-                workspace.untyped_storage().data_ptr()
-            )
+
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -2363,10 +2360,13 @@ def test_h2o_contiguous_decode_buffer_handles_padded_graph_batch_and_low_dtype()
 def test_h2o_free_seq_cleans_score_vectors():
     manager = _manager_with_rows([2])
     manager._h2o_scores[(0, 0)] = torch.ones(2)
+    buffer = torch.ones(8)
+    manager._h2o_decode_score_rows = {(0, 0): (buffer, buffer[:2]), (1, 0): (buffer, buffer[:2])}
     manager._h2o_active_decode_seq_ids.add(0)
     with patch.object(SnapKVCacheManager, "free_seq", autospec=True) as parent_free:
         manager.free_seq(0)
     assert manager._h2o_scores == {}
+    assert manager._h2o_decode_score_rows == {}
     assert manager._h2o_active_decode_seq_ids == set()
     parent_free.assert_called_once_with(manager, 0)
 
@@ -2386,6 +2386,8 @@ def test_h2o_chain_turn_aligns_score_free_decode_growth_until_reclaimed():
 def test_h2o_reset_after_warmup_clears_scores_and_counters():
     manager = _manager_with_rows([2])
     manager._h2o_scores[(0, 0)] = torch.ones(2)
+    buffer = torch.ones(8)
+    manager._h2o_decode_score_rows = {(0, 0): (buffer, buffer[:2])}
     manager._h2o_active_decode_seq_ids.add(0)
     manager._h2o_counters.update(
         {
@@ -2399,6 +2401,7 @@ def test_h2o_reset_after_warmup_clears_scores_and_counters():
 
     manager.reset_after_warmup()
     assert manager._h2o_scores == {}
+    assert manager._h2o_decode_score_rows == {}
     assert manager._h2o_active_decode_seq_ids == set()
     assert manager._h2o_counters == {
         "intermediate_prefill_evictions": 0,

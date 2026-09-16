@@ -44,21 +44,14 @@ def test_prefill_replay_checks_scale_with_queue_not_batch(monkeypatch):
     assert reads < 10 * len(seqs)
 
 
-def test_decode_skips_long_prefix_once_and_preserves_queue(monkeypatch):
+def test_decode_mixed_lengths_preserve_queue_order():
     scheduler = make_scheduler('all_chunked')
-    long = [request(20) for _ in range(1000)]
-    short = [request() for _ in range(64)]
-    scheduler.decoding = deque(long + short)
-    reads = 0
-    def classify(seq, is_prefill):
-        nonlocal reads
-        reads += 1
-        return seq.num_tokens > 10
-    monkeypatch.setattr(scheduler, '_is_long_text', classify)
+    seqs = [request(n) for n in (20, 1, 6, 1000)]
+    scheduler.max_decoding_seqs = 3
+    scheduler.decoding = deque(seqs)
     batch, prefill, _ = scheduler.schedule()
-    assert not prefill and batch == short[:scheduler.max_decoding_seqs]
-    assert list(scheduler.decoding) == batch + long + short[len(batch):]
-    assert reads < 4 * (len(long) + len(short))
+    assert not prefill and batch == seqs[:3]
+    assert list(scheduler.decoding) == seqs
 
 
 def test_prefill_skipped_requests_survive_admission_exception(monkeypatch):
@@ -166,11 +159,10 @@ def test_prefill_incompatible_prefix_is_scanned_once_and_stays_ordered(monkeypat
     assert reads <= len(incompatible) + len(eligible)
 
 
-def test_decode_preemption_sees_parked_long_requests(monkeypatch):
+def test_decode_preemption_preserves_other_requests(monkeypatch):
     scheduler = make_scheduler('all_chunked')
     long, victim = request(20), request()
-    scheduler.decoding = deque([long, victim])
-    monkeypatch.setattr(scheduler, '_is_long_text', lambda seq, is_prefill: seq is long)
+    scheduler.decoding = deque([victim, long])
     monkeypatch.setattr(scheduler.memory_oracle, 'decode_step_free_slots', lambda: 0)
     def preempt(seq, scheduled, preempted, **kwargs):
         assert seq is victim

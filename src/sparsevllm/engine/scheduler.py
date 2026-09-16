@@ -12,7 +12,6 @@ from sparsevllm.engine.prefill import (
 )
 from sparsevllm.engine.sequence import Sequence, SequenceStatus
 from sparsevllm.engine.runtime_state import MemoryOracle
-from sparsevllm.method_registry import decode_sparse_long_text_threshold
 from sparsevllm.sampling_params import resolve_eos_token_ids
 from sparsevllm.utils.log import logger
 from sparsevllm.utils.profiler import cpu_timing
@@ -56,9 +55,6 @@ class Scheduler:
             fallback_eos_token_id=self.eos,
         )
 
-        self.sink_keep_tokens = config.sink_keep_tokens
-        self.recent_keep_tokens = config.recent_keep_tokens
-        self.decode_keep_tokens = config.decode_keep_tokens
         
         # memory_oracle 引用 Rank 0 的 CacheManager，作为全局显存余量参考。
         # 对多层异构预算，采用更保守的可用空间估计。
@@ -75,26 +71,6 @@ class Scheduler:
         self._admission_defer_warned_seq_ids: set[int] = set()
         self.total_preemptions = 0
         self.total_recompute_replays = 0
-
-    def _long_text_threshold(self, is_prefill: bool) -> int:
-        """Long-text boundary retained only for decode batch partitioning."""
-        del is_prefill
-        return decode_sparse_long_text_threshold(
-            self.config.sparse_method,
-            num_sink_tokens=self.sink_keep_tokens,
-            decode_keep_tokens=self.decode_keep_tokens,
-            num_recent_tokens=self.recent_keep_tokens,
-        )
-
-    def _is_long_text(self, seq: Sequence, is_prefill: bool) -> bool:
-        if not self.config.sparse_method:
-            return False
-        if is_prefill:
-            raise ValueError(
-                "Prefill must use prefill_execution_mode(), not decode long-text partitioning."
-            )
-        threshold = self._long_text_threshold(is_prefill)
-        return int(seq.num_tokens) > int(threshold)
 
     def _prefill_execution_mode(self, seq: Sequence) -> str:
         return validate_prefill_execution_mode(
@@ -385,15 +361,12 @@ class Scheduler:
         return [], False, preempted_seqs
 
     def _eligible_decode_batch(self) -> list[Sequence]:
-        """Mirror short-first decode selection without popping or preempting."""
+        """Mirror decode selection without popping or preempting."""
         if not self.decoding:
             return []
-        target_long = all(self._is_long_text(seq, False) for seq in self.decoding)
         free = max(0, int(self.memory_oracle.decode_step_free_slots()))
         batch = []
         for seq in self.decoding:
-            if self._is_long_text(seq, False) != target_long:
-                continue
             cost = int(self.memory_oracle.decode_step_reservation_cost(seq))
             if min(free, int(self.memory_oracle.decode_step_free_slots_for(seq))) < cost:
                 if free <= 0:
@@ -749,75 +722,54 @@ class Scheduler:
         self._phase_reason = "prefill_unavailable" if self.waiting else "no_prefill"
         # --- 阶段 2: Decode 调度 ---
         # 只有在没有 Prefill 任务时才处理增量生成任务。
-        # Decode 优先短序列：如果当前 decoding 队列里存在 short，则本轮只调度 short；
-        # 仅当全部都是 long 时，才调度 long。（避免 short 被 long 淹没）
-        if self.decoding:
-            has_short_decode = any(
-                not self._is_long_text(seq, is_prefill=False)
-                for seq in self.decoding
-            )
-            target_is_long_decode = not has_short_decode
-        else:
-            target_is_long_decode = False
         decode_scan_budget = len(self.decoding)
         blocked_decode_victim: Sequence | None = None
-        skipped_decode = deque()
-        try:
-            while (
-                self.decoding
-                and decode_scan_budget > 0
-                and num_batched_seqs < self.max_decoding_seqs
-            ):
-                while self.decoding and self._is_long_text(self.decoding[0], False) != target_is_long_decode:
-                    skipped_decode.append(self.decoding.popleft())
-                if not self.decoding:
-                    break
-                seq = self.decoding.popleft()
-                decode_scan_budget -= 1
+        while (
+            self.decoding
+            and decode_scan_budget > 0
+            and num_batched_seqs < self.max_decoding_seqs
+        ):
+            seq = self.decoding.popleft()
+            decode_scan_budget -= 1
 
-                # 检查逻辑空间是否够塞下一个新 Token (Decode 步进)
-                candidate_decode_free = min(
-                    int(decode_logical_free_count),
-                    int(self.memory_oracle.decode_step_free_slots_for(seq)),
+            # 检查逻辑空间是否够塞下一个新 Token (Decode 步进)
+            candidate_decode_free = min(
+                int(decode_logical_free_count),
+                int(self.memory_oracle.decode_step_free_slots_for(seq)),
+            )
+            decode_reservation_cost = int(self.memory_oracle.decode_step_reservation_cost(seq))
+            if candidate_decode_free < decode_reservation_cost:
+                if decode_logical_free_count > 0:
+                    if blocked_decode_victim is None:
+                        blocked_decode_victim = seq
+                    self.decoding.append(seq)
+                    continue
+                if scheduled_seqs:
+                    # The current step still has useful work. Keep this request
+                    # queued and run the partial decode batch before considering
+                    # preemption; otherwise a fourth request can fail the whole
+                    # step after three requests have already reserved its last
+                    # three writable KV slots.
+                    if blocked_decode_victim is None:
+                        blocked_decode_victim = seq
+                    self.decoding.append(seq)
+                    break
+                # 显存耗尽，触发驱逐/抢占逻辑
+                # 策略：牺牲当前 seq，并立刻返回，让上层先释放槽位再进入下一轮调度。
+                # 这样可以避免在一次 schedule() 调用中反复驱逐多个请求造成抖动。
+                return self._preempt_decode_victim(
+                    seq,
+                    scheduled_seqs,
+                    preempted_seqs,
+                    physical_free_count=physical_free_count,
+                    reserved_prefill=reserved_prefill,
                 )
-                decode_reservation_cost = int(self.memory_oracle.decode_step_reservation_cost(seq))
-                if candidate_decode_free < decode_reservation_cost:
-                    if decode_logical_free_count > 0:
-                        if blocked_decode_victim is None:
-                            blocked_decode_victim = seq
-                        self.decoding.append(seq)
-                        continue
-                    if scheduled_seqs:
-                        # The current step still has useful work. Keep this request
-                        # queued and run the partial decode batch before considering
-                        # preemption; otherwise a fourth request can fail the whole
-                        # step after three requests have already reserved its last
-                        # three writable KV slots.
-                        if blocked_decode_victim is None:
-                            blocked_decode_victim = seq
-                        self.decoding.append(seq)
-                        break
-                    # 显存耗尽，触发驱逐/抢占逻辑
-                    # 策略：牺牲当前 seq，并立刻返回，让上层先释放槽位再进入下一轮调度。
-                    # 这样可以避免在一次 schedule() 调用中反复驱逐多个请求造成抖动。
-                    self.decoding.extendleft(reversed(skipped_decode))
-                    skipped_decode.clear()
-                    return self._preempt_decode_victim(
-                        seq,
-                        scheduled_seqs,
-                        preempted_seqs,
-                        physical_free_count=physical_free_count,
-                        reserved_prefill=reserved_prefill,
-                    )
-                else:
-                    # Reserve the cache-manager-specific decode capacity for this step.
-                    decode_logical_free_count -= decode_reservation_cost
-                    num_batched_seqs += 1
-                    scheduled_seqs.append(seq)
-                    # logger.debug('Add a decode req.')
-        
-        finally:
-            self.decoding.extendleft(reversed(skipped_decode))
+            else:
+                # Reserve the cache-manager-specific decode capacity for this step.
+                decode_logical_free_count -= decode_reservation_cost
+                num_batched_seqs += 1
+                scheduled_seqs.append(seq)
+                # logger.debug('Add a decode req.')
 
         if not scheduled_seqs:
             if blocked_decode_victim is not None:

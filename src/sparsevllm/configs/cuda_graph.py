@@ -7,7 +7,6 @@ from sparsevllm.configs.common import _coerce_bool_config
 from sparsevllm.method_registry import (
     DECODE_CUDA_GRAPH_SUPPORTED_METHODS,
     decode_graph_path_id,
-    decode_sparse_long_text_threshold,
     is_decode_cuda_graph_supported,
     is_tp_decode_cuda_graph_supported,
 )
@@ -175,57 +174,16 @@ def _select_evenly_spaced_sizes(
     return sorted(set(dense + [tail[index] for index in sorted(indices)]))
 
 
-def _decode_cuda_graph_reachable_paths(config) -> list[tuple[bool, int]]:
-    method = str(config.sparse_method or "")
-    max_model_len = int(config.max_model_len)
-    if not method:
-        return [(False, max_model_len)]
-    threshold = decode_sparse_long_text_threshold(
-        method,
-        num_sink_tokens=config.sink_keep_tokens,
-        decode_keep_tokens=config.decode_keep_tokens,
-        num_recent_tokens=config.recent_keep_tokens,
-    )
-    paths: list[tuple[bool, int]] = []
-    if threshold >= 2:
-        paths.append((False, min(threshold, max_model_len)))
-    if threshold + 2 <= max_model_len:
-        paths.append((True, max_model_len))
-    deduplicated: dict[str, tuple[bool, int]] = {}
-    for is_long_text, capacity in paths:
-        deduplicated[decode_graph_path_id(method, is_long_text)] = (
-            is_long_text,
-            capacity,
-        )
-    if not deduplicated:
-        raise ValueError(
-            "No reachable sparse decode CUDA Graph topology path."
-        )
-    return list(deduplicated.values())
-
-
-def build_decode_cuda_graph_startup_plan(
-    config,
-) -> list[tuple[int, int, bool]]:
-    """Return every reachable batch and semantic topology path."""
-
+def build_decode_cuda_graph_startup_plan(config) -> list[tuple[int, int]]:
+    """Capture each batch bucket once, with capacity for every request length."""
     batches = sorted(set(int(size) for size in config.decode_graph_capture_sizes))
-    paths = _decode_cuda_graph_reachable_paths(config)
     limit = int(config.decode_graph_startup_capture_limit)
-    required = len(batches) * len(paths)
-    if required > limit:
+    if len(batches) > limit:
         raise ValueError(
-            "decode CUDA Graph startup capture must cover every batch/topology "
-            f"path: required={required}, limit={limit}."
+            "decode CUDA Graph startup capture must cover every batch bucket: "
+            f"required={len(batches)}, limit={limit}."
         )
-    return sorted(
-        (
-            (batch_size, context_capacity, is_long_text)
-            for batch_size in batches
-            for is_long_text, context_capacity in paths
-        ),
-        reverse=True,
-    )
+    return [(size, int(config.max_model_len)) for size in reversed(batches)]
 
 
 def normalize_decode_cuda_graph(config) -> None:
@@ -315,21 +273,17 @@ def normalize_decode_cuda_graph(config) -> None:
         capture_sizes_setting,
         max_real_batch_size,
     )
-    paths = _decode_cuda_graph_reachable_paths(config)
     if capture_sizes_auto:
         config.decode_graph_capture_sizes = _select_evenly_spaced_sizes(
             config.decode_graph_capture_sizes,
-            int(config.decode_graph_startup_capture_limit) // len(paths),
+            int(config.decode_graph_startup_capture_limit),
         )
 
     startup_plan = build_decode_cuda_graph_startup_plan(config)
-    path_summary = [
-        {
-            "path_id": decode_graph_path_id(config.sparse_method, is_long_text),
-            "context_capacity": context_capacity,
-        }
-        for is_long_text, context_capacity in paths
-    ]
+    path_summary = [{
+        "path_id": decode_graph_path_id(config.sparse_method),
+        "context_capacity": int(config.max_model_len),
+    }]
     log_once(
         "Decode CUDA Graph startup precapture enabled "
         f"({'default' if startup_capture_auto else 'explicit'}): "

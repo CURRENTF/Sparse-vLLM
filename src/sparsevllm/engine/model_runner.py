@@ -32,7 +32,6 @@ from sparsevllm.kernels.external.required import (
     validate_required_cuda_kernel_families,
 )
 from sparsevllm.kernels.external.flashinfer.jit_cache import configure_trtllm_cache
-from sparsevllm.method_registry import decode_sparse_long_text_threshold
 from sparsevllm.operators import registry as operator_registry
 from sparsevllm.operators.decode_attention import (
     collect_decode_graph_participants,
@@ -68,7 +67,7 @@ from sparsevllm.multimodal.runtime import MultiModalRuntime
 from sparsevllm.engine.sparse_controller import SparseController
 from sparsevllm.models.spec import ModelSpec
 import sparsevllm.platforms as platforms
-from sparsevllm.utils.profiler import profiler
+from sparsevllm.utils.profiler import cpu_timing, profiler
 
 try:
     from sparsevllm.models.qwen3 import Qwen3ForCausalLM
@@ -582,7 +581,6 @@ class ModelRunner:
             recurrent_state_manager=self.recurrent_state_manager,
             sparse_controller=self.sparse_controller,
             run_model=self.run_model,
-            is_long_text_batch=self._is_long_text_batch,
             method=runtime_config.sparse_method,
             capture_sizes=decode_static_capture_sizes,
             graph_pool=self.cuda_graph_pool,
@@ -716,7 +714,7 @@ class ModelRunner:
 
     def resolve_startup_decode_graph_plan(
         self,
-        startup_plan: list[tuple[int, int, bool]],
+        startup_plan: list[tuple[int, int]],
     ):
         feasible, skipped = feasible_startup_graph_plan(
             self.config,
@@ -902,6 +900,7 @@ class ModelRunner:
     def _sync_tp_run_status(self, local_error: BaseException | None) -> None:
         self._sync_tp_host_status("run", local_error)
 
+    @cpu_timing.timed
     def _sync_tp_host_status(
         self,
         method_name: str,
@@ -1761,31 +1760,6 @@ class ModelRunner:
         )
         return summaries if self.parallel_context.attn_tp_rank == 0 else None
 
-    def _long_text_threshold(self, is_prefill: bool) -> int:
-        del is_prefill
-        return decode_sparse_long_text_threshold(
-            self.config.sparse_method,
-            num_sink_tokens=self.config.sink_keep_tokens,
-            decode_keep_tokens=self.config.decode_keep_tokens,
-            num_recent_tokens=self.config.recent_keep_tokens,
-        )
-
-    def _is_long_text_batch(self, seqs: list[Sequence], is_prefill: bool) -> bool:
-        # Prefill execution is per-sequence and cache-manager owned.  This
-        # batch-level flag remains only for decode graph families.
-        if not seqs:
-            return False
-        if not self.config.sparse_method:
-            return False
-        if is_prefill:
-            return False
-        threshold = self._long_text_threshold(is_prefill)
-        flags = [int(seq.num_tokens) > int(threshold) for seq in seqs]
-        is_long = bool(flags[0])
-        if any(bool(flag) != is_long for flag in flags):
-            raise ValueError("Mixed long/short batch detected; scheduler should enforce separation.")
-        return is_long
-
     def prepare_step(self, seqs: list[Sequence], is_prefill: bool):
         """准备前向上下文并设置 Context"""
         input_ids, positions, cu_seqlens_q = self.runtime_state.prepare_step(seqs, is_prefill)
@@ -1793,7 +1767,6 @@ class ModelRunner:
             is_prefill,
             cu_seqlens_q=cu_seqlens_q,
             cache_manager=self.cache_manager,
-            is_long_text=self._is_long_text_batch(seqs, is_prefill),
             seqs=seqs,
             recurrent_state_manager=self.recurrent_state_manager,
         )
@@ -1900,6 +1873,7 @@ class ModelRunner:
             repetition_token_ids=repetition_token_ids,
         )
 
+    @cpu_timing.timed
     def _sample_model_outputs(
         self,
         logits: torch.Tensor,
@@ -2096,6 +2070,7 @@ class ModelRunner:
         finally:
             reset_context()
 
+    @cpu_timing.timed
     def _post_sparse_forward(self, seqs: list[Sequence], is_prefill: bool) -> None:
         with profiler.record("model_sparse_post"):
             with profiler.record("sparse_post_forward"):
@@ -2140,6 +2115,7 @@ class ModelRunner:
                 top_logprobs.append({int(token_id): float(value) for token_id, value in zip(indices, values)})
         return sampled_logprobs, top_logprobs
 
+    @cpu_timing.timed
     def run(
         self,
         seqs: list[Sequence],

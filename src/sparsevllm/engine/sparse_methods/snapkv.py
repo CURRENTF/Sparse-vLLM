@@ -560,16 +560,6 @@ class PyramidKVRuntime(ScoredCompactionRuntime):
         if bool(getattr(self.config, "decode_graph", False)):
             state = self.layer_batch_sparse_states[layer_idx]
             graph_capacity = self._snapkv_decode_score_width(state)
-            if not bool(step.forward_context.is_long_text):
-                short_family_max_len = (
-                    int(self.num_sink)
-                    + int(self.num_recent)
-                    + int(self.decode_keep_tokens)
-                )
-                graph_capacity = min(
-                    int(graph_capacity),
-                    short_family_max_len,
-                )
             return (
                 int(graph_capacity) >= int(trigger_len)
                 and int(graph_capacity) > int(budget)
@@ -692,12 +682,9 @@ class PyramidKVRuntime(ScoredCompactionRuntime):
                 return
             self._snapkv_prefill_eviction(step.seqs)
             return
-        if (
-            step.forward_context.is_long_text is False
-            and not any(
-                state.attn_score is not None
-                for state in self.layer_batch_sparse_states.values()
-            )
+        if not any(
+            state.attn_score is not None
+            for state in self.layer_batch_sparse_states.values()
         ):
             return
         self._snapkv_decode_eviction(step.seqs)

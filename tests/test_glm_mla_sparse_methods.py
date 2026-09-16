@@ -308,11 +308,13 @@ def test_omnikv_observation_selects_mla_latent_active_slots():
         1: LayerBatchSparseState(),
     }
     controller.runtime._is_kv_layer = lambda layer_idx: 0 <= int(layer_idx) < 2
+    observer = controller.runtime.layer_batch_sparse_states[0]
+    controller.runtime._omnikv_score_provider.prepare(observer.attn_score, slot=id(observer))
 
     set_context(
         False,
         cache_manager=manager,
-        is_long_text=True,
+
         seqs=[Sequence([1])],
     )
     try:

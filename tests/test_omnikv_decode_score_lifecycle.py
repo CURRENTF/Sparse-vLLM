@@ -58,7 +58,6 @@ def _make_controller():
     set_context(
         False,
         cache_manager=manager,
-        is_long_text=True,
         seqs=seqs,
     )
     controller.prepare_forward(seqs, is_prefill=False)

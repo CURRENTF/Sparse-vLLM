@@ -3380,13 +3380,16 @@ def _deltakv_static_decode_plan_kernel(
     row = tl.load(req_indices_ptr + b).to(tl.int32)
     context_len = tl.load(context_lens_ptr + b).to(tl.int32)
     compressed_len = tl.load(compressed_lens_ptr + b).to(tl.int32)
-    top_len = tl.minimum(tl.maximum(compressed_len, 0), K_MAX)
+    context_len = tl.maximum(context_len, 0)
+    sink_len = tl.minimum(SINK, context_len)
+    compressed_len = tl.minimum(tl.maximum(compressed_len, 0), context_len - sink_len)
+    top_len = tl.minimum(compressed_len, K_MAX)
 
     safe_slot = tl.full([BLOCK_M], 0, dtype=tl.int32)
     if SINK > 0:
         first_sink = tl.load(
             raw_slots_map_ptr + row * stride_raw_r,
-            mask=True,
+            mask=context_len > 0,
             other=0,
         ).to(tl.int32)
         safe_slot = tl.zeros([BLOCK_M], dtype=tl.int32) + tl.maximum(first_sink, 0)
@@ -3395,7 +3398,7 @@ def _deltakv_static_decode_plan_kernel(
     out_pos = tl.zeros([BLOCK_M], dtype=tl.int32)
 
     if SINK > 0:
-        sink_mask = cols < SINK
+        sink_mask = cols < sink_len
         sink_pos = tl.minimum(cols, MAX_POS)
         sink_slots = tl.load(
             raw_slots_map_ptr + row * stride_raw_r + sink_pos * stride_raw_p,
@@ -3405,8 +3408,8 @@ def _deltakv_static_decode_plan_kernel(
         out_slot = tl.where(sink_mask, sink_slots, out_slot)
         out_pos = tl.where(sink_mask, sink_pos, out_pos)
 
-    top_start = SINK
-    top_capacity_end = SINK + K_MAX
+    top_start = sink_len
+    top_capacity_end = sink_len + K_MAX
     top_capacity_mask = (cols >= top_start) & (cols < top_capacity_end)
     top_j = cols - top_start
     top_rel = tl.load(
@@ -3467,17 +3470,17 @@ def _deltakv_static_decode_plan_kernel(
         mask=top_capacity_mask & mask,
     )
 
-    buffer_start = SINK + compressed_len
+    buffer_start = sink_len + compressed_len
     raw_buffer_len = context_len - buffer_start
     buffer_len = tl.minimum(tl.maximum(raw_buffer_len, 0), MAX_BUFFER)
-    buffer_start_out = SINK + top_len
+    buffer_start_out = sink_len + top_len
     buffer_j = cols - buffer_start_out
     buffer_mask = cols >= buffer_start_out
     buffer_pos = tl.minimum(tl.maximum(buffer_start + buffer_j, 0), MAX_POS)
     buffer_valid = buffer_mask & (buffer_j < buffer_len)
     buffer_slots = tl.load(
         raw_slots_map_ptr + row * stride_raw_r + buffer_pos * stride_raw_p,
-        mask=buffer_mask & mask,
+        mask=buffer_valid & mask,
         other=0,
     ).to(tl.int32)
     buffer_out = tl.where(buffer_valid, tl.maximum(buffer_slots, 0), safe_slot)
@@ -3495,7 +3498,7 @@ def _deltakv_static_decode_plan_kernel(
         mask=mask,
     )
 
-    tl.store(new_context_lens_out_ptr + b, SINK + top_len + buffer_len)
+    tl.store(new_context_lens_out_ptr + b, sink_len + top_len + buffer_len)
 
 
 @torch.no_grad()

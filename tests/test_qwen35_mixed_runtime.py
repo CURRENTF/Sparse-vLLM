@@ -1478,6 +1478,12 @@ def test_omnikv_uses_first_target_kv_layer_for_slot_table_in_mixed_layout():
     runtime.num_sink = 0
     runtime.num_recent = 1
     runtime.decode_keep_tokens = 2
+    from sparsevllm.operators.omnikv_selection import (
+        OmniKVSelectionSpec, prepare_omnikv_selection,
+    )
+    runtime._omnikv_selection_provider = prepare_omnikv_selection(
+        OmniKVSelectionSpec(0, 2), device=runtime.device,
+    )
     runtime.config = SimpleNamespace(decode_graph=False)
     runtime.layer_batch_sparse_states = {
         3: LayerBatchSparseState(),
@@ -1488,14 +1494,14 @@ def test_omnikv_uses_first_target_kv_layer_for_slot_table_in_mixed_layout():
     obs_state.context_lens = torch.tensor([10], dtype=torch.int32)
     obs_state.req_indices = torch.tensor([0], dtype=torch.int32)
 
-    def fake_build(topk_indices, topk_lens, hist_lens, recent_chunk_lens, slot_table, req_indices, num_sink, max_s):
+    def fake_build(topk_indices, topk_lens, hist_lens, recent_chunk_lens, slot_table, req_indices, num_sink, max_s, *, context_lens):
         del topk_indices, topk_lens, hist_lens, recent_chunk_lens, slot_table, req_indices, num_sink
         keep = torch.zeros((1, max_s), dtype=torch.int32)
         slots = torch.zeros((1, max_s), dtype=torch.int32)
         lens = torch.tensor([max_s], dtype=torch.int32)
         return keep, slots, lens
 
-    context = SimpleNamespace(is_long_text=True, is_prefill=False)
+    context = SimpleNamespace(is_prefill=False)
     with patch(
         "sparsevllm.engine.sparse_methods.dynamic.build_omnikv_keep_and_slots",
         side_effect=fake_build,

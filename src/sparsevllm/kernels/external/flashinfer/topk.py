@@ -144,3 +144,44 @@ __all__ = [
     "flashinfer_top_k_page_table_transform",
     "flashinfer_top_k_page_table_transform_support",
 ]
+
+
+@lru_cache(maxsize=1)
+def _ragged_topk_api():
+    flashinfer_kernel_support('ragged top-k transform')
+    module = importlib.import_module('flashinfer.topk')
+    api = getattr(module, 'top_k_ragged_transform', None)
+    required = {'input', 'offsets', 'lengths', 'k', 'deterministic',
+                'tie_break', 'dsa_graph_safe', 'row_starts'}
+    if not callable(api) or not required.issubset(inspect.signature(api).parameters):
+        raise ExternalKernelContractError(
+            'flashinfer-python', 'ragged top-k transform', 'public API contract is missing',
+        )
+    return api
+
+
+def flashinfer_ragged_topk_support(device_index=None):
+    from sparsevllm.kernels.external.flashinfer.support import flashinfer_kernel_metadata_health
+    from sparsevllm.kernels.external.support import KernelFamilyState
+    health = flashinfer_kernel_metadata_health()
+    if health.state is KernelFamilyState.ABSENT:
+        return False, health.reason
+    _ragged_topk_api()
+    del device_index
+    return True, 'public length-aware deterministic radix top-k with scalar row-start indexing'
+
+
+def flashinfer_ragged_topk(scores, lengths, k, *, sink):
+    if not scores.is_contiguous():
+        raise ValueError('FlashInfer ragged top-k requires contiguous scores')
+    starts = torch.full_like(lengths, sink)
+    output = _ragged_topk_api()(
+        scores, starts, lengths, k, deterministic=True, tie_break=0,
+        # dsa_graph_safe forces FilteredTopK (k <= 2048); it is not required
+        # for radix graph capture. Non-null row_starts forces scalar loads,
+        # and capacity fixes its CTA envelope across all replay lengths.
+        dsa_graph_safe=False, row_starts=starts,
+    )
+    if output.shape != (scores.shape[0], k) or output.dtype != torch.int32 or output.device != scores.device:
+        raise RuntimeError('FlashInfer ragged top-k returned an invalid index tensor')
+    return output

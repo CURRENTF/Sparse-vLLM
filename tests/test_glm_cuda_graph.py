@@ -80,10 +80,10 @@ def test_dense_startup_graph_plan_has_one_graph_per_batch() -> None:
     )
 
     assert build_decode_cuda_graph_startup_plan(config) == [
-        (8, 262144, False),
-        (4, 262144, False),
-        (2, 262144, False),
-        (1, 262144, False),
+        (8, 262144),
+        (4, 262144),
+        (2, 262144),
+        (1, 262144),
     ]
 
 
@@ -101,17 +101,9 @@ def test_sparse_startup_graph_plan_has_one_graph_per_batch_and_path() -> None:
 
     plan = build_decode_cuda_graph_startup_plan(config)
 
-    assert len(batches) == 22
-    assert len(plan) == 44
-    assert {(batch, is_long) for batch, _, is_long in plan} == {
-        (batch, is_long) for batch in batches for is_long in (False, True)
-    }
-    assert {
-        context for _, context, is_long in plan if not is_long
-    } == {4672}
-    assert {
-        context for _, context, is_long in plan if is_long
-    } == {65536}
+    assert len(plan) == len(batches)
+    assert {batch for batch, _ in plan} == set(batches)
+    assert {context for _, context in plan} == {config.max_model_len}
 
 
 
@@ -318,7 +310,6 @@ def _make_glm_graph_lane(
         recurrent_state_manager=None,
         sparse_controller=sparse_controller,
         run_model=run_model,
-        is_long_text_batch=lambda seqs, is_prefill: False,
         method="",
         capture_sizes=[1],
     )
@@ -626,7 +617,6 @@ def _make_glm_full_graph_lane(
         recurrent_state_manager=None,
         sparse_controller=sparse_controller,
         run_model=run_model,
-        is_long_text_batch=lambda seqs, is_prefill: False,
         method="",
         capture_sizes=[1],
     )
@@ -871,6 +861,11 @@ def _initialize_glm_method_cache_manager(
     free_count = num_slots - int(initial_len)
 
     if method == "omnikv":
+        manager.offload_enabled = False
+        manager._prefetched = set()
+        manager._pending_prefetch = deque()
+        manager._current_writes = {}
+        manager.lru = None
         manager.free_slots_stack = torch.empty(
             num_slots,
             dtype=torch.int32,
@@ -1183,7 +1178,6 @@ def _make_glm_method_graph_lane(
         recurrent_state_manager=None,
         sparse_controller=controller,
         run_model=run_model,
-        is_long_text_batch=lambda seqs, is_prefill: True,
         method=method,
         capture_sizes=[1],
     )

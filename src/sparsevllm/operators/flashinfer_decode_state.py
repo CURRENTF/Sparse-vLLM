@@ -158,10 +158,7 @@ class FlashInferPagedDecodeGraphState:
         self.host_sparse_indptr: torch.Tensor | None = None
         self.host_sparse_last_page_len: torch.Tensor | None = None
         self.sparse_wrapper = None
-        if (
-            spec.sparse_context_budget is not None
-            and contract.topology_path_id == "long"
-        ):
+        if spec.sparse_context_budget is not None:
             self.sparse_indptr = torch.empty_like(self.indptr)
             self.sparse_indices = torch.empty_like(self.indices)
             self.sparse_last_page_len = torch.ones_like(self.last_page_len)
@@ -265,7 +262,11 @@ class FlashInferPagedDecodeGraphState:
             dense_context_lens - 1,
             page_size,
         ) + 1
-        sparse_context_lens = prev_budget * page_size + last_page_lens
+        num_pages = torch.div(dense_context_lens + page_size - 1, page_size, rounding_mode="floor")
+        use_dense = (dense_context_lens <= int(self.spec.sparse_context_budget)) | (num_pages <= prev_budget + 1)
+        sparse_context_lens = torch.where(
+            use_dense, dense_context_lens, prev_budget * page_size + last_page_lens,
+        )
         self._plan(
             self.sparse_wrapper,
             self.host_sparse_indptr,

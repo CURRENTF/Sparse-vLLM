@@ -17,7 +17,7 @@ class JointDecodeRuntime(PassThroughRuntime):
     use_query_cache_scores = False
 
     def finish_step(self, step: SparseStepContext) -> None:
-        if step.is_prefill or step.forward_context.is_long_text is False:
+        if step.is_prefill:
             return
         self._joint_decode_eviction(step.seqs)
 

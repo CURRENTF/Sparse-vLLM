@@ -29,6 +29,9 @@ METHOD_CHOICES = (
     "deltakv",
     "deltakv-less-memory",
     "deltakv-less-memory-cudagraph",
+    "kivi",
+    "turboquant",
+    "fp8_kv",
 )
 
 GLM_GRAPH_METHODS = frozenset(
@@ -213,6 +216,11 @@ def _install_method_instrumentation(llm) -> dict[str, int]:
             "controller",
             llm.model_runner.sparse_controller,
             ("_update_dynamic_omnikv_indices",),
+        ),
+        (
+            "runtime",
+            llm.model_runner.sparse_controller.runtime,
+            ("_update_dynamic_indices",),
         ),
     )
     for prefix, target, names in targets:
@@ -400,6 +408,7 @@ def _capture_selection_trace(
         "step": int(step),
         "stage": str(stage),
         "logical_context_len": int(logical_context_len),
+        "attention_cache_layout": str(llm.config.attention_cache_layout),
         "use_graph": bool(use_graph),
         "compressed_lens": _tensor_summary(compressed_lens),
         "layers": layers,
@@ -422,6 +431,16 @@ def _live_row_lengths(trace: dict[str, Any]) -> list[int]:
 
 def _has_physical_compaction(traces: list[dict[str, Any]]) -> bool:
     for trace in traces:
+        if "logical_context_lens" in trace:
+            logical = trace["logical_context_lens"]
+            if any(
+                int(record["row_len"]) < logical[str(record["seq_id"])]
+                for records in trace.get("cache", {}).get("live_rows", {}).values()
+                for record in records
+                if str(record["seq_id"]) in logical
+            ):
+                return True
+            continue
         row_lengths = _live_row_lengths(trace)
         if row_lengths and min(row_lengths) < int(trace["logical_context_len"]):
             return True
@@ -507,7 +526,7 @@ def _build_method_trigger_evidence(
     elif method == "omnikv":
         selection_calls = int(
             positive_calls.get("controller._update_dynamic_omnikv_indices", 0)
-        )
+        ) + int(positive_calls.get("runtime._update_dynamic_indices", 0))
         selected = _has_omnikv_selection(traces)
         captured_replay = any(bool(trace.get("use_graph")) for trace in traces)
         evidence.update(
@@ -544,7 +563,10 @@ def _build_method_trigger_evidence(
                 physical_compaction
                 and score_calls > 0
                 and materializer_calls > 0
-                and materializer_layers
+                and (
+                    materializer_layers
+                    or all(trace.get("attention_cache_layout") == "explicit_kv" for trace in traces)
+                )
             ),
             trigger_kind="query_scored_eviction_compaction",
             query_score_call_count=int(score_calls),
@@ -562,11 +584,28 @@ def _validate_method_trigger(evidence: dict[str, Any]) -> None:
         )
 
 
+def _same_provider_eager_model_runner(*args, **kwargs):
+    """Spawn-safe diagnostic adapter: bind Graph providers, execute eagerly."""
+    from sparsevllm.engine.model_runner import ModelRunner
+
+    original_run = ModelRunner.run
+
+    def run_eager(self, *run_args, **run_kwargs):
+        # Each TP worker owns its own deserialized config. Changing the leader's
+        # config alone would leave follower ranks trying to replay a graph.
+        self.config.decode_graph = False
+        self.config.decode_graph_startup_capture = False
+        return original_run(self, *run_args, **run_kwargs)
+
+    ModelRunner.run = run_eager
+    return ModelRunner(*args, **kwargs)
+
+
 def _run_decode_logits(
     *,
     model_path: str,
     method: str,
-    prompt_lens: list[int],
+    prompt_lens: list[int | list[int]],
     batch_size: int,
     max_tokens: int,
     hyper_params: dict[str, Any],
@@ -576,10 +615,22 @@ def _run_decode_logits(
 ) -> tuple[torch.Tensor, list[dict[str, Any]], dict[str, Any]]:
     from sparsevllm import LLM, SamplingParams
 
+    rounds = [
+        [lengths] * batch_size if isinstance(lengths, int) else lengths
+        for lengths in prompt_lens
+    ]
+    if not rounds or any(
+        len(lengths) != batch_size or any(length <= 0 for length in lengths)
+        for lengths in rounds
+    ):
+        raise ValueError("Each prompt-length round must contain one positive length per request.")
     construct_with_graph = bool(use_graph or same_provider_eager)
     if os.getenv("SPARSEVLLM_DEBUG_SKIP_ENGINE_WARMUP", "0") == "1":
         LLM._warmup = lambda self: None
     elif same_provider_eager and not use_graph:
+        import sparsevllm.engine.llm_engine as engine_module
+
+        engine_module.ModelRunner = _same_provider_eager_model_runner
         original_warmup = LLM._warmup
 
         def eager_warmup(self):
@@ -597,7 +648,7 @@ def _run_decode_logits(
     engine_kwargs = {
         **hyper_params,
         **_sparse_kwargs(method),
-        "max_model_len": max(prompt_lens) + max_tokens + 100,
+        "max_model_len": max(map(max, rounds)) + max_tokens + 100,
         "max_num_seqs_in_batch": batch_size,
         "max_decoding_seqs": decode_capacity,
         "decode_graph": construct_with_graph,
@@ -615,6 +666,24 @@ def _run_decode_logits(
     trace: list[dict[str, Any]] = []
     runtime_step = 0
     generated_token_outputs: list[dict[str, Any]] = []
+    decode_batches: list[list[int]] = []
+    original_schedule = llm.scheduler.schedule
+    scheduled_lengths: dict[str, int] = {}
+
+    def record_schedule():
+        seqs, is_prefill, preempted = original_schedule()
+        scheduled_lengths.clear()
+        scheduled_lengths.update({
+            str(seq.seq_id): (
+                seq.num_prefilled_tokens + seq.current_chunk_size if is_prefill else len(seq)
+            )
+            for seq in seqs
+        })
+        if seqs and not is_prefill:
+            decode_batches.append([len(seq) for seq in seqs])
+        return seqs, is_prefill, preempted
+
+    llm.scheduler.schedule = record_schedule
 
     if not use_graph:
         runner = llm.model_runner
@@ -647,7 +716,8 @@ def _run_decode_logits(
         graph_runner.run = wrapped_graph_run
 
     try:
-        for round_idx, prompt_len in enumerate(prompt_lens):
+        for round_idx, request_lengths in enumerate(rounds):
+            prompt_len = max(request_lengths)
             round_decode_step = 0
             round_prefilled_tokens = 0
             prompt_token_ids = []
@@ -655,7 +725,9 @@ def _run_decode_logits(
                 # Use deterministic non-uniform prompts so sparse selection and
                 # graph-state reuse bugs are not hidden by identical rows.
                 base = 100 + 997 * round_idx + 131 * batch_idx
-                prompt_token_ids.append([base + (pos % 127) for pos in range(prompt_len)])
+                prompt_token_ids.append([
+                    base + (pos % 127) for pos in range(request_lengths[batch_idx])
+                ])
             sampling_params = [
                 SamplingParams(temperature=0.0, top_p=1.0, ignore_eos=True, max_tokens=max_tokens)
                 for _ in range(batch_size)
@@ -710,6 +782,7 @@ def _run_decode_logits(
                             use_graph=use_graph,
                         )
                     )
+                    trace[-1]["logical_context_lens"] = dict(scheduled_lengths)
 
         graph_runtime = _graph_runtime_summary(
             llm,
@@ -726,6 +799,7 @@ def _run_decode_logits(
             "method_trigger": method_evidence,
             "method_calls": {key: int(value) for key, value in method_calls.items()},
             "generated_token_outputs": generated_token_outputs,
+            "decode_batches": decode_batches,
         }
     finally:
         llm.exit()
@@ -808,6 +882,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Run a second generate() on the same LLM instance to test graph reuse.",
     )
     parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument(
+        "--prompt_length_rounds",
+        help=(
+            "JSON list of per-request length lists, for example [[1,3,129],[257,5,33]]. "
+            "Overrides prompt_len and second_prompt_len; each round must match batch_size."
+        ),
+    )
     parser.add_argument("--max_tokens", type=int, default=3)
     parser.add_argument("--hyper_params", default="{}")
     parser.add_argument("--output", required=True)
@@ -898,6 +979,7 @@ def main(argv: list[str] | None = None):
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wrote_current_output = False
+    hyper_params = None
 
     try:
         if args.max_tokens < 3:
@@ -915,6 +997,15 @@ def main(argv: list[str] | None = None):
         prompt_lens = [args.prompt_len]
         if args.second_prompt_len is not None:
             prompt_lens.append(args.second_prompt_len)
+        if args.prompt_length_rounds is not None:
+            prompt_lens = json.loads(args.prompt_length_rounds)
+            if not isinstance(prompt_lens, list) or not prompt_lens or any(
+                not isinstance(lengths, list)
+                or len(lengths) != args.batch_size
+                or any(type(length) is not int or length <= 0 for length in lengths)
+                for lengths in prompt_lens
+            ):
+                raise ValueError("--prompt_length_rounds requires one positive integer per request in each round.")
         eager_logits, eager_trace, eager_runtime = _run_decode_logits_isolated(
             model_path=args.model_path,
             method=args.method,
@@ -1001,6 +1092,14 @@ def main(argv: list[str] | None = None):
                 graph_method_error is None
             ),
         }
+        if args.prompt_length_rounds is not None and any(
+            len(set(lengths)) > 1 for lengths in prompt_lens
+        ):
+            gates["mixed_decode_batch_observed"] = all(
+                any(len(set(lengths)) > 1 for lengths in runtime["decode_batches"])
+                for runtime in (eager_runtime, graph_runtime)
+            )
+        gates["no_serving_recapture"] = graph_runtime["graph"]["counter_delta"]["capture_count"] == 0
         passed = all(gates.values())
         output = {
             "status": "success" if passed else "failed",
@@ -1054,6 +1153,8 @@ def main(argv: list[str] | None = None):
                         "status": "failed",
                         "method": args.method,
                         "same_provider_eager": bool(args.same_provider_eager),
+                        "arguments": vars(args),
+                        "hyper_params": hyper_params,
                         "error": traceback.format_exc(),
                     },
                     indent=2,

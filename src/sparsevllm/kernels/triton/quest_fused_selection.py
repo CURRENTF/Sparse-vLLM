@@ -69,6 +69,8 @@ def _fused_exact_select_paged_view_kernel(
     K: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     OUTPUT_WIDTH: tl.constexpr,
+    TOKEN_BUDGET: tl.constexpr,
+    USE_DENSE_FALLBACK: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -104,20 +106,33 @@ def _fused_exact_select_paged_view_kernel(
         other=0,
     )
 
-    num_pages = previous_count + 1
-    last_page = tl.load(row_page_slots + row * page_stride + num_pages - 1)
+    context_len = tl.load(context_lens + row)
+    num_pages = (context_len + PAGE_SIZE - 1) // PAGE_SIZE
+    last_page = tl.load(
+        row_page_slots + row * page_stride + tl.maximum(num_pages - 1, 0),
+        mask=num_pages > 0, other=0,
+    )
+    last_page_len = tl.where(num_pages > 0, context_len - (num_pages - 1) * PAGE_SIZE, 0)
     output_pages = tl.where(offsets < K, selected_pages, last_page)
+    output_count = K + 1
+    output_len = K * PAGE_SIZE + last_page_len
+    if USE_DENSE_FALLBACK:
+        use_dense = (context_len <= TOKEN_BUDGET) | (num_pages <= K + 1)
+        dense_pages = tl.load(
+            row_page_slots + row * page_stride + offsets,
+            mask=(offsets < OUTPUT_WIDTH) & (offsets < num_pages), other=0,
+        )
+        output_pages = tl.where(use_dense, dense_pages, output_pages)
+        output_count = tl.where(use_dense, num_pages, K + 1)
+        output_len = tl.where(use_dense, context_len, output_len)
     tl.store(
         output_page_table + row * output_stride + offsets,
-        output_pages,
+        tl.where(offsets < output_count, output_pages, 0),
         mask=offsets < OUTPUT_WIDTH,
     )
-
-    context_len = tl.load(context_lens + row)
-    last_page_len = context_len - (num_pages - 1) * PAGE_SIZE
     tl.store(output_req_indices + row, row)
-    tl.store(output_context_lens + row, K * PAGE_SIZE + last_page_len)
-    tl.store(output_page_counts + row, K + 1)
+    tl.store(output_context_lens + row, output_len)
+    tl.store(output_page_counts + row, output_count)
     tl.store(output_last_page_lens + row, last_page_len)
 
 
@@ -134,6 +149,8 @@ def fused_exact_select_quest_paged_view(
     output_context_lens: torch.Tensor,
     output_page_counts: torch.Tensor,
     output_last_page_lens: torch.Tensor,
+    token_budget: int = 0,
+    use_dense_fallback: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Exact BF16 page selection fused with sparse paged-view finalization."""
 
@@ -167,8 +184,10 @@ def fused_exact_select_quest_paged_view(
         raise ValueError(
             f"Profiled fused QuEST selection supports width <= 512, got {width}."
         )
-    if output_page_table.shape != (batch_size, k + 1):
-        raise ValueError("Fused QuEST output page table must have width k + 1.")
+    output_width = int(output_page_table.shape[1])
+    required_width = max(k + 1, triton.cdiv(int(token_budget), int(page_size))) if use_dense_fallback else k + 1
+    if output_page_table.shape != (batch_size, output_width) or output_width < required_width:
+        raise ValueError("Fused QuEST output page table has insufficient capacity.")
     for name, tensor in {
         "previous_page_counts": previous_page_counts,
         "context_lens": context_lens,
@@ -188,7 +207,7 @@ def fused_exact_select_quest_paged_view(
     if output_page_table.device != scores.device:
         raise ValueError("Fused QuEST outputs must share the score device.")
 
-    block_n = triton.next_power_of_2(width)
+    block_n = triton.next_power_of_2(max(width, output_width))
     _fused_exact_select_paged_view_kernel[(batch_size,)](
         scores,
         row_page_slots,
@@ -200,7 +219,9 @@ def fused_exact_select_quest_paged_view(
         output_page_table.stride(0),
         K=k,
         PAGE_SIZE=int(page_size),
-        OUTPUT_WIDTH=k + 1,
+        OUTPUT_WIDTH=output_width,
+        TOKEN_BUDGET=int(token_budget),
+        USE_DENSE_FALLBACK=bool(use_dense_fallback),
         BLOCK_N=block_n,
         num_warps=8,
         num_stages=1,

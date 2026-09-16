@@ -42,6 +42,21 @@ There are two stable interfaces:
 The cache manager remains a separate physical-storage abstraction. Runtime and
 cache-manager inheritance are not required to match.
 
+Decode batches may contain different request lengths. Each method uses per-row
+lengths to score, select, or compact valid KV entries. Rows that fit a method's
+effective retention budget keep all available KV entries, even when they execute
+scoring and selection. CUDA Graph capture
+uses one family per batch bucket with `max_model_len` capacity. Growing a request
+across a sparse budget does not change graph identity. Prefill execution-mode and
+compatibility grouping remain separate.
+
+OmniKV decode selection consumes device-side candidate lengths directly. Rows
+whose history fits the keep budget retain all history without score reduction
+or top-k scanning. Longer rows reduce and select only valid history; unused
+score tails are undefined and must not be read. Provider output order may differ,
+but selected logical indices and physical slots must stay paired. The static
+capture capacity and graph identity remain unchanged.
+
 ## Ownership Boundaries
 
 | Component | Owns | Must not own |

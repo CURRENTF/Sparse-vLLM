@@ -13,8 +13,9 @@ from sparsevllm.engine.decode_graph_contract import (
     DecodeGraphState,
 )
 from sparsevllm.engine.sequence import Sequence
+from sparsevllm.method_registry import decode_graph_path_id
 from sparsevllm.utils.context import get_context, set_context
-from sparsevllm.utils.profiler import profiler
+from sparsevllm.utils.profiler import cpu_timing, profiler
 
 
 @dataclass(frozen=True)
@@ -55,7 +56,6 @@ class DecodeCudaGraphRunner:
         recurrent_state_manager,
         sparse_controller,
         run_model: Callable[[torch.Tensor, torch.Tensor, bool], torch.Tensor],
-        is_long_text_batch: Callable[[list[Sequence], bool], bool],
         method: str,
         capture_sizes: list[int],
         graph_pool=None,
@@ -66,7 +66,6 @@ class DecodeCudaGraphRunner:
         self.recurrent_state_manager = recurrent_state_manager
         self.sparse_controller = sparse_controller
         self.run_model = run_model
-        self.is_long_text_batch = is_long_text_batch
         self.method = str(method or "")
         self.platform = platforms.current_platform
         self.capture_sizes = sorted(set(int(size) for size in capture_sizes))
@@ -140,13 +139,10 @@ class DecodeCudaGraphRunner:
         method: str,
         batch_size: int,
         context_capacity: int,
-        is_long_text: bool,
         capture_sampling: bool,
         graph_path_id: str = "",
     ) -> DecodeCudaGraphState:
-        graph_path_id = str(graph_path_id) or (
-            "dense" if not method else ("long" if is_long_text else "short")
-        )
+        graph_path_id = str(graph_path_id) or decode_graph_path_id(method)
         key = DecodeCudaGraphKey(
             method=method,
             batch_size=batch_size,
@@ -201,11 +197,11 @@ class DecodeCudaGraphRunner:
         self._graphs[key] = state
         return state
 
+    @cpu_timing.timed
     def _prepare_static_step(
         self,
         state: DecodeCudaGraphState,
         seqs: list[Sequence],
-        is_long_text: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         prepare_decode_graph_step = getattr(
             self.runtime_state,
@@ -233,7 +229,6 @@ class DecodeCudaGraphRunner:
             False,
             cu_seqlens_q=None,
             cache_manager=self.cache_manager,
-            is_long_text=bool(is_long_text),
             seqs=seqs,
             recurrent_state_manager=self.recurrent_state_manager,
         )
@@ -260,14 +255,14 @@ class DecodeCudaGraphRunner:
             ],
         }
 
-    def _graph_path_id(self, is_long_text: bool) -> str:
+    def _graph_path_id(self) -> str:
         resolver = getattr(self.cache_manager, "decode_graph_path_id", None)
         if callable(resolver):
-            return str(resolver(bool(is_long_text)))
-        return "dense" if not self.method else ("long" if is_long_text else "short")
+            return str(resolver())
+        return decode_graph_path_id(self.method)
 
     def _graph_path_capacity(
-        self, seqs: list[Sequence], *, is_long_text: bool
+        self, seqs: list[Sequence]
     ) -> int:
         resolver = getattr(
             self.cache_manager,
@@ -278,14 +273,14 @@ class DecodeCudaGraphRunner:
             raise TypeError(
                 "decode CUDA Graph requires a topology-path capacity resolver."
             )
-        capacity = int(resolver(bool(is_long_text)))
+        capacity = int(resolver())
         validator = getattr(
             self.cache_manager,
             "validate_decode_graph_path_capacity",
             None,
         )
         if callable(validator):
-            validator(seqs, capacity=capacity, is_long_text=bool(is_long_text))
+            validator(seqs, capacity=capacity)
         return capacity
 
     def _snapshot_sparse_state_refs(self) -> dict[int, dict[str, object]]:
@@ -454,22 +449,18 @@ class DecodeCudaGraphRunner:
             return self.run_eager_static(seqs), None
 
         graph_batch_size = self.dp_batch_capacity or self._select_graph_batch_size(real_batch_size)
-        is_long_text = self.is_long_text_batch(seqs, False)
-        graph_path_id = self._graph_path_id(is_long_text)
-        context_capacity = self._graph_path_capacity(
-            seqs, is_long_text=is_long_text
-        )
+        graph_path_id = self._graph_path_id()
+        context_capacity = self._graph_path_capacity(seqs)
         state = self._select_state(
             method=self.method,
             batch_size=graph_batch_size,
             context_capacity=context_capacity,
-            is_long_text=is_long_text,
             capture_sampling=bool(capture_sampling),
             graph_path_id=graph_path_id,
         )
         self.last_state_key = state.key
         self.last_real_batch_size = real_batch_size
-        input_ids, positions = self._prepare_static_step(state, seqs, is_long_text)
+        input_ids, positions = self._prepare_static_step(state, seqs)
 
         if state.graph is None:
             state = self._capture(state, seqs, input_ids, positions)
@@ -509,22 +500,18 @@ class DecodeCudaGraphRunner:
 
         real_batch_size = len(seqs)
         graph_batch_size = self.dp_batch_capacity or self._select_graph_batch_size(real_batch_size)
-        is_long_text = self.is_long_text_batch(seqs, False)
-        graph_path_id = self._graph_path_id(is_long_text)
-        context_capacity = self._graph_path_capacity(
-            seqs, is_long_text=is_long_text
-        )
+        graph_path_id = self._graph_path_id()
+        context_capacity = self._graph_path_capacity(seqs)
         state = self._select_state(
             method=self.method,
             batch_size=graph_batch_size,
             context_capacity=context_capacity,
-            is_long_text=is_long_text,
             capture_sampling=False,
             graph_path_id=graph_path_id,
         )
         self.last_state_key = state.key
         self.last_real_batch_size = real_batch_size
-        input_ids, positions = self._prepare_static_step(state, seqs, is_long_text)
+        input_ids, positions = self._prepare_static_step(state, seqs)
         graph_state = state.decode_state
         if graph_state is None:
             raise RuntimeError("Decode graph state was released before static execution.")

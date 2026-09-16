@@ -755,7 +755,7 @@ def test_model_runner_runtime_rebuild_resolves_graph_shapes_locally():
     runner.model = SimpleNamespace()
     runner.load_deltakv_compressors = lambda: None
     runner.run_model = object()
-    runner._is_long_text_batch = object()
+
     runner.collective_runtime = object()
     config = SimpleNamespace(
         resolved_prefix_cache_mode="disabled",

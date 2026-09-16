@@ -179,7 +179,7 @@ it as an LLM Python argument, as
 `--hyper-params '{"favor_min_decoding_seqs":4}'` to the efficiency probe.
 
 During decode, retain the phase while the next executable decode batch meets the
-threshold; otherwise try prefill. Counting respects existing short-first grouping,
+threshold; otherwise try prefill. Counting includes mixed-length requests and respects
 the decode batch cap and writable KV capacity, including recompute decode work.
 Resident KV rows are not the count. Without waiting prefill, decode continues
 without waiting to fill a batch. After 60 seconds of prefill waiting, override the

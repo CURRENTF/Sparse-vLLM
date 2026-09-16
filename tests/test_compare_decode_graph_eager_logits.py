@@ -11,6 +11,7 @@ from scripts.debug.compare_decode_graph_eager_logits import (
     _compare_logits,
     _canonicalize_decode_logits,
     _generated_token_ids,
+    _has_physical_compaction,
     _graph_runtime_summary,
     _save_full_logits_artifact,
     _start_graph_measurement,
@@ -18,6 +19,21 @@ from scripts.debug.compare_decode_graph_eager_logits import (
     _validate_graph_runtime,
     _validate_method_trigger,
 )
+
+
+def test_mixed_length_trace_compares_physical_rows_to_their_own_request():
+    # A short dense row must not count as eviction merely because another
+    # request in the same decode batch is longer.
+    trace = {
+        "logical_context_len": 129,
+        "logical_context_lens": {"7": 3, "9": 129},
+        "cache": {"live_rows": {"0": [
+            {"seq_id": 7, "row_len": 3}, {"seq_id": 9, "row_len": 129},
+        ]}},
+    }
+    assert not _has_physical_compaction([trace])
+    trace["cache"]["live_rows"]["0"][1]["row_len"] = 44
+    assert _has_physical_compaction([trace])
 
 
 def test_logit_comparison_aligns_request_identity_across_batch_schedules():
@@ -184,6 +200,15 @@ def test_sparse_method_trigger_gate_rejects_unexercised_path():
 
     with pytest.raises(RuntimeError, match="trigger gate failed"):
         _validate_method_trigger(evidence)
+
+
+def test_rkv_explicit_keys_do_not_require_an_mla_materializer_registration():
+    trace = {**_trace(), "attention_cache_layout": "explicit_kv"}
+    calls = {"cache.rkv_query_attention_scores_batch": 1, "cache.materialize_attention_keys": 1}
+    _validate_method_trigger(_build_method_trigger_evidence("rkv", [trace], calls))
+    trace["attention_cache_layout"] = "mla_latent"
+    with pytest.raises(RuntimeError, match="trigger gate failed"):
+        _validate_method_trigger(_build_method_trigger_evidence("rkv", [trace], calls))
 
 
 def test_graph_runtime_gate_requires_capture_replay_and_zero_fallback():

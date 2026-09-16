@@ -155,7 +155,7 @@ def test_mla_quest_prefix_graph_replay_updates_pages_rows_and_padding(long_only)
         )
 
     # Exercise the dynamic short-row fallback inside the fixed long-capacity view.
-    set_context(False, cache_manager=manager, is_long_text=long_only)
+    set_context(False, cache_manager=manager)
     try:
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
@@ -183,7 +183,7 @@ def test_mla_quest_prefix_graph_replay_updates_pages_rows_and_padding(long_only)
             writes.latent[:, 0, 0] = 110 + step
             sign = -1 if step % 2 else 1
             q_latent[:, :, 0] = sign
-            set_context(False, cache_manager=manager, is_long_text=long_only)
+            set_context(False, cache_manager=manager)
             graph.replay()
             torch.cuda.synchronize()
             manager.on_forward_end(seqs, is_prefill=False)

@@ -2811,12 +2811,9 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             if prev_budget <= 0:
                 return active_slots, req_indices, context_lens
 
-            is_long_text = bool(get_context().is_long_text)
-            dense_slots = None
-            if not is_long_text:
-                dense_slots = self.buffer_req_to_token_slots[:, :max_keep].index_select(
-                    0, req_indices.to(torch.long)
-                )
+            dense_slots = self.buffer_req_to_token_slots[:, :max_keep].index_select(
+                0, req_indices.to(torch.long)
+            )
             page_scores, row_page_slots, num_pages, previous_page_counts = (
                 self._score_previous_decode_pages(
                     layer_idx,
@@ -2833,11 +2830,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                 previous_page_counts,
                 prev_budget,
             )
-            output_width = (
-                (prev_budget + 1) * self.page_size
-                if is_long_text
-                else max_keep
-            )
+            output_width = max_keep
             return finalize_quest_decode_view(
                 selected_prev_page_slots,
                 row_page_slots,
@@ -2909,7 +2902,6 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                     width=max_pages,
                 )
 
-            is_long_text = bool(get_context().is_long_text)
             page_scores, row_page_slots, num_pages, previous_page_counts = (
                 self._score_previous_decode_pages(
                     layer_idx,
@@ -2920,7 +2912,9 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                     num_kv_heads=num_kv_heads,
                 )
             )
-            output_width = prev_budget + 1 if is_long_text else page_budget_base
+            output_width = max(
+                prev_budget + 1, (int(token_budget) + self.page_size - 1) // self.page_size,
+            )
             outputs = self._get_decode_paged_view_buffers(
                 int(batch_size),
                 int(output_width),
@@ -2935,6 +2929,6 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
                 page_size=self.page_size,
                 token_budget=token_budget,
                 outputs=outputs,
-                use_dense_fallback=not is_long_text,
+                use_dense_fallback=True,
             )
-            return (*paged_view, bool(is_long_text))
+            return (*paged_view, True)

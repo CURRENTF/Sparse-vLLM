@@ -1457,96 +1457,6 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
             manager._should_use_pyramidkv_full_prefill_staging(scheduled)
         )
 
-    def test_model_runner_keeps_long_text_boundary_decode_only(self):
-        runner = object.__new__(ModelRunner)
-        runner.config = SimpleNamespace(
-            prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-            engine_prefill_chunk_size=8192,
-            sparse_method="pyramidkv",
-            sink_keep_tokens=64,
-            recent_keep_tokens=128,
-            decode_keep_tokens=4096,
-        )
-
-        self.assertEqual(
-            ModelRunner._long_text_threshold(runner, is_prefill=True),
-            64 + 128 + 4096,
-        )
-        self.assertEqual(
-            ModelRunner._long_text_threshold(runner, is_prefill=False),
-            64 + 128 + 4096,
-        )
-
-    def test_vanilla_model_runner_does_not_partition_long_and_short(self):
-        runner = object.__new__(ModelRunner)
-        runner.config = SimpleNamespace(
-            sparse_method="",
-        )
-        seqs = [seq_with_len(8), seq_with_len(20_000)]
-
-        self.assertFalse(
-            ModelRunner._is_long_text_batch(runner, seqs, is_prefill=False)
-        )
-
-    def test_sparse_model_runner_rejects_mixed_decode_topology_batch(self):
-        runner = object.__new__(ModelRunner)
-        runner.config = SimpleNamespace(
-            sparse_method="quest",
-            sink_keep_tokens=1,
-            recent_keep_tokens=1,
-            decode_keep_tokens=4,
-        )
-
-        with self.assertRaisesRegex(ValueError, "Mixed long/short batch"):
-            ModelRunner._is_long_text_batch(
-                runner,
-                [seq_with_len(4), seq_with_len(20)],
-                is_prefill=False,
-            )
-
-    def test_sparse_decode_transition_and_prefix_restore_select_long_path(self):
-        runner = object.__new__(ModelRunner)
-        runner.config = SimpleNamespace(
-            sparse_method="omnikv",
-            sink_keep_tokens=1,
-            recent_keep_tokens=1,
-            decode_keep_tokens=4,
-        )
-        threshold = ModelRunner._long_text_threshold(
-            runner,
-            is_prefill=False,
-        )
-        sequence = seq_with_len(threshold)
-
-        self.assertFalse(
-            ModelRunner._is_long_text_batch(
-                runner,
-                [sequence],
-                is_prefill=False,
-            )
-        )
-        sequence.append_token(0)
-        self.assertTrue(
-            ModelRunner._is_long_text_batch(
-                runner,
-                [sequence],
-                is_prefill=False,
-            )
-        )
-
-        restored = seq_with_len(threshold + 1)
-        restored.prefix_cache_enabled = True
-        restored.prefix_cache_hit_len = threshold
-        restored.prefix_cache_hit_block_count = 1
-        restored.prefix_cache_hit_last_block_id = b"prefix"
-        self.assertTrue(
-            ModelRunner._is_long_text_batch(
-                runner,
-                [restored],
-                is_prefill=False,
-            )
-        )
-
     def test_all_chunked_batches_sparse_mixed_lengths(self):
         scheduler = make_scheduler(
             PREFILL_POLICY_ALL_CHUNKED,
@@ -1580,6 +1490,24 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         self.assertFalse(is_prefill)
         self.assertEqual(scheduled, [short_seq, long_seq])
 
+    def test_h2o_decode_does_not_starve_long_rows_behind_short_rows(self):
+        # H2O has one physical-row attention topology. The old generic sparse
+        # partition ran only the short row, even with room for every request.
+        for affinity in (0, 2):
+            with self.subTest(affinity=affinity):
+                scheduler = make_scheduler(PREFILL_POLICY_ALL_CHUNKED, method="h2o")
+                scheduler.favor_min_decoding_seqs = affinity
+                scheduler.phase = "decode"
+                seqs = [seq_with_len(length) for length in (2, 4, 20)]
+                for seq in seqs:
+                    seq.num_prefilled_tokens = seq.num_prompt_tokens
+                scheduler.decoding.extend(seqs)
+
+                scheduled, is_prefill, preempted = scheduler.schedule()
+
+                self.assertFalse(is_prefill)
+                self.assertEqual(scheduled, seqs)
+                self.assertEqual(preempted, [])
     def test_decode_batch_limit_is_independent_from_prefill_batch_limit(self):
         scheduler = make_scheduler(
             PREFILL_POLICY_ALL_CHUNKED,
@@ -1610,28 +1538,22 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         self.assertTrue(is_prefill)
         self.assertEqual(scheduled, seqs[:4])
 
-    def test_sparse_decode_schedules_short_and_long_topologies_separately(self):
-        scheduler = make_scheduler(
-            PREFILL_POLICY_ALL_CHUNKED,
-            method="quest",
-        )
-        short_seq = seq_with_len(4)
-        long_seq = seq_with_len(20)
-        short_seq.num_prefilled_tokens = short_seq.num_prompt_tokens
-        long_seq.num_prefilled_tokens = long_seq.num_prompt_tokens
-        scheduler.decoding.extend((short_seq, long_seq))
-
-        short_batch, is_prefill, _ = scheduler.schedule()
-
-        self.assertFalse(is_prefill)
-        self.assertEqual(short_batch, [short_seq])
-        self.assertIn(long_seq, scheduler.decoding)
-
-        scheduler.decoding.remove(short_seq)
-        long_batch, is_prefill_long, _ = scheduler.schedule()
-
-        self.assertFalse(is_prefill_long)
-        self.assertEqual(long_batch, [long_seq])
+    def test_sparse_decode_mixes_lengths_without_starvation(self):
+        # Short arrivals must not exclude existing long requests. Repeat after
+        # the short row crosses the former budget threshold and is replaced.
+        for method in ("quest", "omnikv", "deltakv", "pyramidkv", "streamingllm", "snapkv", "rkv", "skipkv", "kivi", "turboquant", "fp8_kv"):
+            with self.subTest(method=method):
+                scheduler = make_scheduler(PREFILL_POLICY_ALL_CHUNKED, method=method)
+                seqs = [seq_with_len(n) for n in (20, 2, 6)]
+                for seq in seqs:
+                    seq.num_prefilled_tokens = seq.num_prompt_tokens
+                scheduler.decoding.extend(seqs)
+                for _ in range(8):
+                    batch, is_prefill, preempted = scheduler.schedule()
+                    self.assertFalse(is_prefill)
+                    self.assertEqual(batch, seqs)
+                    self.assertEqual(preempted, [])
+                    scheduler.postprocess(batch, [0] * len(batch), False)
 
     def test_all_chunked_caps_each_prefill_by_chunk_size(self):
         scheduler = make_scheduler(PREFILL_POLICY_ALL_CHUNKED, method="", chunk=5, max_tokens=20)

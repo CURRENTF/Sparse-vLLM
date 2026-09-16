@@ -10,6 +10,7 @@ def _omnikv_build_keep_and_slots_kernel(
     topk_lens_ptr,
     hist_lens_ptr,
     recent_lens_ptr,
+    context_lens_ptr,
     buffer_req_to_token_slots_ptr,
     req_indices_ptr,
     new_context_lens_ptr,
@@ -37,22 +38,25 @@ def _omnikv_build_keep_and_slots_kernel(
     recent_len = tl.load(recent_lens_ptr + pid_b)
     k_b = tl.load(topk_lens_ptr + pid_b).to(tl.int32)
     req_row = tl.load(req_indices_ptr + pid_b)
-    hist_len = tl.maximum(hist_len, 0).to(tl.int32)
-    recent_len = tl.maximum(recent_len, 0).to(tl.int32)
-    new_context_len = num_sink + k_b + recent_len
+    context_len = tl.maximum(tl.load(context_lens_ptr + pid_b), 0)
+    sink_len = tl.minimum(num_sink, context_len)
+    hist_len = tl.minimum(tl.maximum(hist_len, sink_len), context_len).to(tl.int32)
+    recent_len = tl.minimum(tl.maximum(recent_len, 0), context_len - hist_len).to(tl.int32)
+    k_b = tl.minimum(k_b, hist_len - sink_len)
+    new_context_len = sink_len + k_b + recent_len
     tl.store(new_context_lens_ptr + pid_b, new_context_len, mask=pid_blk == 0)
 
-    mask_sink = offs < num_sink
-    mask_topk = (offs >= num_sink) & (offs < num_sink + k_b)
-    mask_recent = (offs >= num_sink + k_b) & (offs < new_context_len)
+    mask_sink = offs < sink_len
+    mask_topk = (offs >= sink_len) & (offs < sink_len + k_b)
+    mask_recent = (offs >= sink_len + k_b) & (offs < new_context_len)
 
-    topk_offs = tl.where(mask_topk, offs - num_sink, 0)
+    topk_offs = tl.where(mask_topk, offs - sink_len, 0)
     topk_idx = tl.load(
         topk_indices_ptr + pid_b * stride_topk_b + topk_offs * stride_topk_k,
         mask=mask_topk,
         other=0,
     )
-    recent_offs = tl.where(mask_recent, offs - num_sink - k_b, 0)
+    recent_offs = tl.where(mask_recent, offs - sink_len - k_b, 0)
     recent_idx = hist_len + recent_offs
 
     keep_idx = tl.where(mask_sink, offs, tl.where(mask_topk, topk_idx, tl.where(mask_recent, recent_idx, 0)))
@@ -65,7 +69,7 @@ def _omnikv_build_keep_and_slots_kernel(
 
     keep_idx_i64 = keep_idx.to(tl.int64)
     req_row_i64 = req_row.to(tl.int64)
-    mask_slot = mask_out & (keep_idx >= 0) & (keep_idx < buf_max_len)
+    mask_slot = mask_out & (offs < new_context_len) & (keep_idx >= 0) & (keep_idx < buf_max_len)
     slot_val = tl.load(
         buffer_req_to_token_slots_ptr + req_row_i64 * stride_buf_b + keep_idx_i64 * stride_buf_s,
         mask=mask_slot,
@@ -88,6 +92,7 @@ def build_omnikv_keep_and_slots(
     num_sink: int,
     max_s: int | None = None,
     *,
+    context_lens: torch.Tensor,
     keep_indices_out: torch.Tensor | None = None,
     active_slots_out: torch.Tensor | None = None,
     new_context_lens_out: torch.Tensor | None = None,
@@ -109,7 +114,9 @@ def build_omnikv_keep_and_slots(
         assert int(topk_lens.min().item()) >= 0
         assert int(topk_lens.max().item()) <= k_max
     if max_s is None:
-        computed_context_lens = num_sink + topk_lens + recent_chunk_lens
+        computed_context_lens = torch.minimum(
+            num_sink + topk_lens + recent_chunk_lens.clamp_min(0), context_lens
+        )
         max_s = int(computed_context_lens.max().item())
     else:
         max_s = int(max_s)
@@ -155,7 +162,7 @@ def build_omnikv_keep_and_slots(
     )
 
     if max_s == 0:
-        new_context_lens.copy_(num_sink + topk_lens + recent_chunk_lens)
+        new_context_lens.zero_()
         return keep_indices, active_slots, new_context_lens
 
     block = 256
@@ -165,6 +172,7 @@ def build_omnikv_keep_and_slots(
         topk_lens,
         hist_lens,
         recent_chunk_lens,
+        context_lens,
         buffer_req_to_token_slots,
         req_indices,
         new_context_lens,

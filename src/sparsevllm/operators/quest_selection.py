@@ -278,9 +278,7 @@ class TritonExactQuestPageSelectionProvider(QuestPageSelectionProvider):
         outputs,
         use_dense_fallback,
     ):
-        if use_dense_fallback:
-            raise ValueError("Fused QuEST paged selection requires sparse-only rows.")
-        del num_pages, token_budget
+        del num_pages
         _validate_inputs(self.spec, scores, page_table, previous_page_counts, k)
         from sparsevllm.kernels.triton.quest_fused_selection import (
             fused_exact_select_quest_paged_view,
@@ -293,6 +291,8 @@ class TritonExactQuestPageSelectionProvider(QuestPageSelectionProvider):
             context_lens,
             k=k,
             page_size=page_size,
+            token_budget=token_budget,
+            use_dense_fallback=use_dense_fallback,
             output_page_table=outputs[0],
             output_req_indices=outputs[1],
             output_context_lens=outputs[2],

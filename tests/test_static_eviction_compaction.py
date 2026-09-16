@@ -46,8 +46,9 @@ def test_snapkv_graph_uses_static_semantic_path_capacities():
         max_model_len=131072,
     )
 
-    assert manager.decode_graph_path_capacity(False) == 8192
-    assert manager.decode_graph_path_capacity(True) == 131072
+    capacity = manager.decode_graph_path_capacity()
+    assert capacity == manager.config.max_model_len
+    manager.validate_decode_graph_path_capacity(_sequences([2, 8193, 131072]), capacity=capacity)
 
 
 def _page_table_manager(

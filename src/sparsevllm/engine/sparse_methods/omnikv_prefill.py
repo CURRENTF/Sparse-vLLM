@@ -123,9 +123,8 @@ class OmniKVPrefillRuntime(SparseMethodRuntime):
             state.req_indices,
             self.num_sink,
             max_s=max_s,
+            context_lens=state.context_lens,
         )
-        # Requests shorter than the sink budget retain their complete context.
-        lengths.copy_(torch.minimum(lengths, state.context_lens))
         rows = torch.arange(batch_size, dtype=torch.int32, device=self.device)
         for layer in targets:
             target = self.layer_batch_sparse_states[layer]

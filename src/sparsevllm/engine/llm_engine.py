@@ -98,8 +98,6 @@ class _ThroughputIntervalLogger:
         self._prefill_chunked_seqs = 0
         self._prefill_full_seqs = 0
         self._prefill_raw_offload_seqs = 0
-        self._decode_long_seqs = 0
-        self._decode_short_seqs = 0
         self._last_batch = "idle"
         self._last_report_t = perf_counter()
 
@@ -139,8 +137,6 @@ class _ThroughputIntervalLogger:
         prefill_chunked_seqs: int,
         prefill_full_seqs: int,
         prefill_raw_offload_seqs: int,
-        decode_long_seqs: int,
-        decode_short_seqs: int,
         last_batch: str,
     ):
         with self._lock:
@@ -150,8 +146,6 @@ class _ThroughputIntervalLogger:
             self._prefill_chunked_seqs = int(prefill_chunked_seqs)
             self._prefill_full_seqs = int(prefill_full_seqs)
             self._prefill_raw_offload_seqs = int(prefill_raw_offload_seqs)
-            self._decode_long_seqs = int(decode_long_seqs)
-            self._decode_short_seqs = int(decode_short_seqs)
             self._last_batch = str(last_batch)
 
     def _run(self):
@@ -170,8 +164,6 @@ class _ThroughputIntervalLogger:
                 prefill_chunked_seqs = self._prefill_chunked_seqs
                 prefill_full_seqs = self._prefill_full_seqs
                 prefill_raw_offload_seqs = self._prefill_raw_offload_seqs
-                decode_long_seqs = self._decode_long_seqs
-                decode_short_seqs = self._decode_short_seqs
                 last_batch = self._last_batch
                 self._prefill_tokens = 0
                 self._decode_tokens = 0
@@ -185,7 +177,6 @@ class _ThroughputIntervalLogger:
                 "Avg TP (last {dt:.1f}s): dp_rank={rank} prefill_tp={prefill_tp:.0f} tok/s, decode_tp={decode_tp:.0f} tok/s "
                 "| seq(run/prf/dc)={running_seqs}/{prefill_seqs}/{decode_seqs} "
                 "| prf(chunked/full/raw_offload)={prefill_chunked_seqs}/{prefill_full_seqs}/{prefill_raw_offload_seqs} "
-                "dc(L/S)={decode_long_seqs}/{decode_short_seqs} "
                 "| last_batch={last_batch} "
                 "| prefill_steps={prefill_steps} decode_batch_steps={decode_batch_counts} "
                 "(prefill_tokens={prefill_tokens}, decode_tokens={decode_tokens})",
@@ -201,8 +192,6 @@ class _ThroughputIntervalLogger:
                 prefill_chunked_seqs=prefill_chunked_seqs,
                 prefill_full_seqs=prefill_full_seqs,
                 prefill_raw_offload_seqs=prefill_raw_offload_seqs,
-                decode_long_seqs=decode_long_seqs,
-                decode_short_seqs=decode_short_seqs,
                 last_batch=last_batch,
                 prefill_steps=prefill_steps,
                 decode_batch_counts=dict(sorted(decode_batch_counts.items())),
@@ -520,7 +509,7 @@ class LLMEngine:
                 "Production KV capacity cannot capture any configured decode CUDA Graph."
             )
 
-        required_prompts = sum(batch_size for batch_size, _, _ in startup_plan)
+        required_prompts = sum(batch_size for batch_size, _ in startup_plan)
         if prompt_offset + required_prompts > int(self.config.hf_config.vocab_size):
             raise ValueError(
                 "Startup CUDA Graph capture requires distinct leading tokens: "
@@ -529,22 +518,16 @@ class LLMEngine:
             )
 
         self.model_runner.call("begin_decode_cuda_graph_capture")
-        short_graphs = sum(not is_long for _, _, is_long in startup_plan)
         logger.info(
-            "Startup CUDA Graph capture: graphs={} short={} long={} "
-            "sequential_prefill_candidates={}.",
-            len(startup_plan),
-            short_graphs,
-            len(startup_plan) - short_graphs,
-            len(sequential_plan),
+            "Startup CUDA Graph capture: graphs={} sequential_prefill_candidates={}.",
+            len(startup_plan), len(sequential_plan),
         )
         logger.debug("Startup CUDA Graph capture plan: {}.", startup_plan)
         capture_params = SamplingParams(max_tokens=2, temperature=0.0, ignore_eos=True)
-        threshold = self.scheduler._long_text_threshold(is_prefill=False)
         skipped_plan = []
         for entry in startup_plan:
-            batch_size, _, is_long_text = entry
-            prompt_len = int(threshold) if is_long_text else 1
+            batch_size, _ = entry
+            prompt_len = 1
             parked, prompt_offset = self._prepare_startup_capture_batch(
                 capture_params,
                 prompt_offset,
@@ -556,17 +539,11 @@ class LLMEngine:
                 skipped_plan.append(entry)
                 logger.info(
                     "Startup CUDA Graph family exceeds KV capacity during "
-                    "prefill or decode preparation: batch={} long={}.", batch_size, is_long_text,
+                    "prefill or decode preparation: batch={} path={!r}.",
+                    batch_size, decode_graph_path_id(str(self.config.sparse_method or "")),
                 )
                 continue
             try:
-                observed_long = self.scheduler._is_long_text(parked[0], is_prefill=False)
-                if bool(observed_long) != bool(is_long_text):
-                    raise RuntimeError(
-                        "Startup CUDA Graph path crossed the wrong long-text boundary: "
-                        f"expected={is_long_text} observed={observed_long} "
-                        f"threshold={threshold} num_tokens={parked[0].num_tokens}."
-                    )
                 self.model_runner.call("capture_decode_cuda_graph_warmup", parked)
             finally:
                 self.scheduler.decoding.extend(parked)
@@ -587,9 +564,9 @@ class LLMEngine:
         }
         method = str(self.config.sparse_method or "")
         expected = {
-            (batch_size, context_capacity, decode_graph_path_id(method, is_long_text))
-            for batch_size, context_capacity, is_long_text in startup_plan
-            if (batch_size, context_capacity, is_long_text) not in skipped_plan
+            (batch_size, context_capacity, decode_graph_path_id(method))
+            for batch_size, context_capacity in startup_plan
+            if (batch_size, context_capacity) not in skipped_plan
         }
         if not expected:
             raise RuntimeError(
@@ -1588,10 +1565,6 @@ class LLMEngine:
                     prefill_seqs = len(self.scheduler.waiting)
                     decode_seqs = len(self.scheduler.decoding)
                     prefill_modes = self.scheduler.prefill_execution_mode_counts()
-                    decode_threshold = self.scheduler._long_text_threshold(is_prefill=False)
-                    decode_long = sum(
-                        1 for s in self.scheduler.decoding if int(s.num_tokens) > int(decode_threshold)
-                    )
                     self._throughput_logger.record_state(
                         prefill_seqs + decode_seqs,
                         prefill_seqs,
@@ -1599,8 +1572,6 @@ class LLMEngine:
                         prefill_modes["chunked"],
                         prefill_modes["full"],
                         prefill_modes["raw_offload"],
-                        decode_long,
-                        decode_seqs - decode_long,
                         "idle",
                     )
                     return [], 0
@@ -1740,15 +1711,12 @@ class LLMEngine:
         prefill_seqs = len(self.scheduler.waiting)
         decode_seqs = len(self.scheduler.decoding)
         prefill_modes = self.scheduler.prefill_execution_mode_counts()
-        decode_threshold = self.scheduler._long_text_threshold(is_prefill=False)
-        decode_long = sum(1 for s in self.scheduler.decoding if int(s.num_tokens) > int(decode_threshold))
         if is_prefill:
             if prefill_batch_mode is None:
                 raise RuntimeError("Missing execution mode for a scheduled prefill batch.")
             last_batch = f"pf-{prefill_batch_mode}"
         else:
-            batch_is_long = bool(int(seqs[0].num_tokens) > int(decode_threshold))
-            last_batch = f"dc-{'L' if batch_is_long else 'S'}"
+            last_batch = "decode"
         self._throughput_logger.record_state(
             prefill_seqs + decode_seqs,
             prefill_seqs,
@@ -1756,8 +1724,6 @@ class LLMEngine:
             prefill_modes["chunked"],
             prefill_modes["full"],
             prefill_modes["raw_offload"],
-            decode_long,
-            decode_seqs - decode_long,
             last_batch,
         )
         return finished_outputs, num_tokens

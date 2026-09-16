@@ -88,6 +88,21 @@ class DPAttentionEngine:
 
     def __init__(self, model, **kwargs):
         self.config = Config(model, **kwargs)
+        topology = self.config.parallel_topology
+        if topology.attn_dp_size > 1 and (
+            topology.attn_tp_size > 1
+            or topology.moe_ep_size > 1
+            or topology.moe_tp_size > 1
+        ):
+            logger.warning(
+                "DP combined with TP/EP has known performance issues in the "
+                "current implementation (attention DP={}, TP={}; MoE EP={}, TP={}). "
+                "Throughput and latency may be degraded.",
+                topology.attn_dp_size,
+                topology.attn_tp_size,
+                topology.moe_ep_size,
+                topology.moe_tp_size,
+            )
         self.tokenizer = AutoTokenizer.from_pretrained(model, use_fast=True)
         self.multimodal_processor = None
         self._connections = []

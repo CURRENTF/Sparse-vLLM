@@ -96,9 +96,11 @@ class TritonOmniKVScoreProvider(OmniKVScoreProvider):
                     sizes, (torch.float32, torch.float32, self.spec.output_dtype)
                 )
             ))
+            # Selection-only execution leaves short rows and unused tails unread.
+            workspace.output.fill_(torch.finfo(self.spec.output_dtype).min)
             self.workspaces[slot] = workspace
 
-    def run(self, scores, lengths, *, slot):
+    def run(self, scores, lengths, *, slot, selection_keep=-1):
         from sparsevllm.kernels.triton.omnikv_score import launch_omnikv_decode_scores
 
         workspace = self.workspaces[slot]
@@ -117,7 +119,7 @@ class TritonOmniKVScoreProvider(OmniKVScoreProvider):
             scores, lengths, workspace.partial, workspace.stats, output,
             sink=self.spec.sink, recent=self.spec.recent, scale=self.spec.scale,
             min_score=torch.finfo(output.dtype).min,
-            block=self.block, output_block=self.output_block,
+            block=self.block, output_block=self.output_block, selection_keep=selection_keep,
         )
         return output
 
@@ -143,7 +145,7 @@ class TorchCPUOmniKVScoreProvider(OmniKVScoreProvider):
             return SupportResult.unsupported('CPU reference only')
         return SupportResult.yes('CPU reference for sparse-runtime lifecycle tests')
 
-    def run(self, scores, lengths, *, slot):
+    def run(self, scores, lengths, *, slot, selection_keep=-1):
         del slot
         candidate = scores[:, :, self.spec.sink:]
         lens = (lengths.to(torch.long) - self.spec.recent - self.spec.sink).clamp(0, candidate.shape[-1])

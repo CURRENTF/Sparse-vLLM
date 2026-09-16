@@ -471,6 +471,16 @@ def _record_batch_first_tokens(
     return observed_seq_ids == expected_seq_ids
 
 
+def _sparse_probe_max_model_len(args, hyper_params):
+    required = max(args.prompt_lens) + max(args.output_lens) + 128
+    capacity = int(hyper_params.get("max_model_len", required))
+    if capacity < required:
+        raise ValueError(
+            f"max_model_len={capacity} cannot cover the probe workload and margin ({required})"
+        )
+    return capacity
+
+
 def _resolve_sparse_probe_protocol(
     args: argparse.Namespace,
 ) -> tuple[dict[str, Any], int | None, dict[str, Any], str]:
@@ -638,7 +648,7 @@ def run_sparsevllm_probe(
     hyper_params, sparse_budget, protocol, protocol_label = _resolve_sparse_probe_protocol(args)
     sparse_kwargs: dict[str, Any] = {"sparse_method": args.sparse_method}
 
-    max_len_needed = max(args.prompt_lens) + max(args.output_lens) + 128
+    max_len_needed = _sparse_probe_max_model_len(args, hyper_params)
     max_concurrency = max(args.batch_sizes)
     wave_size = int(getattr(args, "prefill_wave_size", 0))
     if wave_size < 0 or (wave_size and (args.sparse_method != "h2o" or args.scenario != "fixed")):
@@ -975,7 +985,7 @@ def run_sparsevllm_churn(
     base_hyper_params, _sparse_budget, protocol, protocol_label = (
         _resolve_sparse_probe_protocol(args)
     )
-    max_len_needed = max(args.prompt_lens) + max(args.output_lens) + 128
+    max_len_needed = _sparse_probe_max_model_len(args, base_hyper_params)
 
     for concurrency in args.batch_sizes:
         engine_kwargs = {

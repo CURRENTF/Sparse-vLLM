@@ -1318,3 +1318,13 @@ def test_probe_dp_concurrency_covers_global_trace_without_multiplying_each_repli
         local = _replica_concurrency(requests, {"data_parallel_size": replicas})
         assert local * replicas >= requests
         assert (local - 1) * replicas < requests
+
+
+def test_native_probe_retains_explicit_graph_capacity_and_rejects_truncated_workload():
+    # Short-request measurements must not silently shrink a 128K graph contract.
+    from types import SimpleNamespace
+    from benchmark.efficiency.bench_probe import _sparse_probe_max_model_len
+    args = SimpleNamespace(prompt_lens=[2048, 8192], output_lens=[64])
+    assert _sparse_probe_max_model_len(args, {'max_model_len': 131072}) == 131072
+    with pytest.raises(ValueError, match='cannot cover'):
+        _sparse_probe_max_model_len(args, {'max_model_len': 8192})

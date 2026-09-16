@@ -27,18 +27,19 @@ def build_omnikv_keep_and_slots(*args, **kwargs):
 
 
 class DynamicSelectionRuntime(SparseMethodRuntime):
-    process_short_text = False
+    def _prepare_decode_attention_score(
+        self, layer_idx, state, batch_size, num_heads, max_len,
+    ) -> None:
+        # Even an all-short batch needs a valid (possibly empty) candidate slice.
+        super()._prepare_decode_attention_score(
+            layer_idx, state, batch_size, num_heads, max(max_len, self.num_sink),
+        )
 
     def needs_attention_score(
         self,
         layer_idx: int,
         step: SparseStepContext,
     ) -> bool:
-        if (
-            not self.process_short_text
-            and step.forward_context.is_long_text is False
-        ):
-            return False
         return layer_idx in self.obs_layer_ids and not step.is_prefill
 
     def on_layer_end(self, event: LayerEndEvent) -> None:
@@ -48,16 +49,6 @@ class DynamicSelectionRuntime(SparseMethodRuntime):
                 "on_layer_end",
                 layer_idx,
                 skipped="linear_attention",
-            )
-            return
-        if (
-            not self.process_short_text
-            and event.forward_context.is_long_text is False
-        ):
-            self._debug_record_dynamic_selection(
-                "on_layer_end",
-                layer_idx,
-                skipped="short_text",
             )
             return
         if event.layer_context.is_prefill:
@@ -81,7 +72,6 @@ class DynamicSelectionRuntime(SparseMethodRuntime):
             skipped="",
             method=str(self.sparse_method),
             is_prefill=bool(event.layer_context.is_prefill),
-            is_dynamic_deltakv=bool(self.process_short_text),
         )
         with profiler.record("sparse_on_layer_end"):
             state = self.layer_batch_sparse_states[layer_idx]
@@ -132,8 +122,6 @@ class OmniKVRuntime(DynamicSelectionRuntime):
             return
         if event.forward_context.is_prefill or event.layer_idx not in self.obs_layer_ids:
             return
-        if event.forward_context.is_long_text is False:
-            return
         with self.cache_manager.selection_stream():
             super().on_layer_end(LayerEndEvent(
                 layer_idx=event.layer_idx,
@@ -164,6 +152,10 @@ class OmniKVRuntime(DynamicSelectionRuntime):
         self._omnikv_score_provider = prepare_omnikv_score_provider(
             OmniKVScoreSpec(self.num_sink, self.num_recent, self.attn_softmax_scale, dtype),
             device=self.device,
+        )
+        from sparsevllm.operators.omnikv_selection import OmniKVSelectionSpec, prepare_omnikv_selection
+        self._omnikv_selection_provider = prepare_omnikv_selection(
+            OmniKVSelectionSpec(self.num_sink, int(self.decode_keep_tokens)), device=self.device,
         )
         logger.info("OmniKV decode score provider: {}", self._omnikv_score_provider.name)
         self._omnikv_decode_attn_score_buffer: torch.Tensor | None = None
@@ -207,7 +199,7 @@ class OmniKVRuntime(DynamicSelectionRuntime):
     ) -> None:
         del state
         self._pending_decode_score_specs.append(
-            (layer_idx, batch_size, num_heads, max_len)
+            (layer_idx, batch_size, num_heads, max(max_len, self.num_sink))
         )
 
     def _end_prepare_step(self, step: SparseStepContext) -> None:
@@ -342,6 +334,7 @@ class OmniKVRuntime(DynamicSelectionRuntime):
     ) -> torch.Tensor:
         return self._omnikv_score_provider.run(
             state.attn_score, state.context_lens, slot=id(state),
+            selection_keep=int(self.decode_keep_tokens),
         )
 
     def _update_dynamic_indices(
@@ -350,7 +343,6 @@ class OmniKVRuntime(DynamicSelectionRuntime):
         target_layers: list[int],
         context,
     ) -> None:
-        assert context.is_long_text
         with profiler.record("sparse_update_dynamic_indices"):
             self._debug_record_dynamic_selection(
                 "update_dynamic",
@@ -374,26 +366,31 @@ class OmniKVRuntime(DynamicSelectionRuntime):
                 hist_lens = obs_state.context_lens - self.num_recent
             hist_lens = hist_lens.clamp_min(self.num_sink)
 
-            search_scores = token_scores[:, self.num_sink:]
             rel_hist_lens = hist_lens - self.num_sink
-            mask = (
-                torch.arange(search_scores.size(1), device=self.device)
-                >= rel_hist_lens.unsqueeze(1)
-            )
-            search_scores.masked_fill_(mask, -1e10)
-
+            if context.is_prefill:
+                search_scores = token_scores[:, self.num_sink:]
+                mask = (
+                    torch.arange(search_scores.size(1), device=self.device)
+                    >= rel_hist_lens.unsqueeze(1)
+                )
+                search_scores.masked_fill_(mask, -1e10)
             decode_keep = int(self.decode_keep_tokens)
-            k_max = min(decode_keep, int(search_scores.size(1)))
+            candidate_capacity = int(token_scores.shape[1]) - self.num_sink
+            k_max = min(decode_keep, candidate_capacity)
             if k_max > 0:
                 topk_lens = rel_hist_lens.clamp(
                     min=0,
                     max=k_max,
                 ).to(torch.int32)
-                topk_indices = (
-                    search_scores.topk(k_max, dim=1, sorted=False)
-                    .indices.to(torch.int32)
-                    + self.num_sink
-                )
+                if context.is_prefill:
+                    topk_indices = (
+                        search_scores.topk(k_max, dim=1, sorted=True)
+                        .indices.to(torch.int32) + self.num_sink
+                    )
+                else:
+                    topk_indices = self._omnikv_selection_provider.select(
+                        token_scores, rel_hist_lens.clamp(max=candidate_capacity).to(torch.int32), k_max,
+                    )
             else:
                 topk_lens = torch.zeros(
                     (batch_size,),
@@ -463,6 +460,7 @@ class OmniKVRuntime(DynamicSelectionRuntime):
                     ),
                     obs_state.req_indices,
                     self.num_sink,
+                    context_lens=obs_state.context_lens,
                     max_s=max_sparse_context_len,
                     **output_kwargs,
                 )
@@ -520,8 +518,6 @@ class OmniKVRuntime(DynamicSelectionRuntime):
 
 
 class DeltaKVRuntime(DynamicSelectionRuntime):
-    process_short_text = True
-
     def build_prefill_selection(
         self,
         request: PrefillSelectionRequest,
@@ -780,5 +776,4 @@ class DeltaKVRuntime(DynamicSelectionRuntime):
 
     @torch.no_grad()
     def _deltakv_eviction(self, seqs, context) -> None:
-        assert context.is_long_text or self.process_short_text
         self.cache_manager.deltakv_evict(seqs)

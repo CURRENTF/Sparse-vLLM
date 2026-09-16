@@ -43,12 +43,12 @@ def _manager(device, lengths):
                            get_layer_buffer_req_to_token_slots=lambda _: table), table, rows
 
 
-def _build_slots_reference(topk, counts, hist, tail, table, rows, sink, max_s):
+def _build_slots_reference(topk, counts, hist, tail, table, rows, sink, max_s, *, context_lens):
     # Stand-in for GPU gathering only; runtime scoring and selection are real.
     keep = torch.zeros((len(rows), max_s), dtype=torch.int32)
-    lengths = sink + counts + tail
+    lengths = torch.minimum(sink + counts + tail, context_lens)
     for b in range(len(rows)):
-        values = list(range(sink)) + topk[b, :counts[b]].tolist() + list(range(int(hist[b]), int(hist[b] + tail[b])))
+        values = list(range(min(sink, int(context_lens[b])))) + topk[b, :counts[b]].tolist() + list(range(int(hist[b]), int(hist[b] + tail[b])))
         keep[b, :min(len(values), max_s)] = torch.tensor(values[:max_s], dtype=torch.int32)
     return keep, table[rows.long()[:, None], keep.long()], lengths
 
@@ -58,7 +58,7 @@ def test_prefill_selection_preserves_chunk_and_decode_ownership(method):
     config = _config(method)
     manager, table, rows = _manager("cpu", [10, 4, 1])
     runtime = create_sparse_method_runtime(config, manager)
-    context = SimpleNamespace(is_prefill=True, is_long_text=True, cu_seqlens_q=torch.tensor([0, 3, 5, 6]))
+    context = SimpleNamespace(is_prefill=True, cu_seqlens_q=torch.tensor([0, 3, 5, 6]))
     step = SparseStepContext([None] * 3, True, context)
     original_table = table.clone()
     with patch("sparsevllm.engine.sparse_methods.omnikv_prefill.build_omnikv_keep_and_slots", side_effect=_build_slots_reference):
@@ -86,7 +86,6 @@ def test_prefill_selection_preserves_chunk_and_decode_ownership(method):
             assert runtime.layer_batch_sparse_states is runtime.decode.layer_batch_sparse_states
     torch.testing.assert_close(table, original_table)
     context.is_prefill = False
-    context.is_long_text = False
     runtime.prepare_step(SparseStepContext([None] * 3, False, context))
     assert runtime.active is runtime.decode
     selection = runtime.build_decode_selection(DecodeSelectionRequest(1, torch.empty(0), context))

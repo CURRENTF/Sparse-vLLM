@@ -38,6 +38,17 @@ flowchart TD
 `CacheManager` 是另一套独立接口，专门处理物理缓存。Runtime 和
 CacheManager 可以各自复用代码，不要求使用相同的继承关系。
 
+Decode batch 可以包含不同长度的请求。各方法根据逐行长度对有效 KV 进行评分、选择或
+压缩；未超过方法实际保留预算的请求即使执行评分与 selection，也保留全部有效 KV。
+CUDA Graph 对每个 batch
+bucket 捕获一组容量为 `max_model_len` 的图，请求跨过稀疏预算边界时不切换图。
+Prefill 仍按执行模式和兼容性分组。
+
+OmniKV decode selection 直接使用设备端候选长度。历史候选未超过保留预算的行直接保留
+全部历史，不执行分数归约或 top-k 扫描；长行只归约、选择有效历史。未写入的分数尾部
+不具备有效值，消费者不得读取。不同 provider 可以输出不同排列，但逻辑索引与物理
+slot 必须逐项对应。捕获容量和图身份保持不变。
+
 ## 各组件负责什么
 
 | 组件 | 主要职责 | 不应负责 |

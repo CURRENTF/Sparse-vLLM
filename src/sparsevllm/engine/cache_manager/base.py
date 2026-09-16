@@ -25,7 +25,6 @@ from sparsevllm.engine.sequence import Sequence
 from sparsevllm.method_registry import (
     SUPPORTED_SPARSE_METHODS,
     decode_graph_path_id,
-    decode_sparse_long_text_threshold,
     normalize_sparse_method,
     resolve_cache_sparse_method,
 )
@@ -1262,40 +1261,23 @@ class CacheManager(ABC):
         del real_batch_size, capture_sizes
         return None
 
-    def decode_graph_path_id(self, is_long_text: bool) -> str:
-        return decode_graph_path_id(
-            str(getattr(self.config, "sparse_method", "") or ""),
-            bool(is_long_text),
-        )
+    def decode_graph_path_id(self) -> str:
+        return decode_graph_path_id(str(getattr(self.config, "sparse_method", "") or ""))
 
-    def decode_graph_path_capacity(
-        self, is_long_text: bool
-    ) -> int:
-        method = str(getattr(self.config, "sparse_method", "") or "")
-        max_model_len = int(self.config.max_model_len)
-        if not method or is_long_text:
-            return max_model_len
-        threshold = decode_sparse_long_text_threshold(
-            method,
-            num_sink_tokens=self.config.sink_keep_tokens,
-            decode_keep_tokens=self.config.decode_keep_tokens,
-            num_recent_tokens=self.config.recent_keep_tokens,
-        )
-        return min(max_model_len, int(threshold))
+    def decode_graph_path_capacity(self) -> int:
+        return int(self.config.max_model_len)
 
     def validate_decode_graph_path_capacity(
         self,
         seqs: list[Sequence],
         *,
         capacity: int,
-        is_long_text: bool,
     ) -> None:
         actual = max(int(seq.num_tokens) for seq in seqs)
         if int(capacity) < actual:
             raise RuntimeError(
                 "decode CUDA Graph path capacity does not cover the "
-                f"request: capacity={capacity}, actual={actual}, "
-                f"is_long_text={is_long_text}."
+                f"request: capacity={capacity}, actual={actual}."
             )
 
     def decode_graph_force_eager(self) -> bool:

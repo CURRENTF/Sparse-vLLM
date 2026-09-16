@@ -162,13 +162,10 @@ class RuntimeState:
             # A clamped physical budget can hide pending prefill demand when
             # the remaining capacity is still held by reclaimable prefixes.
             pending["slots"] = max(pending["slots"], scalar)
-        for seq in decoding:
-            if not self.decode_reservations.acquire(
-                seq, allow_short=len(decoding) == 1, prefill_reserve=pending,
-                budgets=budgets,
-            ):
-                return seq
-        return None
+        return self.decode_reservations.acquire_many(
+            decoding, allow_short=len(decoding) == 1, prefill_reserve=pending,
+            budgets=budgets,
+        )
 
     @property
     def num_free_slots(self) -> int:

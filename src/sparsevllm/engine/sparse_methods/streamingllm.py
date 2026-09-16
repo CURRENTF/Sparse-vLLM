@@ -16,8 +16,6 @@ class StreamingLLMRuntime(PassThroughRuntime):
             if any(seq.is_last_chunk_prefill for seq in step.seqs):
                 self._streamingllm_prefill_eviction(step.seqs)
             return
-        if step.forward_context.is_long_text is False:
-            return
         self._streamingllm_decode_eviction(step.seqs)
 
     @torch.no_grad()

@@ -106,10 +106,10 @@ def test_prefill_accepts_arrivals_and_partial_at_admission_limit(monkeypatch):
 def test_count_uses_executable_group_and_capacity(monkeypatch):
     s, _ = setup(monkeypatch)
     active = decode(s, 3)
-    s._is_long_text = lambda seq, is_prefill: seq is not active[0]
+    active[0].append_token(3)
     fresh = request()
     s.add(fresh)
-    assert s.schedule()[:2] == ([fresh], True)
+    assert s.schedule()[:2] == (active, False)
 
     oracle = FakeMemoryOracle()
     s, _ = setup(monkeypatch, oracle=oracle)

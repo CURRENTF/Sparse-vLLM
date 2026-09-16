@@ -92,6 +92,78 @@ def test_pending_prefill_capacity_is_not_spent_by_decode():
     assert ledger.requests == {}
 
 
+def test_batch_renewal_accounts_for_live_windows_and_keeps_successful_prefix():
+    # A batch-local total must include existing windows and every earlier
+    # acquisition, including when a later request fails in a different pool.
+    pools = Pools(raw=12, latent=10)
+    ledger = DecodeReservations(pools, 4)
+    a, b, c = request(), request(), request()
+    assert ledger.acquire(a)
+    a.append_token(4)
+    pools.free = {name: free - 1 for name, free in pools.free.items()}
+    reserved = dict(raw=2, latent=1)
+    assert ledger.acquire_many([a, b, c], prefill_reserve=reserved) is c
+    assert set(ledger.requests) == {a.seq_id, b.seq_id}
+    assert ledger.outstanding() == dict(raw=7, latent=7)
+    assert all(7 + reserved[name] <= free for name, free in pools.free.items())
+    ledger.release(a.seq_id)
+    assert ledger.acquire_many([b, c], prefill_reserve=reserved) is None
+    assert ledger.outstanding() == dict(raw=8, latent=8)
+
+
+def test_batch_renewal_refreshes_eviction_headroom_between_calls():
+    # Eviction lowers residency but increases the outstanding append headroom
+    # of a live window. A persistent cached total would admit B unsafely.
+    class EvictingPool(Pools):
+        def __init__(self):
+            super().__init__(slots=3)
+            self.lengths = {}
+
+        def decode_window_costs(self, seq, tokens):
+            length = peak = self.lengths[seq.seq_id]
+            for _ in range(tokens):
+                length += 1
+                peak = max(peak, length)
+                if length >= 7:
+                    length = 4
+            return {"slots": peak - self.lengths[seq.seq_id]}
+
+    pool = EvictingPool()
+    ledger = DecodeReservations(pool, 4)
+    a, b = request(), request()
+    pool.lengths = {a.seq_id: 6, b.seq_id: 4}
+    assert ledger.acquire_many([a]) is None
+    a.append_token(4)
+    pool.lengths[a.seq_id] = 4
+    pool.free['slots'] += 2
+    assert ledger.acquire_many([a, b]) is b  # 3 + 3 cannot fit in five slots.
+    assert set(ledger.requests) == {a.seq_id}
+    # The expired window must no longer be counted when A itself renews.
+    for _ in range(3):
+        a.append_token(4)
+    assert ledger.acquire_many([a, b]) is b
+    assert ledger.requests[a.seq_id].end == a.num_completion_tokens + 4
+    ledger.release(a.seq_id)
+    assert ledger.acquire_many([b]) is None
+
+
+def test_batch_failure_propagates_without_committing_failing_request():
+    pools = Pools(slots=12)
+    ledger = DecodeReservations(pools, 4)
+    a, b = request(), request()
+    original = pools.decode_window_costs
+
+    def costs(seq, tokens):
+        if seq is b:
+            raise RuntimeError('missing physical row')
+        return original(seq, tokens)
+
+    pools.decode_window_costs = costs
+    with pytest.raises(RuntimeError, match='missing physical row'):
+        ledger.acquire_many([a, b])
+    assert set(ledger.requests) == {a.seq_id}
+
+
 def test_runtime_reuses_live_windows_without_querying_prefix_capacity():
     # The ledger's early return alone did not prevent its caller from scanning
     # the radix tree first. Exercise that caller and renewal safety together.
@@ -196,26 +268,30 @@ def test_snapkv_window_cost_ignores_output_limit(tokens):
     assert manager.chain_physical_residency(seq.seq_id) == (8,)
 
 
-@pytest.mark.parametrize('tokens', [1, 2, 7, 31])
-def test_h2o_window_covers_append_before_eviction(tokens):
+@pytest.mark.parametrize('tokens,eviction', [(0, True), (1, True), (2, True),
+                                          (7, True), (31, True), (7, False)])
+def test_h2o_window_covers_append_before_eviction(tokens, eviction):
+    # Include rows before/at/past the eviction trigger, uneven residency, and
+    # non-contiguous layer IDs: the direct cost path must retain physical peaks.
     from sparsevllm.engine.cache_manager.methods.h2o import H2OCacheManager
     manager = object.__new__(H2OCacheManager)
     manager.config = SimpleNamespace(sparse_method='h2o', h2o_decode_budget=4,
                                      h2o_decode_eviction_interval=3, h2o_prefill_budget=4,
-                                     h2o_decode_eviction=True,
+                                     h2o_decode_eviction=eviction,
                                      engine_prefill_chunk_size=4)
-    manager.kv_transformer_layer_indices = lambda: [0]
-    manager.chain_physical_residency = lambda seq_id: (6,)
-    manager._num_free_slots = [1000]
-    manager.free_rows = [[]]
-    length = 6
-    peak = length
-    for _ in range(tokens):
-        length += 1
-        peak = max(peak, length)
-        if length >= 7:
-            length = 4
-    assert manager.decode_window_costs(request(), tokens) == {'layer_0': peak - 6}
+    layers, residents = [0, 2, 3, 5], (2, 6, 7, 9)
+    manager.kv_transformer_layer_indices = lambda: layers
+    manager.chain_physical_residency = lambda seq_id: residents
+    expected = {}
+    for layer, resident in zip(layers, residents):
+        length = peak = resident
+        for _ in range(tokens):
+            length += 1
+            peak = max(peak, length)
+            if eviction and length >= 7:
+                length = 4
+        expected[f'layer_{layer}'] = peak - resident
+    assert manager.decode_window_costs(request(), tokens) == expected
 
 
 @pytest.mark.parametrize('resident,tokens', [

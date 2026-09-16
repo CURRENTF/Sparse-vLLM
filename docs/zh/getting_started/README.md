@@ -160,7 +160,7 @@ OpenAI 服务 CLI 使用 `--favor-min-decoding-seqs 4`；效率 probe 使用
 `--hyper-params '{"favor_min_decoding_seqs":4}'`。
 
 Decode 阶段中，下一步可执行 decode 数达到阈值时保持 decode，否则尝试 prefill。
-计数沿用已有 short 优先、short/long 分批、decode batch 上限和可写 KV 容量规则，
+计数包含混合长度请求，并遵守 decode batch 上限和可写 KV 容量规则，
 包含可执行的 recompute decode；不使用 resident KV 行数。
 没有 prefill 时继续 decode，不等待凑批。最老 prefill 等待达到 60 秒时，
 取消 decode 偏好并优先尝试最老可接纳的 prefill；容量和 replay 恢复约束仍然有效。

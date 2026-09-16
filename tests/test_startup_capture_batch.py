@@ -7,6 +7,7 @@ import pytest
 
 from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphKey
 from sparsevllm.engine.llm_engine import LLMEngine
+from sparsevllm.sampling_params import SamplingParams
 
 
 def _engine(*, capacity=25, remote_capacity=None, fail_prefill=False, fail_capture=False):
@@ -19,8 +20,6 @@ def _engine(*, capacity=25, remote_capacity=None, fail_prefill=False, fail_captu
     )
     engine.scheduler = SimpleNamespace(
         waiting=deque(), decoding=deque(),
-        _long_text_threshold=lambda **_: 10,
-        _is_long_text=lambda seq, **_: seq.num_tokens > 10,
     )
     live = {}
     costs = {}
@@ -55,7 +54,7 @@ def _engine(*, capacity=25, remote_capacity=None, fail_prefill=False, fail_captu
         if method == "resolve_startup_decode_graph_plan":
             plan = args[0]
             return [{"feasible": [entry for entry in plan
-                                   if entry[0] * (10 if entry[2] else 1) <= capacity]}]
+                                   if entry[0] * 3 <= capacity]}]
         if method == "startup_capture_prefill_fits":
             peak = sum(costs.values()) + args[0]
             return [{"fits": peak <= limit}
@@ -70,13 +69,12 @@ def _engine(*, capacity=25, remote_capacity=None, fail_prefill=False, fail_captu
             assert sum(costs.values()) + len(seqs) <= capacity
             if fail_capture:
                 raise RuntimeError("capture kernel failed")
-            is_long = seqs[0].num_tokens > 10
             key = DecodeCudaGraphKey(
                 method="h2o", batch_size=len(seqs), capture_sampling=False,
-                graph_path_id="long" if is_long else "short",
+                graph_path_id="unified",
             )
             graph._graphs[key] = SimpleNamespace(
-                graph=object(), capture_context_capacity=24 if is_long else 10,
+                graph=object(), capture_context_capacity=24,
             )
             graph.capture_count += 1
             events.append(("capture", key.graph_path_id, len(seqs)))
@@ -88,29 +86,34 @@ def _engine(*, capacity=25, remote_capacity=None, fail_prefill=False, fail_captu
     return engine, live, costs, events
 
 
-def test_capture_reaches_full_batch_after_prefill_compaction():
-    # All prompts need 30 slots together, but serial prefill peaks at 24,
-    # including the already parked requests. The decode batch still has B=3.
+def test_capture_uses_short_seeds_for_full_context_capacity():
     engine, live, costs, events = _engine()
-
-    assert engine._capture_startup_decode_graphs(0, respect_runtime_capacity=True) == 6
-
-    assert ("capture", "long", 3) in events
-    assert ("capture", "short", 3) in events
-    assert max(event[2] for event in events if event[0] == "prefill") <= 25
+    assert engine._capture_startup_decode_graphs(0, respect_runtime_capacity=True) == 3
+    assert ("capture", "unified", 3) in events
     assert not live and not costs
     assert not engine.scheduler.waiting and not engine.scheduler.decoding
 
 
+def test_capture_reaches_full_batch_after_prefill_compaction():
+    engine, live, costs, events = _engine()
+    parked, offset = engine._prepare_startup_capture_batch(
+        SamplingParams(max_tokens=2), 0, batch_size=3, prompt_len=10,
+        sequential_prefill=True,
+    )
+    assert offset == 3 and len(parked) == 3
+    assert max(event[2] for event in events if event[0] == "prefill") <= 25
+    for seq in parked:
+        engine.abort_request(seq.seq_id)
+    assert not live and not costs
+
+
 def test_serial_capture_checks_every_rank_and_releases_partial_batch():
     engine, live, costs, events = _engine(remote_capacity=20)
-
-    # Two long requests are parked, but the third cannot fit on the other
-    # rank. They must be released before the short family is prepared.
-    assert engine._capture_startup_decode_graphs(0, respect_runtime_capacity=True) == 5
-
-    assert ("capture", "long", 3) not in events
-    assert ("capture", "short", 3) in events
+    parked, offset = engine._prepare_startup_capture_batch(
+        SamplingParams(max_tokens=2), 0, batch_size=3, prompt_len=10,
+        sequential_prefill=True,
+    )
+    assert parked is None and offset == 2
     assert not live and not costs
     assert not engine.scheduler.waiting and not engine.scheduler.decoding
 
@@ -125,13 +128,13 @@ def test_capture_prefill_failure_propagates_and_releases_requests():
     assert not engine.scheduler.waiting and not engine.scheduler.decoding
 
 
-@pytest.mark.parametrize("capacity,remote_capacity,capture_long", [
+@pytest.mark.parametrize("capacity,remote_capacity,fits", [
     (31, None, False),
     (32, None, True),
     (32, 31, False),
 ])
 def test_capture_checks_full_decode_append_after_serial_prefill(
-    capacity, remote_capacity, capture_long,
+    capacity, remote_capacity, fits,
 ):
     # Four prompts peak at 31 slots with serial prefill, retain 28, and need
     # 32 for the captured decode step. Existing B=3 coverage misses this gap.
@@ -140,10 +143,14 @@ def test_capture_checks_full_decode_append_after_serial_prefill(
     )
     engine.config.decode_graph_capture_sizes = [4]
 
-    assert engine._capture_startup_decode_graphs(0, respect_runtime_capacity=True) == 8
-
-    assert (("capture", "long", 4) in events) == capture_long
-    assert ("capture", "short", 4) in events
+    parked, offset = engine._prepare_startup_capture_batch(
+        SamplingParams(max_tokens=2), 0, batch_size=4, prompt_len=10,
+        sequential_prefill=True,
+    )
+    assert offset == 4
+    assert (parked is not None) == fits
+    for seq in parked or []:
+        engine.abort_request(seq.seq_id)
     assert not live and not costs
     assert not engine.scheduler.waiting and not engine.scheduler.decoding
 

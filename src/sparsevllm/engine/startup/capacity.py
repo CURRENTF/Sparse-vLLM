@@ -8,7 +8,6 @@ import torch
 from sparsevllm.configs.cuda_graph import build_decode_cuda_graph_startup_plan
 from sparsevllm.engine.cache_manager.storage import CacheLayout
 from sparsevllm.method_registry import (
-    decode_sparse_long_text_threshold,
     normalize_sparse_method,
     resolve_cache_sparse_method,
 )
@@ -105,10 +104,10 @@ def profiling_kv_slots(config) -> int:
     if not bool(config.decode_graph_startup_capture):
         return required
 
-    for batch_size, _, is_long_text in build_decode_cuda_graph_startup_plan(config):
+    for batch_size, _ in build_decode_cuda_graph_startup_plan(config):
         required = max(
             required,
-            startup_graph_family_kv_slots(config, batch_size, is_long_text),
+            startup_graph_family_kv_slots(config, batch_size),
         )
     return required
 
@@ -116,19 +115,9 @@ def profiling_kv_slots(config) -> int:
 def startup_graph_family_kv_slots(
     config,
     batch_size: int,
-    is_long_text: bool,
 ) -> int:
     method = normalize_sparse_method(config.sparse_method)
-    prompt_tokens = (
-        decode_sparse_long_text_threshold(
-            method,
-            num_sink_tokens=config.sink_keep_tokens,
-            decode_keep_tokens=config.decode_keep_tokens,
-            num_recent_tokens=config.recent_keep_tokens,
-        )
-        if is_long_text
-        else 1
-    )
+    prompt_tokens = 1
     page_size = int(config.quest_chunk_size) if method == "quest" else 1
     slots_per_sequence = ceil((int(prompt_tokens) + 2) / page_size) * page_size
     return int(batch_size) * slots_per_sequence
@@ -136,23 +125,14 @@ def startup_graph_family_kv_slots(
 
 def feasible_startup_graph_plan(
     config,
-    startup_plan: list[tuple[int, int, bool]],
+    startup_plan: list[tuple[int, int]],
     memory_oracle,
-) -> tuple[list[tuple[int, int, bool]], list[tuple[int, int, bool]]]:
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
     feasible = []
     skipped = []
     for entry in startup_plan:
-        batch_size, _, is_long_text = entry
-        prompt_tokens = (
-            decode_sparse_long_text_threshold(
-                normalize_sparse_method(config.sparse_method),
-                num_sink_tokens=config.sink_keep_tokens,
-                decode_keep_tokens=config.decode_keep_tokens,
-                num_recent_tokens=config.recent_keep_tokens,
-            )
-            if is_long_text
-            else 1
-        )
+        batch_size, _ = entry
+        prompt_tokens = 1
         destination = (
             feasible
             if memory_oracle.startup_batch_fits(

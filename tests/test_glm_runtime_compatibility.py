@@ -177,7 +177,7 @@ def test_glm_config_rejects_disabling_sparse_startup_capture():
 
 
 def test_glm_config_rejects_startup_budget_smaller_than_batch_plan():
-    with pytest.raises(ValueError, match="must cover every batch/topology path"):
+    with pytest.raises(ValueError, match="must cover every batch bucket"):
         _glm_config(
             decode_graph=True,
             decode_graph_startup_capture=True,

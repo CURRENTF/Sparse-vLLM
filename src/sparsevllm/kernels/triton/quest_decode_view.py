@@ -785,9 +785,9 @@ def _finalize_quest_paged_decode_view_kernel(
     row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_SIZE)
     output_mask = offsets < WIDTH
-    row_num_pages = tl.maximum(tl.load(num_pages + row), 1)
+    row_num_pages = tl.load(num_pages + row)
     context_len = tl.load(context_lens + row)
-    last_page_len = context_len - (row_num_pages - 1) * PAGE_SIZE
+    last_page_len = tl.where(row_num_pages > 0, context_len - (row_num_pages - 1) * PAGE_SIZE, 0)
     use_dense = False
     if USE_DENSE_FALLBACK:
         use_dense = (context_len <= TOKEN_BUDGET) | (
@@ -801,7 +801,9 @@ def _finalize_quest_paged_decode_view_kernel(
         other=0,
     )
     last_page = tl.load(
-        row_page_slots + row * row_page_stride + row_num_pages - 1
+        row_page_slots + row * row_page_stride + tl.maximum(row_num_pages - 1, 0),
+        mask=row_num_pages > 0,
+        other=0,
     )
     sparse_pages = tl.where(offsets < PREV_BUDGET, previous_pages, last_page)
     sparse_valid = offsets < PREV_BUDGET + 1
@@ -895,12 +897,16 @@ def finalize_quest_paged_decode_view(
     token_budget = int(token_budget)
     if page_size <= 0 or token_budget <= 0:
         raise ValueError("page_size and token_budget must be positive")
+    if use_dense_fallback and width < min(
+        int(row_page_slots.shape[1]), triton.cdiv(token_budget, page_size)
+    ):
+        raise ValueError("QuEST paged output table cannot hold the dense token budget")
 
     if not selected_prev_page_slots.is_cuda:
         safe_num_pages = num_pages.to(torch.long).clamp_min(1)
         last_pages = row_page_slots.gather(1, (safe_num_pages - 1)[:, None])
         sparse_pages = torch.cat((selected_prev_page_slots, last_pages), dim=1)
-        last_page_lens = context_lens - (num_pages - 1) * page_size
+        last_page_lens = torch.where(num_pages > 0, context_lens - (num_pages - 1) * page_size, 0)
         sparse_lens = prev_budget * page_size + last_page_lens
         if use_dense_fallback:
             use_dense = (context_lens <= token_budget) | (

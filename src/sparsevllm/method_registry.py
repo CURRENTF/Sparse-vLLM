@@ -462,32 +462,9 @@ TP_DECODE_CUDA_GRAPH_SUPPORTED_METHODS = {
 }
 
 
-def decode_sparse_long_text_threshold(
-    method: str,
-    *,
-    num_sink_tokens: int,
-    decode_keep_tokens: int,
-    num_recent_tokens: int,
-) -> int:
-    """Return the shared decode boundary between short and sparse graph families."""
-    method = str(method or "")
-    if not method:
-        return 0
-    if method in {"streamingllm", "attention-sink", "attention_sink"}:
-        return int(num_sink_tokens) + int(num_recent_tokens)
-    return (
-        int(num_sink_tokens)
-        + int(decode_keep_tokens)
-        + int(num_recent_tokens)
-    )
-
-
-def decode_graph_path_id(method: str, is_long_text: bool) -> str:
-    """Identify one graph-stable decode topology family."""
-    method = str(method or "")
-    if not method:
-        return "dense"
-    return "long" if is_long_text else "short"
+def decode_graph_path_id(method: str) -> str:
+    """One graph-stable decode family for all request lengths."""
+    return "unified" if method else "dense"
 
 
 _DEFAULT_PREFILL_POLICY_BY_METHOD = {

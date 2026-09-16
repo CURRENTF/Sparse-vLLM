@@ -90,7 +90,6 @@ def make_controller(
     sink=1,
     recent=1,
     pyramid_ratios=None,
-    is_long_text=True,
 ):
     layout = SimpleNamespace(
         kv_layer_index=lambda layer: int(layer),
@@ -153,7 +152,6 @@ def make_controller(
     set_context(
         False,
         cache_manager=manager,
-        is_long_text=is_long_text,
         seqs=seqs,
     )
     controller.prepare_forward(seqs, is_prefill=False)
@@ -305,7 +303,6 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
             "sink": 64,
             "recent": 512,
             "pyramid_ratios": [0.6, 0.01],
-            "is_long_text": False,
         }
         controller, _manager, _seqs = make_controller(
             **common,
@@ -340,7 +337,6 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
             keep=4,
             sink=1,
             recent=1,
-            is_long_text=False,
         )
         self.assertEqual(
             snap_short.runtime._snapkv_decode_trigger_len(

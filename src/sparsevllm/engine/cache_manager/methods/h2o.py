@@ -12,8 +12,9 @@ from sparsevllm.method_registry import (
     normalize_sparse_method,
     resolve_prefill_sparse_method,
 )
+from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.context import get_context
-from sparsevllm.utils.profiler import profiler
+from sparsevllm.utils.profiler import cpu_timing, profiler
 
 from ..base import ExplicitKVPayload, PrefillComputeView, PrefillScoreRequest
 from .snapkv import SnapKVCacheManager
@@ -50,6 +51,8 @@ class H2OCacheManager(SnapKVCacheManager):
             allocation_budget_bytes=allocation_budget_bytes,
         )
         self._h2o_scores: dict[tuple[int, int], torch.Tensor] = {}
+        self._h2o_decode_score_rows: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._h2o_decode_score_metadata = None
         # Decode rows remain reclaimable while temporarily absent from a
         # scheduled batch. Keep only ids here: caching full Sequence objects
         # would retain their logical token histories on every worker.
@@ -180,6 +183,23 @@ class H2OCacheManager(SnapKVCacheManager):
         del seq
         return 1
 
+    def _decode_append_peak(self, resident: int, tokens: int) -> int:
+        peak = resident + tokens
+        if getattr(self.config, "h2o_decode_eviction", False) and tokens:
+            trigger = self.h2o_decode_budget + self.h2o_decode_eviction_interval
+            peak = min(peak, max(resident + 1, trigger))
+        return peak
+
+    def decode_window_costs(self, seq: Sequence, tokens: int) -> dict[str, int]:
+        # Decode only needs append headroom, not chain admission deficits/rows.
+        tokens = max(0, int(tokens))
+        return {
+            f"layer_{layer}": self._decode_append_peak(resident, tokens) - resident
+            for layer, resident in zip(
+                self.kv_transformer_layer_indices(), self.chain_physical_residency(seq.seq_id),
+            )
+        }
+
     def chain_capacity_deficits(
         self,
         *,
@@ -219,10 +239,7 @@ class H2OCacheManager(SnapKVCacheManager):
                 )
             else:
                 resident_after_prefill = prefill_peak
-            decode_peak = resident_after_prefill + generated_kv_tokens
-            if getattr(self.config, "h2o_decode_eviction", False) and generated_kv_tokens:
-                trigger = self.h2o_decode_budget + self.h2o_decode_eviction_interval
-                decode_peak = min(decode_peak, max(resident_after_prefill + 1, trigger))
+            decode_peak = self._decode_append_peak(resident_after_prefill, generated_kv_tokens)
             required_by_layer.append(
                 max(0, max(prefill_peak, decode_peak) - (0 if needs_resident_row else existing))
             )
@@ -265,6 +282,7 @@ class H2OCacheManager(SnapKVCacheManager):
             row_deficit,
         )
 
+    @cpu_timing.timed
     @torch.no_grad()
     def prepare_decode_static(
         self,
@@ -1035,6 +1053,7 @@ class H2OCacheManager(SnapKVCacheManager):
             )
             self._h2o_scores[key] = cumulative
 
+    @cpu_timing.timed
     @torch.no_grad()
     def accumulate_decode_headwise_logits(
         self,
@@ -1043,77 +1062,84 @@ class H2OCacheManager(SnapKVCacheManager):
         raw_logits: torch.Tensor,
         *,
         softmax_scale: float,
+        normalize_logits: bool = True,
     ) -> None:
-        """Normalize per query head and accumulate in retained physical order.
+        """Accumulate into request-owned rows, independent of the scheduled batch.
 
-        Runs at finish_step, outside model capture, like the probability baseline.
-        Eviction, batch changes and prefill invalidate/rebuild the existing score
-        workspace; no captured graph points to this persistent history.
+        Only a replaced/compacted row or an exhausted capacity copies history.
+        No model graph owns these rows; finish_step publishes the updated views.
         """
-        from sparsevllm.kernels.triton.h2o_score import h2o_headwise_softmax_accumulate
+        from sparsevllm.kernels.triton.h2o_score import h2o_headwise_softmax_accumulate_rows
 
         if raw_logits.ndim != 4 or tuple(raw_logits.shape[:2]) != (len(layer_indices), len(seqs)):
             raise ValueError("H2O raw decode logits must be [layers, batch, heads, width]")
         if not layer_indices or not seqs:
             return
-        lengths = tuple(
-            self._physical_row_len(layer, seq) for layer in layer_indices for seq in seqs
-        )
+        if raw_logits.dtype != torch.float32 or not 0 < softmax_scale < float("inf"):
+            raise ValueError("H2O raw decode requires FP32 logits and finite positive scale")
+        if len(set(layer_indices)) != len(layer_indices) or len({seq.seq_id for seq in seqs}) != len(seqs):
+            raise ValueError("H2O decode cannot update the same destination row twice")
+        keys = [(layer, int(seq.seq_id)) for layer in layer_indices for seq in seqs]
+        lengths = [self._physical_row_len(layer, seq) for layer in layer_indices for seq in seqs]
         if min(lengths) <= 0 or max(lengths) > raw_logits.shape[-1]:
             raise ValueError("H2O raw decode logits do not cover the physical rows")
-        previous_lengths = tuple(length - 1 for length in lengths)
-        signature = ("headwise", tuple(layer_indices), tuple(int(seq.seq_id) for seq in seqs))
-        workspace = getattr(self, "_h2o_decode_score_workspace", None)
-        reuse = (
-            workspace is not None
-            and getattr(self, "_h2o_decode_score_signature", None) == signature
-            and getattr(self, "_h2o_decode_score_length", None) == previous_lengths
-            and workspace.shape[-1] >= max(lengths)
-        )
-        if not reuse or self.validate_runtime_invariants:
-            previous_rows = []
-            for index, (layer, seq) in enumerate(
-                (layer, seq) for layer in layer_indices for seq in seqs
-            ):
-                previous = self._h2o_scores.get(self._score_key(layer, seq.seq_id))
-                if previous is None or previous.numel() != previous_lengths[index]:
-                    raise RuntimeError(
-                        "H2O headwise score vector must align before appending: "
-                        f"layer={layer} seq_id={seq.seq_id} expected={previous_lengths[index]}"
-                    )
-                previous_rows.append(previous)
-            if reuse:
-                reuse = all(
-                    row.data_ptr() == workspace[i // len(seqs), i % len(seqs)].data_ptr()
-                    for i, row in enumerate(previous_rows)
+        previous_rows = [self._h2o_scores.get(key) for key in keys]
+        # Validate the entire batch before changing ownership or publishing views.
+        for key, previous, length in zip(keys, previous_rows, lengths):
+            if previous is None or previous.numel() != length - 1:
+                raise RuntimeError(
+                    "H2O headwise score vector must align before appending: "
+                    f"layer={key[0]} seq_id={key[1]} expected={length - 1}"
                 )
-        if not reuse:
-            capacity = max(max(lengths), self.h2o_decode_budget + self.h2o_decode_eviction_interval)
-            workspace = torch.empty(
-                (len(layer_indices), len(seqs), capacity),
-                dtype=torch.float32, device=raw_logits.device,
-            )
-            for index, previous in enumerate(previous_rows):
-                workspace[index // len(seqs), index % len(seqs), :previous.numel()].copy_(previous)
-        context_lens = torch.tensor(lengths, dtype=torch.int32, device=raw_logits.device).view(
-            len(layer_indices), len(seqs)
-        )
-        h2o_headwise_softmax_accumulate(
-            # finish_step is graph-out: avoid reducing the unused logical
-            # context capacity while keeping the captured logits storage fixed.
-            raw_logits[..., :max(lengths)], workspace, context_lens,
-            softmax_scale=softmax_scale,
-        )
-        self._h2o_decode_score_workspace = workspace
-        self._h2o_decode_score_signature = signature
-        self._h2o_decode_score_length = lengths
-        for index, (layer, seq) in enumerate(
-            (layer, seq) for layer in layer_indices for seq in seqs
-        ):
-            self._h2o_scores[self._score_key(layer, seq.seq_id)] = workspace[
-                index // len(seqs), index % len(seqs), :lengths[index]
-            ]
+            if previous.device != raw_logits.device or previous.dtype != torch.float32:
+                raise TypeError("H2O history and logits must share FP32 dtype and device")
+        rows = getattr(self, "_h2o_decode_score_rows", None)
+        if rows is None:
+            rows = self._h2o_decode_score_rows = {}
+        destinations = []
+        for key, previous, length in zip(keys, previous_rows, lengths):
+            owned = rows.get(key)
+            if owned is None or owned[1] is not previous or owned[0].numel() < length:
+                capacity = max(length, self.h2o_decode_budget + self.h2o_decode_eviction_interval)
+                if owned is not None and owned[1] is previous:
+                    capacity = max(capacity, 2 * owned[0].numel())
+                buffer = torch.empty(capacity, dtype=torch.float32, device=raw_logits.device)
+                if length > 1:
+                    buffer[:length - 1].copy_(previous)
+            else:
+                buffer = owned[0]
+            destinations.append(buffer)
 
+        # Reuse pinned host metadata only after its preceding DMA has completed.
+        # Device copies are ordered on the same stream as score accumulation.
+        metadata = getattr(self, "_h2o_decode_score_metadata", None)
+        if metadata is not None:
+            device_runtime.synchronize_event(metadata[2])
+        count = len(keys)
+        pin_memory = raw_logits.is_cuda and device_runtime.supports_pin_memory()
+        if metadata is None or metadata[0].shape[0] < count or metadata[1].device != raw_logits.device:
+            capacity = 1 << (count - 1).bit_length()
+            host = torch.empty((capacity, 2), dtype=torch.int64, pin_memory=pin_memory)
+            device = torch.empty_like(host, device=raw_logits.device)
+            ready = device_runtime.new_event(device=raw_logits.device)
+            metadata = self._h2o_decode_score_metadata = (host, device, ready)
+        host, device, ready = metadata
+        host.numpy()[:count, 0] = [buffer.data_ptr() for buffer in destinations]
+        host.numpy()[:count, 1] = lengths
+        device[:count].copy_(host[:count], non_blocking=pin_memory)
+        device_runtime.record_event(ready, device=raw_logits.device)
+        h2o_headwise_softmax_accumulate_rows(
+            raw_logits[..., :max(lengths)],
+            device[:count].view(len(layer_indices), len(seqs), 2),
+            softmax_scale=softmax_scale,
+            normalize_logits=normalize_logits,
+        )
+        for key, buffer, length in zip(keys, destinations, lengths):
+            view = buffer[:length]
+            self._h2o_scores[key] = view
+            rows[key] = (buffer, view)
+
+    @cpu_timing.timed
     @torch.no_grad()
     def update_decode_attention_scores_all_layers(
         self,
@@ -1126,9 +1152,9 @@ class H2OCacheManager(SnapKVCacheManager):
     ) -> bool:
         """Accumulate one reduced [layers, batch, width] decode score tensor.
 
-        Returns True when the cross-layer path was used. Raw QK logits are
-        normalized and accumulated in one CUDA launch, including non-uniform
-        rows. Already-normalized non-uniform scores use the per-layer path.
+        Returns True when the cross-layer path was used. CUDA rows keep their
+        ownership through batch churn for raw QK and already-normalized scores.
+        CPU probability updates retain their reference tensor implementation.
         """
         if reduced_scores.dim() != 3:
             raise ValueError(
@@ -1148,10 +1174,19 @@ class H2OCacheManager(SnapKVCacheManager):
                 "H2O raw-logit accumulation requires an explicit softmax_scale."
             )
 
+        if normalize_logits or reduced_scores.is_cuda:
+            scores = reduced_scores if normalize_logits else reduced_scores.float()
+            self.accumulate_decode_headwise_logits(
+                layer_indices, seqs, scores.unsqueeze(2),
+                softmax_scale=float(softmax_scale) if normalize_logits else 1.0,
+                normalize_logits=normalize_logits,
+            )
+            return True
+
         physical_lens = [
             self._physical_row_len(layer_indices[0], seq) for seq in seqs
         ]
-        if normalize_logits or self.validate_runtime_invariants:
+        if self.validate_runtime_invariants:
             physical_lens.extend(
                 self._physical_row_len(layer_idx, seq)
                 for layer_idx in layer_indices[1:]
@@ -1159,17 +1194,6 @@ class H2OCacheManager(SnapKVCacheManager):
             )
         kv_len = int(physical_lens[0])
         if any(int(length) != kv_len for length in physical_lens[1:]):
-            if normalize_logits:
-                # MLA has already reduced its query heads. A singleton head
-                # preserves softmax(head-reduced QK), while the fused updater
-                # masks each physical row and appends its new token separately.
-                self.accumulate_decode_headwise_logits(
-                    layer_indices,
-                    seqs,
-                    reduced_scores.unsqueeze(2),
-                    softmax_scale=float(softmax_scale),
-                )
-                return True
             for local_layer, layer_idx in enumerate(layer_indices):
                 self.update_decode_attention_scores(
                     layer_idx,
@@ -1244,27 +1268,10 @@ class H2OCacheManager(SnapKVCacheManager):
                 )
                 workspace[:, :, :previous_len].copy_(previous_scores)
 
-        if normalize_logits:
-            from sparsevllm.kernels.triton.h2o_score import (
-                h2o_softmax_accumulate,
-            )
-
-            h2o_softmax_accumulate(
-                reduced_scores,
-                workspace,
-                width=kv_len,
-                previous_width=previous_len,
-                softmax_scale=float(softmax_scale),
-            )
-        else:
-            score_update = reduced_scores[:, :, :kv_len].float()
-            if previous_len:
-                workspace[:, :, :previous_len].add_(
-                    score_update[:, :, :previous_len]
-                )
-            workspace[:, :, previous_len:kv_len].copy_(
-                score_update[:, :, previous_len:kv_len]
-            )
+        score_update = reduced_scores[:, :, :kv_len].float()
+        if previous_len:
+            workspace[:, :, :previous_len].add_(score_update[:, :, :previous_len])
+        workspace[:, :, previous_len:kv_len].copy_(score_update[:, :, previous_len:kv_len])
         self._h2o_decode_score_workspace = workspace
         self._h2o_decode_score_signature = signature
         self._h2o_decode_score_length = kv_len
@@ -1903,6 +1910,7 @@ class H2OCacheManager(SnapKVCacheManager):
         self._h2o_counters["decode_evictions"] += int(evicted_rows)
         self._h2o_counters["dropped_tokens"] += int(dropped_tokens)
 
+    @cpu_timing.timed
     def evict_after_decode(self, seqs: list[Sequence]):
         if not seqs:
             return
@@ -1927,6 +1935,10 @@ class H2OCacheManager(SnapKVCacheManager):
         for key in list(self._h2o_scores):
             if key[1] == seq_id:
                 self._h2o_scores.pop(key, None)
+        rows = getattr(self, "_h2o_decode_score_rows", {})
+        for key in list(rows):
+            if key[1] == seq_id:
+                rows.pop(key)
         super().free_seq(seq_id)
 
     def on_chain_turn_finished(
@@ -1958,6 +1970,8 @@ class H2OCacheManager(SnapKVCacheManager):
 
     def reset_after_warmup(self) -> None:
         self._h2o_scores.clear()
+        getattr(self, "_h2o_decode_score_rows", {}).clear()
+        self._h2o_decode_score_metadata = None
         self._h2o_active_decode_seq_ids.clear()
         self._h2o_decode_score_workspace = None
         self._h2o_decode_score_signature = None
