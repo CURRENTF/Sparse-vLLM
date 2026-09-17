@@ -109,7 +109,7 @@ def prepare(args):
 
 
 def environment(python):
-    python = str(Path(python).resolve(strict=True))
+    python = str(Path(python).absolute())
     env = os.environ.copy()
     env["PATH"] = str(Path(python).parent) + os.pathsep + env.get("PATH", "")
     env["PYTHONPATH"] = os.pathsep.join((str(REPO / "src"), str(REPO), env.get("PYTHONPATH", "")))
