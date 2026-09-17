@@ -4570,6 +4570,36 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("tool_calls", choice["message"])
         self.assertEqual(choice["finish_reason"], "stop")
 
+    async def test_chat_completion_glm_empty_tool_name_preserves_output(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_response
+
+        for text in (
+            "</think><tool_call></tool_call>",
+            "</think><tool_call>   </tool_call>",
+            "</think><tool_call><arg_key>command</arg_key><arg_value>ls</arg_value></tool_call>",
+        ):
+            with self.subTest(text=text):
+                queue = asyncio.Queue()
+                await queue.put({
+                    "type": "final", "index": 0, "text": text, "raw_text": text,
+                    "finish_reason": "length", "prompt_tokens": 12,
+                    "completion_tokens": 3, "token_ids": [1, 2, 3],
+                    "token_logprobs": [None] * 3, "top_logprobs": [None] * 3,
+                })
+                response = await _chat_completion_response(
+                    "chatcmpl-test", 123, "model",
+                    [RequestHandle(output_queue=queue, cancelled=threading.Event())],
+                    prompt="[gMASK]<sop><|assistant|><think>",
+                    parse_tools=True,
+                    response_parser=_transformers_response_parser(glm_tools=True),
+                )
+                choice = response["choices"][0]
+                self.assertEqual(choice["message"]["content"], text)
+                self.assertNotIn("tool_calls", choice["message"])
+                self.assertEqual(choice["finish_reason"], "length")
+                self.assertEqual(response["usage"]["completion_tokens"], 3)
+                self.assertEqual(response["usage"]["prompt_tokens"], 12)
+
     async def test_chat_completion_does_not_mask_parser_contract_errors(self):
         from fastapi import HTTPException
 
@@ -6206,10 +6236,10 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
     def test_glm_response_parser_rejects_empty_tool_name(self):
         from sparsevllm.entrypoints.openai.serving.response_parsing import (
-            ResponseParseError,
+            ModelOutputParseError,
         )
 
-        with self.assertRaisesRegex(ResponseParseError, "non-empty function name"):
+        with self.assertRaisesRegex(ModelOutputParseError, "non-empty function name"):
             _transformers_response_parser(glm_tools=True).parse(
                 "</think><tool_call></tool_call>",
                 prefix="[gMASK]<sop><|assistant|><think>",

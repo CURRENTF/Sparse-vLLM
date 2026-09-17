@@ -399,8 +399,8 @@ def _normalize_tool_call(tool_call: Any) -> dict[str, Any]:
         raise ResponseParseError("Parsed tool call function must be an object.")
     name = function.get("name")
     arguments = function.get("arguments", {})
-    if not isinstance(name, str) or not name:
-        raise ResponseParseError("Parsed tool call requires a non-empty function name.")
+    if not isinstance(name, str) or not name.strip():
+        raise ModelOutputParseError("Parsed tool call requires a non-empty function name.")
     if not isinstance(arguments, str):
         arguments = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
     return {

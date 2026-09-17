@@ -273,6 +273,10 @@ def replay_agent(agent, send, *, sleep=time.sleep, clock=time.perf_counter):
                 raise ValueError(f"Response/token work mismatch: expected {turn['completion_tokens']}, got {tokens}")
             row.update(status="success", latency_s=elapsed, completion_tokens=tokens, response=response)
         except Exception as exc:
+            error_response = getattr(exc, "response", None)
+            if error_response is not None:
+                row["http_status"] = error_response.status_code
+                row["error_response_body"] = error_response.text
             row.update(status="model_failed", latency_s=clock() - start,
                        error=f"{type(exc).__name__}: {exc}")
             failed = True
