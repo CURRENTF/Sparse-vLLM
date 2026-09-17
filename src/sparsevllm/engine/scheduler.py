@@ -90,14 +90,13 @@ class Scheduler:
         return mode, compatibility
 
     def prefill_execution_mode_counts(self) -> dict[str, int]:
-        """Count queued prompts by their method-owned execution contract."""
+        """Observe queued modes using their last refreshed scheduling metadata."""
         counts = {
             PREFILL_EXECUTION_CHUNKED: 0,
             PREFILL_EXECUTION_FULL: 0,
             PREFILL_EXECUTION_RAW_OFFLOAD: 0,
         }
         for seq in self.waiting:
-            self._refresh_prefill_metadata(seq)
             counts[self._prefill_execution_mode(seq)] += 1
         return counts
 
@@ -121,6 +120,10 @@ class Scheduler:
         modes: list[tuple[str, object]] = []
         for seq in self.waiting:
             if replay_pending and not seq.is_recompute_replay:
+                continue
+            # Match candidate admission before prefix refresh, which broadcasts
+            # an RPC to every TP rank. Blocked fresh prompts cannot run yet.
+            if len(self.decoding) >= self.max_decoding_seqs and seq.num_prefilled_tokens == 0:
                 continue
             self._refresh_prefill_metadata(seq)
             batch_key = self._prefill_batch_key(seq)

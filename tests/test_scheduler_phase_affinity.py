@@ -85,6 +85,47 @@ def test_timeout_survives_scans_and_partial_gets_new_wait(monkeypatch):
     assert s.schedule()[1]  # high decode count cannot interrupt remaining chunks
 
 
+def test_saturated_decode_skips_prefix_rpc_until_admission_is_possible(monkeypatch):
+    # Aged queued prompts formerly issued TP prefix RPCs every decode step even
+    # though the decode limit made every fresh prompt ineligible.
+    from unittest.mock import Mock
+
+    s, clock = setup(monkeypatch)
+    active = decode(s)
+    s.max_decoding_seqs = len(active)
+    fresh = request()
+    s.add(fresh)
+    refresh = Mock(wraps=s.prefix_cache_hit_refresher)
+    s.prefix_cache_hit_refresher = refresh
+    clock[0] = 61
+    for _ in range(3):
+        assert s.schedule()[:2] == (active, False)
+    refresh.assert_not_called()
+    assert list(s.waiting) == [fresh]
+    assert s._prefill_wait_since[fresh.seq_id] == 0
+    s.abort(active[0].seq_id)
+    assert s.schedule()[:2] == ([fresh], True)
+    refresh.assert_called_once_with(fresh)
+
+
+def test_prefill_diagnostic_counts_do_not_refresh_or_mutate_hits(monkeypatch):
+    # LLMEngine calls these counters after every step; telemetry must not issue
+    # distributed cache operations or alter future admission state.
+    from unittest.mock import Mock
+
+    oracle = FakeMemoryOracle(prefix_hit_len=2)
+    s, _ = setup(monkeypatch, oracle=oracle)
+    fresh = request()
+    s.add(fresh)
+    refresh = Mock(wraps=s.prefix_cache_hit_refresher)
+    s.prefix_cache_hit_refresher = refresh
+    before = fresh.prefix_cache_hit_len
+    counts = s.prefill_execution_mode_counts()
+    assert sum(counts.values()) == 1
+    refresh.assert_not_called()
+    assert fresh.prefix_cache_hit_len == before
+
+
 def test_prefill_accepts_arrivals_and_partial_at_admission_limit(monkeypatch):
     s, _ = setup(monkeypatch, threshold=1)
     partial = request(12)
