@@ -1,5 +1,59 @@
 # SparseVLLM 回归测试
 
+## 真实 Agent 轨迹性能回归
+
+`--layer agent_trace` 可向已启动的 Sparse-vLLM vanilla 或 upstream vLLM
+OpenAI-compatible 服务回放 MiniSWE 轨迹，不启动 GPU 服务、不执行工具，也不评解题分数。
+先检查 GPU 空闲并启动服务，保存真实 `server_manifest.json`；基线和候选运行保持
+相同缓存冷热状态、客户端和网络位置。该层使用外部 trace manifest，不使用合成负载矩阵。
+
+优先从旧记录恢复：
+
+```bash
+python -m benchmark.sparsevllm_regression.agent_trace \
+  --run-dir "$MINISWE_RUN" --expected-instances 100 \
+  --legacy-server-requests "$SERVER_REQUESTS" --output "$TRACE_DIR"
+```
+
+恢复运行的请求日志可重复传 `--legacy-server-requests`。按冻结的 `instances.txt`
+取前 100 条，不按成功与否筛选；用 response ID 精确关联轨迹和请求，保留原始输入、
+输出、输出 token 数与轮间等待。超时/步数耗尽仍是原来的终止状态，不能叫成功。
+请求缺失/重复、API 次数不符、单条轨迹跨服务器运行或出现负间隔时明确失败。
+
+旧日志的等待时间按 `下一轮日志时间 - 下一轮请求耗时 - 上一轮日志时间` **估算**。
+日志序列化开销未知，不能宣称精确计时；工具、网络和重试等待均保留，不做推测性扣除。
+旧生成耗时只参与间隔计算，不作为回放字段保存，更不会在回放时等待这段时间。
+
+未来精确采集：在 `python -m benchmark.swe_bench_lite.run` 的常规命令上增加
+`--record-agent-trace --slice 0:100`，保留模型、API、manifest、数据集和 Docker 参数。
+默认 `mini-extra` 自动通过 `timed_mini.py` 包装，同步非流式 HTTP 请求按 instance
+写入 `agent_trace.jsonl` 并逐条 flush。未结束或包含失败 HTTP 调用的轨迹不能静默导出。
+导出时去掉 legacy 参数即可。使用既有 MiniSWE/httpx 环境；不记录认证头，但输入和
+工具输出可能敏感，语料存放在数据盘，不提交 Git。
+
+```bash
+python benchmark/sparsevllm_regression/run_suite.py --layer agent_trace \
+  --agent_trace "$TRACE_DIR" --agent_api_base "$API_BASE" \
+  --agent_server_manifest "$SERVER_MANIFEST" --agent_concurrency 16 \
+  --agent_allow_estimated_timing \
+  --output_root "$OUTPUT_ROOT" --run_id agent_baseline
+# 用匹配的新服务和新 run_id 重测，并追加：
+# --agent_baseline "$OUTPUT_ROOT/sparsevllm_regression/agent_baseline/agent_trace.json"
+# --agent_max_slowdown 1.10
+```
+
+只有旧日志估算语料需要显式接受 `--agent_allow_estimated_timing`。
+每个 worker 跑完整条 agent 再接下一条；第一轮立即发送，之后每轮都在**当前响应结束后**
+等待录下的间隔，再发送原始下一轮输入，不复用原绝对到达时间。
+模型别名替换为目标服务别名；移除 stop 条件、设置 `ignore_eos=true` 和记录的输出
+token 数，固定解码工作量并核对实际 token 数。新生成的文本不执行、不参与后续输入。
+
+`agent_trace.json` 记录本次 HTTP 延迟 P50/P95/P99，以及全部输出 token / 含等待的
+完整回放时间，不是纯 GPU 吞吐或 TTFT/TPOT。每条 agent 保存新原始响应、失败及
+依赖失败而跳过的请求。任何请求失败则 gate 失败；匹配基线时检查 P95 延迟与总时间，
+默认最多慢 10%。trace hash、模型、GPU UUID、后端、引擎配置、并发与超时须一致。
+未传基线仅建立基线，不宣称通过性能回归；`--dry_run` 只验证数据和配置、不访问服务。
+
 ## 目的
 
 本文说明如何运行 `benchmark/sparsevllm_regression/` 下固定的 SparseVLLM regression harness。

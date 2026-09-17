@@ -34,6 +34,30 @@ def percentile(values: list[float], quantile: float) -> float:
     return ordered[lower] * (1 - weight) + ordered[upper] * weight
 
 
+def http_trace_summary(rows: list[dict], elapsed_s: float) -> dict:
+    """Whole replay rate includes think time; non-streaming HTTP has no TTFT/TPOT."""
+    if not rows or not math.isfinite(elapsed_s) or elapsed_s <= 0:
+        raise ValueError("HTTP trace summary needs requests and positive wall time")
+    failures = sum(row["status"] != "success" for row in rows)
+    result = {"status": "failed" if failures else "success", "request_count": len(rows),
+              "unsuccessful_request_count": failures, "elapsed_s": elapsed_s,
+              "output_token_throughput_tps": None,
+              "throughput_scope": "all_output_tokens_over_whole_replay_including_think_time",
+              "latency_s_p50": None, "latency_s_p95": None, "latency_s_p99": None}
+    if failures:
+        return result
+    latencies = [row["latency_s"] for row in rows]
+    tokens = [row["completion_tokens"] for row in rows]
+    if any(not math.isfinite(value) or value <= 0 for value in latencies) or any(
+            type(value) is not int or value <= 0 for value in tokens):
+        raise ValueError("Invalid HTTP latency/token counts")
+    result["completion_tokens"] = sum(tokens)
+    result["output_token_throughput_tps"] = sum(tokens) / elapsed_s
+    for pct in (50, 95, 99):
+        result[f"latency_s_p{pct}"] = percentile(latencies, pct / 100)
+    return result
+
+
 def request_metrics(ttft_s: float, after_first_s: float, generated_tokens: int) -> dict:
     """Include all waiting after first token; do not subtract other stage work."""
     if (

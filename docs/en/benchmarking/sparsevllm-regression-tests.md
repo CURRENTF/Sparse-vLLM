@@ -17,9 +17,75 @@ The harness is intended for reproducible method/model checks across:
   workloads, variable prompt lengths, and prefix-cache hit validation for
   supported methods.
 - `validate`: manifest and output-artifact validation.
+- `agent_trace`: recorded MiniSWE HTTP trajectories against an already-running
+  OpenAI-compatible vanilla server; see below.
 
 The test plan is controlled by
 `benchmark/sparsevllm_regression/manifest.json`.
+
+## Recorded agent performance regression
+
+This layer uses an external trace manifest instead of the synthetic model/method
+matrix. It does not start a GPU server or execute tools. Prepare an idle-GPU server
+separately, using Sparse-vLLM vanilla or upstream vLLM; retain its actual MiniSWE
+`server_manifest.json`. Match cache state and client/network placement between runs.
+
+Reuse existing recordings:
+
+```bash
+python -m benchmark.sparsevllm_regression.agent_trace \
+  --run-dir "$MINISWE_RUN" --expected-instances 100 \
+  --legacy-server-requests "$SERVER_REQUESTS" --output "$TRACE_DIR"
+```
+
+Repeat the legacy option for recovery-run request directories. Import joins exact
+response IDs and selects the first 100 IDs in frozen `instances.txt`, never the
+first 100 successful tasks. Missing/duplicate requests, unmatched call counts,
+cross-server trajectories and negative gaps fail explicitly. Terminal agent
+time/step limits remain in the corpus. Inputs/outputs are exact saved payloads;
+legacy delays are **estimates** calculated as
+`next_log_timestamp - next_request_elapsed - previous_log_timestamp`.
+Unknown logging overhead prevents a precision guarantee. Tool/network/retry waits
+are retained. Historical generation duration is used only to derive the gap, not
+stored as a replay field or used as a performance target.
+
+For new exact client-boundary recordings, add `--record-agent-trace --slice 0:100`
+to `python -m benchmark.swe_bench_lite.run`, retaining its usual model, API,
+manifest, dataset, Docker and generation arguments. The default `mini-extra` is
+wrapped by `timed_mini.py`. Synchronous non-streaming HTTP calls are associated
+with each instance and flushed to `agent_trace.jsonl`; incomplete/failed HTTP
+traces cannot be exported as complete. Export without the legacy option. This
+uses the existing MiniSWE/httpx environment. Headers/credentials are not saved;
+prompts and tool outputs can be private, so keep trace corpora outside Git.
+
+```bash
+python benchmark/sparsevllm_regression/run_suite.py --layer agent_trace \
+  --agent_trace "$TRACE_DIR" --agent_api_base "$API_BASE" \
+  --agent_server_manifest "$SERVER_MANIFEST" --agent_concurrency 16 \
+  --agent_allow_estimated_timing \
+  --output_root "$OUTPUT_ROOT" --run_id agent_baseline
+# Repeat with a matching fresh server and new run_id, adding:
+# --agent_baseline "$OUTPUT_ROOT/sparsevllm_regression/agent_baseline/agent_trace.json"
+# --agent_max_slowdown 1.10
+```
+
+Only legacy imports require the explicit estimated-timing flag. Workers replay
+whole agents with rolling concurrency. The first turn has no delay; subsequent
+turns wait the recorded gap **after the current response**, then send the original
+next input. This is not replay of the original absolute arrival schedule. The
+target alias is substituted; original prompts/tools/sampling settings are retained,
+but stop conditions are removed and `ignore_eos=true` plus the recorded completion
+count fixes decode work. Actual output counts must match. Generated text is not
+executed or substituted into later prompts; this is not a solution-quality test.
+
+`agent_trace.json` reports current HTTP latency P50/P95/P99 and output tokens /
+whole replay wall time **including waits**, not pure GPU throughput or TTFT/TPOT.
+Per-agent files retain raw current outputs and failures/skipped dependent turns.
+Any failed request fails the gate. Matched results gate P95 latency and complete
+replay duration against a supplied baseline (default maximum slowdown 1.10).
+Trace hash, model, GPU UUIDs, backend, engine settings, concurrency and timeout must
+match. Without a baseline this creates a baseline, not a regression-pass claim.
+`--dry_run` validates the corpus/config without contacting the server.
 
 ## Prerequisites
 

@@ -1311,6 +1311,7 @@ def parse_args() -> argparse.Namespace:
             "perf",
             "stress",
             "stress_v2",
+            "agent_trace",
             "scbench",
             "nightly",
             "pre-refactor",
@@ -1319,6 +1320,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--models", default=None, help="Comma-separated model ids from the manifest.")
     parser.add_argument("--methods", default=None, help="Comma-separated method ids from the manifest.")
     parser.add_argument("--run_id", default=None)
+    parser.add_argument("--agent_trace", help="Exported MiniSWE agent trace directory")
+    parser.add_argument("--agent_api_base", help="Already-running vanilla OpenAI-compatible server /v1 URL")
+    parser.add_argument("--agent_server_manifest", help="Actual target server identity/config/hardware JSON")
+    parser.add_argument("--agent_concurrency", type=int, default=16)
+    parser.add_argument("--agent_request_timeout", type=float, default=900)
+    parser.add_argument("--agent_api_key_env", default="OPENAI_API_KEY")
+    parser.add_argument("--agent_baseline", help="Previous successful agent_trace.json to compare")
+    parser.add_argument("--agent_max_slowdown", type=float, default=1.10)
+    parser.add_argument("--agent_allow_estimated_timing", action="store_true",
+                        help="Explicitly accept legacy server-log timing estimates, not exact client delays")
     parser.add_argument("--output_root", default=None)
     parser.add_argument(
         "--tensor_parallel_size",
@@ -1426,6 +1437,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.layer == "agent_trace":
+        from benchmark.sparsevllm_regression.agent_trace import run_replay
+        return run_replay(args)
     manifest = load_manifest(args.manifest)
     resolved = resolve_manifest_paths(manifest)
     quality_benchmarks = set(_parse_csv(args.quality_benchmarks))

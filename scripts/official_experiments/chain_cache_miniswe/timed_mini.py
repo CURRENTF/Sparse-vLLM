@@ -6,6 +6,7 @@ import importlib.metadata
 import importlib.util
 import inspect
 import json
+import os
 from pathlib import Path
 import time
 
@@ -30,12 +31,21 @@ def instrument(original):
         started = time.perf_counter()
         wall_started = time.time()
         error = None
+        trace = None
+        token = None
+        if os.getenv("MINISWE_RECORD_AGENT_TRACE") == "1":
+            from benchmark.swe_bench_lite.agent_trace import AgentTrace, CURRENT_TRACE
+            trace = AgentTrace(directory / "agent_trace.jsonl", iid)
+            token = CURRENT_TRACE.set(trace)
         try:
             return original(*args, **kwargs)
         except BaseException as exc:
             error = type(exc).__name__
             raise
         finally:
+            if trace is not None:
+                CURRENT_TRACE.reset(token)
+                trace.finish(error)
             duration = time.perf_counter() - started
             # Upstream may handle errors internally; final status comes from its
             # trajectory and official per-sample results, never from return alone.
@@ -48,6 +58,9 @@ def instrument(original):
 
 
 def main():
+    if os.getenv("MINISWE_RECORD_AGENT_TRACE") == "1":
+        from benchmark.swe_bench_lite.agent_trace import install_http_recorder
+        install_http_recorder()
     # mini-SWE moved this module between releases. Select the installed location,
     # fail on ambiguity or unsupported signatures; do not replace its algorithm.
     modules = []

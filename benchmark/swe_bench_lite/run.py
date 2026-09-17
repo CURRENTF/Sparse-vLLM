@@ -925,6 +925,9 @@ class SweBenchLiteRunner:
 
     def _model_env(self) -> dict[str, str]:
         env = os.environ.copy()
+        env.pop("MINISWE_RECORD_AGENT_TRACE", None)
+        if getattr(self.args, "record_agent_trace", False):
+            env["MINISWE_RECORD_AGENT_TRACE"] = "1"
         python_path = []
         writable_limit_gib = getattr(
             self.args, "docker_writable_layer_limit_gib", 0.0
@@ -1082,6 +1085,7 @@ class SweBenchLiteRunner:
             "mini_base_config": self.args.mini_base_config,
             "mini_extra_configs": self.extra_mini_config_records,
             "mini_command": self.args.mini_command,
+            "record_agent_trace": bool(getattr(self.args, "record_agent_trace", False)),
             "batch_size": self.args.batch_size,
             "step_limit": self.args.step_limit,
             "cost_limit": self.args.cost_limit,
@@ -1429,6 +1433,11 @@ class SweBenchLiteRunner:
         batches = self._batches()
         model_env = self._model_env()
         mini_prefix = shlex.split(self.args.mini_command)
+        if getattr(self.args, "record_agent_trace", False):
+            timed = self.repo_root / "scripts/official_experiments/chain_cache_miniswe/timed_mini.py"
+            if mini_prefix != ["mini-extra"] and mini_prefix != [sys.executable, str(timed)]:
+                raise RunnerError("--record-agent-trace requires the default mini-extra or timed_mini command")
+            mini_prefix = [sys.executable, str(timed)]
         if not mini_prefix:
             error = RunnerError("--mini-command is empty")
             self._write_generation_failure_results(
@@ -1722,6 +1731,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--mini-command", default="mini-extra")
+    parser.add_argument("--record-agent-trace", action="store_true",
+                        help="Record per-instance non-streaming HTTP input/output and inter-turn delays.")
     parser.add_argument("--mini-base-config", default="swebench.yaml")
     parser.add_argument(
         "--mini-extra-config",
