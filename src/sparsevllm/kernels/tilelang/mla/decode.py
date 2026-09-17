@@ -23,10 +23,6 @@ def build_glm_mla_decode_kernel(
     h_q,
     h_kv,
     valid_output_heads,
-    cache_slots,
-    slot_rows,
-    active_slot_width,
-    max_seqlen_pad,
     dv,
     dpe,
     block_N,
@@ -64,6 +60,12 @@ def build_glm_mla_decode_kernel(
         "block_size must be at least block_N and a multiple of block_N"
     )
 
+    cache_slots = T.dynamic("cache_slots")
+    slot_rows = T.dynamic("slot_rows")
+    active_slot_width = T.dynamic("active_slot_width")
+    max_seqlen_pad = T.dynamic("score_capacity")
+    score_strides = [T.dynamic("score_stride_b"), T.dynamic("score_stride_h"), T.dynamic("score_stride_t")]
+
     @T.prim_func
     def main_split(
         Q: T.StridedTensor(
@@ -80,8 +82,8 @@ def build_glm_mla_decode_kernel(
         glse: T.Tensor([batch, h_q, num_split], dtype),
         Output_partial: T.Tensor([batch, h_q, num_split, dv], dtype),
         Output: T.Tensor([batch, VALID_OUTPUT_HEADS, dv], dtype),
-        AttnScore: T.Tensor(
-            [batch, SCORE_TILE_COUNT, max_seqlen_pad], accum_dtype
+        AttnScore: T.StridedTensor(
+            [batch, SCORE_TILE_COUNT, max_seqlen_pad], score_strides, accum_dtype
         ),
     ):
         # split kv
@@ -183,11 +185,8 @@ def build_glm_mla_decode_kernel(
                     elif score_mode == "partial":
                         for j in T.Parallel(block_N):
                             score_index = start + k * block_N + j
-                            AttnScore[bx, by, score_index] = T.if_then_else(
-                                score_index < cache_seqlens[bx],
-                                token_scores[j],
-                                AttnScore[bx, by, score_index],
-                            )
+                            if score_index < cache_seqlens[bx]:
+                                AttnScore[bx, by, score_index] = token_scores[j]
                 T.reduce_max(acc_s, scores_max, dim=1, clear=False)
                 for i in T.Parallel(block_H):
                     scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
@@ -267,8 +266,8 @@ def build_glm_mla_decode_kernel(
         glse: T.Tensor([batch, h_q, num_split], dtype),
         Output_partial: T.Tensor([batch, h_q, num_split, dv], dtype),
         Output: T.Tensor([batch, VALID_OUTPUT_HEADS, dv], dtype),
-        AttnScore: T.Tensor(
-            [batch, SCORE_TILE_COUNT, max_seqlen_pad], accum_dtype
+        AttnScore: T.StridedTensor(
+            [batch, SCORE_TILE_COUNT, max_seqlen_pad], score_strides, accum_dtype
         ),
     ):
         with T.Kernel(batch, h_q // min(block_H, kv_group_num), threads=256) as (bx, by):
@@ -365,11 +364,8 @@ def build_glm_mla_decode_kernel(
                     elif score_mode == "partial":
                         for j in T.Parallel(block_N):
                             score_index = k * block_N + j
-                            AttnScore[bx, by, score_index] = T.if_then_else(
-                                score_index < cache_seqlens[bx],
-                                token_scores[j],
-                                AttnScore[bx, by, score_index],
-                            )
+                            if score_index < cache_seqlens[bx]:
+                                AttnScore[bx, by, score_index] = token_scores[j]
                 T.reduce_max(acc_s, scores_max, dim=1, clear=False)
                 for i in T.Parallel(block_H):
                     scores_max[i] = T.max(scores_max[i], scores_max_prev[i])

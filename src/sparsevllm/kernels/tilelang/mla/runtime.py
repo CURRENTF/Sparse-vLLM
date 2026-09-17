@@ -1,14 +1,14 @@
 """Lazy TileLang adapter for GLM TP1/TP2/TP4 MLA decode.
 
-The repository-owned TileLang kernel is shape-specialized.  This adapter keeps
-compilation and split-KV workspaces outside the kernel call and caches them by
-the CUDA Graph's static batch/context/query-stride shape.
+Length and cache dimensions are symbolic. Compilation and split-KV workspaces
+are cached by batch, launch configuration, and query layout; changing context
+length does not create another compiled kernel.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -198,10 +198,6 @@ class TileMlaWorkspace:
 @dataclass(frozen=True, slots=True)
 class _KernelKey:
     batch_size: int
-    cache_slot_count: int
-    active_slot_rows: int
-    active_slot_width: int
-    score_capacity: int
     num_split: int
     block_h: int
     score_mode: str
@@ -214,10 +210,11 @@ class _KernelKey:
 class _BoundKernel:
     call: Callable[..., object]
     workspace: TileMlaWorkspace
+    retired_scores: list[torch.Tensor] = field(default_factory=list)
 
 
 class TileMlaDecodeKernel:
-    """Shape-cached GLM TP1/TP2/TP4 TileLang MLA runner."""
+    """Batch/layout-bound GLM TP1/TP2/TP4 TileLang MLA runner."""
 
     def __init__(
         self,
@@ -267,22 +264,19 @@ class TileMlaDecodeKernel:
             variants.append(
                 {
                     "batch_size": key.batch_size,
-                    "cache_slot_count": key.cache_slot_count,
-                    "active_slot_rows": key.active_slot_rows,
-                    "active_slot_width": key.active_slot_width,
-                    "score_capacity": key.score_capacity,
                     "num_split": key.num_split,
                     "block_h": key.block_h,
                     "score_mode": key.score_mode,
                     "need_score": key.need_score,
                     "q_latent_strides": key.q_latent_strides,
                     "q_rope_strides": key.q_rope_strides,
+                    "workspace_score_capacity": bound.workspace.score.shape[-1],
                     "workspace_bytes": sum(
                         tensor.numel() * tensor.element_size()
-                        for tensor in workspace_tensors
+                        for tensor in (*workspace_tensors, *bound.retired_scores)
                     ),
                     "workspace_data_ptrs": [
-                        tensor.data_ptr() for tensor in workspace_tensors
+                        tensor.data_ptr() for tensor in (*workspace_tensors, *bound.retired_scores)
                     ],
                 }
             )
@@ -343,10 +337,6 @@ class TileMlaDecodeKernel:
             h_q=self.padded_heads,
             h_kv=1,
             valid_output_heads=self.valid_heads,
-            cache_slots=key.cache_slot_count,
-            slot_rows=key.active_slot_rows,
-            active_slot_width=key.active_slot_width,
-            max_seqlen_pad=key.score_capacity,
             dv=_LATENT_DIM,
             dpe=_ROPE_DIM,
             block_N=config.block_n,
@@ -385,7 +375,7 @@ class TileMlaDecodeKernel:
                     if config.score_mode == "partial"
                     else 1
                 ),
-                key.score_capacity,
+                1,
                 dtype=torch.float32,
                 device=self.device,
             ),
@@ -541,10 +531,6 @@ class TileMlaDecodeKernel:
         )
         key = _KernelKey(
             batch_size=batch_size,
-            cache_slot_count=int(latent_cache.shape[0]),
-            active_slot_rows=int(active_slots.shape[0]),
-            active_slot_width=int(active_slots.shape[1]),
-            score_capacity=score_capacity,
             num_split=config.num_split,
             block_h=config.block_h,
             score_mode=config.score_mode,
@@ -561,11 +547,21 @@ class TileMlaDecodeKernel:
         score_output = workspace.score
         if attn_score is not None:
             if config.score_mode == "partial":
+                if workspace.score.shape[-1] < score_capacity:
+                    if torch.cuda.is_current_stream_capturing():
+                        raise RuntimeError("TileLang MLA partial score capacity was not warmed before CUDA Graph capture.")
+                    capacity = 1 << (score_capacity - 1).bit_length()
+                    # Captured graphs may still reference the previous allocation.
+                    bound.retired_scores.append(workspace.score)
+                    workspace.score = torch.empty(
+                        (*workspace.score.shape[:-1], capacity),
+                        dtype=torch.float32, device=self.device,
+                    )
+                score_output = workspace.score[..., :score_capacity]
                 score_output.fill_(-1e20)
             elif config.score_mode == "per_head":
-                if attn_score.is_contiguous():
-                    score_output = attn_score
-                else:
+                score_output = attn_score
+                if not attn_score.is_contiguous():
                     score_output.fill_(-1e20)
             else:
                 score_output = attn_score.unsqueeze(1)
@@ -584,12 +580,6 @@ class TileMlaDecodeKernel:
         )
         if attn_score is not None and config.score_mode == "partial":
             torch.amax(score_output, dim=1, out=attn_score)
-        elif (
-            attn_score is not None
-            and config.score_mode == "per_head"
-            and score_output is not attn_score
-        ):
-            attn_score.copy_(score_output)
         return output
 
 
