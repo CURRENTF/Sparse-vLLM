@@ -1321,20 +1321,41 @@ def run_vllm_probe(
     args: argparse.Namespace,
     model_specs: ModelArchitectureSpecs,
 ) -> list[dict[str, Any]]:
-    import torch
-    from vllm import LLM, SamplingParams
+    from vllm import LLM
 
+    if int(_parse_json_arg(args.engine_kwargs).get("data_parallel_size", 1)) > 1 and args.scenario != "fixed":
+        raise ValueError("vLLM DP currently supports fixed request-mode probes only")
     if args.scenario == "churn":
         return run_vllm_churn(args, model_specs)
+
+    kwargs = _vllm_engine_kwargs(args)
+    dp_size = int(kwargs.get("data_parallel_size", 1))
+    print(f"[vLLM Probe] Initializing vLLM (TP={args.tensor_parallel_size}, DP={dp_size})...")
+    if dp_size > 1:
+        from benchmark.efficiency.vllm_dp import VLLMDPBatch
+
+        if kwargs.get("data_parallel_size_local", dp_size) != dp_size:
+            raise ValueError("The DP request probe currently requires single-node local DP")
+        kwargs["max_num_seqs"] = (max(args.batch_sizes) + dp_size - 1) // dp_size
+        (Path(args.output_dir) / "dp_engine_config.json").write_text(json.dumps(kwargs, indent=2))
+        llm = VLLMDPBatch(kwargs)
+    else:
+        llm = LLM(**kwargs)
+    try:
+        return _run_vllm_fixed_probe(args, model_specs, llm, dp_size)
+    finally:
+        if dp_size > 1:
+            llm.close()
+
+
+def _run_vllm_fixed_probe(args, model_specs, llm, dp_size):
+    import torch
+    from vllm import SamplingParams
 
     results = []
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     raw_samples_file = output_dir / "raw_samples.jsonl"
-
-    max_len_needed = max(args.prompt_lens) + max(args.output_lens) + 128
-    print(f"[vLLM Probe] Initializing vLLM (TP={args.tensor_parallel_size}, max_model_len={max_len_needed})...")
-    llm = LLM(**_vllm_engine_kwargs(args))
 
     for p_len in args.prompt_lens:
         for o_len in args.output_lens:
@@ -1402,6 +1423,16 @@ def run_vllm_probe(
                         )
                         torch.cuda.synchronize()
                         elapsed_s = time.perf_counter() - started
+                        if dp_size > 1:
+                            with (output_dir / "generated_outputs.jsonl").open("a") as f:
+                                for index, output in enumerate(outputs):
+                                    f.write(json.dumps({
+                                        "prompt_len": p_len, "output_len": o_len,
+                                        "concurrency": bs, "iteration": it,
+                                        "request_id": output.request_id,
+                                        "dp_rank": index % dp_size,
+                                        "token_ids": [candidate.token_ids for candidate in output.outputs],
+                                    }) + "\n")
                         if len(outputs) != bs:
                             raise RuntimeError(f"vLLM returned {len(outputs)} outputs for batch_size={bs}.")
 
@@ -1437,6 +1468,8 @@ def run_vllm_probe(
                         )
                         rec = {
                             "engine": "vllm",
+                            "data_parallel_size": dp_size,
+                            "request_adapter": "async_dp_round_robin" if dp_size > 1 else "offline_llm",
                             "sparse_method": args.sparse_method,
                             "scenario": "fixed_batch",
                             "prompt_len": p_len,
@@ -1501,6 +1534,8 @@ def run_vllm_probe(
 
                 summary_row = {
                     "engine": "vllm",
+                    "data_parallel_size": dp_size,
+                    "request_adapter": "async_dp_round_robin" if dp_size > 1 else "offline_llm",
                     "sparse_method": args.sparse_method,
                     "scenario": "fixed_batch",
                     "prompt_len": p_len,
@@ -1882,6 +1917,10 @@ def parse_args():
 def main():
     args = parse_args()
     if args.decode_only_steps:
+        if args.engine == "vllm" and int(
+            _parse_json_arg(args.engine_kwargs).get("data_parallel_size", 1)
+        ) > 1:
+            raise ValueError("vLLM DP currently supports fixed request-mode probes only")
         if args.engine == "sparsevllm" and int(
             _parse_json_arg(args.hyper_params).get("data_parallel_size", 1)
         ) > 1:

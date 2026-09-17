@@ -102,7 +102,7 @@ _GLM_DECODE_32 = MoeGemmConfig(4, 32, 128, 8, 4, 3)
 _GLM_DECODE_64 = MoeGemmConfig(64, 128, 64, 8, 8, 3)
 _GLM_MID_BATCH = MoeGemmConfig(64, 128, 64, 1, 8, 3)
 _GLM_LARGE_BATCH = MoeGemmConfig(128, 128, 64, 1, 8, 3)
-_GLM_EP2_TINY_BATCH = MoeGemmConfig(16, 128, 32, 8, 4, 4)
+_GLM_EP2_TINY_BATCH = MoeGemmConfig(16, 64, 128, 1, 4, 3)
 _GLM_EP2_SMALL_BATCH = MoeGemmConfig(16, 64, 128, 1, 4, 4)
 
 

@@ -658,6 +658,7 @@ class GlmH100Bf16DecodeMoeDispatchPlan(MoeDispatchPlan):
         {
             (64, 64, 2048, 768, 4, 2, 1, "biased_sigmoid"),
             (65, 65, 2048, 768, 5, 2, 1, "biased_sigmoid"),
+            (64, 32, 2048, 1536, 4, 1, 2, "biased_sigmoid"),
         }
     )
 
@@ -690,6 +691,21 @@ class GlmH100Bf16DecodeMoeDispatchPlan(MoeDispatchPlan):
         return ProfileMatch.yes("matched GLM H100 BF16 decode fusion profile")
 
     def _build_routes(self, spec: MoeOpSpec) -> tuple[MoeDispatchRoute, ...]:
+        if spec.ep_size == 2:
+            # The EP-local 1536-wide experts favor fusion only at tiny batches.
+            # Larger decode and prefill retain the established unfused path.
+            return (
+                MoeDispatchRoute(
+                    0, 2, SglAlignedTritonGlmMoeProvider(), "triton_routed_gemm_silu",
+                ),
+                MoeDispatchRoute(
+                    3, 4, SglAlignedTritonGlmFusedMoeProvider(),
+                    "triton_routed_gate_up_swiglu",
+                ),
+                MoeDispatchRoute(
+                    5, None, SglAlignedTritonGlmMoeProvider(), "triton_routed_gemm_silu",
+                ),
+            )
         del spec
         return (
             MoeDispatchRoute(
