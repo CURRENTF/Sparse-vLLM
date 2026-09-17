@@ -1,158 +1,94 @@
-# 运行时参数语义
+# 运行时参数
 
-Sparse-vLLM 只有一个推理后端：`src/sparsevllm/` 下的原生引擎。
-`LLM(...)`、`Config`、JSON 配置、benchmark manifest 与内部代码使用完全
-相同的 runtime 参数名；引擎不再维护 public-to-internal alias 层。
+以下列出常用运行时参数，传入 `LLM(model, **kwargs)` 或 `Config`；JSON 配置和 benchmark manifest 使用相同名称。默认值为配置初始值，`None` 表示自动解析或未设置。
 
-## Public 参数名
+## 模型与执行
 
-命令、JSON 配置和 benchmark manifest 应使用语义化 public 名称：
+| 参数 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `model` | str | 必填 | 模型路径。 |
+| `max_model_len` | int / None | `None` | 最大上下文长度；自动值受模型和运行时容量限制，显式值不能超过模型上限。 |
+| `gpu_memory_utilization` | float | `0.9` | 引擎可使用的 GPU 显存比例。 |
+| `tensor_parallel_size` | int | `1` | Attention 张量并行度。 |
+| `decode_graph` | bool | `True` | 启用 decode CUDA Graph；需要 eager 执行或方法不支持时设为 `False`。 |
 
-| 规范名称 | 含义 |
-| --- | --- |
-| `sparse_method` | 稀疏方法选择器。 |
-| `prefill_sparse_method` | 与 cache/decode `sparse_method` 正交的 prefill 加速选择器。`h2o_prefill` 压缩中间 prompt chunk，`flashprefill_v2` 稀疏化 prefill attention 计算。 |
-| `deltakv_checkpoint_path` | DeltaKV compressor checkpoint 路径。 |
-| `engine_prefill_chunk_size` | Prefill 最大调度 chunk。 |
-| `sink_keep_tokens` | Sink token 预算。 |
-| `recent_keep_tokens` | Recent token 预算。 |
-| `full_attention_layers` | `auto`（默认）、逗号分隔的字符串或 full-layer index 列表。`auto` 按方法和模型名精确匹配 profile；catalog 条目可以由 OmniKV 和 DeltaKV 共享，也可以限定到单一方法。 |
-| `deltakv_neighbor_count` | DeltaKV reference neighbor 数量。 |
-| `deltakv_center_ratio` | DeltaKV reference center 比例。 |
-| `deltakv_latent_dim` | Compressor latent 宽度。 |
-| `deltakv_latent_quant_bits` | Latent state 量化位数。 |
-| `deltakv_latent_quant_group_size` | Latent 量化 group size。 |
-| `gpu_memory_utilization` | 引擎可使用的 GPU 显存比例。 |
-| `decode_graph` | 启用 decode CUDA Graph，默认 `True`。需要 eager 执行或方法不支持 CUDA Graph 时，显式设置 `False`。 |
+## 调度与 Token 预算
 
-`full_attention_layers=auto` 会对模型路径或仓库名的最后一段做不区分大小写的
-精确匹配，并识别 `models--org--model/snapshots/...` 形式的 Hugging Face cache
-路径；不会使用子串模糊匹配。未登记的 OmniKV 或 DeltaKV 模型会明确提示先
-校准。当 catalog 条目同时列出两个方法时，两者有意共享相同的 full-layer
-anchor；显式传入的层列表仍会覆盖 `auto`。
+| 参数 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `max_num_batched_tokens` | int | `65536` | 每轮调度的 token 预算。 |
+| `max_num_seqs_in_batch` | int | `32` | 单个 batch 的最大请求数。 |
+| `engine_prefill_chunk_size` | int / None | `8192` | Prefill 分块大小，单位 token；显式设为 `None` 时按调度策略确定。 |
+| `long_prefill_offload_threshold` | int | `65536` | 长请求阈值，单位 token；用于长请求整段 prefill、短请求批处理策略。 |
+| `mla_prefill_history_chunk_size` | int | `16384` | MLA prefill 每次处理的历史 KV token 上限；调小可减少历史工作区显存。 |
+| `decode_reservation_tokens` | int | `1024` | 每次为后续 decode 预留的最大 token 窗口；须为正整数，不是总输出上限。 |
 
-`sparse_method`、`deltakv_checkpoint_path`、`engine_prefill_chunk_size`、
-`sink_keep_tokens`、`recent_keep_tokens`、`full_attention_layers`、
-`deltakv_neighbor_count`、`deltakv_center_ratio`、`deltakv_latent_dim`、
-`deltakv_latent_quant_bits`、`deltakv_latent_quant_group_size`、`device_memory_utilization` 和
-`decode_graph*` 等旧 alias 不再接受。未知名称会在 engine boundary 直接失败，
-不会被重写。
+## 稀疏方法与共享预算
 
-## Token 预算
+| 参数 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `sparse_method` | str | `""` | Cache/decode 方法；空字符串或 `vanilla` 表示全量注意力。可选方法见[稀疏方法](../features/sparse-methods.md)。 |
+| `sink_keep_tokens` | int | `64` | 保留的开头 token 数。 |
+| `recent_keep_tokens` | int | `512` | 保留的最近 token 数。 |
+| `decode_keep_tokens` | int | `4096` | 稀疏选择的 token 预算，具体含义随方法而定。 |
+| `full_attention_layers` | str / list[int] | `"auto"` | 完整注意力层；支持自动配置、逗号分隔字符串或层索引列表。未登记的 OmniKV / DeltaKV 模型需先校准或显式指定。 |
+| `sparse_prefill_score_mode` | str / None | `None` | Prefill 评分方式：自动选择、`probability` 或 `logits`；后者仅适用于 SnapKV、PyramidKV、H2O，且要求 float32 分数。 |
 
-原生 Sparse-vLLM 的 token 预算必须是显式整数。像
-`decode_keep_tokens=0.17` 这样的 ratio 值依赖目标 context length，因此会被
-拒绝；启动前应先转换为 token 数。
+Token 数预算须为非负整数，不接受比例。QuEST 的总选择预算为 `sink_keep_tokens + decode_keep_tokens + recent_keep_tokens`，不能直接设置 `quest_token_budget`。
 
-`quest_token_budget` 不是 public 参数。QuEST 的总选择预算由
-`sink_keep_tokens`、`decode_keep_tokens` 和 `recent_keep_tokens` 推导。
-
-## Prefill 调度
-
-Prefill policy 的唯一事实来源是 `src/sparsevllm/method_registry.py`：
-
-- `all_chunked` 使用 `engine_prefill_chunk_size` 进行常规 chunked batching。
-- `long_bs1full_short_batch` 对符合条件的 request 执行 atomic full prefill，
-  并使用 `long_prefill_offload_threshold` 划分长请求。
-
-不要在 benchmark script 中复制 method policy。运行报告应记录解析后的
-method、policy、chunk size、context length、batch size 和 checkpoint 路径。
-
-### MLA 历史工作区
-
-`mla_prefill_history_chunk_size` 为正整数，默认 `16384`，限制 MLA prefill
-一次 gather 和展开的历史 KV token 数，与控制新 token 的
-`engine_prefill_chunk_size` 独立。较小的值降低历史工作区，但增加 attention
-调用和结果合并次数。当前 token 激活和稀疏分数状态仍需显存，因此该参数不是
-完整 prefill 峰值的上限。观察窗口和 `sparse_prefill_score_mode` 的语义保持不变。
+<a id="prefill-sparsity"></a>
 
 ## Prefill 稀疏
 
-`prefill_sparse_method` 独立选择 prefill 加速，不替代 `sparse_method`。当前有
-三种选择：`h2o_prefill` 在中间 prompt chunk 后压缩物理 KV；
-`flashprefill_v2` 稀疏化 prefill attention 计算；`omnikv_prefill` 在分块 prefill
-中执行跨层历史选择。`omnikv_prefill` 支持显式 KV 或 MLA 下的 vanilla/OmniKV decode，
-包括 OmniKV offload 和 chain cache，不支持 radix 前缀复用；独立预算、Auto 完整层 profile 和限制见
-[稀疏方法](../features/sparse-methods.md)。`flashprefill_v2` 支持
-`vanilla`、`omnikv`、`quest`、
-`snapkv` 和 `h2o`，但仅限 explicit-KV MHA 模型；MLA latent 模型会在配置阶段拒绝
-该 prefill 方法。这些组合也支持各方法已经支持的 prefix-cache mode。
-
-| `prefill_sparse_method` | `sparse_method` | 中间 prompt chunk | 最终 prompt boundary / decode |
+| 参数 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| 省略 | `h2o` | H2O 压缩（兼容旧配置的组合默认值） | 压缩到 `h2o_decode_budget`，随后 score-free decode |
-| `""` | `h2o` | 不做 prefill 压缩 | 压缩到 `h2o_decode_budget`，随后 score-free decode |
-| `h2o_prefill` | `vanilla` | 压缩到 `h2o_prefill_budget` | 不压缩到 decode budget；对剩余物理 row 做 dense、score-free decode |
-| `h2o_prefill` | `h2o` | 压缩到 `h2o_prefill_budget` | 压缩到 `h2o_decode_budget`，随后 score-free decode |
-| `flashprefill_v2` | `h2o` | 使用 FlashPrefill V2 计算，不做 H2O 中间压缩 | 收集 H2O posthoc prompt 分数，压缩到 `h2o_decode_budget`，随后 score-free decode |
+| `prefill_sparse_method` | str / None | `None` | 独立选择 prefill 加速：`h2o_prefill`、`flashprefill_v2`、`omnikv_prefill`；`""` 关闭。省略时仅 H2O 默认启用 `h2o_prefill`。 |
+| `omnikv_prefill_full_attention_layers` | str / list[int] / None | `"auto"` | OmniKV prefill 的完整注意力层，独立于 decode 配置。 |
+| `omnikv_prefill_keep_tokens` | int | `4096` | OmniKV prefill 的历史选择预算。 |
+| `omnikv_prefill_sink_keep_tokens` | int | `8` | OmniKV prefill 保留的开头 token 数。 |
+| `omnikv_prefill_recent_keep_tokens` | int | `128` | OmniKV prefill 保留的最近 token 数。 |
+| `flashprefill_v2_abs_threshold` | float / None | `None` | FlashPrefill V2 稀疏阈值，范围 `[0, 1]`；启用时必须显式提供模型校准值。 |
 
-上表描述默认的 `h2o_decode_eviction=False`。Explicit-KV H2O 可设置
-`h2o_decode_eviction=True`，每步累计概率分数，在
-`h2o_decode_budget + h2o_decode_eviction_interval` 处驱逐（容量压力下可提前）。
-开启时强制使用 `sparse_prefill_score_mode="probability"`，但保持 prefill window
-不变；允许 `[0, 128]` 内的非零 window。MLA latent 模型通过近似的
-`softmax(scale * RAW_QK_REDUCED)` decode 分数支持此开关，每个进程仅警告一次
-其尚未与原 H2O 完全对齐；prefill 评分不变。
+`flashprefill_v2` 仅支持显式 KV 模型；`omnikv_prefill` 不支持 radix 前缀复用。组合限制见[稀疏方法](../features/sparse-methods.md)，FlashPrefill 调参见 [FlashPrefill V2](../features/flashprefill-v2.md)。
 
-开启 decode 驱逐后，`h2o_decode_score_fusion=True` 会复用 attention 的逐 head
-logits 来累计概率。设为 `False` 可使用独立概率评分路径做实现对照。两条路径都先在
-每个 query head 的保留 token 维做 softmax，再跨 head 求和并累计历史；此开关不改变
-prefill 评分、预算或驱逐策略。
+## H2O
 
-`sparse_method="h2o"` 时省略 `prefill_sparse_method` 会保留旧的组合行为；显式传入
-空字符串则关闭 prefill 加速，得到 decode-only H2O。Sparse-vLLM 扩展的中间 chunk
-压缩属于 prefill；最终 prompt 压缩则准备 decode 消费的短 cache。
-CacheManager 拥有这套物理生命周期，prepared prefill Provider
-只消费其 view，不检查 cache method 名称。已验证的
-kernel 契约和必须校准的参数见
-[FlashPrefill V2](../features/flashprefill-v2.md)。
+| 参数 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `h2o_prefill_budget` | int | `8192` | 中间 prefill chunk 压缩后的 KV 预算；不能小于 decode 预算。 |
+| `h2o_decode_budget` | int | `4096` | 最终 prompt 压缩后的 KV 预算；须为正整数。 |
+| `h2o_recent_ratio` | float | `0.5` | 预算中 recent token 的比例，范围 `(0, 1)`。 |
+| `h2o_prefill_score_window` | int | `128` | Prefill 评分的 query 窗口；`0` 表示整个当前 chunk，probability 模式范围为 `[0, 128]`。 |
+| `h2o_decode_eviction` | bool | `False` | 启用 decode 持续评分和驱逐；开启后强制使用 probability 评分。 |
+| `h2o_decode_eviction_interval` | int | `128` | Decode 驱逐间隔；容量紧张时可能提前驱逐。 |
+| `h2o_decode_score_fusion` | bool | `True` | 启用 decode 驱逐时复用 attention 分数，减少独立评分开销。 |
 
-## RoPE scaling
-
-Sparse-vLLM 读取 checkpoint 中 Transformers 规范的 `rope_parameters`，并兼容
-旧字段名 `rope_scaling`。统一的一维 RotaryEmbedding 在普通 MHA/GQA 模型路径
-上支持 `default`、`linear`、`yarn` 和 `llama3`。YaRN 实现 Transformers
-标准的 cache amplitude 与 `mscale`/`mscale_all_dim` 处理。GLM-4.7-Flash
-MLA 保留现有的未 scaling RoPE 实现。
-YaRN 的上下文 admission 与静态 RoPE cache 统一使用有效长度
-`original_max_position_embeddings * factor`。Sparse-vLLM 同时接受
-`max_position_embeddings` 已经等于扩展长度的规范配置，以及声明长度仍等于
-原始长度的旧式配置；其他不一致组合会在模型配置阶段明确失败。优先级更高的
-显式上下文字段（例如 `max_sequence_length`）可以限制该有效长度，但不能超过它。
-其他已支持的静态 RoPE 类型保留现有的上下文 admission 语义。
-
-DeltaKV 保留现有的 `default`/`llama3` RoPE 重建契约。由于它的专用
-de-RoPE/re-RoPE CUDA kernel 还没有验证其他 scaling mode，模型配置阶段
-会明确拒绝 DeltaKV 与 `linear` 或 `yarn` 的组合。
-
-`dynamic` 和 `longrope` 会在模型构造时明确拒绝。它们需要 server-level 策略，
-才能在 continuous batching 中选择或切换频率而不使已经旋转并写入的 KV cache
-失效。Qwen3.5 多模态 MRoPE、GLM-4.7-Flash MLA 与 Gemma4 per-layer
-proportional RoPE 保留各自的坐标语义，不接受普通一维 scaling 参数。
+默认只在 prefill 压缩，decode 不持续驱逐。MLA 的 decode 驱逐使用近似分数，尚未与原始 H2O 完全对齐。
 
 ## DeltaKV
 
-可报告的 DeltaKV 推理必须使用兼容 compressor checkpoint。对于已登记模型，
-默认的 `full_attention_layers=auto` 会与 OmniKV 共用模型 profile：
+| 参数 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `deltakv_checkpoint_path` | str / None | `None` | 兼容的 compressor checkpoint 路径；正式推理需提供。 |
+| `deltakv_neighbor_count` | int | `4` | Reference neighbor 数量。 |
+| `deltakv_center_ratio` | float | `0.1` | Reference center 比例。 |
+| `deltakv_latent_dim` | int | `128` | Compressor 隐空间维度，需与 checkpoint 匹配。 |
+| `deltakv_latent_quant_bits` | int | `4` | 隐状态量化位数：`0`、`2` 或 `4`；`0` 关闭量化。 |
+| `deltakv_latent_quant_group_size` | int | `0` | 隐状态量化分组大小；默认 4-bit 配置下自动设为 `32`。 |
 
-```python
-from sparsevllm import LLM
+模型与 checkpoint 配置见 [DeltaKV](../features/deltakv.md)。
 
-llm = LLM(
-    "/path/to/Qwen3-4B-Instruct-2507",
-    sparse_method="deltakv",
-    deltakv_checkpoint_path="/path/to/compressor",
-    full_attention_layers="auto",
-    decode_keep_tokens=2048,
-    recent_keep_tokens=128,
-    sink_keep_tokens=8,
-    engine_prefill_chunk_size=16384,
-)
-```
+## RoPE 与上下文限制
 
-原生实现、cache metadata、loader 和 kernel 都位于 `src/sparsevllm/`。
-Compressor 训练由 [CURRENTF/DeltaKV](https://github.com/CURRENTF/DeltaKV)
-独立维护。
+RoPE 从模型 checkpoint 的 `rope_parameters` 读取，兼容旧字段 `rope_scaling`。
+
+| 模型路径 | 支持范围 |
+| --- | --- |
+| 普通一维 MHA/GQA | `default`、`linear`、`yarn`、`llama3`；不支持 `dynamic`、`longrope`。 |
+| DeltaKV | 仅 `default`、`llama3`。 |
+| Qwen3.5 MRoPE、GLM-4.7-Flash MLA、Gemma4 per-layer RoPE | 使用各自的 RoPE 配置，不接受普通一维 scaling 参数。 |
+
+YaRN 的有效上下文长度为 `original_max_position_embeddings × factor`；显式上下文上限不能超过该值。
 
 ## Benchmark adapter
 

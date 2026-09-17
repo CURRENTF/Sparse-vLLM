@@ -70,7 +70,7 @@ class Config(
     favor_min_decoding_seqs: int | None = None
     max_num_seqs_in_gpu: int | None = None
 
-    engine_prefill_chunk_size: int | None = None
+    engine_prefill_chunk_size: int | None = 8192
     long_prefill_offload_threshold: int = 64 * 1024
     mlp_chunk_size: int = 16384
     mla_prefill_workspace_bytes: int = 6 * 1024**3

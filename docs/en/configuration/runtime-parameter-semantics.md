@@ -1,186 +1,92 @@
-# Runtime Parameter Semantics
+# Runtime Parameters
 
-Sparse-vLLM has one inference backend: the native engine under
-`src/sparsevllm/`. Runtime parameter names are identical in `LLM(...)`,
-`Config`, JSON configs, benchmark manifests, and internal code. The engine does
-not maintain a public-to-internal alias layer.
+Common runtime parameters below can be passed to `LLM(model, **kwargs)` or `Config`. JSON configs and benchmark manifests use the same names. Defaults are initial configuration values; `None` means automatic resolution or unset.
 
-## Public names
+## Model and Execution
 
-Use semantic public names in commands, JSON configs, and benchmark manifests:
-
-| Canonical name | Meaning |
-| --- | --- |
-| `sparse_method` | Sparse method selector. |
-| `prefill_sparse_method` | Orthogonal prefill-acceleration selector. `h2o_prefill` compacts intermediate prompt chunks; `flashprefill_v2` sparsifies prefill attention computation. It does not replace the cache/decode `sparse_method`. |
-| `deltakv_checkpoint_path` | DeltaKV compressor checkpoint path. |
-| `engine_prefill_chunk_size` | Maximum scheduled prefill chunk. |
-| `sink_keep_tokens` | Fixed sink-token budget. |
-| `recent_keep_tokens` | Recent-token budget. |
-| `full_attention_layers` | `auto` (default), a comma-separated string, or a list of full-layer indices. `auto` resolves an exact method/model-name profile; catalog entries can be shared by OmniKV and DeltaKV or scoped to one method. |
-| `deltakv_neighbor_count` | Number of DeltaKV reference neighbors. |
-| `deltakv_center_ratio` | DeltaKV reference-center ratio. |
-| `deltakv_latent_dim` | Compressor latent width. |
-| `deltakv_latent_quant_bits` | Quantization bits for latent state. |
-| `deltakv_latent_quant_group_size` | Latent quantization group size. |
-| `gpu_memory_utilization` | Fraction of GPU memory available to the engine. |
-| `decode_graph` | Enable decode CUDA Graph execution (default: `True`). Set `False` for eager execution, including methods that do not support CUDA Graph. |
-
-The `auto` full-layer matcher compares the final model path/repository segment
-case-insensitively and also recognizes Hugging Face cache paths such as
-`models--org--model/snapshots/...`. It never uses substring matching. An
-unregistered OmniKV or DeltaKV model fails with an explicit calibration error.
-When a catalog entry lists both methods, they intentionally share the same
-full-layer anchors; an explicit layer list still overrides `auto`.
-
-Legacy aliases such as `sparse_method`, `deltakv_checkpoint_path`,
-`engine_prefill_chunk_size`, `sink_keep_tokens`, `recent_keep_tokens`,
-`full_attention_layers`, `deltakv_neighbor_count`, `deltakv_center_ratio`,
-`deltakv_latent_dim`, `deltakv_latent_quant_bits`, `deltakv_latent_quant_group_size`,
-`device_memory_utilization`, and `decode_graph*` are not accepted. Unknown
-names fail at the engine boundary instead of being rewritten.
-
-## Token budgets
-
-Native Sparse-vLLM token budgets are explicit integer token counts. Ratio-style
-values such as `decode_keep_tokens=0.17` are rejected because their meaning
-depends on a target context length. Convert ratios before launching a run.
-
-`quest_token_budget` is not a public input. QuEST derives its total selection
-budget from `sink_keep_tokens`, `decode_keep_tokens`, and
-`recent_keep_tokens`.
-
-## Prefill scheduling
-
-Prefill policy ownership lives in `src/sparsevllm/method_registry.py`:
-
-- `all_chunked` uses `engine_prefill_chunk_size` for regular chunked batching.
-- `long_bs1full_short_batch` runs qualifying full-prefill requests atomically
-  and uses `long_prefill_offload_threshold` for its long-request boundary.
-
-Do not duplicate method policy decisions in benchmark scripts. Runtime reports
-should record the resolved method, policy, chunk size, context length, batch
-size, and checkpoint path.
-
-### MLA history workspace
-
-`mla_prefill_history_chunk_size` is a positive integer (default: `16384`).
-It limits the historical KV tokens gathered and expanded at once during MLA
-prefill, independently of the new-token limit `engine_prefill_chunk_size`.
-Smaller values reduce history workspace but add attention calls and merges.
-Current-token activations and sparse score state still require memory; this
-parameter is not a cap on the complete prefill peak. Sparse observation windows
-and the selected `sparse_prefill_score_mode` retain their existing meanings.
-
-## Prefill sparsity
-
-`prefill_sparse_method` selects prefill acceleration independently from
-`sparse_method`. Sparse-vLLM exposes `h2o_prefill` for physical KV compaction
-after intermediate prompt chunks, `flashprefill_v2` for sparse prefill attention,
-and `omnikv_prefill` for cross-layer history selection during chunked prefill.
-`omnikv_prefill` supports vanilla/OmniKV decode with explicit KV or MLA, including
-OmniKV offload and chain cache;
-its independent budgets, automatic full-layer profile and restrictions are described
-in [sparse methods](../features/sparse-methods.md). Radix prefix reuse is unsupported.
-`flashprefill_v2` supports `vanilla`, `omnikv`, `quest`,
-`snapkv`, and `h2o` on explicit-KV MHA models, including their supported
-prefix-cache modes. MLA latent models reject this prefill method during
-configuration.
-
-| `prefill_sparse_method` | `sparse_method` | Intermediate prompt chunks | Final prompt boundary / decode |
+| Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| omitted | `h2o` | H2O compaction (legacy combined default) | Compact to `h2o_decode_budget`, then score-free decode |
-| `""` | `h2o` | No prefill compaction | Compact to `h2o_decode_budget`, then score-free decode |
-| `h2o_prefill` | `vanilla` | Compact to `h2o_prefill_budget` | No final decode-budget compaction; dense score-free decode over the remaining row |
-| `h2o_prefill` | `h2o` | Compact to `h2o_prefill_budget` | Compact to `h2o_decode_budget`, then score-free decode |
-| `flashprefill_v2` | `h2o` | FlashPrefill V2 computation; no H2O intermediate compaction | Collect H2O posthoc prompt scores, compact to `h2o_decode_budget`, then score-free decode |
+| `model` | str | Required | Model path. |
+| `max_model_len` | int / None | `None` | Maximum context length. Automatic values are limited by model and runtime capacity; explicit values cannot exceed the model limit. |
+| `gpu_memory_utilization` | float | `0.9` | Fraction of GPU memory available to the engine. |
+| `tensor_parallel_size` | int | `1` | Attention tensor parallel size. |
+| `decode_graph` | bool | `True` | Enable decode CUDA Graphs. Set to `False` for eager execution or methods without graph support. |
 
-The table shows the default `h2o_decode_eviction=False`. For explicit-KV H2O,
-set `h2o_decode_eviction=True` to accumulate decode probability scores and evict
-at `h2o_decode_budget + h2o_decode_eviction_interval` (earlier under memory
-pressure). This forces `sparse_prefill_score_mode="probability"` while preserving
-the prefill window; any supported value in `[0, 128]` is allowed, including
-nonzero windows. MLA latent storage supports this switch through the approximate
-`softmax(scale * RAW_QK_REDUCED)` decode score, with a once-per-process warning
-that it is not fully aligned with original H2O. Prefill scoring is unchanged.
+## Scheduling and Token Budgets
 
-With decode eviction enabled, `h2o_decode_score_fusion=True` reuses attention's
-per-head logits for probability accumulation. Set it to `False` to use separate
-probability scoring for an implementation comparison. Both paths normalize each
-query head over retained tokens before summing heads and adding history; the
-switch does not change prefill scoring, budgets, or eviction policy.
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `max_num_batched_tokens` | int | `65536` | Token budget per scheduling step. |
+| `max_num_seqs_in_batch` | int | `32` | Maximum requests per batch. |
+| `engine_prefill_chunk_size` | int / None | `8192` | Prefill chunk size in tokens. Explicit `None` selects a value based on the scheduling policy. |
+| `long_prefill_offload_threshold` | int | `65536` | Long-request threshold in tokens for the policy that prefills long requests in full and batches short requests. |
+| `mla_prefill_history_chunk_size` | int | `16384` | Maximum historical KV tokens processed at once during MLA prefill. Smaller values reduce history workspace memory. |
+| `decode_reservation_tokens` | int | `1024` | Maximum token window reserved for subsequent decode steps. Must be positive; this is not the total output limit. |
 
-Omitting `prefill_sparse_method` with `sparse_method="h2o"` preserves the old
-combined behavior. An explicit empty string disables prefill acceleration and
-therefore selects decode-only H2O. Sparse-vLLM's intermediate-chunk H2O
-compaction is a prefill extension, while final-prompt compaction prepares the
-shorter cache consumed by decode. The cache manager owns that physical
-lifecycle, while the prepared
-prefill provider consumes its view without inspecting the cache method name. See
-[FlashPrefill V2](../features/flashprefill-v2.md) for the validated kernel
-contract and required calibration parameters.
+## Sparse Methods and Shared Budgets
 
-## RoPE scaling
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `sparse_method` | str | `""` | Cache/decode method. An empty string or `vanilla` selects full attention. See [Sparse Methods](../features/sparse-methods.md) for available methods. |
+| `sink_keep_tokens` | int | `64` | Number of initial tokens to retain. |
+| `recent_keep_tokens` | int | `512` | Number of recent tokens to retain. |
+| `decode_keep_tokens` | int | `4096` | Token budget for sparse selection; interpretation depends on the method. |
+| `full_attention_layers` | str / list[int] | `"auto"` | Full-attention layers: automatic profile, comma-separated string, or index list. Unregistered OmniKV / DeltaKV models require calibration or an explicit list. |
+| `sparse_prefill_score_mode` | str / None | `None` | Prefill scoring: automatic, `probability`, or `logits`. Logits scoring is limited to SnapKV, PyramidKV, and H2O and requires float32 scores. |
 
-Sparse-vLLM consumes the checkpoint's canonical Transformers
-`rope_parameters` (and the legacy `rope_scaling` spelling). The shared
-one-dimensional rotary implementation supports `default`, `linear`, `yarn`,
-and `llama3` for the ordinary MHA/GQA model paths. YaRN includes the standard
-Transformers cache amplitude and `mscale`/`mscale_all_dim` handling. The
-GLM-4.7-Flash MLA path retains its existing unscaled RoPE implementation.
-For YaRN, context admission and the static RoPE cache share the effective
-length `original_max_position_embeddings * factor`. Sparse-vLLM accepts both
-canonical configs whose `max_position_embeddings` already equals that scaled
-length and legacy configs whose declared length still equals the original
-length. Any other mismatch fails during model configuration. A higher-priority
-explicit context field such as `max_sequence_length` may cap the effective
-length but may not exceed it. Other supported static RoPE types retain their
-existing context-admission semantics.
+Token-count budgets must be nonnegative integers, not ratios. QuEST derives its total selection budget from `sink_keep_tokens + decode_keep_tokens + recent_keep_tokens`; `quest_token_budget` cannot be set directly.
 
-DeltaKV retains its existing `default`/`llama3` RoPE reconstruction contract.
-It rejects `linear` and `yarn` during model configuration because its dedicated
-de-RoPE/re-RoPE CUDA kernels have not been validated for those scaling modes.
+## Prefill Sparsity
 
-`dynamic` and `longrope` are rejected at model construction. They require a
-server-level policy for choosing or changing frequencies without invalidating
-already-rotated KV cache entries in continuous batches. Qwen3.5 multimodal
-MRoPE, GLM-4.7-Flash MLA, and Gemma4 per-layer proportional RoPE retain their
-dedicated coordinate systems and do not accept one-dimensional scaling
-parameters.
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `prefill_sparse_method` | str / None | `None` | Independent prefill acceleration: `h2o_prefill`, `flashprefill_v2`, or `omnikv_prefill`; `""` disables it. When omitted, only H2O enables `h2o_prefill` by default. |
+| `omnikv_prefill_full_attention_layers` | str / list[int] / None | `"auto"` | Full-attention layers for OmniKV prefill, independent of decode settings. |
+| `omnikv_prefill_keep_tokens` | int | `4096` | Historical token selection budget for OmniKV prefill. |
+| `omnikv_prefill_sink_keep_tokens` | int | `8` | Initial tokens retained during OmniKV prefill. |
+| `omnikv_prefill_recent_keep_tokens` | int | `128` | Recent tokens retained during OmniKV prefill. |
+| `flashprefill_v2_abs_threshold` | float / None | `None` | FlashPrefill V2 sparsity threshold in `[0, 1]`. Enabling the method requires an explicit value calibrated for the model. |
 
-## Runtime invariant validation
+`flashprefill_v2` requires explicit KV models; `omnikv_prefill` does not support radix prefix reuse. See [Sparse Methods](../features/sparse-methods.md) for compatible combinations and [FlashPrefill V2](../features/flashprefill-v2.md) for tuning.
 
-`validate_runtime_invariants=False` is the serving fast-path default. Set it to
-`True` in allocator, eviction, and CUDA Graph diagnostics to enable expensive
-internal checks such as MLA slot range/uniqueness, H2O decode context bounds,
-and H2O/SnapKV cross-layer metadata alignment. The option is resolved when the
-engine is initialized and is independent of `enable_profiler`, so profiling
-does not silently enable debug work.
+## H2O
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `h2o_prefill_budget` | int | `8192` | KV budget after intermediate prefill chunk compression. Must be at least the decode budget. |
+| `h2o_decode_budget` | int | `4096` | KV budget after final prompt compression. Must be positive. |
+| `h2o_recent_ratio` | float | `0.5` | Fraction of the budget assigned to recent tokens, in `(0, 1)`. |
+| `h2o_prefill_score_window` | int | `128` | Query window for prefill scoring. `0` uses the whole current chunk; probability mode accepts `[0, 128]`. |
+| `h2o_decode_eviction` | bool | `False` | Enable ongoing decode scoring and eviction. Forces probability scoring when enabled. |
+| `h2o_decode_eviction_interval` | int | `128` | Decode eviction interval. Capacity pressure may trigger earlier eviction. |
+| `h2o_decode_score_fusion` | bool | `True` | Reuse attention scores during decode eviction to reduce separate scoring overhead. |
+
+By default, compression happens during prefill without ongoing decode eviction. MLA decode eviction uses approximate scores and is not fully aligned with original H2O.
 
 ## DeltaKV
 
-Reportable DeltaKV inference requires a compatible compressor checkpoint.
-For registered models, its default `full_attention_layers=auto` consumes the
-same model profile as OmniKV:
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `deltakv_checkpoint_path` | str / None | `None` | Compatible compressor checkpoint path, required for reportable inference. |
+| `deltakv_neighbor_count` | int | `4` | Number of reference neighbors. |
+| `deltakv_center_ratio` | float | `0.1` | Reference center ratio. |
+| `deltakv_latent_dim` | int | `128` | Compressor latent dimension; must match the checkpoint. |
+| `deltakv_latent_quant_bits` | int | `4` | Latent-state quantization bits: `0`, `2`, or `4`; `0` disables quantization. |
+| `deltakv_latent_quant_group_size` | int | `0` | Latent-state quantization group size. Automatically set to `32` with the default 4-bit configuration. |
 
-```python
-from sparsevllm import LLM
+See [DeltaKV](../features/deltakv.md) for model and checkpoint configuration.
 
-llm = LLM(
-    "/path/to/Qwen3-4B-Instruct-2507",
-    sparse_method="deltakv",
-    deltakv_checkpoint_path="/path/to/compressor",
-    full_attention_layers="auto",
-    decode_keep_tokens=2048,
-    recent_keep_tokens=128,
-    sink_keep_tokens=8,
-    engine_prefill_chunk_size=16384,
-)
-```
+## RoPE and Context Limits
 
-The native implementation, cache metadata, loader, and kernels live under
-`src/sparsevllm/`. Compressor training is maintained in
-[CURRENTF/DeltaKV](https://github.com/CURRENTF/DeltaKV).
+RoPE settings come from the model checkpoint's `rope_parameters`, with support for the legacy `rope_scaling` field.
+
+| Model path | Supported settings |
+| --- | --- |
+| Standard one-dimensional MHA/GQA | `default`, `linear`, `yarn`, and `llama3`; `dynamic` and `longrope` are unsupported. |
+| DeltaKV | Only `default` and `llama3`. |
+| Qwen3.5 MRoPE, GLM-4.7-Flash MLA, Gemma4 per-layer RoPE | Use their own RoPE configurations; standard one-dimensional scaling parameters are not accepted. |
+
+YaRN's effective context length is `original_max_position_embeddings × factor`; explicit context limits cannot exceed it.
 
 ## Benchmark adapter
 
