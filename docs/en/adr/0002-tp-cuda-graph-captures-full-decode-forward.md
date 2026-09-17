@@ -13,11 +13,13 @@ collective operations used by that forward. This preserves model-layer
 boundaries. A capture or execution failure must remain explicit rather than
 silently selecting eager execution.
 
-Sparse selection is TP-local: each rank selects tokens from its local heads
+For methods without cross-rank score reduction, sparse selection is TP-local: each rank selects tokens from its local heads
 or KV heads without cross-rank sparse-index aggregation. Graph correctness
 therefore means equivalence to the same TP eager/static path, not equivalence
 to TP=1 or global-head selection. Sparse TP graph configurations emit a warning
-about this distinction.
+about this distinction. RKV instead sums scores across attention TP ranks after
+the forward and applies one global retained set to all layers/ranks. This
+post-forward selection remains outside graph capture.
 
 Sampling stays outside TP graph capture because worker ranks do not materialize
 rank-0 gathered logits. Setting `decode_graph_capture_sampling=True` with TP

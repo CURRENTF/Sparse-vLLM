@@ -277,8 +277,8 @@ def build_chain_cache_fingerprint(config: Any) -> bytes:
             "rkv_alpha",
             "rkv_similarity_threshold",
             "rkv_recent_similar_keep",
-            "rkv_max_redundancy_tokens",
-            "rkv_redundancy_window",
+            "rkv_kernel_size",
+            "rkv_score_chunk_mb",
         ),
         "skipkv": (
             "sink_keep_tokens",

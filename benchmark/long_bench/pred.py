@@ -391,6 +391,7 @@ def _write_worker_load_stats(*, generate_fn, out_root: str, rank: int) -> None:
             "status": "success",
             "launcher_rank": int(rank),
             "worker_load": llm.worker_load(),
+            "sparse_state": llm.debug_sparse_state_summaries(synchronize=True),
         },
     )
 

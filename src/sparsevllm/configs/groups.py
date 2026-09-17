@@ -68,9 +68,11 @@ class SparseMethodConfig:
     rkv_compression_interval: int = 128
     rkv_observation_tokens: int = 8
     rkv_alpha: float = 0.1
-    rkv_similarity_threshold: float = 0.8
+    rkv_kernel_size: int = 7
+    rkv_score_chunk_mb: int = 512
+    rkv_similarity_threshold: float | None = None
     rkv_recent_similar_keep: int = 1
-    rkv_max_redundancy_tokens: int = 4096
+    rkv_max_redundancy_tokens: int | None = None
     rkv_redundancy_window: int = 0
 
     skipkv_compression_interval: int = 128

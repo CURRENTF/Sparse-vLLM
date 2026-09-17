@@ -716,6 +716,14 @@ class SnapKVCacheManager(CacheManager):
                     )
                 if generated_kv_tokens <= 0:
                     decode_physical_peak = resident_after_prefill
+                elif method == "rkv":
+                    # Global R-KV is armed only at decode-buffer boundaries. A
+                    # long prompt can grow by a full interval before eviction.
+                    interval = int(self.config.rkv_compression_interval)
+                    decode_physical_peak = min(
+                        resident_after_prefill + generated_kv_tokens,
+                        max(resident_after_prefill, int(trigger_len) - 1) + interval,
+                    )
                 elif resident_after_prefill >= int(trigger_len):
                     decode_physical_peak = resident_after_prefill + 1
                 else:

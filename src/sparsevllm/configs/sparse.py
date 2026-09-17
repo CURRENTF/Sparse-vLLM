@@ -264,11 +264,6 @@ def _normalize_sparse_prefill_score(config) -> None:
 def _normalize_rkv(config) -> None:
     _normalize_positive_int(config, "rkv_compression_interval", fallback=0)
     _normalize_positive_int(config, "rkv_observation_tokens", fallback=0)
-    if config.rkv_observation_tokens > 128:
-        raise ValueError(
-            "rkv_observation_tokens must be <= 128 because the prefill score kernel "
-            f"supports at most 128 query tokens, got {config.rkv_observation_tokens}."
-        )
     if config.rkv_observation_tokens > config.rkv_compression_interval:
         raise ValueError(
             "rkv_observation_tokens must be <= rkv_compression_interval so the query cache "
@@ -278,6 +273,8 @@ def _normalize_rkv(config) -> None:
     _normalize_float_attr(config, "rkv_alpha")
     if not 0.0 <= config.rkv_alpha <= 1.0:
         raise ValueError(f"rkv_alpha must be in [0, 1], got {config.rkv_alpha}.")
+    if config.rkv_similarity_threshold is None:
+        config.rkv_similarity_threshold = 0.5 if config.sparse_method == "rkv" else 0.8
     _normalize_float_attr(config, "rkv_similarity_threshold")
     if not 0.0 <= config.rkv_similarity_threshold <= 1.0:
         raise ValueError(
@@ -289,26 +286,21 @@ def _normalize_rkv(config) -> None:
         raise ValueError(
             f"rkv_recent_similar_keep must be >= 0, got {config.rkv_recent_similar_keep}."
         )
-    _normalize_positive_int(config, "rkv_max_redundancy_tokens", fallback=0)
-    _normalize_int_attr(config, "rkv_redundancy_window", fallback=0)
-    if config.rkv_redundancy_window < 0:
-        raise ValueError(
-            f"rkv_redundancy_window must be >= 0, got {config.rkv_redundancy_window}."
-        )
-    if 0 < config.rkv_redundancy_window > config.rkv_max_redundancy_tokens:
-        raise ValueError(
-            "rkv_redundancy_window must be <= rkv_max_redundancy_tokens, "
-            f"got window={config.rkv_redundancy_window} max={config.rkv_max_redundancy_tokens}."
-        )
+    _normalize_positive_int(config, "rkv_kernel_size", fallback=0)
+    _normalize_positive_int(config, "rkv_score_chunk_mb", fallback=0)
+    if config.rkv_kernel_size % 2 != 1:
+        raise ValueError("rkv_kernel_size must be odd.")
     if config.sparse_method == "rkv":
-        log_once(
-            "R-KV support is an approximation of the official implementation: "
-            "Sparse-VLLM uses one shared physical token index set across KV heads, "
-            "so official per-KV-head token selection is not fully reproduced. "
-            f"rkv_redundancy_window={config.rkv_redundancy_window}; values > 0 score "
-            "redundancy only over the trailing candidate tokens.",
-            level="WARNING",
-        )
+        budget = config.sink_keep_tokens + config.decode_keep_tokens + config.recent_keep_tokens
+        if budget <= config.rkv_observation_tokens:
+            raise ValueError("R-KV total retention budget must exceed rkv_observation_tokens.")
+        if config.rkv_similarity_threshold != 0.5 or config.rkv_recent_similar_keep != 1:
+            raise ValueError("R-KV vLLM scoring requires threshold=0.5 and the last similar representative; "
+                             "remove legacy rkv_similarity_threshold/rkv_recent_similar_keep overrides.")
+        if config.rkv_redundancy_window != 0 or config.rkv_max_redundancy_tokens is not None:
+            raise ValueError("R-KV vLLM scoring uses the full resident domain with bounded row tiles; "
+                             "remove rkv_redundancy_window/rkv_max_redundancy_tokens overrides "
+                             "and configure rkv_score_chunk_mb instead.")
 
 def _normalize_skipkv(config) -> None:
     _normalize_positive_int(config, "skipkv_compression_interval", fallback=0)

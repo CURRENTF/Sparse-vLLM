@@ -814,6 +814,8 @@ def _glm_method_runtime_config(method: str, *, num_layers: int):
         rkv_compression_interval=1,
         rkv_observation_tokens=1,
         rkv_alpha=0.5,
+        rkv_kernel_size=1,
+        rkv_score_chunk_mb=16,
         rkv_similarity_threshold=0.0,
         rkv_recent_similar_keep=0,
         rkv_max_redundancy_tokens=16,
@@ -1142,7 +1144,8 @@ def _make_glm_method_graph_lane(
     storage.latent_cache[:, :initial_len].copy_(initial_latent)
     storage.rope_cache[:, :initial_len].copy_(initial_rope)
 
-    sequence = Sequence([5, 7, 11, 13])
+    sequence = Sequence([5, 7, 11])
+    sequence.append_token(13)
     sequence.num_prefilled_tokens = sequence.num_prompt_tokens
     sequence.temperature = 0.0
     sequence.max_tokens = 8

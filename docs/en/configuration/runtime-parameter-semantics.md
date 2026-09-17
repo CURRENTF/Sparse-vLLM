@@ -204,3 +204,28 @@ receive a smaller window if at least one step fits. A window boundary never
 forces a queue rotation or changes scoring/eviction. Small windows can increase
 preemption under load; larger windows can delay new requests. Chain admission
 still checks suffix-prefill and CPU restore capacity separately.
+
+## R-KV retention
+
+`rkv` uses a global retained token set across KV layers and attention TP ranks.
+Its total retention budget is `sink_keep_tokens + decode_keep_tokens +
+recent_keep_tokens`; for this method these fields contribute only to the total,
+not separate protected regions. Exactly `rkv_observation_tokens` trailing tokens
+are protected, with no fixed sink. This window also determines the number of
+recent decode queries used for scoring; prompt queries are excluded.
+
+`rkv_compression_interval` sets decode-buffer boundaries and must be at least
+the observation window. Compression also requires physical length >= total
+budget + interval. A long prompt therefore remains resident until a decode
+boundary, rather than being compressed during prefill.
+
+`rkv_kernel_size` is the positive odd importance-pooling width (default 7).
+`rkv_alpha` weights importance in `alpha * importance - (1-alpha) * redundancy`.
+`rkv_score_chunk_mb` bounds scoring tiles (default 512 MiB); the cache allocator
+reserves this workspace separately. Increase it if even one scoring tile cannot
+fit. There is no automatic Full-KV fallback on scoring failure.
+
+Legacy RKV approximation overrides `rkv_redundancy_window` (nonzero),
+`rkv_max_redundancy_tokens` (non-null), `rkv_similarity_threshold` (other than 0.5),
+and `rkv_recent_similar_keep` (other than 1) are rejected. Existing RKV results
+must be rerun before comparison because the token-selection semantics changed.

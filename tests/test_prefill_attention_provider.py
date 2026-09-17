@@ -169,7 +169,6 @@ def _mock_flashinfer_paged_prefill_contract():
         ("snapkv", AttentionScoreKind.NONE, PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED),
         ("pyramidkv", AttentionScoreKind.NONE, PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED),
         ("h2o", AttentionScoreKind.NONE, PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED),
-        ("rkv", AttentionScoreKind.NONE, PrefillScoreCollectionKind.METHOD_OWNED_POSTHOC_REDUCED),
         ("omnikv", AttentionScoreKind.NONE, PrefillScoreCollectionKind.NONE),
         ("deltakv", AttentionScoreKind.NONE, PrefillScoreCollectionKind.NONE),
     ],

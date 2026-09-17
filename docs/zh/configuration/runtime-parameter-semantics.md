@@ -173,3 +173,24 @@ Scheduler 在接纳更多 prefill 工作前为活动 decode 续租。失败时�
 窗口边界不会强制轮转队列或改变评分与驱逐。较小窗口可能增加高负载下的
 抢占，较大窗口可能延迟新请求。Chain 仍单独检查 suffix prefill 和 CPU
 快照恢复所需容量。
+
+## R-KV 保留策略
+
+`rkv` 在所有 KV 层和 attention TP ranks 间使用同一组保留 token。
+总保留预算仍为 `sink_keep_tokens + decode_keep_tokens + recent_keep_tokens`，
+但这三个字段对 RKV 只贡献总量，不再表示分别保护的区域。RKV 不固定保留 sink，
+只保护最后 `rkv_observation_tokens` 个 token；该参数也决定评分使用的最近 decode
+query 数量，不包含 prompt queries。
+
+`rkv_compression_interval` 指定 decode buffer 边界，必须不小于观察窗口。
+压缩还要求物理缓存长度达到“总预算 + interval”。长 prompt 会保留到 decode
+边界，不在 prefill 阶段压缩。
+
+`rkv_kernel_size` 是重要性评分的正奇数 pooling 宽度，默认 7。
+`rkv_alpha` 对应 `alpha * importance - (1-alpha) * redundancy`。
+`rkv_score_chunk_mb` 限制评分分块工作区，默认 512 MiB，cache allocator 会单独
+预留。若一个评分分块都无法容纳，需要增大该参数；评分失败不会自动退回 Full-KV。
+
+旧近似算法的非零 `rkv_redundancy_window`、非空 `rkv_max_redundancy_tokens`、
+非 0.5 的 `rkv_similarity_threshold` 和非 1 的 `rkv_recent_similar_keep` 会被拒绝。
+选择语义已变化，旧 RKV 结果需要重新运行后才能比较。

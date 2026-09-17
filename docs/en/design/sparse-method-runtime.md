@@ -196,7 +196,8 @@ the number of observation layers and chunk/budget settings and require measureme
 | `StreamingLLMRuntime` | StreamingLLM | Pass-through attention view followed by physical sink/recent retention. |
 | `ScoredCompactionRuntime` | SnapKV, PyramidKV | Shared score lifecycle and physical compaction; PyramidKV specializes layer budgets and triggers. |
 | `H2ORuntime` | H2O prefill and/or H2O decode | Prompt-score workspace and independent prefill/final-prompt compaction; optional decode probability accumulation and periodic eviction. |
-| `JointDecodeRuntime` | R-KV, SkipKV | Shared decode compaction pipeline with different score sources and selectors. |
+| `JointDecodeRuntime` | SkipKV | Layer-local joint-score decode compaction. |
+| `RKVRuntime` | R-KV | Cross-head mean, cross-layer sum and attention-TP reduction followed by one global selection. |
 | `DynamicSelectionRuntime` | OmniKV, DeltaKV | Observation-layer scoring and cross-layer dynamic selection; physical payload semantics remain method-specific. |
 
 The optional H2O decode switch reuses the existing scoring kernels: prefill

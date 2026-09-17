@@ -5,9 +5,8 @@ import torch
 from sparsevllm.config import Config
 from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.sequence import Sequence
-from sparsevllm.kernels.triton.prefill_score import prefill_score_fwd
+from .rkv_scoring import rkv_head_scores
 
-from ..base import PrefillComputeView
 from .snapkv import SnapKVCacheManager
 
 
@@ -28,11 +27,8 @@ class RKVCacheManager(SnapKVCacheManager):
             allocation_budget_bytes=allocation_budget_bytes,
         )
         self._rkv_observation_tokens = int(config.rkv_observation_tokens)
-        self._rkv_vectorized_prefill_query_cache = True
-        self._rkv_batch_clear_query_cache_rows = True
         self._rkv_query_cache = []
         self._rkv_query_positions = []
-        self._rkv_query_score_static_buffers: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
         if self._rkv_query_cache_enabled:
             kv_layer_set = set(self.kv_transformer_layer_indices())
             self._rkv_query_cache = [
@@ -111,33 +107,19 @@ class RKVCacheManager(SnapKVCacheManager):
     def _get_available_slots_info(self) -> tuple[int, int]:
         available_memory, slot_bytes_per_layer = super()._get_available_slots_info()
         query_cache_bytes = self._rkv_query_cache_bytes()
+        if (self._is_rkv_query_cache_enabled()
+                and getattr(self.config, "startup_cache_phase", "") != "profiling"):
+            # Startup profiling builds a small prefill-only cache. Scoring is
+            # post-decode work and its reserve belongs to the serving pool.
+            query_cache_bytes += int(self.config.rkv_score_chunk_mb) * 1024**2
         if query_cache_bytes >= available_memory:
             raise RuntimeError(
-                "Not enough GPU memory for R-KV query cache. "
+                "Not enough GPU memory for R-KV query cache and scoring workspace. "
                 f"query_cache={query_cache_bytes / 1024**3:.2f}GiB "
                 f"available={available_memory / 1024**3:.2f}GiB. "
-                "Reduce rkv_observation_tokens or max_num_seqs_in_batch."
+                "Reduce rkv_observation_tokens, rkv_score_chunk_mb or max_num_seqs_in_batch."
             )
         return int(available_memory - query_cache_bytes), int(slot_bytes_per_layer)
-
-    def _get_rkv_query_score_static_buffers(
-        self,
-        batch_size: int,
-        max_score_len: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        key = (int(batch_size), int(max_score_len))
-        if not hasattr(self, "_rkv_query_score_static_buffers"):
-            self._rkv_query_score_static_buffers = {}
-        buffers = self._rkv_query_score_static_buffers.get(key)
-        if buffers is None:
-            offsets = torch.arange(int(max_score_len), dtype=torch.long, device=self.device)
-            b_start_loc = (
-                torch.arange(int(batch_size), dtype=torch.int32, device=self.device)
-                * int(max_score_len)
-            )
-            buffers = (offsets, b_start_loc)
-            self._rkv_query_score_static_buffers[key] = buffers
-        return buffers
 
     def _rkv_layer_query_cache(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         layer_idx = int(layer_idx)
@@ -164,68 +146,12 @@ class RKVCacheManager(SnapKVCacheManager):
         rows_tensor = torch.tensor(rows, dtype=torch.long, device=self.device)
         positions.index_fill_(0, rows_tensor, -1)
 
-    @staticmethod
-    def attention_scores_from_materialized_keys(
-        q_window: torch.Tensor,
-        keys: torch.Tensor,
-        query_positions: torch.Tensor,
-        candidate_positions: torch.Tensor,
-    ) -> torch.Tensor:
-        """Match the R-KV prefill-score contract using actual post-RoPE keys."""
-
-        if q_window.ndim != 3 or keys.ndim != 3:
-            raise ValueError(
-                "R-KV materialized scoring requires q=[queries, heads, dim] "
-                f"and keys=[tokens, kv_heads, dim], got {tuple(q_window.shape)} "
-                f"and {tuple(keys.shape)}."
-            )
-        if int(q_window.shape[-1]) != int(keys.shape[-1]):
-            raise ValueError(
-                "R-KV query/key head dimensions differ: "
-                f"q={int(q_window.shape[-1])} k={int(keys.shape[-1])}."
-            )
-        num_query_heads = int(q_window.shape[1])
-        num_key_heads = int(keys.shape[1])
-        if num_key_heads <= 0 or num_query_heads % num_key_heads:
-            raise ValueError(
-                "R-KV query heads must be divisible by materialized key heads: "
-                f"q_heads={num_query_heads} key_heads={num_key_heads}."
-            )
-        if query_positions.shape != (int(q_window.shape[0]),):
-            raise ValueError(
-                "R-KV query positions do not match the query window: "
-                f"positions={tuple(query_positions.shape)} "
-                f"queries={int(q_window.shape[0])}."
-            )
-        if candidate_positions.shape != (int(keys.shape[0]),):
-            raise ValueError(
-                "R-KV candidate positions do not match materialized keys: "
-                f"positions={tuple(candidate_positions.shape)} "
-                f"keys={int(keys.shape[0])}."
-            )
-        if int(keys.shape[0]) == 0:
-            return torch.empty((0,), dtype=torch.float32, device=keys.device)
-
-        heads_per_key = num_query_heads // num_key_heads
-        expanded_keys = keys.repeat_interleave(heads_per_key, dim=1)
-        logits = torch.einsum(
-            "qhd,chd->qhc",
-            q_window.float(),
-            expanded_keys.float(),
-        )
-        logits.mul_(float(q_window.shape[-1]) ** -0.5)
-        valid = query_positions[:, None] >= candidate_positions[None, :]
-        valid_rows = valid.any(dim=1)
-        logits = logits.masked_fill(~valid[:, None, :], float("-inf"))
-        logits = torch.where(
-            valid_rows[:, None, None],
-            logits,
-            torch.zeros_like(logits),
-        )
-        probabilities = torch.softmax(logits, dim=-1)
-        probabilities.masked_fill_(~valid[:, None, :], 0.0)
-        probabilities.masked_fill_(~valid_rows[:, None, None], 0.0)
-        return probabilities.mean(dim=0).amax(dim=0)
+    def decode_window_costs(self, seq: Sequence, tokens: int) -> dict[str, int]:
+        if seq.is_recompute_replay:
+            # Recompute is not genuine decode and cannot release slots at a
+            # compression boundary. Reserve its entire requested decode window.
+            return {f"layer_{layer}": int(tokens) for layer in self.kv_transformer_layer_indices()}
+        return super().decode_window_costs(seq, tokens)
 
     def snapshot_chain_method_state(self, seq_id: int):
         state = super().snapshot_chain_method_state(seq_id)
@@ -294,12 +220,7 @@ class RKVCacheManager(SnapKVCacheManager):
             keep_indices,
             keep_indices_sorted=keep_indices_sorted,
         )
-        if bool(getattr(self, "_rkv_batch_clear_query_cache_rows", True)):
-            self._clear_rkv_query_cache_rows(layer_idx, row_indices)
-        else:
-            for row_idx in row_indices:
-                if row_idx is not None:
-                    self._clear_rkv_query_cache_row(layer_idx, row_idx)
+        self._clear_rkv_query_cache_rows(layer_idx, row_indices)
         return result
 
     def free_part_slots_batch_layers(
@@ -326,12 +247,7 @@ class RKVCacheManager(SnapKVCacheManager):
             keep_indices_sorted=keep_indices_sorted,
         )
         for layer_idx, row_indices in zip(layer_indices, row_indices_by_layer):
-            if bool(getattr(self, "_rkv_batch_clear_query_cache_rows", True)):
-                self._clear_rkv_query_cache_rows(int(layer_idx), row_indices)
-            else:
-                for row_idx in row_indices:
-                    if row_idx is not None:
-                        self._clear_rkv_query_cache_row(int(layer_idx), row_idx)
+            self._clear_rkv_query_cache_rows(int(layer_idx), row_indices)
         return result
 
     def decode_graph_keepalive_tensors(self) -> list[torch.Tensor]:
@@ -340,537 +256,44 @@ class RKVCacheManager(SnapKVCacheManager):
         return super().decode_graph_keepalive_tensors() + list(self._rkv_query_cache) + list(self._rkv_query_positions)
 
     @torch.no_grad()
-    def record_prefill_query(
-        self,
-        layer_idx: int,
-        q: torch.Tensor,
-        view: PrefillComputeView,
-        *,
-        b_start_loc: torch.Tensor,
-        chunk_lens: torch.Tensor,
-    ):
-        obs = int(self._rkv_observation_tokens)
-        if not self._is_rkv_query_cache_enabled() or obs <= 0 or q.numel() == 0:
-            return None
-
-        layer_idx = int(layer_idx)
-        cache, positions_cache = self._rkv_layer_query_cache(layer_idx)
-        meta = view.meta
-        if not bool(getattr(self, "_rkv_vectorized_prefill_query_cache", True)):
-            batch = int(meta.context_lens.numel())
-            for b_idx in range(batch):
-                context_len = int(meta.context_lens[b_idx].item())
-                chunk_len = int(chunk_lens[b_idx].item())
-                if context_len <= 0 or chunk_len <= 0:
-                    continue
-                chunk_start = context_len - chunk_len
-                record_start = max(chunk_start, context_len - obs)
-                record_len = context_len - record_start
-                if record_len <= 0:
-                    continue
-
-                row_idx = int(meta.req_indices[b_idx].item())
-                q_start = int(b_start_loc[b_idx].item()) + (record_start - chunk_start)
-                token_positions = torch.arange(
-                    record_start,
-                    context_len,
-                    dtype=torch.long,
-                    device=q.device,
-                )
-                cols = token_positions.remainder(obs)
-                cache[row_idx, cols] = q[q_start : q_start + record_len]
-                positions_cache[row_idx, cols] = token_positions.to(torch.int32)
-            return None
-
-        context_lens = meta.context_lens.to(device=q.device, dtype=torch.long)
-        chunk_lens = chunk_lens.to(device=q.device, dtype=torch.long)
-        req_indices = meta.req_indices.to(device=q.device, dtype=torch.long)
-        b_start_loc = b_start_loc.to(device=q.device, dtype=torch.long)
-
-        offsets = torch.arange(obs, dtype=torch.long, device=q.device)
-        record_lens = torch.minimum(chunk_lens.clamp_min(0), torch.full_like(chunk_lens, obs))
-        record_starts = context_lens - record_lens
-        valid = offsets.unsqueeze(0) < record_lens.unsqueeze(1)
-        positions = record_starts.unsqueeze(1) + offsets.unsqueeze(0)
-        cols = positions.remainder(obs)
-        q_starts = b_start_loc + (chunk_lens - record_lens)
-        q_indices = q_starts.unsqueeze(1) + offsets.unsqueeze(0)
-
-        rows = req_indices.unsqueeze(1).expand_as(cols)
-        cache[rows[valid], cols[valid]] = q[q_indices[valid]]
-        positions_cache[rows[valid], cols[valid]] = positions[valid].to(torch.int32)
-        return None
+    def record_prefill_query(self, layer_idx, q, view, *, b_start_loc, chunk_lens):
+        # A prompt/chain append is not an observation of generated reasoning.
+        if self._is_rkv_query_cache_enabled():
+            _, positions = self._rkv_layer_query_cache(layer_idx)
+            positions.index_fill_(0, view.meta.req_indices.to(torch.long), -1)
 
     @torch.no_grad()
     def record_decode_query(self, layer_idx: int, q: torch.Tensor):
-        obs = int(self._rkv_observation_tokens)
-        if not self._is_rkv_query_cache_enabled() or obs <= 0 or q.numel() == 0:
-            return None
-
-        layer_idx = int(layer_idx)
+        if not self._is_rkv_query_cache_enabled() or q.numel() == 0:
+            return
         cache, positions_cache = self._rkv_layer_query_cache(layer_idx)
-        batch_state = self.get_layer_batch_states(layer_idx)
-        if batch_state.req_indices is None or batch_state.context_lens is None:
-            raise RuntimeError(
-                f"R-KV decode query cache requires decode metadata at layer={layer_idx}."
-            )
-        rows = batch_state.req_indices.to(device=q.device, dtype=torch.long)
-        positions = batch_state.context_lens.to(device=q.device, dtype=torch.long) - 1
-        cols = positions.remainder(obs)
+        state = self.get_layer_batch_states(layer_idx)
+        rows = state.req_indices.to(torch.long)
+        positions = state.context_lens.to(torch.long) - 1
+        cols = positions.remainder(self._rkv_observation_tokens)
         cache[rows, cols] = q
         positions_cache[rows, cols] = positions.to(torch.int32)
-        return None
 
-    @torch.no_grad()
-    def rkv_query_attention_scores(
-        self,
-        layer_idx: int,
-        seq: Sequence,
-        kv_len: int,
-        *,
-        candidate_start: int,
-        recent_keep_tokens: int,
-    ) -> torch.Tensor:
-        layer_idx = int(layer_idx)
-        if not self._is_rkv_query_cache_enabled():
-            raise RuntimeError(
-                "R-KV query cache is disabled because max_model_len is below the "
-                "decode-eviction trigger; query attention scores should not be requested."
-            )
-        cache, positions_cache = self._rkv_layer_query_cache(layer_idx)
-        kv_len = int(kv_len)
-        obs = int(self._rkv_observation_tokens)
-        score_end = kv_len
-        score_start = max(0, score_end - obs)
-        score_len = score_end - score_start
-        if score_len <= 0:
-            return torch.zeros((kv_len,), dtype=self._prefill_score_dtype(), device=self.device)
+    def rkv_observation_ready(self, layer_idx: int, seqs, kv_len: int) -> torch.Tensor:
+        _, positions = self._rkv_layer_query_cache(layer_idx)
+        rows = torch.tensor([self.seq_id_to_row[layer_idx][s.seq_id] for s in seqs],
+                            device=self.device, dtype=torch.long)
+        expected = torch.arange(kv_len - self._rkv_observation_tokens, kv_len,
+                                device=self.device)
+        return (positions[rows[:, None], expected.remainder(self._rkv_observation_tokens)]
+                == expected).all(dim=-1)
 
-        row_idx = self.seq_id_to_row[layer_idx].get(seq.seq_id)
-        if row_idx is None:
-            raise RuntimeError(f"Missing R-KV row: layer={layer_idx} seq_id={seq.seq_id}.")
-
-        positions = torch.arange(score_start, score_end, dtype=torch.long, device=self.device)
-        cols = positions.remainder(obs)
-        stored_positions = positions_cache[row_idx, cols]
-        positions_ok = (stored_positions == positions).all()
-        if positions_ok.is_cuda:
-            torch._assert_async(
-                positions_ok,
-                f"R-KV query cache missing observation positions: layer={layer_idx} "
-                f"seq_id={seq.seq_id} needed=[{score_start}, {score_end}).",
-            )
-        elif not bool(positions_ok.item()):
-            raise RuntimeError(
-                "R-KV query cache missing observation positions: "
-                f"layer={layer_idx} seq_id={seq.seq_id} "
-                f"needed=[{score_start}, {score_end}) "
-                f"stored_min={int(stored_positions.min().item())} "
-                f"stored_max={int(stored_positions.max().item())}."
-            )
-
-        q_window = cache[row_idx, cols].contiguous()
-        if self.has_attention_key_materializer(layer_idx):
-            candidate_start = max(0, int(candidate_start))
-            candidate_end = max(
-                candidate_start,
-                kv_len - int(recent_keep_tokens),
-            )
-            scores = torch.zeros(
-                (kv_len,),
-                dtype=self._prefill_score_dtype(),
-                device=self.device,
-            )
-            if candidate_end <= candidate_start:
-                return scores
-            candidate_positions = torch.arange(
-                candidate_start,
-                candidate_end,
-                dtype=torch.long,
-                device=self.device,
-            )
-            candidate_slots = self.buffer_req_to_token_slots[layer_idx][
-                row_idx,
-                candidate_start:candidate_end,
-            ]
-            keys = self.materialize_attention_keys(
-                layer_idx,
-                candidate_slots,
-            )
-            candidate_scores = self.attention_scores_from_materialized_keys(
-                q_window,
-                keys,
-                positions,
-                candidate_positions,
-            )
-            scores[candidate_start:candidate_end] = candidate_scores.to(
-                scores.dtype
-            )
-            return scores
-
-        k_cache, _ = self.get_layer_kv_cache(layer_idx)
-        attn_score = torch.zeros(
-            (1, kv_len),
-            dtype=self._prefill_score_dtype(),
-            device=self.device,
-        )
-        b_req_idx, b_start_loc, b_seq_len, score_q_start, score_q_end = torch.tensor(
-            [row_idx, 0, kv_len, score_start, score_end],
-            dtype=torch.int32,
-            device=self.device,
-        ).split(1)
-
-        prefill_score_fwd(
-            q_window,
-            k_cache,
-            attn_score,
-            b_req_idx,
-            b_start_loc,
-            b_seq_len,
-            score_q_start,
-            score_len,
-            self.buffer_req_to_token_slots[layer_idx],
-            score_q_start,
-            score_q_end,
-            candidate_start=int(candidate_start),
-            recent_keep_tokens=int(recent_keep_tokens),
-        )
-        return attn_score[0]
-
-    @torch.no_grad()
-    def rkv_query_attention_scores_batch(
-        self,
-        layer_idx: int,
-        seqs: list[Sequence],
-        kv_lens: list[int],
-        *,
-        candidate_start: int,
-        recent_keep_tokens: int,
-    ) -> torch.Tensor:
-        layer_idx = int(layer_idx)
-        if not self._is_rkv_query_cache_enabled():
-            raise RuntimeError(
-                "R-KV query cache is disabled because max_model_len is below the "
-                "decode-eviction trigger; query attention scores should not be requested."
-            )
-        cache, positions_cache = self._rkv_layer_query_cache(layer_idx)
-        if not seqs:
-            return torch.empty((0, 0), dtype=self._prefill_score_dtype(), device=self.device)
-        if len(seqs) != len(kv_lens):
-            raise RuntimeError(
-                "rkv_query_attention_scores_batch expected one kv_len per sequence: "
-                f"seqs={len(seqs)} kv_lens={len(kv_lens)}"
-            )
-        if self.has_attention_key_materializer(layer_idx):
-            max_kv_len = max(int(kv_len) for kv_len in kv_lens)
-            scores = torch.zeros(
-                (len(seqs), max_kv_len),
-                dtype=self._prefill_score_dtype(),
-                device=self.device,
-            )
-            for batch_idx, (seq, kv_len) in enumerate(zip(seqs, kv_lens)):
-                single = self.rkv_query_attention_scores(
-                    layer_idx,
-                    seq,
-                    int(kv_len),
-                    candidate_start=candidate_start,
-                    recent_keep_tokens=recent_keep_tokens,
-                )
-                scores[batch_idx, : int(kv_len)] = single
-            return scores
-
-        obs = int(self._rkv_observation_tokens)
-        if obs <= 0:
-            return torch.zeros((len(seqs), max(int(x) for x in kv_lens)), dtype=self._prefill_score_dtype(), device=self.device)
-
-        row_indices = []
-        for seq in seqs:
-            row_idx = self.seq_id_to_row[layer_idx].get(seq.seq_id)
-            if row_idx is None:
-                raise RuntimeError(f"Missing R-KV row: layer={layer_idx} seq_id={seq.seq_id}.")
-            row_indices.append(int(row_idx))
-
-        kv_lens_cpu = [int(kv_len) for kv_len in kv_lens]
-        score_ends_cpu = kv_lens_cpu
-        score_starts_cpu = [max(0, int(kv_len) - obs) for kv_len in score_ends_cpu]
-        score_lens_cpu = [
-            int(score_end) - int(score_start)
-            for score_start, score_end in zip(score_starts_cpu, score_ends_cpu)
-        ]
-        max_score_len = max(score_lens_cpu) if score_lens_cpu else 0
-        max_kv_len = max(kv_lens_cpu) if kv_lens_cpu else 0
-
-        rows = torch.tensor(row_indices, dtype=torch.long, device=self.device)
-        kv_lens_tensor = torch.tensor(kv_lens_cpu, dtype=torch.long, device=self.device)
-        score_ends = kv_lens_tensor
-        score_starts = torch.tensor(score_starts_cpu, dtype=torch.long, device=self.device)
-        score_lens = torch.tensor(score_lens_cpu, dtype=torch.long, device=self.device)
-        if max_score_len <= 0:
-            return torch.zeros((len(seqs), max_kv_len), dtype=self._prefill_score_dtype(), device=self.device)
-
-        offsets, b_start_loc = self._get_rkv_query_score_static_buffers(len(seqs), max_score_len)
-        positions = score_starts[:, None] + offsets[None, :]
-        valid_positions = offsets[None, :] < score_lens[:, None]
-        cols = positions.remainder(obs)
-        stored_positions = positions_cache[rows[:, None], cols].to(torch.long)
-        positions_ok = ((stored_positions == positions) | ~valid_positions).all()
-        if positions_ok.is_cuda:
-            torch._assert_async(positions_ok)
-        elif not bool(positions_ok.item()):
-            raise RuntimeError(
-                "R-KV query cache missing observation positions in batch: "
-                f"layer={layer_idx} kv_lens={[int(x) for x in kv_lens]}."
-            )
-
-        q_window = cache[rows[:, None], cols].contiguous()
-        q_window = q_window.view(len(seqs) * max_score_len, q_window.shape[2], q_window.shape[3])
-        k_cache, _ = self.get_layer_kv_cache(layer_idx)
-        attn_score = torch.zeros(
-            (len(seqs), max_kv_len),
-            dtype=self._prefill_score_dtype(),
-            device=self.device,
-        )
-        prefill_score_fwd(
-            q_window,
-            k_cache,
-            attn_score,
-            rows.to(torch.int32),
-            b_start_loc,
-            kv_lens_tensor.to(torch.int32),
-            score_starts.to(torch.int32),
-            int(max_score_len),
-            self.buffer_req_to_token_slots[layer_idx],
-            score_starts.to(torch.int32),
-            score_ends.to(torch.int32),
-            candidate_start=int(candidate_start),
-            recent_keep_tokens=int(recent_keep_tokens),
-        )
-        return attn_score
-
-    @staticmethod
-    def redundancy_scores_from_keys(
-        keys: torch.Tensor,
-        *,
-        similarity_threshold: float,
-        recent_similar_keep: int,
-        max_tokens: int,
-    ) -> torch.Tensor:
-        token_count = int(keys.shape[0])
-        if token_count == 0:
-            return torch.empty((0,), dtype=torch.float32, device=keys.device)
-        if token_count > int(max_tokens):
-            raise RuntimeError(
-                "R-KV redundancy scoring is quadratic in candidate tokens. "
-                f"candidate_tokens={token_count} exceeds rkv_max_redundancy_tokens={int(max_tokens)}. "
-                "Reduce decode_keep_tokens/rkv_compression_interval or raise the explicit limit."
-            )
-
-        flat_keys = keys.float().reshape(token_count, -1)
-        flat_keys = torch.nn.functional.normalize(flat_keys, p=2, dim=-1, eps=1.0e-6)
-        sim = flat_keys @ flat_keys.transpose(0, 1)
-        sim.diagonal().zero_()
-
-        threshold = float(similarity_threshold)
-        if threshold > 0.0:
-            sim = torch.where(sim >= threshold, sim, torch.zeros_like(sim))
-
-        keep = int(recent_similar_keep)
-        if keep > 0 and token_count > 1:
-            upper = torch.triu(torch.ones((token_count, token_count), dtype=torch.bool, device=keys.device), diagonal=1)
-            high_future = (sim > 0) & upper
-            # For each token, ignore up to the most recent similar future tokens so
-            # later reasoning tokens are not penalized just because older tokens match them.
-            future_rank_from_right = high_future.flip(1).to(torch.int32).cumsum(1).flip(1)
-            keep_recent_links = high_future & (future_rank_from_right <= keep)
-            sim = sim.masked_fill(keep_recent_links, 0.0)
-
-        avg_sim = sim.mean(dim=1)
-        return torch.softmax(avg_sim, dim=0)
-
-    @staticmethod
-    def redundancy_scores_from_keys_batch(
-        keys: torch.Tensor,
-        *,
-        similarity_threshold: float,
-        recent_similar_keep: int,
-        max_tokens: int,
-    ) -> torch.Tensor:
-        batch_size = int(keys.shape[0])
-        token_count = int(keys.shape[1])
-        if token_count == 0:
-            return torch.empty((batch_size, 0), dtype=torch.float32, device=keys.device)
-        if token_count > int(max_tokens):
-            raise RuntimeError(
-                "R-KV redundancy scoring is quadratic in candidate tokens. "
-                f"candidate_tokens={token_count} exceeds rkv_max_redundancy_tokens={int(max_tokens)}. "
-                "Reduce decode_keep_tokens/rkv_compression_interval or raise the explicit limit."
-            )
-
-        flat_keys = keys.float().reshape(batch_size, token_count, -1)
-        flat_keys = torch.nn.functional.normalize(flat_keys, p=2, dim=-1, eps=1.0e-6)
-        sim = torch.bmm(flat_keys, flat_keys.transpose(1, 2))
-        diag = torch.arange(token_count, device=keys.device)
-        sim[:, diag, diag] = 0.0
-
-        threshold = float(similarity_threshold)
-        if threshold > 0.0:
-            sim = torch.where(sim >= threshold, sim, torch.zeros_like(sim))
-
-        keep = int(recent_similar_keep)
-        if keep > 0 and token_count > 1:
-            upper = torch.triu(
-                torch.ones((token_count, token_count), dtype=torch.bool, device=keys.device),
-                diagonal=1,
-            )
-            high_future = (sim > 0) & upper.unsqueeze(0)
-            future_rank_from_right = high_future.flip(2).to(torch.int32).cumsum(2).flip(2)
-            keep_recent_links = high_future & (future_rank_from_right <= keep)
-            sim = sim.masked_fill(keep_recent_links, 0.0)
-
-        avg_sim = sim.mean(dim=2)
-        return torch.softmax(avg_sim, dim=1)
-
-    @staticmethod
-    def joint_retention_scores(
-        importance: torch.Tensor,
-        redundancy: torch.Tensor,
-        *,
-        alpha: float,
-    ) -> torch.Tensor:
-        """Paper-style R-KV score: alpha * importance - (1 - alpha) * redundancy."""
-        alpha = float(alpha)
-        return alpha * importance.float() - (1.0 - alpha) * redundancy.float()
-
-    def select_rkv_indices(
-        self,
-        layer_idx: int,
-        seq: Sequence,
-        importance_scores: torch.Tensor,
-        kv_len: int,
-        budget: int,
-    ) -> torch.Tensor:
-        kv_len = int(kv_len)
-        budget = int(budget)
-        if kv_len <= budget:
-            return torch.arange(kv_len, dtype=torch.long, device=importance_scores.device)
-
-        num_sink = min(int(self.config.sink_keep_tokens), kv_len)
-        num_recent = min(int(self.config.recent_keep_tokens), max(0, kv_len - num_sink))
-        recent_start = kv_len - num_recent
-        candidate_start = num_sink
-        candidate_end = max(candidate_start, recent_start)
-        num_top = max(0, budget - num_sink - num_recent)
-
-        sink_indices = torch.arange(0, num_sink, dtype=torch.long, device=importance_scores.device)
-        recent_indices = torch.arange(recent_start, kv_len, dtype=torch.long, device=importance_scores.device)
-        if num_top <= 0 or candidate_end <= candidate_start:
-            return torch.cat((sink_indices, recent_indices), dim=0)
-
-        row_idx = self.seq_id_to_row[layer_idx].get(seq.seq_id)
-        if row_idx is None:
-            raise RuntimeError(f"Missing R-KV row: layer={layer_idx} seq_id={seq.seq_id}.")
-        slots = self.buffer_req_to_token_slots[layer_idx][row_idx, candidate_start:candidate_end].to(torch.long)
-        candidate_importance = importance_scores[candidate_start:candidate_end].float()
-        final_scores = candidate_importance.clone()
-
-        configured_window = int(self.config.rkv_redundancy_window)
-        window = int(slots.numel()) if configured_window == 0 else min(configured_window, int(slots.numel()))
-        if window > 0:
-            window_slots = slots[-window:]
-            window_keys = self.materialize_attention_keys(
-                layer_idx,
-                window_slots,
-            )
-            redundancy = self.redundancy_scores_from_keys(
-                window_keys,
-                similarity_threshold=float(self.config.rkv_similarity_threshold),
-                recent_similar_keep=int(self.config.rkv_recent_similar_keep),
-                max_tokens=int(self.config.rkv_max_redundancy_tokens),
-            )
-            final_scores[-window:] = self.joint_retention_scores(
-                candidate_importance[-window:],
-                redundancy,
-                alpha=float(self.config.rkv_alpha),
-            )
-
-        keep_count = min(int(num_top), int(final_scores.numel()))
-        top_rel = final_scores.topk(keep_count, dim=0, sorted=False).indices
-        top_indices = top_rel + int(candidate_start)
-        return torch.cat((sink_indices, top_indices, recent_indices), dim=0)
-
-    def select_rkv_indices_batch(
-        self,
-        layer_idx: int,
-        seqs: list[Sequence],
-        importance_scores: torch.Tensor,
-        kv_lens: list[int],
-        budget: int,
-    ) -> torch.Tensor:
-        if not seqs:
-            return torch.empty((0, 0), dtype=torch.long, device=importance_scores.device)
-        if len(seqs) != len(kv_lens):
-            raise RuntimeError(
-                "select_rkv_indices_batch expected one kv_len per sequence: "
-                f"seqs={len(seqs)} kv_lens={len(kv_lens)}"
-            )
-        kv_len = int(kv_lens[0])
-        if any(int(x) != kv_len for x in kv_lens):
-            raise RuntimeError(
-                "select_rkv_indices_batch requires uniform kv_lens. "
-                f"kv_lens={[int(x) for x in kv_lens]}"
-            )
-        budget = int(budget)
-        if kv_len <= budget:
-            keep = torch.arange(kv_len, dtype=torch.long, device=importance_scores.device)
-            return keep.unsqueeze(0).expand(len(seqs), -1).contiguous()
-
-        num_sink = min(int(self.config.sink_keep_tokens), kv_len)
-        num_recent = min(int(self.config.recent_keep_tokens), max(0, kv_len - num_sink))
-        recent_start = kv_len - num_recent
-        candidate_start = num_sink
-        candidate_end = max(candidate_start, recent_start)
-        num_top = max(0, budget - num_sink - num_recent)
-
-        sink_indices = torch.arange(0, num_sink, dtype=torch.long, device=importance_scores.device)
-        recent_indices = torch.arange(recent_start, kv_len, dtype=torch.long, device=importance_scores.device)
-        if num_top <= 0 or candidate_end <= candidate_start:
-            keep = torch.cat((sink_indices, recent_indices), dim=0)
-            return keep.unsqueeze(0).expand(len(seqs), -1).contiguous()
-
-        row_indices = []
-        for seq in seqs:
-            row_idx = self.seq_id_to_row[layer_idx].get(seq.seq_id)
-            if row_idx is None:
-                raise RuntimeError(f"Missing R-KV row: layer={layer_idx} seq_id={seq.seq_id}.")
-            row_indices.append(int(row_idx))
-
-        rows = torch.tensor(row_indices, dtype=torch.long, device=importance_scores.device)
-        slots = self.buffer_req_to_token_slots[layer_idx][rows, candidate_start:candidate_end].to(torch.long)
-        final_scores = importance_scores[:, candidate_start:candidate_end].float().clone()
-
-        configured_window = int(self.config.rkv_redundancy_window)
-        window = int(slots.shape[1]) if configured_window == 0 else min(configured_window, int(slots.shape[1]))
-        if window > 0:
-            window_slots = slots[:, -window:]
-            window_keys = self.materialize_attention_keys(
-                layer_idx,
-                window_slots,
-            )
-            redundancy = self.redundancy_scores_from_keys_batch(
-                window_keys,
-                similarity_threshold=float(self.config.rkv_similarity_threshold),
-                recent_similar_keep=int(self.config.rkv_recent_similar_keep),
-                max_tokens=int(self.config.rkv_max_redundancy_tokens),
-            )
-            final_scores[:, -window:] = self.joint_retention_scores(
-                importance_scores[:, candidate_start:candidate_end][:, -window:],
-                redundancy,
-                alpha=float(self.config.rkv_alpha),
-            )
-
-        keep_count = min(int(num_top), int(final_scores.shape[1]))
-        top_rel = final_scores.topk(keep_count, dim=1, sorted=False).indices
-        top_indices = top_rel + int(candidate_start)
-        sink_batch = sink_indices.unsqueeze(0).expand(len(seqs), -1)
-        recent_batch = recent_indices.unsqueeze(0).expand(len(seqs), -1)
-        return torch.cat((sink_batch, top_indices, recent_batch), dim=1)
+    def rkv_joint_scores(self, layer_idx: int, seqs, kv_len: int) -> torch.Tensor:
+        cache, _ = self._rkv_layer_query_cache(layer_idx)
+        rows = torch.tensor([self.seq_id_to_row[layer_idx][s.seq_id] for s in seqs],
+                            device=self.device, dtype=torch.long)
+        slots = self.buffer_req_to_token_slots[layer_idx][rows, :kv_len].to(torch.long)
+        keys = self.materialize_attention_keys(layer_idx, slots).transpose(1, 2)
+        cols = torch.arange(kv_len - self._rkv_observation_tokens, kv_len,
+                            device=self.device).remainder(self._rkv_observation_tokens)
+        queries = cache[rows[:, None], cols].transpose(1, 2).contiguous()
+        return rkv_head_scores(
+            keys, queries, window=self._rkv_observation_tokens,
+            kernel_size=int(self.config.rkv_kernel_size), alpha=float(self.config.rkv_alpha),
+            workspace_bytes=int(self.config.rkv_score_chunk_mb) * 1024**2,
+        ).mean(dim=1)

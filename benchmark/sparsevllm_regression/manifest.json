@@ -163,10 +163,9 @@
         "decode_keep_tokens": 4096,
         "rkv_compression_interval": 128,
         "rkv_alpha": 0.1,
-        "rkv_similarity_threshold": 0.8,
-        "rkv_recent_similar_keep": 1,
-        "rkv_max_redundancy_tokens": 4096,
-        "rkv_redundancy_window": 64,
+        "rkv_observation_tokens": 8,
+        "rkv_kernel_size": 7,
+        "rkv_score_chunk_mb": 512,
         "gpu_memory_utilization": 0.9
       },
       "memory": {"expected_savings": 0.3}

@@ -122,7 +122,7 @@ def test_graph_measurement_preserves_warmup_graph_pool_ownership():
 
 def test_graph_summary_reads_capacity_from_capture_state_not_batch_only_key():
     state = DecodeCudaGraphState(
-        key=DecodeCudaGraphKey("h2o", 2, False, "short"),
+        key=DecodeCudaGraphKey("h2o", 2, False, "unified"),
         capture_context_capacity=129,
         graph=object(),
     )
@@ -177,7 +177,7 @@ def test_graph_summary_reads_capacity_from_capture_state_not_batch_only_key():
             "rkv",
             _trace(rkv=True),
             {
-                "cache.rkv_query_attention_scores_batch": 1,
+                "cache.rkv_joint_scores": 1,
                 "cache.materialize_attention_keys": 2,
                 "cache.free_part_slots_batch_layers": 1,
             },
@@ -204,7 +204,7 @@ def test_sparse_method_trigger_gate_rejects_unexercised_path():
 
 def test_rkv_explicit_keys_do_not_require_an_mla_materializer_registration():
     trace = {**_trace(), "attention_cache_layout": "explicit_kv"}
-    calls = {"cache.rkv_query_attention_scores_batch": 1, "cache.materialize_attention_keys": 1}
+    calls = {"cache.rkv_joint_scores": 1, "cache.materialize_attention_keys": 1}
     _validate_method_trigger(_build_method_trigger_evidence("rkv", [trace], calls))
     trace["attention_cache_layout"] = "mla_latent"
     with pytest.raises(RuntimeError, match="trigger gate failed"):

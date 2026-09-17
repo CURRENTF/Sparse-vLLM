@@ -10,7 +10,8 @@ from sparsevllm.method_registry import (
 from .base import SparseMethodRuntime
 from .dynamic import DeltaKVRuntime, OmniKVRuntime
 from .h2o import H2ORuntime
-from .joint import RKVRuntime, SkipKVRuntime
+from .joint import SkipKVRuntime
+from .rkv import RKVRuntime
 from .passthrough import PassThroughRuntime
 from .snapkv import PyramidKVRuntime, SnapKVRuntime
 from .streamingllm import StreamingLLMRuntime

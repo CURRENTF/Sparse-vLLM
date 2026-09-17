@@ -207,7 +207,7 @@ class SparsePrefillAttentionContract:
 
 
 _PREFILL_POSTHOC_SCORE_METHODS = frozenset(
-    {"snapkv", "pyramidkv", "h2o", "rkv"}
+    {"snapkv", "pyramidkv", "h2o"}
 )
 
 # Prefill provider planning may be reused across transformer layers only when

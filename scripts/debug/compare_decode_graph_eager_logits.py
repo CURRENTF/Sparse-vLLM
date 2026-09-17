@@ -205,10 +205,7 @@ def _install_method_instrumentation(llm) -> dict[str, int]:
                 "evict_after_decode",
                 "update_decode_attention_scores_all_layers",
                 "accumulate_decode_headwise_logits",
-                "rkv_query_attention_scores_batch",
-                "rkv_query_attention_scores",
-                "select_rkv_indices_batch",
-                "select_rkv_indices",
+                "rkv_joint_scores",
                 "materialize_attention_keys",
             ),
         ),
@@ -546,7 +543,7 @@ def _build_method_trigger_evidence(
         score_calls = sum(
             count
             for name, count in positive_calls.items()
-            if "rkv_query_attention_scores" in name
+            if "rkv_joint_scores" in name
         )
         materializer_calls = int(
             positive_calls.get("cache.materialize_attention_keys", 0)

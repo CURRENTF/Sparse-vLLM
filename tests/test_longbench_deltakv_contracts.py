@@ -90,7 +90,10 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
                         "prefix_cache_hit_requests": 3,
                         "prefix_cache_hit_tokens": 48,
                     },
-                }
+                },
+                debug_sparse_state_summaries=lambda synchronize: [
+                    {"world_rank": 0, "state": {"dynamic_selection": {"rkv_compactions": 2}}}
+                ],
             )
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -108,6 +111,10 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
         self.assertEqual(
             recorded["worker_load"]["cache"]["prefix_cache_hit_tokens"],
             48,
+        )
+        self.assertEqual(
+            recorded["sparse_state"][0]["state"]["dynamic_selection"]["rkv_compactions"],
+            2,
         )
 
     def test_chat_template_policy_matches_regular_prompt_paths(self):

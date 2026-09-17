@@ -8,7 +8,7 @@ from sparsevllm.config import Config
 from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.sequence import Sequence
 
-from .rkv import RKVCacheManager
+from .snapkv import SnapKVCacheManager
 
 
 @dataclass
@@ -32,7 +32,7 @@ class SkipKVSequenceState:
     redundant_sentence_count: int = 0
 
 
-class SkipKVCacheManager(RKVCacheManager):
+class SkipKVCacheManager(SnapKVCacheManager):
     """SkipKV sentence-aware KV storage skipping."""
 
     def __init__(
@@ -47,8 +47,6 @@ class SkipKVCacheManager(RKVCacheManager):
             parallel_context,
             allocation_budget_bytes=allocation_budget_bytes,
         )
-        self._rkv_vectorized_prefill_query_cache = False
-        self._rkv_batch_clear_query_cache_rows = False
         self._skipkv_delimiter_token_ids: set[int] = set()
         self._skipkv_non_execution_token_ids: set[int] = set()
         self._skipkv_seq_states: dict[int, SkipKVSequenceState] = {}
@@ -113,7 +111,6 @@ class SkipKVCacheManager(RKVCacheManager):
         return snapshot
 
     def restore_chain_method_state(self, seq_id: int, snapshot) -> None:
-        super().restore_chain_method_state(seq_id, snapshot)
         state, indices = snapshot.metadata
         if state is not None:
             sentences = [replace(sentence,
@@ -710,3 +707,86 @@ class SkipKVCacheManager(RKVCacheManager):
         sink_batch = sink_indices.unsqueeze(0).expand(len(seqs), -1)
         recent_batch = recent_indices.unsqueeze(0).expand(len(seqs), -1)
         return torch.cat((sink_batch, top_indices, recent_batch), dim=1)
+
+    @staticmethod
+    def redundancy_scores_from_keys(
+        keys: torch.Tensor,
+        *,
+        similarity_threshold: float,
+        recent_similar_keep: int,
+        max_tokens: int,
+    ) -> torch.Tensor:
+        token_count = int(keys.shape[0])
+        if token_count == 0:
+            return torch.empty((0,), dtype=torch.float32, device=keys.device)
+        if token_count > int(max_tokens):
+            raise RuntimeError(
+                "R-KV redundancy scoring is quadratic in candidate tokens. "
+                f"candidate_tokens={token_count} exceeds skipkv_max_redundancy_tokens={int(max_tokens)}. "
+                "Reduce decode_keep_tokens/rkv_compression_interval or raise the explicit limit."
+            )
+
+        flat_keys = keys.float().reshape(token_count, -1)
+        flat_keys = torch.nn.functional.normalize(flat_keys, p=2, dim=-1, eps=1.0e-6)
+        sim = flat_keys @ flat_keys.transpose(0, 1)
+        sim.diagonal().zero_()
+
+        threshold = float(similarity_threshold)
+        if threshold > 0.0:
+            sim = torch.where(sim >= threshold, sim, torch.zeros_like(sim))
+
+        keep = int(recent_similar_keep)
+        if keep > 0 and token_count > 1:
+            upper = torch.triu(torch.ones((token_count, token_count), dtype=torch.bool, device=keys.device), diagonal=1)
+            high_future = (sim > 0) & upper
+            # For each token, ignore up to the most recent similar future tokens so
+            # later reasoning tokens are not penalized just because older tokens match them.
+            future_rank_from_right = high_future.flip(1).to(torch.int32).cumsum(1).flip(1)
+            keep_recent_links = high_future & (future_rank_from_right <= keep)
+            sim = sim.masked_fill(keep_recent_links, 0.0)
+
+        avg_sim = sim.mean(dim=1)
+        return torch.softmax(avg_sim, dim=0)
+
+    @staticmethod
+    def redundancy_scores_from_keys_batch(
+        keys: torch.Tensor,
+        *,
+        similarity_threshold: float,
+        recent_similar_keep: int,
+        max_tokens: int,
+    ) -> torch.Tensor:
+        batch_size = int(keys.shape[0])
+        token_count = int(keys.shape[1])
+        if token_count == 0:
+            return torch.empty((batch_size, 0), dtype=torch.float32, device=keys.device)
+        if token_count > int(max_tokens):
+            raise RuntimeError(
+                "R-KV redundancy scoring is quadratic in candidate tokens. "
+                f"candidate_tokens={token_count} exceeds skipkv_max_redundancy_tokens={int(max_tokens)}. "
+                "Reduce decode_keep_tokens/rkv_compression_interval or raise the explicit limit."
+            )
+
+        flat_keys = keys.float().reshape(batch_size, token_count, -1)
+        flat_keys = torch.nn.functional.normalize(flat_keys, p=2, dim=-1, eps=1.0e-6)
+        sim = torch.bmm(flat_keys, flat_keys.transpose(1, 2))
+        diag = torch.arange(token_count, device=keys.device)
+        sim[:, diag, diag] = 0.0
+
+        threshold = float(similarity_threshold)
+        if threshold > 0.0:
+            sim = torch.where(sim >= threshold, sim, torch.zeros_like(sim))
+
+        keep = int(recent_similar_keep)
+        if keep > 0 and token_count > 1:
+            upper = torch.triu(
+                torch.ones((token_count, token_count), dtype=torch.bool, device=keys.device),
+                diagonal=1,
+            )
+            high_future = (sim > 0) & upper.unsqueeze(0)
+            future_rank_from_right = high_future.flip(2).to(torch.int32).cumsum(2).flip(2)
+            keep_recent_links = high_future & (future_rank_from_right <= keep)
+            sim = sim.masked_fill(keep_recent_links, 0.0)
+
+        avg_sim = sim.mean(dim=2)
+        return torch.softmax(avg_sim, dim=1)

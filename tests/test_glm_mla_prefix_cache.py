@@ -406,11 +406,7 @@ def test_rkv_chain_resume_rebuilds_query_observations_without_cross_turn_leak():
         b_start_loc=torch.tensor([0], dtype=torch.int32),
         chunk_lens=torch.tensor([6], dtype=torch.int32),
     )
-    assert manager._rkv_query_positions[0][0].tolist() == [4, 5]
-    torch.testing.assert_close(
-        manager._rkv_query_cache[0][0, :, 0, 0],
-        torch.tensor([4, 5], dtype=torch.bfloat16),
-    )
+    assert manager._rkv_query_positions[0][0].tolist() == [-1, -1]
 
     manager.free_part_slots(
         0,
@@ -473,11 +469,7 @@ def test_rkv_chain_resume_rebuilds_query_observations_without_cross_turn_leak():
         b_start_loc=torch.tensor([0], dtype=torch.int32),
         chunk_lens=torch.tensor([2], dtype=torch.int32),
     )
-    assert manager._rkv_query_positions[0][0].tolist() == [4, 5]
-    torch.testing.assert_close(
-        manager._rkv_query_cache[0][0, :, 0, 0],
-        torch.tensor([106, 107], dtype=torch.bfloat16),
-    )
+    assert manager._rkv_query_positions[0][0].tolist() == [-1, -1]
     manager.free_part_slots(
         0,
         resumed,

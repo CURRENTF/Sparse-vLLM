@@ -14,7 +14,6 @@ class JointDecodeRuntime(PassThroughRuntime):
     profiler_name: str
     select_fn_name: str
     interval_config_name: str
-    use_query_cache_scores = False
 
     def finish_step(self, step: SparseStepContext) -> None:
         if step.is_prefill:
@@ -44,21 +43,6 @@ class JointDecodeRuntime(PassThroughRuntime):
                 f"Cache manager {type(self.cache_manager).__name__} does not "
                 f"implement {self.select_fn_name}."
             )
-        query_score_fn = getattr(
-            self.cache_manager,
-            "rkv_query_attention_scores",
-            None,
-        )
-        query_score_batch_fn = getattr(
-            self.cache_manager,
-            "rkv_query_attention_scores_batch",
-            None,
-        )
-        if self.use_query_cache_scores and query_score_fn is None:
-            raise RuntimeError(
-                f"Cache manager {type(self.cache_manager).__name__} does not "
-                "implement rkv_query_attention_scores."
-            )
         select_batch_fn = getattr(
             self.cache_manager,
             f"{self.select_fn_name}_batch",
@@ -69,17 +53,8 @@ class JointDecodeRuntime(PassThroughRuntime):
             "free_part_slots_batch",
             None,
         )
-        free_layers = getattr(
-            self.cache_manager,
-            "free_part_slots_batch_layers",
-            None,
-        )
 
         with profiler.record(self.profiler_name):
-            pending_layer_compactions: dict[
-                tuple[tuple[int, ...], int],
-                tuple[list[Sequence], list[int], list[torch.Tensor]],
-            ] = {}
             kv_len_fn = getattr(
                 self.cache_manager,
                 "decode_kv_lens_for_layer",
@@ -89,11 +64,9 @@ class JointDecodeRuntime(PassThroughRuntime):
                 if not self._is_kv_layer(layer_idx):
                     continue
                 state = self.layer_batch_sparse_states[layer_idx]
-                attn_scores = None
-                if not self.use_query_cache_scores:
-                    attn_scores = state.attn_score
-                    if attn_scores is None:
-                        continue
+                attn_scores = state.attn_score
+                if attn_scores is None:
+                    continue
 
                 if kv_len_fn is not None:
                     kv_lens = kv_len_fn(layer_idx, seqs)
@@ -120,18 +93,6 @@ class JointDecodeRuntime(PassThroughRuntime):
                         ).clamp_min(0),
                     )
 
-                batch_importance_scores = None
-                if (
-                    self.use_query_cache_scores
-                    and query_score_batch_fn is not None
-                ):
-                    batch_importance_scores = query_score_batch_fn(
-                        layer_idx,
-                        [seq for _, seq, _ in triggered],
-                        [kv_len for _, _, kv_len in triggered],
-                        candidate_start=self.num_sink,
-                        recent_keep_tokens=self.num_recent,
-                    )
                 batch_keep_indices = None
                 triggered_seqs = [seq for _, seq, _ in triggered]
                 triggered_kv_lens = [kv_len for _, _, kv_len in triggered]
@@ -142,9 +103,7 @@ class JointDecodeRuntime(PassThroughRuntime):
                     )
                     == 1
                 ):
-                    if batch_importance_scores is not None:
-                        select_importance_scores = batch_importance_scores
-                    elif attn_scores is not None:
+                    if attn_scores is not None:
                         batch_indices = torch.tensor(
                             [
                                 batch_idx
@@ -188,21 +147,7 @@ class JointDecodeRuntime(PassThroughRuntime):
                     if batch_keep_indices is not None:
                         keep_indices = batch_keep_indices[local_trigger_idx]
                     else:
-                        if batch_importance_scores is not None:
-                            importance_scores = batch_importance_scores[
-                                local_trigger_idx,
-                                :kv_len,
-                            ]
-                        elif self.use_query_cache_scores:
-                            importance_scores = query_score_fn(
-                                layer_idx,
-                                seq,
-                                kv_len,
-                                candidate_start=self.num_sink,
-                                recent_keep_tokens=self.num_recent,
-                            )
-                        else:
-                            importance_scores = attn_scores[batch_idx, :kv_len]
+                        importance_scores = attn_scores[batch_idx, :kv_len]
                         keep_indices = select_fn(
                             layer_idx,
                             seq,
@@ -213,27 +158,7 @@ class JointDecodeRuntime(PassThroughRuntime):
                     keep_batch.append(keep_indices)
                     seq_batch.append(seq)
 
-                use_layer_batch = (
-                    self.use_query_cache_scores
-                    and free_layers is not None
-                    and len(seq_batch) > 1
-                    and all(
-                        int(keep.numel()) == int(keep_batch[0].numel())
-                        for keep in keep_batch
-                    )
-                )
-                if use_layer_batch:
-                    key = (
-                        tuple(int(seq.seq_id) for seq in seq_batch),
-                        int(keep_batch[0].numel()),
-                    )
-                    entry = pending_layer_compactions.get(key)
-                    if entry is None:
-                        entry = (list(seq_batch), [], [])
-                        pending_layer_compactions[key] = entry
-                    entry[1].append(int(layer_idx))
-                    entry[2].append(torch.stack(keep_batch, dim=0))
-                elif free_batch is not None and len(seq_batch) > 1:
+                if free_batch is not None and len(seq_batch) > 1:
                     keep_indices = torch.stack(keep_batch, dim=0)
                     free_batch(layer_idx, seq_batch, keep_indices)
                 else:
@@ -243,29 +168,6 @@ class JointDecodeRuntime(PassThroughRuntime):
                             seq,
                             keep_indices,
                         )
-
-            for (
-                seq_batch,
-                layer_indices,
-                keep_batches,
-            ) in pending_layer_compactions.values():
-                keep_indices = torch.stack(keep_batches, dim=0)
-                free_layers(layer_indices, seq_batch, keep_indices)
-
-
-class RKVRuntime(JointDecodeRuntime):
-    profiler_name = "rkv_decode_eviction"
-    select_fn_name = "select_rkv_indices"
-    interval_config_name = "rkv_compression_interval"
-    use_query_cache_scores = True
-
-    def needs_attention_score(
-        self,
-        layer_idx: int,
-        step: SparseStepContext,
-    ) -> bool:
-        del layer_idx, step
-        return False
 
 
 class SkipKVRuntime(JointDecodeRuntime):

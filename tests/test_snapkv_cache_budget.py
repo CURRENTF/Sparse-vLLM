@@ -138,12 +138,15 @@ def test_rkv_manager_query_reserve_matches_allocated_tensors(
         method="rkv",
         compression_interval=compression_interval,
     )
+    config.rkv_score_chunk_mb = 1
+    scoring_reserve = config.rkv_score_chunk_mb * 1024**2 if enabled else 0
+    available_bytes = 1_000 + scoring_reserve
     with (
         patch.object(platforms, "_current_platform", CpuPlatform()),
         patch.object(
             CacheManager,
             "_get_available_slots_info",
-            return_value=(1_000, 40),
+            return_value=(available_bytes, 40),
         ),
     ):
         manager = RKVCacheManager(config, _parallel_context())
@@ -181,7 +184,8 @@ def test_rkv_manager_query_reserve_matches_allocated_tensors(
         + free_stack_bytes
         + query_cache_bytes
         + query_position_bytes
-        == 1_000
+        + scoring_reserve
+        == available_bytes
     )
 
 
