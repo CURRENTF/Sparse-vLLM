@@ -57,7 +57,7 @@ description: Standardize Sparse-vLLM paper efficiency comparisons, capacity swee
 | decode 窗口 | 满批后舍弃 32 步，连续测 256 步；所有对照一致 |
 | 执行 | Graph 开启，保留兼容的 async/overlap，不额外逐步同步 |
 | 内存 / 缓存 | gpu_memory_utilization=0.90，prefix cache 关闭 |
-| Prefill | max_num_batched_tokens=8192；支持时 chunk size=8192 |
+| Prefill | max_num_batched_tokens=65536；支持独立设置时 chunk size=8192 |
 | 并发 | 1,2,4,8,…；要求最大并发时定位整数边界并验证 max+1 |
 
 显式填写模型/checkpoint、权重与 KV dtype、GPU/拓扑及稀疏预算。

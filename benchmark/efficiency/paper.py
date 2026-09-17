@@ -91,8 +91,9 @@ def run_paper_decode(args):
     explicit = dict(tensor_parallel_size=args.tensor_parallel_size,
         expert_parallel_size=args.expert_parallel_size, data_parallel_size=1,
         gpu_memory_utilization=args.gpu_memory_utilization, decode_graph=True,
-        enable_prefix_caching=False, max_num_batched_tokens=args.max_num_batched_tokens,
-        engine_prefill_chunk_size=args.max_num_batched_tokens)
+        enable_prefix_caching=False, max_num_batched_tokens=args.max_num_batched_tokens)
+    hp.setdefault("engine_prefill_chunk_size",
+                  8192 if args.engine == "sparsevllm" else args.max_num_batched_tokens)
     for key, value in explicit.items():
         if key in hp and hp[key] != value:
             raise ValueError(f"Conflicting paper parameter: {key}")

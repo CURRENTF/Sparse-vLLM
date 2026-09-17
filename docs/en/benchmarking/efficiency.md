@@ -34,6 +34,12 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD:$PWD/src" python3 \
 
 See `python3 benchmark/efficiency/bench_probe.py --help` for all arguments.
 `--monitor-gpus` uses physical IDs aligned with `CUDA_VISIBLE_DEVICES`.
+The probe defaults to `max_num_batched_tokens=65536` per scheduler.
+Sparse-vLLM independently defaults to `engine_prefill_chunk_size=8192`; override
+it through `--hyper-params`. The scheduler token budget and prefill chunk size
+are separate controls. vLLM has no equivalent independent chunk-size option in
+these adapters; its chunking follows the available scheduler token budget.
+Record this difference and per-replica/global budgets in cross-topology comparisons.
 Match checkpoints, weight/KV dtypes, traces, GPUs/TP/DP/EP, budgets, Graph policy,
 seed, lengths, jitter, warmups, and repetitions across systems. Report
 sink/recent/selected/full-layer budgets separately: equal names do not establish

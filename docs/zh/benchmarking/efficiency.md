@@ -32,6 +32,11 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD:$PWD/src" python3 \
 
 完整参数用 `python3 benchmark/efficiency/bench_probe.py --help` 查询。
 `--monitor-gpus` 是物理 GPU ID，须与 `CUDA_VISIBLE_DEVICES` 对齐。
+Probe 默认每个 scheduler 的 `max_num_batched_tokens=65536`。
+Sparse-vLLM 独立默认 `engine_prefill_chunk_size=8192`，可通过
+`--hyper-params` 覆盖；调度 token 总预算与 prefill chunk size 是两个独立参数。
+当前 vLLM 适配器没有对应的独立 chunk size 参数，其切块受可用调度 token 预算约束。
+跨拓扑比较须记录这一差异，以及每 replica 和全局的预算。
 跨系统运行时对齐模型、权重/KV dtype、trace、GPU/TP/DP/EP、预算、Graph、
 seed、长度、jitter、warmup 和重复次数；不同方法的预算需分别说明
 sink/recent/selected/full layers，同名预算不保证相同工作量或质量。

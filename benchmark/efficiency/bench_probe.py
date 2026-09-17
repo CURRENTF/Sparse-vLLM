@@ -492,7 +492,7 @@ def _resolve_sparse_probe_protocol(
     from sparsevllm.config import Config
     hyper_params.setdefault("decode_reservation_tokens", Config.decode_reservation_tokens)
     hyper_params.setdefault("max_num_batched_tokens", args.max_num_batched_tokens)
-    hyper_params.setdefault("engine_prefill_chunk_size", args.max_num_batched_tokens)
+    hyper_params.setdefault("engine_prefill_chunk_size", 8192)
     if args.sparse_method == "snapkv":
         hyper_params.setdefault("snapkv_window_size", 64)
         hyper_params.setdefault("sink_keep_tokens", 64)
@@ -1829,7 +1829,7 @@ def parse_args():
     parser.add_argument(
         "--max-num-batched-tokens",
         type=int,
-        default=8192,
+        default=65536,
         help="Matched scheduler token budget used by Sparse-vLLM and vLLM.",
     )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
