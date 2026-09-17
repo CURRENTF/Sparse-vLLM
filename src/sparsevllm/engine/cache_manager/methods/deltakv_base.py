@@ -2913,98 +2913,82 @@ class DeltaKVCacheManager(CacheManager):
             empty0 = torch.empty((0,), device=self.device, dtype=torch.int32)
             return torch.empty((0, 0), device=self.device, dtype=torch.int32), empty0, empty0, empty0, empty0, empty0, empty0
 
-        local_req = torch.arange(bsz, device=self.device, dtype=torch.int32)
+        from sparsevllm.kernels.triton.deltakv_eager_plan import (
+            finish_eager_plan,
+            prepare_eager_plan,
+        )
+
         sink = int(self.config.sink_keep_tokens)
-
-        with profiler.record("deltakv_build_view_read_lens"):
-            req_indices_cpu = req_indices.cpu().numpy()
-            # Keep per-seq lengths on CPU to avoid repeated CUDA sync via .item().
-            total_lens_cpu = self.row_seq_lens[req_indices_cpu]
-            compressed_lens_cpu = self.row_deltakv_compressed_lens[req_indices_cpu]
-
-        plans: list[tuple[int, int, int, int, int, torch.Tensor]] = []
-        new_context_lens_list = [0] * bsz
-        max_s = 0
-        with profiler.record("deltakv_build_view_plan_cpu"):
-            for b in range(bsz):
-                row = int(req_indices_cpu[b])
-                total_len = int(total_lens_cpu[b])
-                sink_len = min(sink, total_len)
-
-                comp_len = int(compressed_lens_cpu[b]) if total_len > sink else 0
-                comp_len = min(comp_len, max(0, total_len - sink))
-
-                buffer_start = (sink + comp_len) if total_len > sink else sink_len
-                buffer_len = total_len - buffer_start
-                if buffer_len < 0:
-                    raise RuntimeError("DeltaKV: negative buffer length; compressed_lens is inconsistent.")
-
-                if active_compressed_indices.numel() == 0 or total_len <= sink or comp_len <= 0:
-                    top_pos = torch.empty((0,), device=self.device, dtype=torch.int32)
-                else:
-                    cand = active_compressed_indices[b].to(torch.int32)
-                    abs_pos = cand + int(sink)
-                    valid = (cand >= 0) & (cand < comp_len) & (abs_pos < total_len)
-                    top_pos = abs_pos[valid]
-
-                k_b = int(top_pos.numel())
-                ctx_len_b = sink_len + k_b + buffer_len
-                new_context_lens_list[b] = ctx_len_b
-                max_s = max(max_s, ctx_len_b)
-                plans.append((row, total_len, sink_len, buffer_start, buffer_len, top_pos))
-
-        new_context_lens = torch.tensor(new_context_lens_list, device=self.device, dtype=torch.int32)
-
-        with profiler.record("deltakv_build_view_alloc_active_slots"):
-            active_slots = torch.zeros((bsz, max_s), device=self.device, dtype=torch.int32)
-
-        temp_slots_all = []
-        recon_pos = []
-        recon_latent = []
-        recon_out_slot = []
-        with profiler.record("deltakv_build_view_fill_and_alloc_temp"):
-            for b, (row, _total_len, sink_len, buffer_start, buffer_len, top_pos) in enumerate(plans):
-                if sink_len > 0:
-                    sink_slots = self.sparse_layer_raw_slots_map[row, :sink_len].to(torch.int32)
-                    if (sink_slots < 0).any():
-                        raise RuntimeError("DeltaKV: missing full slots in sink window.")
-                    active_slots[b, :sink_len] = sink_slots
-
-                k_b = int(top_pos.numel())
-                if k_b > 0:
-                    top_slots = self.sparse_layer_raw_slots_map[row, top_pos.to(torch.long)].to(torch.int32)
-                    latent_slots_for_top = self.sparse_layer_latent_slots_map[row, top_pos.to(torch.long)].to(torch.int32)
-                    need = latent_slots_for_top >= 0
-                    if need.any():
-                        latent_slots = latent_slots_for_top[need]
-                        if (latent_slots < 0).any():
-                            raise RuntimeError("DeltaKV: selected token has neither full slot nor latent slot.")
-                        out_slots = self._allocate_temp_deltakv_full(int(need.sum().item())).to(torch.int32)
-                        top_slots[need] = out_slots
-                        temp_slots_all.append(out_slots)
-
-                        recon_pos.append(top_pos[need].to(torch.int32))
-                        recon_latent.append(latent_slots)
-                        recon_out_slot.append(out_slots)
-
-                    active_slots[b, sink_len: sink_len + k_b] = top_slots
-
-                if buffer_len > 0:
-                    buf_slots = self.sparse_layer_raw_slots_map[row, buffer_start: buffer_start + buffer_len].to(torch.int32)
-                    if (buf_slots < 0).any():
-                        raise RuntimeError("DeltaKV: buffer contains missing full slots.")
-                    active_slots[b, sink_len + k_b: sink_len + k_b + buffer_len] = buf_slots
-
-        if not temp_slots_all:
-            empty = torch.empty((0,), device=self.device, dtype=torch.int32)
-            return active_slots, local_req, new_context_lens, empty, empty, empty, empty
-
-        with profiler.record("deltakv_build_view_pack_recon"):
-            recon_pos = torch.cat(recon_pos, dim=0).to(torch.int32)
-            recon_latent = torch.cat(recon_latent, dim=0).to(torch.int32)
-            recon_out_slot = torch.cat(recon_out_slot, dim=0).to(torch.int32)
-            temp_slots = torch.cat(temp_slots_all, dim=0).to(torch.int32)
-        return active_slots, local_req, new_context_lens, temp_slots, recon_pos, recon_latent, recon_out_slot
+        req_indices = req_indices.contiguous()
+        req_indices_cpu = req_indices.cpu().numpy()
+        total_lens = self.row_seq_lens[req_indices_cpu]
+        compressed_lens = self.row_deltakv_compressed_lens[req_indices_cpu]
+        lengths = torch.tensor(
+            np.stack((total_lens, compressed_lens), axis=1),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        plan = prepare_eager_plan(
+            self.sparse_layer_raw_slots_map,
+            self.sparse_layer_latent_slots_map,
+            req_indices,
+            lengths,
+            active_compressed_indices.to(torch.int32),
+            sink,
+        )
+        # Exact allocation remains host-owned. Read all counts and validation
+        # flags together instead of synchronizing for every selected request.
+        stats = plan[-1].cpu().tolist()
+        context_lens = []
+        for total, compressed, (kept, needed, bad_sink, bad_tail) in zip(
+            total_lens, compressed_lens, stats
+        ):
+            if bad_sink:
+                raise RuntimeError("DeltaKV: missing full slots in sink window.")
+            if bad_tail:
+                raise RuntimeError("DeltaKV: buffer contains missing full slots.")
+            sink_len = min(sink, int(total))
+            compressed = min(int(compressed), max(0, int(total) - sink_len))
+            context_lens.append(int(total) - compressed + kept)
+        needed_total = sum(row[1] for row in stats)
+        if needed_total > self._num_free_slots_deltakv_full:
+            raise RuntimeError(
+                "Out of DeltaKV full cache slots (temp). "
+                f"need={needed_total} free={self._num_free_slots_deltakv_full}."
+            )
+        allocated = [
+            self._allocate_temp_deltakv_full(row[1]) for row in stats if row[1]
+        ]
+        empty = torch.empty(0, dtype=torch.int32, device=self.device)
+        temp_slots = torch.cat(allocated) if allocated else empty
+        active_slots = torch.empty(
+            (bsz, max(context_lens)), dtype=torch.int32, device=self.device
+        )
+        new_context_lens = torch.empty((bsz,), dtype=torch.int32, device=self.device)
+        recon_pos = torch.empty_like(temp_slots)
+        recon_latent = torch.empty_like(temp_slots)
+        finish_eager_plan(
+            self.sparse_layer_raw_slots_map,
+            req_indices,
+            lengths,
+            plan,
+            temp_slots,
+            active_slots,
+            recon_pos,
+            recon_latent,
+            new_context_lens,
+            sink,
+        )
+        local_req = torch.arange(bsz, device=self.device, dtype=torch.int32)
+        return (
+            active_slots,
+            local_req,
+            new_context_lens,
+            temp_slots,
+            recon_pos,
+            recon_latent,
+            temp_slots.clone(),
+        )
 
 
 class DeltaKVCacheTritonManagerV4(DeltaKVCacheManager):

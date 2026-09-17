@@ -136,6 +136,7 @@ def select_global_keep_indices(
         )
     candidates = [index for index in range(int(scores.numel())) if index not in protected]
     # Python ordering makes equal-score selection stable by original token position.
-    candidates.sort(key=lambda index: (-float(scores[index].item()), index))
+    host_scores = scores.cpu().tolist()
+    candidates.sort(key=lambda index: (-host_scores[index], index))
     selected = sorted(protected | set(candidates[: keep_tokens - len(protected)]))
     return torch.tensor(selected, dtype=torch.long, device=scores.device)

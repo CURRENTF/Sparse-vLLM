@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from itertools import pairwise
 
+import numpy as np
 import torch
 
 
@@ -11,6 +13,10 @@ class MultiModalState:
     embeddings: dict[int, torch.Tensor]
     position_ids: torch.Tensor | None
     position_delta: int
+    feature_ranges: dict[int, list[tuple[int, int, int]]] = field(
+        default_factory=dict, init=False
+    )
+    image_ranges: list[tuple[int, int]] = field(default_factory=list, init=False)
 
 
 class MultiModalRuntime:
@@ -49,8 +55,34 @@ class MultiModalRuntime:
                 "Multimodal token types must align with the prompt: "
                 f"types={tuple(encoded.type_ids.shape)} tokens={len(input_ids)}."
             )
+        # Token types are immutable request metadata. Compute host ranges once
+        # so chunk preparation needs neither device reductions nor ragged gathers.
+        encoded.feature_ranges = {int(modality): [] for modality in encoded.embeddings}
+        encoded.image_ranges = []
+        counts = dict.fromkeys(encoded.feature_ranges, 0)
+        host_types = encoded.type_ids.cpu().numpy()
+        boundaries = np.concatenate(
+            (
+                [0],
+                np.flatnonzero(host_types[1:] != host_types[:-1]) + 1,
+                [len(host_types)],
+            )
+        )
+        for start, end in pairwise(boundaries):
+            if start == end:
+                continue
+            start, end = int(start), int(end)
+            modality = int(host_types[start])
+            if modality in encoded.feature_ranges:
+                encoded.feature_ranges[modality].append((start, end, counts[modality]))
+                counts[modality] += end - start
+            if modality in (1, 2):
+                if encoded.image_ranges and encoded.image_ranges[-1][1] == start:
+                    encoded.image_ranges[-1] = (encoded.image_ranges[-1][0], end)
+                else:
+                    encoded.image_ranges.append((start, end))
         for modality, features in encoded.embeddings.items():
-            expected = int(encoded.type_ids.eq(int(modality)).sum().item())
+            expected = counts[int(modality)]
             if features.ndim != 2 or int(features.shape[0]) != expected:
                 raise ValueError(
                     "Multimodal feature/token mismatch: "
@@ -110,28 +142,32 @@ class MultiModalRuntime:
                 batch_offset += chunk_size
                 continue
 
-            chunk_types = state.type_ids[start:end]
             position_rows.append(
                 state.position_ids[:, start:end]
                 if state.position_ids is not None
                 else positions[batch_offset : batch_offset + chunk_size].expand(3, -1)
             )
             for modality, features in state.embeddings.items():
-                prompt_indices = state.type_ids.eq(int(modality)).nonzero().flatten()
-                selected = (prompt_indices >= start) & (prompt_indices < end)
-                if not selected.any():
-                    continue
-                chunk_indices = prompt_indices[selected] - start + batch_offset
-                feature_start = int((prompt_indices < start).sum().item())
-                feature_end = feature_start + int(selected.sum().item())
-                inputs_embeds[chunk_indices] = features[feature_start:feature_end]
-                multimodal_mask[chunk_indices] = True
+                for run_start, run_end, feature_offset in state.feature_ranges[
+                    int(modality)
+                ]:
+                    left, right = max(start, run_start), min(end, run_end)
+                    if left >= right:
+                        continue
+                    chunk_start = batch_offset + left - start
+                    chunk_end = batch_offset + right - start
+                    feature_start = feature_offset + left - run_start
+                    inputs_embeds[chunk_start:chunk_end].copy_(
+                        features[feature_start : feature_start + right - left]
+                    )
+                    multimodal_mask[chunk_start:chunk_end] = True
 
-            image_positions = ((chunk_types == 1) | (chunk_types == 2)).nonzero().flatten()
-            if image_positions.numel():
-                split = torch.where(image_positions[1:] != image_positions[:-1] + 1)[0] + 1
-                for group in torch.tensor_split(image_positions, split.cpu().tolist()):
-                    image_groups[batch_offset + group] = next_image_group
+            for run_start, run_end in state.image_ranges:
+                left, right = max(start, run_start), min(end, run_end)
+                if left < right:
+                    image_groups[
+                        batch_offset + left - start : batch_offset + right - start
+                    ] = next_image_group
                     next_image_group += 1
             batch_offset += chunk_size
 

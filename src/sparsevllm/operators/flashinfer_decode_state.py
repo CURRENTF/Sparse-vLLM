@@ -30,6 +30,7 @@ class FlashInferPagedDecodeState:
         )
         self.wrapper = make_flashinfer_paged_decode_wrapper(self.workspace)
         self.plan_key: tuple[object, ...] | None = None
+        self.indices = torch.empty(0, dtype=torch.int32, device=device)
 
     def plan(
         self,
@@ -59,21 +60,25 @@ class FlashInferPagedDecodeState:
                 f"max_page_count={max_page_count} "
                 f"width={int(active_slots.shape[1])}."
             )
-        rows = active_slots.index_select(0, req_indices.to(torch.long))[
-            :, :max_page_count
-        ]
-        positions = torch.arange(
-            max_page_count,
-            device=context_lens.device,
-            dtype=context_lens.dtype,
+        capacity = batch_size * max_page_count
+        if self.indices.numel() < capacity:
+            self.indices = torch.empty(
+                capacity, dtype=torch.int32, device=context_lens.device
+            )
+        indices = self.indices[:capacity]
+        pack_flashinfer_page_indices(
+            active_slots,
+            req_indices.contiguous(),
+            context_lens.contiguous(),
+            indices,
+            context_capacity=max_context_len,
+            page_size=page_size,
         )
         page_counts = torch.div(
             context_lens + page_size - 1,
             page_size,
             rounding_mode="floor",
         )
-        valid = positions.unsqueeze(0) < page_counts.unsqueeze(1)
-        indices = rows.masked_select(valid).to(torch.int32).contiguous()
         indptr = torch.cat(
             (
                 torch.zeros(1, device=context_lens.device, dtype=torch.int32),

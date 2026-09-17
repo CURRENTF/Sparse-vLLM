@@ -452,8 +452,15 @@ class RKVCacheManager(SnapKVCacheManager):
 
         positions = torch.arange(score_start, score_end, dtype=torch.long, device=self.device)
         cols = positions.remainder(obs)
-        stored_positions = positions_cache[row_idx, cols].to(torch.long)
-        if bool((stored_positions != positions).any().item()):
+        stored_positions = positions_cache[row_idx, cols]
+        positions_ok = (stored_positions == positions).all()
+        if positions_ok.is_cuda:
+            torch._assert_async(
+                positions_ok,
+                f"R-KV query cache missing observation positions: layer={layer_idx} "
+                f"seq_id={seq.seq_id} needed=[{score_start}, {score_end}).",
+            )
+        elif not bool(positions_ok.item()):
             raise RuntimeError(
                 "R-KV query cache missing observation positions: "
                 f"layer={layer_idx} seq_id={seq.seq_id} "
@@ -507,12 +514,11 @@ class RKVCacheManager(SnapKVCacheManager):
             dtype=self._prefill_score_dtype(),
             device=self.device,
         )
-        b_req_idx = torch.tensor([row_idx], dtype=torch.int32, device=self.device)
-        b_start_loc = torch.zeros((1,), dtype=torch.int32, device=self.device)
-        b_seq_len = torch.tensor([kv_len], dtype=torch.int32, device=self.device)
-        b_prompt_cache_len = torch.tensor([score_start], dtype=torch.int32, device=self.device)
-        score_q_start = torch.tensor([score_start], dtype=torch.int32, device=self.device)
-        score_q_end = torch.tensor([score_end], dtype=torch.int32, device=self.device)
+        b_req_idx, b_start_loc, b_seq_len, score_q_start, score_q_end = torch.tensor(
+            [row_idx, 0, kv_len, score_start, score_end],
+            dtype=torch.int32,
+            device=self.device,
+        ).split(1)
 
         prefill_score_fwd(
             q_window,
@@ -521,7 +527,7 @@ class RKVCacheManager(SnapKVCacheManager):
             b_req_idx,
             b_start_loc,
             b_seq_len,
-            b_prompt_cache_len,
+            score_q_start,
             score_len,
             self.buffer_req_to_token_slots[layer_idx],
             score_q_start,
