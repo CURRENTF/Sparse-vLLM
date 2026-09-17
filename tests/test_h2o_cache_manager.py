@@ -2002,7 +2002,7 @@ def test_snapkv_decode_graph_populates_host_mirrors_for_provider_planning(
     seq = _seq(0, 5, prefilled=4, chunk=1)
     contract = DecodeGraphContract(
         method=manager.config.sparse_method,
-        topology_path_id="short",
+        topology_path_id="unified",
         batch_capacity=4,
         context_capacity=8,
     )

@@ -3423,7 +3423,7 @@ def test_quest_no_prefix_graph_publishes_page_boundary_in_graph_phase():
 
     contract = DecodeGraphContract(
         method="quest",
-        topology_path_id="long",
+        topology_path_id="unified",
         batch_capacity=2,
         context_capacity=16,
     )
@@ -3466,7 +3466,7 @@ def test_quest_no_prefix_graph_capacity_failure_preserves_allocator():
     row = manager.seq_id_to_row[seq.seq_id]
     contract = DecodeGraphContract(
         method="quest",
-        topology_path_id="long",
+        topology_path_id="unified",
         batch_capacity=1,
         context_capacity=4,
     )

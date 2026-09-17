@@ -319,12 +319,13 @@ def _spec(**overrides) -> DecodeAttentionOpSpec:
     return DecodeAttentionOpSpec(**values)
 
 
-def test_deltakv_fixed_grid_graph_state_owns_per_graph_workspace():
+@pytest.mark.parametrize("context_capacity", [8192, 131072])
+def test_deltakv_fixed_grid_graph_state_owns_per_graph_workspace(context_capacity):
     spec = _spec(
         max_batch_size=8,
         may_require_attention_scores=True,
         layer_varying_page_table=True,
-        context_capacity=131072,
+        context_capacity=context_capacity,
         may_use_full_layer_kivi_int4=True,
         full_layer_kivi_decode_block_seq=512,
         full_layer_kivi_decode_block_n=32,
@@ -332,59 +333,61 @@ def test_deltakv_fixed_grid_graph_state_owns_per_graph_workspace():
         full_layer_kivi_decode_num_stages=2,
     )
     provider = DeltaKVFixedGridDecodeAttentionProvider.bind(spec, _cuda_caps())
-    long_contract = DecodeGraphContract(
+    contract = DecodeGraphContract(
         method="deltakv",
-        topology_path_id="long",
+        topology_path_id="unified",
         batch_capacity=4,
-        context_capacity=131072,
+        context_capacity=context_capacity,
     )
-    short_contract = DecodeGraphContract(
+    larger_batch_contract = DecodeGraphContract(
         method="deltakv",
-        topology_path_id="short",
-        batch_capacity=4,
-        context_capacity=8192,
+        topology_path_id="unified",
+        batch_capacity=8,
+        context_capacity=context_capacity,
     )
-    long_inputs = DecodeGraphInputs.allocate(
-        long_contract,
+    inputs = DecodeGraphInputs.allocate(
+        contract,
         device=torch.device("cpu"),
         pin_memory=False,
     )
-    short_inputs = DecodeGraphInputs.allocate(
-        short_contract,
+    larger_batch_inputs = DecodeGraphInputs.allocate(
+        larger_batch_contract,
         device=torch.device("cpu"),
         pin_memory=False,
     )
 
-    long_state = provider.init_decode_graph_state(spec, long_contract, long_inputs)
-    short_state = provider.init_decode_graph_state(spec, short_contract, short_inputs)
+    state = provider.init_decode_graph_state(spec, contract, inputs)
+    larger_batch_state = provider.init_decode_graph_state(
+        spec, larger_batch_contract, larger_batch_inputs
+    )
 
-    assert long_state.launch_plan.context_capacity == 131072
-    assert short_state.launch_plan.context_capacity == 8192
-    assert long_state.kivi_launch_plan.target_tokens_per_split == 512
-    assert long_state.kivi_launch_plan.block_n == 32
-    assert long_state.kivi_launch_plan.stage1_num_warps == 4
-    assert long_state.kivi_launch_plan.stage1_num_stages == 2
-    assert long_state.launch_plan.max_kv_splits > short_state.launch_plan.max_kv_splits
-    assert (
-        long_state.kivi_launch_plan.max_kv_splits
-        >= short_state.kivi_launch_plan.max_kv_splits
-    )
-    assert (
-        long_state.kivi_mid_o.shape[2]
-        == long_state.kivi_launch_plan.max_kv_splits
-    )
-    assert (
-        short_state.kivi_mid_o.shape[2]
-        == short_state.kivi_launch_plan.max_kv_splits
-    )
-    assert long_state.mid_o.data_ptr() != short_state.mid_o.data_ptr()
-    assert long_state.kivi_mid_o.data_ptr() != long_state.mid_o.data_ptr()
-    assert len(provider.decode_graph_keepalive_tensors(long_state)) == 6
-    provider.prepare_decode_graph_out(long_state)
-    assert provider._active_graph_state is long_state
-    provider.prepare_decode_graph_in(short_state)
-    assert provider._active_graph_state is short_state
-    provider.close_decode_graph_state(short_state)
+    for graph_state, graph_contract in (
+        (state, contract),
+        (larger_batch_state, larger_batch_contract),
+    ):
+        assert graph_state.launch_plan.context_capacity == context_capacity
+        assert graph_state.kivi_launch_plan.context_capacity == context_capacity
+        assert graph_state.mid_o.shape == (
+            graph_contract.batch_capacity,
+            spec.num_query_heads,
+            graph_state.launch_plan.max_kv_splits,
+            spec.head_dim,
+        )
+        assert graph_state.kivi_mid_o.shape == (
+            graph_contract.batch_capacity,
+            spec.num_query_heads,
+            graph_state.kivi_launch_plan.max_kv_splits,
+            spec.head_dim,
+        )
+        assert graph_state.kivi_mid_o.data_ptr() != graph_state.mid_o.data_ptr()
+        assert len(provider.decode_graph_keepalive_tensors(graph_state)) == 6
+    assert state.mid_o.data_ptr() != larger_batch_state.mid_o.data_ptr()
+    assert state.kivi_mid_o.data_ptr() != larger_batch_state.kivi_mid_o.data_ptr()
+    provider.prepare_decode_graph_out(state)
+    assert provider._active_graph_state is state
+    provider.prepare_decode_graph_in(larger_batch_state)
+    assert provider._active_graph_state is larger_batch_state
+    provider.close_decode_graph_state(larger_batch_state)
     assert provider._active_graph_state is None
 
 
@@ -1069,7 +1072,7 @@ def test_flashinfer_graph_page_size_16_replans_and_replays():
     )
     contract = DecodeGraphContract(
         method="quest",
-        topology_path_id="long",
+        topology_path_id="unified",
         batch_capacity=batch,
         context_capacity=context_capacity,
     )

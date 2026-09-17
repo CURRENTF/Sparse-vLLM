@@ -97,7 +97,7 @@ def test_model_runner_gathers_one_debug_summary_per_world_rank():
         last_state_key=SimpleNamespace(
             method="snapkv",
             batch_size=2,
-            graph_path_id="long",
+            graph_path_id="unified",
             capture_sampling=False,
         ),
         graph_plan=lambda: {
@@ -136,7 +136,7 @@ def test_model_runner_gathers_one_debug_summary_per_world_rank():
         "last_state_key": {
             "method": "snapkv",
             "batch_size": 2,
-            "graph_path_id": "long",
+            "graph_path_id": "unified",
             "capture_sampling": False,
         },
     }

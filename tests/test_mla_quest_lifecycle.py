@@ -118,7 +118,7 @@ def test_mla_quest_prefix_graph_replay_updates_pages_rows_and_padding(long_only)
         seq.append_token(110)
     contract = DecodeGraphContract(
         method="quest",
-        topology_path_id="long",
+        topology_path_id="unified",
         batch_capacity=3,
         context_capacity=128,
     )

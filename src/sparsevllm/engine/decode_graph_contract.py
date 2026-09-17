@@ -38,8 +38,12 @@ class DecodeGraphContract:
                 "Decode graph batch and context capacities must be positive, got "
                 f"batch={self.batch_capacity} context={self.context_capacity}."
             )
-        if not self.topology_path_id:
-            raise ValueError("Decode graph topology_path_id must be non-empty.")
+        if self.topology_path_id not in {"dense", "unified"}:
+            raise ValueError(
+                "Decode graph topology_path_id must be 'dense' or 'unified'; "
+                f"got {self.topology_path_id!r}. Length-specific decode paths "
+                "are not supported."
+            )
         if not self.dynamic_context_lens:
             raise ValueError(
                 "decode graphs require device-resident dynamic context lengths."
@@ -47,11 +51,7 @@ class DecodeGraphContract:
 
     @property
     def capability_level(self) -> str:
-        return (
-            "strict"
-            if self.topology_path_id in {"dense", "unified"}
-            else "path_scoped"
-        )
+        return "strict"
 
 
 @dataclass

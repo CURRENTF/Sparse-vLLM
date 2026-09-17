@@ -294,7 +294,7 @@ class SnapKVDecodeScoreLifecycleTest(unittest.TestCase):
             )
         )
 
-    def test_pyramid_short_graph_uses_layer_trigger_and_graph_capacity(self):
+    def test_pyramid_graph_with_short_context_uses_layer_trigger_and_graph_capacity(self):
         common = {
             "method": "pyramidkv",
             "layers": 2,

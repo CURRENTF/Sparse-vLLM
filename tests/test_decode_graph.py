@@ -76,7 +76,7 @@ def _cuda_caps() -> DeviceCaps:
     )
 
 
-def test_decode_graph_startup_plan_has_one_graph_per_batch_and_path() -> None:
+def test_decode_graph_startup_plan_has_one_graph_per_batch() -> None:
     config = SimpleNamespace(
         decode_graph_capture_sizes=[1, 4],
         decode_graph_startup_capture_limit=8,
@@ -90,6 +90,17 @@ def test_decode_graph_startup_plan_has_one_graph_per_batch_and_path() -> None:
         (4, 32768),
         (1, 32768),
     ]
+
+
+@pytest.mark.parametrize("legacy_path", ["short", "long"])
+def test_decode_graph_contract_rejects_removed_length_paths(legacy_path) -> None:
+    with pytest.raises(ValueError, match="Length-specific decode paths"):
+        DecodeGraphContract(
+            method="quest",
+            topology_path_id=legacy_path,
+            batch_capacity=4,
+            context_capacity=32768,
+        )
 
 
 def test_decode_graph_state_identity_omits_context_capacity() -> None:

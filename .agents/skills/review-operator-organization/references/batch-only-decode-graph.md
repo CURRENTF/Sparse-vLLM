@@ -2,7 +2,7 @@
 
 Read this reference when a review touches an operator reachable from captured
 decode, decode graph input preparation, provider graph state, or sparse
-short/long topology paths.
+mixed-length decode.
 
 ## Scope and Vocabulary
 
@@ -17,9 +17,8 @@ Use these terms consistently:
 
 - **batch-only graph**: graph identity depends on batch capacity but not actual
   per-step context lengths;
-- **strict batch-only**: one forward graph per batch and sampling topology;
-- **path-scoped batch-only**: one forward graph per batch, sampling topology,
-  and finite semantic topology path when kernel chains genuinely differ;
+- **strict batch-only**: one forward graph per batch and sampling topology for
+  a fixed model/method, with `dense` or `unified` as its sole decode path;
 - **context capacity**: a capture-time storage and launch upper bound, not a
   replay-time graph bucket;
 - **static launch plan**: capture-time tile, warp, stage, split envelope, grid
@@ -37,9 +36,10 @@ provider binding.
 
 ## Operator and Provider Adaptation
 
-- Define graph identity from batch capacity, finite semantic topology path,
-  sampling topology, and capture-time tensor/layout contract. Actual
-  `context_lens` must not enter graph keys or cause runtime capture.
+- Define graph identity from batch capacity and sampling topology for a fixed
+  model/method and capture-time tensor/layout contract. Use `dense` for dense
+  decode and `unified` for sparse decode. Actual `context_lens` must not enter
+  graph keys or cause runtime capture.
 - Resolve model/hardware tuning tables and compile-time choices before capture.
   A table selected for a fixed model architecture and hardware combination is
   valid static configuration. Tile, warp, stage, compiled variant, grid
@@ -51,10 +51,11 @@ provider binding.
 - Dynamic lengths may drive device masking, effective split/range metadata, or
   an explicit replay-before provider plan when those updates write only stable
   graph state and leave the captured launch contract unchanged.
-- Permit separate startup-captured short/long paths only when the semantic
-  kernel chain truly differs. Merge methods or length regimes with identical
-  topology. Seal the startup plan; transitions among declared paths must not
-  JIT, reselect a provider or variant, grow workspace, or recapture.
+- Do not split decode batches or capture separate short/long graphs. Represent
+  per-row dense/sparse selection with dynamic lengths and method-owned metadata
+  inside the unified path. Seal the startup plan; length changes must not JIT,
+  reselect a provider or variant, grow workspace, or recapture. This does not
+  change method-specific prefill scheduling or cache transformation policies.
 - Require `supports(spec, caps)` and preparation to validate dtype, shape,
   layout, capacity, padding, workspace, and batch-only compatibility before
   forward. Do not treat a few fixed-shape experiments as production support.
@@ -113,7 +114,7 @@ order without taking ownership of private algorithms or layouts.
 Use a typed lifecycle equivalent to:
 
 ```text
-init_graph_state(contract, topology_path)
+init_decode_graph_state(contract, inputs)
 prepare_out_graph(step, state)
 prepare_in_graph(state)
 graph_keepalive_tensors(state)
@@ -170,9 +171,9 @@ CUDA Graph lifecycle:
 
 ## Required Review Evidence
 
-For every claimed model/method/provider topology path require:
+For every claimed model/method/provider configuration require:
 
-- one startup-captured graph per batch/topology/sampling state and no actual
+- one startup-captured graph per batch/sampling state and no actual
   context bucket in graph keys;
 - repeated replay across representative, historical-threshold boundary,
   ragged, padded, and maximum-capacity contexts;
@@ -188,10 +189,10 @@ For every claimed model/method/provider topology path require:
 - isolated timing for CPU metadata preparation, H2D/D2H, provider planning,
   waits, and graph replay when replay-before work is nontrivial.
 
-For semantic short/long paths, test the algorithm threshold below, at, and
-above the boundary and transition between the already captured paths without
-state loss or new capture. Do not preserve a historical kernel-tuning threshold
-as a semantic topology path.
+Test algorithm thresholds below, at, and above the boundary, including mixed
+rows in one batch and length transitions within the same captured graph without
+state loss or new capture. Do not use an algorithm or historical kernel-tuning
+threshold to define a separate decode topology path.
 
 ## Finding Severity Additions
 
