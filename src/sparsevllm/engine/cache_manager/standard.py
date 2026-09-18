@@ -1973,8 +1973,20 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
                 cu_seqlens_q.append(cu_seqlens_q[-1] + chunk_size)
                 token_offset += chunk_size
 
-            context_lens = torch.tensor(context_lens_list, dtype=torch.int32, device=self.device)
-            req_indices_tensor = torch.tensor(req_indices, dtype=torch.int32, device=self.device)
+            # Pack metadata into two owned staging allocations. CUDA copies use
+            # pinned storage and do not wait for the preceding model step. Fresh
+            # allocations avoid overwriting inputs still used by an async step;
+            # PyTorch's pinned allocator tracks the copy stream before reuse.
+            pin = self.device.type == "cuda" and device_runtime.supports_pin_memory()
+            host_tokens = torch.empty((2, total_chunk_tokens), dtype=torch.int64, pin_memory=pin)
+            host_tokens[0].numpy()[:] = input_ids_np
+            host_tokens[1].numpy()[:] = positions_np
+            host_metadata = torch.empty(3 * len(seqs) + 1, dtype=torch.int32, pin_memory=pin)
+            host_metadata.numpy()[:] = context_lens_list + req_indices + cu_seqlens_q
+            device_tokens = host_tokens.to(self.device, non_blocking=pin)
+            device_metadata = host_metadata.to(self.device, non_blocking=pin)
+            context_lens = device_metadata[:len(seqs)]
+            req_indices_tensor = device_metadata[len(seqs):2 * len(seqs)]
 
             self.layer_batch_state.slot_mapping = slot_mapping
             self.layer_batch_state.context_lens = context_lens
@@ -1985,9 +1997,8 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             if log_level == 'DEBUG':
                 logger.debug(f'{context_lens_list=}   {req_indices=}  {slot_mapping[:10].tolist()=}  {slot_mapping[-10:].tolist()=}')
 
-            input_ids = torch.from_numpy(input_ids_np).to(self.device)
-            positions = torch.from_numpy(positions_np).to(self.device)
-            cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, device=self.device)
+            input_ids, positions = device_tokens.unbind(0)
+            cu_seqlens_q = device_metadata[2 * len(seqs):]
             return input_ids, positions, cu_seqlens_q
 
     def _prepare_decode(self, seqs: list[Sequence]):

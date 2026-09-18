@@ -3677,3 +3677,28 @@ def test_quest_admission_counts_cascade_freeable_prefix_pages():
 
     assert manager.prefix_cache.evictable_blocks() == 1
     assert manager.prompt_admission_free_slots() == 6
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_prefill_inputs_keep_values_across_inflight_chunks(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    manager = _make_standard_manager_for_prefix()
+    manager.device = torch.device(device)
+    manager.buffer_req_to_token_slots = manager.buffer_req_to_token_slots.to(device)
+    manager.free_slots_stack = manager.free_slots_stack.to(device)
+    seq = Sequence([11, 12, 13, 14, 15, 16])
+    seq.current_chunk_size = 3
+    first = manager._prepare_prefill([seq])
+    first_context = manager.layer_batch_state.context_lens
+    seq.num_prefilled_tokens = 3
+    second = manager._prepare_prefill([seq])
+    second_context = manager.layer_batch_state.context_lens
+    # Independent expected prompt slices and logical positions, checked only
+    # after both uploads are submitted to exercise staging-buffer ownership.
+    for actual, expected in zip(first, [[11, 12, 13], [0, 1, 2], [0, 3]]):
+        assert actual.cpu().tolist() == expected
+    for actual, expected in zip(second, [[14, 15, 16], [3, 4, 5], [0, 3]]):
+        assert actual.cpu().tolist() == expected
+    assert first_context.cpu().tolist() == [3]
+    assert second_context.cpu().tolist() == [6]
