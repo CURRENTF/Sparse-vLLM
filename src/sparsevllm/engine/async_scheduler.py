@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Sequence as ReadOnlySequence
 from dataclasses import dataclass
 import time
 
@@ -11,13 +12,36 @@ from sparsevllm.sampling_params import resolve_eos_token_ids
 from sparsevllm.utils.profiler import profiler
 
 
+class _TokenHistoryView(ReadOnlySequence):
+    """Bounded view of append-only history; snapshot cost is context independent."""
+
+    def __init__(self, tokens):
+        self.tokens = tokens
+        self.length = len(tokens)
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start, stop, stride = index.indices(self.length)
+            if stride == 1:
+                return self.tokens[start:stop]
+            return [self.tokens[i] for i in range(start, stop, stride)]
+        if index < 0:
+            index += self.length
+        if index < 0 or index >= self.length:
+            raise IndexError(index)
+        return self.tokens[index]
+
+
 def execution_snapshot(seq: Sequence) -> Sequence:
     # copy.copy uses Sequence's compact IPC state and loses rank-0 history.
     result = object.__new__(Sequence)
     result.__dict__ = dict(seq.__dict__)
     result.num_tokens += seq.num_pending_outputs
     result.num_pending_outputs = 0
-    result.token_ids = list(seq.token_ids)
+    result.token_ids = _TokenHistoryView(seq.token_ids)
     return result
 
 

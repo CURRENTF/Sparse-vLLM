@@ -305,6 +305,10 @@ class Scheduler:
     ) -> tuple[list[Sequence], bool, list[Sequence]]:
         if getattr(self, "_async_inflight", 0):
             from sparsevllm.engine.async_execution import AsyncDrainRequired
+            # Every caller removes the victim before entering this helper.
+            # Draining must preserve its ownership and cancellation visibility.
+            self.decoding.appendleft(victim)
+            self.decoding.extendleft(reversed(scheduled_seqs))
             raise AsyncDrainRequired("Preemption requires completed in-flight KV users")
         has_waiting_replay = any(
             seq.is_recompute_replay for seq in self.waiting

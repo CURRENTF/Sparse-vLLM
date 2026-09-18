@@ -4,11 +4,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sparsevllm.engine.async_execution import AsyncExecution
+from sparsevllm.engine.async_execution import AsyncDrainRequired, AsyncExecution
 from sparsevllm.engine.async_scheduler import AsyncScheduler, execution_snapshot
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.sampling_params import SamplingParams
-from test_prefill_schedule_policy import make_scheduler
+from test_prefill_schedule_policy import FakeMemoryOracle, make_scheduler
 
 
 class Executor:
@@ -123,9 +123,15 @@ def test_execution_snapshot_advances_position_without_fabricating_history():
     seq.num_pending_outputs = 2
     snapshot = execution_snapshot(seq)
     assert snapshot.decode_input_position == seq.decode_input_position + 2
-    assert snapshot.token_ids == seq.token_ids
+    assert list(snapshot.token_ids) == seq.token_ids
     seq.append_token(17)
-    assert snapshot.token_ids == [1, 2, 3, 4, 5]
+    assert list(snapshot.token_ids) == [1, 2, 3, 4, 5]
+    assert snapshot.token_ids[-1] == 5
+    assert snapshot.token_ids[:] == [1, 2, 3, 4, 5]
+    assert snapshot.token_ids[::-1] == [5, 4, 3, 2, 1]
+    assert snapshot.token_ids[3:100] == [4, 5]
+    with pytest.raises(IndexError):
+        snapshot.token_ids[5]
 
 
 def test_device_penalty_state_matches_independent_value_formula():
@@ -155,3 +161,27 @@ def test_sync_recovery_invalidates_feedback_only_after_all_results_retire():
     state.prepare_synchronous_execution()
     assert not state.last_tokens
     assert not state.penalties
+
+
+@pytest.mark.parametrize('reservation_failure', [False, True])
+@pytest.mark.parametrize('count', [1, 2])
+def test_inflight_preemption_preserves_every_request_for_drain_and_abort(reservation_failure, count):
+    oracle = FakeMemoryOracle(free_slots=0)
+    scheduler = make_scheduler('all_chunked', oracle=oracle)
+    seqs = [request(4, 16, ignore_eos=True) for _ in range(count)]
+    for seq in seqs:
+        seq.num_prefilled_tokens = 4
+        seq.append_token(7)
+        seq.num_pending_outputs = 1
+        scheduler.decoding.append(seq)
+    if reservation_failure:
+        oracle.reserve_decode_windows = lambda decoding, waiting: seqs[0]
+    scheduler._async_inflight = 1
+    with pytest.raises(AsyncDrainRequired):
+        scheduler.schedule()
+    assert list(scheduler.decoding) == seqs
+    assert scheduler.total_preemptions == 0
+    assert not any(seq.is_recompute_replay for seq in seqs)
+    for seq in seqs:
+        assert scheduler.abort(seq.seq_id)
+    assert scheduler.is_finished()
