@@ -3,11 +3,14 @@ import os
 import queue
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
 from typing import Callable
 
+from sparsevllm.engine.input_processor import tokenize_text_prompt
 from sparsevllm.entrypoints.openai.detokenizer import IncrementalDetokenizer
 from sparsevllm.entrypoints.openai.sampling import _find_stop_index
 from sparsevllm.entrypoints.openai.sampling import _safe_stream_text_len
@@ -46,6 +49,8 @@ class _QueuedRequest:
     admission_future: asyncio.Future
     chain_id: str | None = None
     chain_append_only: bool = False
+    stream: bool = True
+    preparation_error: Exception | None = None
 
 
 @dataclass
@@ -60,6 +65,7 @@ class _ActiveRequest:
     completion_token_logprobs: list[float | None]
     completion_top_logprobs: list[dict[int, float] | None]
     detokenizer: IncrementalDetokenizer
+    stream: bool = True
     eos_token_ids: frozenset[int] = field(default_factory=frozenset)
     ignore_eos: bool = False
     terminal: threading.Event = field(default_factory=threading.Event)
@@ -103,6 +109,14 @@ _WAKEUP = object()
 class AsyncEngineDispatcher:
     def __init__(self, engine: LLM):
         self.engine = engine
+        # Serialize preparation/submission without blocking the engine thread or
+        # the ASGI loop. A dedicated worker also bounds tokenizer concurrency
+        # when a submitting task is cancelled while encode is still running.
+        self._input_tokenizer = None
+        self._prepare_lock = asyncio.Lock()
+        self._prepare_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="sparsevllm-input"
+        )
         self._pending: queue.Queue[_QueuedRequest | object | None] = queue.Queue()
         self._aborts: queue.Queue[
             _AbortRequest | tuple[int, str, str | None] | tuple[int, str] | int
@@ -179,6 +193,8 @@ class AsyncEngineDispatcher:
         stop: list[str] | None = None,
         chain_id: str | None = None,
         chain_append_only: bool = False,
+        *,
+        stream: bool = True,
     ) -> RequestHandle:
         output_queue: asyncio.Queue = asyncio.Queue()
         cancelled = threading.Event()
@@ -198,11 +214,26 @@ class AsyncEngineDispatcher:
             admission_future=admission_future,
             chain_id=chain_id,
             chain_append_only=bool(chain_append_only),
+            stream=stream,
         )
-        with self._state_lock:
-            terminal_message = self._terminal_message_locked()
-            if terminal_message is None:
-                self._pending.put(queued)
+        async with self._prepare_lock:
+            with self._state_lock:
+                terminal_message = self._terminal_message_locked()
+            if terminal_message is None and isinstance(prompt, str):
+                try:
+                    queued.prompt = await loop.run_in_executor(
+                        self._prepare_executor,
+                        self._prepare_text_prompt,
+                        prompt,
+                        chain_append_only,
+                    )
+                except Exception as exc:
+                    # Keep the existing admission error/final notification path.
+                    queued.preparation_error = exc
+            with self._state_lock:
+                terminal_message = self._terminal_message_locked()
+                if terminal_message is None:
+                    self._pending.put(queued)
         if terminal_message is not None:
             handle.admission_error = RuntimeError(terminal_message)
             handle.terminal.set()
@@ -212,6 +243,18 @@ class AsyncEngineDispatcher:
             )
         return handle
 
+    def _prepare_text_prompt(self, prompt: str, chain_append_only: bool) -> list[int]:
+        if self._input_tokenizer is None:
+            # Fast tokenizers can mutate padding/truncation settings during
+            # encode. Do not share that backend with engine detokenization.
+            self._input_tokenizer = deepcopy(self.engine.tokenizer)
+        tokenizer = self._input_tokenizer
+        if chain_append_only:
+            # A suffix must never acquire a new BOS token. Empty suffix handling
+            # and chain validation remain owned by engine admission.
+            return tokenizer.encode(prompt, add_special_tokens=False)
+        return tokenize_text_prompt(tokenizer, prompt)
+
     async def submit_admitted(
         self,
         prompt: str | list[int],
@@ -220,6 +263,8 @@ class AsyncEngineDispatcher:
         stop: list[str] | None = None,
         chain_id: str | None = None,
         chain_append_only: bool = False,
+        *,
+        stream: bool = True,
     ) -> RequestHandle:
         handle = await self.submit(
             prompt,
@@ -228,6 +273,7 @@ class AsyncEngineDispatcher:
             stop,
             chain_id=chain_id,
             chain_append_only=chain_append_only,
+            stream=stream,
         )
         if handle.admission_future is not None:
             try:
@@ -426,6 +472,7 @@ class AsyncEngineDispatcher:
             if not self._closing.is_set():
                 self._closing.set()
                 self._pending.put(None)
+        self._prepare_executor.shutdown(wait=False, cancel_futures=True)
         timeout_s = float(os.getenv("SPARSEVLLM_OPENAI_SHUTDOWN_TIMEOUT_S", "5"))
         self._thread.join(timeout=max(0.0, timeout_s))
         if self._thread.is_alive():
@@ -564,6 +611,8 @@ class AsyncEngineDispatcher:
             return
         try:
             detokenizer = IncrementalDetokenizer(self.engine.tokenizer)
+            if item.preparation_error is not None:
+                raise item.preparation_error
             admit = getattr(self.engine, "admit_request", None)
             if callable(admit):
                 admission_kwargs = {"chain_id": item.chain_id}
@@ -619,6 +668,7 @@ class AsyncEngineDispatcher:
                 completion_token_logprobs=[],
                 completion_top_logprobs=[],
                 detokenizer=detokenizer,
+                stream=item.stream,
                 eos_token_ids=eos_token_ids,
                 ignore_eos=bool(
                     getattr(item.sampling_params, "ignore_eos", False)
@@ -852,22 +902,23 @@ class AsyncEngineDispatcher:
         text: str,
         raw_text_delta: str,
     ):
-        self._put(
-            request,
-            {
-                "type": "token",
-                "index": request.index,
-                "text": text,
-                "raw_text_delta": raw_text_delta,
-                "token_ids": list(request.pending_token_ids),
-                "token_logprobs": list(request.pending_token_logprobs),
-                "top_logprobs": list(request.pending_top_logprobs),
-                "chain_id": request.chain_id,
-                "chain_status": request.chain_status,
-                "reused_tokens": request.reused_tokens,
-                "prefilled_tokens": request.prefilled_tokens,
-            },
-        )
+        if request.stream:
+            self._put(
+                request,
+                {
+                    "type": "token",
+                    "index": request.index,
+                    "text": text,
+                    "raw_text_delta": raw_text_delta,
+                    "token_ids": list(request.pending_token_ids),
+                    "token_logprobs": list(request.pending_token_logprobs),
+                    "top_logprobs": list(request.pending_top_logprobs),
+                    "chain_id": request.chain_id,
+                    "chain_status": request.chain_status,
+                    "reused_tokens": request.reused_tokens,
+                    "prefilled_tokens": request.prefilled_tokens,
+                },
+            )
         request.pending_token_ids.clear()
         request.pending_token_logprobs.clear()
         request.pending_top_logprobs.clear()

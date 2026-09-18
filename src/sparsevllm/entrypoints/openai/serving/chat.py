@@ -99,7 +99,7 @@ async def serve_chat_completion(
             else dispatcher.submit
         )
         if request.chain_id is None:
-            handle = await submit(prompt, sampling_params, 0, stop)
+            handle = await submit(prompt, sampling_params, 0, stop, stream=request.stream)
         else:
             submit_kwargs = {"chain_id": request.chain_id}
             if request.chain_append_start is not None:
@@ -109,6 +109,7 @@ async def serve_chat_completion(
                 sampling_params,
                 0,
                 stop,
+                stream=request.stream,
                 **submit_kwargs,
             )
     except ChainCacheError as exc:

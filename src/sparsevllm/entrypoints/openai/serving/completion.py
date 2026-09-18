@@ -95,7 +95,7 @@ async def serve_completion(
         )
         for index, prompt in enumerate(prompts):
             handle = (
-                await submit(prompt, sampling_params, index, stop)
+                await submit(prompt, sampling_params, index, stop, stream=request.stream)
                 if request.chain_id is None
                 else await submit(
                     prompt,
@@ -103,6 +103,7 @@ async def serve_completion(
                     index,
                     stop,
                     chain_id=request.chain_id,
+                    stream=request.stream,
                 )
             )
             handles.append(handle)

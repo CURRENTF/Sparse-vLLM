@@ -78,7 +78,7 @@ async def serve_response(
             else dispatcher.submit
         )
         handle = (
-            await submit(prompt, sampling_params, 0, [])
+            await submit(prompt, sampling_params, 0, [], stream=request.stream)
             if request.chain_id is None
             else await submit(
                 prompt,
@@ -86,6 +86,7 @@ async def serve_response(
                 0,
                 [],
                 chain_id=request.chain_id,
+                stream=request.stream,
             )
         )
     except ChainCacheError as exc:

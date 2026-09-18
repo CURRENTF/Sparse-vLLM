@@ -17,6 +17,7 @@ class _FastTokenizerAdapter:
         self.is_fast = True
         self.backend_tokenizer = tokenizer._tokenizer
         self.chat_template = None
+        self.bos_token = None
 
     def encode(self, text, add_special_tokens=False):
         del add_special_tokens
@@ -89,6 +90,7 @@ async def _dispatcher_items_for_token_ids(
     *,
     stop=(),
     incremental=True,
+    stream=True,
 ):
     from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher, _ActiveRequest
     from sparsevllm.entrypoints.openai.detokenizer import IncrementalDetokenizer
@@ -121,6 +123,7 @@ async def _dispatcher_items_for_token_ids(
             completion_token_logprobs=[],
             completion_top_logprobs=[],
             detokenizer=IncrementalDetokenizer(tokenizer),
+            stream=stream,
         )
     }
     items = []
@@ -3582,6 +3585,8 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 _sampling_params,
                 index,
                 _stop,
+                *,
+                stream=True,
             ):
                 self.submitted.append((prompt, index))
                 output_queue = asyncio.Queue()
@@ -3665,6 +3670,8 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 _sampling_params,
                 index,
                 _stop,
+                *,
+                stream=True,
             ):
                 if index == 1:
                     raise ChainCapacityError(
@@ -5599,7 +5606,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         )
 
         class Dispatcher:
-            async def submit(self, prompt, _sampling_params, index, stop):
+            async def submit(self, prompt, _sampling_params, index, stop, *, stream=True):
                 self.prompt = prompt
                 self.index = index
                 self.stop = stop
@@ -6561,6 +6568,274 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 )
         finally:
             app.state.dispatcher.close()
+
+
+    async def test_nonstream_suppresses_tokens_but_preserves_final_output(self):
+        tokenizer = _byte_level_tokenizer(special_tokens=("<tool_call>",))
+        for text, stop in [
+            ("中文🙂 café", []),
+            ("answer STOP hidden", ["STOP"]),
+            ("<tool_call>tool arguments", []),
+            ("partial ST", ["STOP"]),
+        ]:
+            for incremental in (True, False):
+                with self.subTest(text=text, incremental=incremental):
+                    token_ids = tokenizer.encode(text)
+                    streamed = await _dispatcher_items_for_token_ids(
+                        tokenizer, token_ids, stop=stop, incremental=incremental,
+                    )
+                    final_only = await _dispatcher_items_for_token_ids(
+                        tokenizer, token_ids, stop=stop, incremental=incremental,
+                        stream=False,
+                    )
+                    self.assertTrue(any(item["type"] == "token" for item in streamed))
+                    self.assertEqual([item["type"] for item in final_only], ["final"])
+                    self.assertEqual(final_only[0], streamed[-1])
+
+    async def test_input_preparation_keeps_engine_running_and_submission_order(self):
+        from sparsevllm.entrypoints.openai.dispatcher import AsyncEngineDispatcher
+        from sparsevllm.sampling_params import SamplingParams
+
+        tokenizer = _byte_level_tokenizer()
+        original_encode = tokenizer.encode
+        encoding = threading.Event()
+        release = threading.Event()
+        stepped_during_encode = threading.Event()
+        worker_names = []
+
+        def encode(text, add_special_tokens=False):
+            worker_names.append(threading.current_thread().name)
+            if text == "slow":
+                encoding.set()
+                if not release.wait(5):
+                    raise RuntimeError("test preparation timed out")
+            return original_encode(text, add_special_tokens=add_special_tokens)
+
+        tokenizer.encode = encode
+
+        class Engine:
+            def __init__(self):
+                self.tokenizer = tokenizer
+                self.prompts = []
+                self.last_step_token_outputs = []
+                self.last_step_logprob_outputs = []
+
+            def add_request(self, prompt, _sampling):
+                self.prompts.append(prompt)
+                return len(self.prompts)
+
+            def step(self):
+                if encoding.is_set() and not release.is_set():
+                    stepped_during_encode.set()
+                time.sleep(0.001)
+                return [], 0
+
+            def abort_request(self, _seq_id):
+                pass
+
+            def exit(self):
+                pass
+
+        engine = Engine()
+        dispatcher = AsyncEngineDispatcher(engine)
+        sampling = SamplingParams(max_tokens=8)
+        tasks = []
+        try:
+            await dispatcher.submit_admitted([1], sampling, 0)
+            slow = asyncio.create_task(dispatcher.submit_admitted("slow", sampling, 1))
+            tasks.append(slow)
+            self.assertTrue(await asyncio.to_thread(encoding.wait, 2))
+            following = asyncio.create_task(dispatcher.submit_admitted([2], sampling, 2))
+            tasks.append(following)
+            self.assertTrue(await asyncio.to_thread(stepped_during_encode.wait, 2))
+            self.assertEqual(engine.prompts, [[1]])
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*tasks), 2)
+            self.assertEqual(engine.prompts, [[1], original_encode("slow"), [2]])
+            self.assertTrue(all(name.startswith("sparsevllm-input") for name in worker_names))
+            self.assertIsNot(dispatcher._input_tokenizer, engine.tokenizer)
+            self.assertIsNot(dispatcher._input_tokenizer.backend_tokenizer, engine.tokenizer.backend_tokenizer)
+        finally:
+            release.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            dispatcher.close()
+
+    async def test_cancel_during_input_preparation_never_admits_request(self):
+        from sparsevllm.entrypoints.openai.dispatcher import AsyncEngineDispatcher
+        from sparsevllm.sampling_params import SamplingParams
+
+        tokenizer = _byte_level_tokenizer()
+        encoding = threading.Event()
+        release = threading.Event()
+
+        def encode(_text, add_special_tokens=False):
+            encoding.set()
+            if not release.wait(5):
+                raise RuntimeError("test preparation timed out")
+            return [7]
+
+        tokenizer.encode = encode
+
+        class Engine:
+            def __init__(self):
+                self.tokenizer = tokenizer
+                self.prompts = []
+                self.last_step_token_outputs = []
+                self.last_step_logprob_outputs = []
+
+            def add_request(self, prompt, _sampling):
+                self.prompts.append(prompt)
+                return len(self.prompts)
+
+            def step(self):
+                time.sleep(0.001)
+                return [], 0
+
+            def abort_request(self, _seq_id):
+                pass
+
+            def exit(self):
+                pass
+
+        engine = Engine()
+        dispatcher = AsyncEngineDispatcher(engine)
+        task = asyncio.create_task(dispatcher.submit_admitted("cancel me", SamplingParams(), 0))
+        try:
+            self.assertTrue(await asyncio.to_thread(encoding.wait, 2))
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            release.set()
+            await dispatcher.submit_admitted("next", SamplingParams(), 1)
+            self.assertEqual(engine.prompts, [[7]])
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            dispatcher.close()
+
+    async def test_input_preparation_preserves_bos_and_chain_suffix_rules(self):
+        from sparsevllm.entrypoints.openai.dispatcher import AsyncEngineDispatcher
+        from sparsevllm.sampling_params import SamplingParams
+
+        tokenizer = _byte_level_tokenizer()
+        tokenizer.bos_token = "<s>"
+        calls = []
+
+        def encode(text, add_special_tokens=False):
+            calls.append((text, add_special_tokens))
+            if text == "invalid":
+                raise ValueError("invalid test input")
+            return ([1] if add_special_tokens else []) + [2]
+
+        tokenizer.encode = encode
+
+        class Engine:
+            def __init__(self):
+                self.tokenizer = tokenizer
+                self.prompts = []
+                self.last_step_token_outputs = []
+                self.last_step_logprob_outputs = []
+
+            def admit_request(self, prompt, _sampling, **kwargs):
+                self.prompts.append((prompt, kwargs))
+                return type("Admission", (), dict(
+                    seq_id=len(self.prompts), chain_id=kwargs.get("chain_id"),
+                    chain_status="disabled", reused_tokens=0,
+                    prefilled_tokens=len(prompt), prompt_token_ids=prompt,
+                ))()
+
+            def step(self):
+                time.sleep(0.001)
+                return [], 0
+
+            def abort_request(self, _seq_id):
+                pass
+
+            def exit(self):
+                pass
+
+        engine = Engine()
+        dispatcher = AsyncEngineDispatcher(engine)
+        try:
+            await dispatcher.submit_admitted("hello", SamplingParams(), 0, stream=False)
+            await dispatcher.submit_admitted("<s>hello", SamplingParams(), 1)
+            await dispatcher.submit_admitted("suffix", SamplingParams(), 2,
+                                             chain_id="chain", chain_append_only=True)
+            with self.assertRaisesRegex(ValueError, "invalid test input"):
+                await dispatcher.submit_admitted("invalid", SamplingParams(), 3)
+            self.assertEqual(calls, [("hello", True), ("<s>hello", False),
+                                     ("suffix", False), ("invalid", True)])
+            self.assertEqual([prompt for prompt, _ in engine.prompts], [[1, 2], [2], [2]])
+            self.assertEqual(engine.prompts[-1][1], dict(chain_id="chain", chain_append_only=True))
+        finally:
+            dispatcher.close()
+
+
+    async def test_all_generation_endpoints_only_publish_tokens_for_streaming(self):
+        from sparsevllm.entrypoints.openai import api_server
+
+        tokenizer = _byte_level_tokenizer()
+        output_ids = tokenizer.encode("ok")
+
+        class Engine:
+            config = type("Config", (), {"sparse_method": ""})()
+
+            def __init__(self):
+                self.tokenizer = tokenizer
+                self.last_step_token_outputs = []
+                self.last_step_logprob_outputs = []
+
+            def add_request(self, _prompt, _sampling):
+                return 1
+
+            def step(self):
+                self.last_step_token_outputs = [(1, output_ids)]
+                self.last_step_logprob_outputs = [(1, [-0.5] * len(output_ids), [None] * len(output_ids))]
+                return [(1, output_ids, [-0.5] * len(output_ids), [None] * len(output_ids))], len(output_ids)
+
+            def abort_request(self, _seq_id):
+                pass
+
+            def exit(self):
+                pass
+
+        for path, request_type, kwargs in [
+            ("/v1/completions", api_server.CompletionRequest, {"prompt": "hello", "max_tokens": 2}),
+            ("/v1/chat/completions", api_server.ChatCompletionRequest,
+             {"messages": [{"role": "user", "content": "hello"}], "max_tokens": 2}),
+            ("/v1/responses", api_server.ResponseRequest, {"input": "hello", "max_output_tokens": 2}),
+        ]:
+            for stream in (False, True):
+                with self.subTest(path=path, stream=stream):
+                    app = api_server.create_app("/tmp/model", served_model_name="model", engine=Engine())
+                    dispatcher = app.state.dispatcher
+                    events = []
+                    original_put = dispatcher._put
+
+                    def record_put(request, item):
+                        events.append(item["type"])
+                        original_put(request, item)
+
+                    dispatcher._put = record_put
+                    try:
+                        response = await _route_endpoint(app, path)(
+                            request_type(model="model", stream=stream, **kwargs),
+                            _TestRequest(app),
+                        )
+                        if stream:
+                            chunks = [chunk async for chunk in response.body_iterator]
+                            self.assertTrue(chunks)
+                            self.assertIn("token", events)
+                        else:
+                            self.assertEqual(response.status_code, 200)
+                            self.assertEqual(events, ["final"])
+                        self.assertEqual(events[-1], "final")
+                    finally:
+                        dispatcher.close()
 
 
 class OpenAIClientTest(unittest.TestCase):
