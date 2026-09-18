@@ -1016,6 +1016,7 @@ def _prefix_batch_gloo_worker(rank, rendezvous, output):
             attn_tp_size=2, attn_tp_rank=rank,
             attn_tp=SimpleNamespace(process_group=dist.group.WORLD),
         )
+        runner.tp_control_group = dist.group.WORLD
         outcomes = []
         for case in ("success", "divergence", "failure"):
             result = [{"hit_len": 8}, {"hit_len": 16}]

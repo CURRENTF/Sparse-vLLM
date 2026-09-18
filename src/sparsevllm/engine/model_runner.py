@@ -24,6 +24,7 @@ from sparsevllm.distributed import (
     init_parallel_context,
     reset_parallel_context,
 )
+from sparsevllm.distributed.topology import parallel_group_ranks
 from sparsevllm.engine.sparse_methods.base import AuxiliaryPrefillRequest
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.async_execution import AsyncExecution, DeviceLogprobs
@@ -332,6 +333,15 @@ class ModelRunner:
         self.parallel_context = init_parallel_context(
             topology=config.parallel_topology,
         )
+        # Prefix lookup agreement contains host metadata only. Using the CUDA
+        # group would enqueue object collectives behind in-flight model work
+        # and synchronously copy their results back to the scheduler.
+        self.tp_control_group = None
+        for ranks in parallel_group_ranks(config.parallel_topology)["attn_tp"]:
+            if len(ranks) > 1:
+                group = dist.new_group(list(ranks), backend="gloo")
+                if rank in ranks:
+                    self.tp_control_group = group
         self.dp_control_group = (
             dist.new_group(backend="gloo") if config.attn_dp_size > 1 else None
         )
@@ -1046,7 +1056,7 @@ class ModelRunner:
             )
             results = [None] * self.parallel_context.attn_tp_size
             dist.all_gather_object(
-                results, payload, group=self.parallel_context.attn_tp.process_group,
+                results, payload, group=self.tp_control_group,
             )
             failures = [
                 (rank, value[0]) for rank, value in enumerate(results)
