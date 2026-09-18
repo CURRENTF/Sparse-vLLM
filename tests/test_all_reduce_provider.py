@@ -448,8 +448,9 @@ def test_vllm_all_reduce_initializes_the_upstream_nvlink_mode(world_size, full_n
 @pytest.mark.parametrize(
     "nvml_present,full_nvlink", [(False, False), (True, False), (True, True)]
 )
+@pytest.mark.parametrize("device_name", ["NVIDIA H100 80GB HBM3", "NVIDIA H20"])
 def test_extended_all_reduce_profile_requires_verified_nvlink(
-    nvml_present, full_nvlink
+    nvml_present, full_nvlink, device_name
 ):
     # A larger service capacity must not opt an unmeasured PCIe fabric into the profile.
     spec = replace(
@@ -469,7 +470,9 @@ def test_extended_all_reduce_profile_requires_verified_nvlink(
             ),
         ),
     ):
-        result = FlashInferVllmAllReduceProfile.matches(spec, _caps())
+        result = FlashInferVllmAllReduceProfile.matches(
+            spec, replace(_caps(), device_name=device_name)
+        )
     assert result.matched == (nvml_present and full_nvlink)
     if nvml_present:
         topology.assert_called_once_with(spec.device_ordinals)

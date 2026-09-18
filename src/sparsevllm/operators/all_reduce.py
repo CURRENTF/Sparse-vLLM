@@ -679,9 +679,11 @@ class FlashInferVllmAllReduceProfile(_FlashInferAllReduceProfile):
 
     @classmethod
     def matches(cls, spec: AllReduceOpSpec, caps: DeviceCaps) -> ProfileMatch:
-        if not device_name_contains(caps.device_name, "H100"):
+        if not any(
+            device_name_contains(caps.device_name, name) for name in ("H100", "H20")
+        ):
             return ProfileMatch.no(
-                f"requires profiled H100 hardware, got {caps.device_name}"
+                f"requires profiled H100 or H20 hardware, got {caps.device_name}"
             )
         if (
             spec.world_size != 2
