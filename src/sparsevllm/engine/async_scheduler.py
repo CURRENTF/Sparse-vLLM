@@ -163,4 +163,13 @@ class AsyncScheduler:
             self._retire_ready()
             count = sum(s.current_chunk_size for s in pending.snapshots) if pending.is_prefill else -len(tokens)
             engine._throughput_logger.record_step(count)
+            scheduler = engine.scheduler
+            prefills, decodes = len(scheduler.waiting), len(scheduler.decoding)
+            modes = scheduler.prefill_execution_mode_counts()
+            batch = ("pf-" + scheduler.prefill_execution_mode_for_batch(pending.snapshots)
+                     if pending.is_prefill else "decode")
+            engine._throughput_logger.record_state(
+                prefills + decodes, prefills, decodes,
+                modes["chunked"], modes["full"], modes["raw_offload"], batch,
+            )
             return finished, count

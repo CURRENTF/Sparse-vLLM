@@ -23,6 +23,18 @@
 | `mla_prefill_history_chunk_size` | int | `16384` | MLA prefill 每次处理的历史 KV token 上限；调小可减少历史工作区显存。 |
 | `decode_reservation_tokens` | int | `1024` | 每次为后续 decode 预留的最大 token 窗口；须为正整数，不是总输出上限。 |
 
+## TP 异步执行
+
+`async_scheduling=true` 启用实验性异步调度，让 CPU 在 GPU 完成当前计算前提交后续工作。
+`async_max_inflight` 限制已提交但尚未取回结果的 batch 数，默认 2，最小 2；默认仍为同步执行。
+目前要求 CUDA、vanilla 全量注意力、decode CUDA Graph、DP=1、纯文本输入，以及 GPU 常驻 KV；
+支持 radix prefix cache 或关闭 prefix cache。稀疏或循环状态模型、独立稀疏 prefill、chain cache、
+多模态输入和 prefix offload 会在配置阶段报错。
+
+输出仍按顺序发布。遇到 EOS 或取消时，已提交的少量后续计算可能继续执行，但不会发布其输出；
+相关存储在所有使用者完成后释放。容量抢占会先取回在途结果，再执行同步重算恢复。
+此开关不会启用 prefill/decode 混合 batch。
+
 ## 稀疏方法与共享预算
 
 | 参数 | 类型 | 默认值 | 说明 |

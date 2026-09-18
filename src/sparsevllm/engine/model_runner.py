@@ -2249,6 +2249,9 @@ class ModelRunner:
         is_prefill: bool,
     ) -> tuple[list[int], tuple[list[float | None], list[dict[int, float] | None]] | None]:
         """单步执行主逻辑"""
+        asynchronous = getattr(self, "_async_execution", None)
+        if asynchronous is not None and not getattr(self, "_async_submitting", False):
+            asynchronous.prepare_synchronous_execution()
         dp_eager = False
         if self.parallel_context.attn_dp_size > 1:
             from sparsevllm.engine.dp_step import coordinate_dp_step

@@ -188,6 +188,14 @@ class AsyncExecution:
                 "inflight": len(self.results), "device_feedback_requests": len(self.last_tokens),
                 "penalty_requests": len(self.penalties)}
 
+    def prepare_synchronous_execution(self):
+        if self.results:
+            raise RuntimeError("Synchronous execution requires all asynchronous results to retire")
+        # A synchronous recovery step can advance any live request. Re-seed
+        # feedback and penalties from accepted history on the next submission.
+        self.last_tokens.clear()
+        self.penalties.clear()
+
     def forget(self, seq_ids):
         for seq_id in seq_ids:
             self.last_tokens.pop(seq_id, None)

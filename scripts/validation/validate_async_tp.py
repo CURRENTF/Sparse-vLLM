@@ -17,7 +17,8 @@ from sparsevllm import LLM, SamplingParams
 from sparsevllm.engine.async_scheduler import AsyncScheduler
 
 
-def run_case(llm, prompts, params, *, asynchronous, cancel_first=False, append_prompt=None, reset=True):
+def run_case(llm, prompts, params, *, asynchronous, cancel_first=False, append_prompt=None,
+             reset=True, sync_interlude=False):
     assert llm.is_finished()
     if hasattr(llm, '_async_scheduler'):
         del llm._async_scheduler
@@ -31,6 +32,13 @@ def run_case(llm, prompts, params, *, asynchronous, cancel_first=False, append_p
     cached = {}
     steps = 0
     while not llm.is_finished():
+        # Exercise the drain -> synchronous recovery -> asynchronous transition
+        # independently of allocator capacity, without changing model execution.
+        if asynchronous and sync_interlude:
+            if steps == 12:
+                llm._async_scheduler._submit = lambda: False
+            elif steps == 12 + llm.config.async_max_inflight + 1:
+                del llm._async_scheduler._submit
         finished, _ = llm.step()
         cached.update(llm.last_step_prompt_cache_hits)
         for seq_id, tokens, logprobs, tops in finished:
@@ -78,6 +86,8 @@ def main():
             ('random_sampling', dict(temperature=.8, top_p=.9, top_k=20, ignore_eos=True), {}),
             ('cancellation', dict(temperature=0., ignore_eos=True), {'cancel_first': True}),
             ('new_arrival', dict(temperature=0., ignore_eos=True), {'append_prompt': prompts[0]}),
+            ('sync_interlude', dict(temperature=0., ignore_eos=True, repetition_penalty=1.1,
+                                    presence_penalty=.2), {'sync_interlude': True}),
         ]
         for name, options, extra in cases:
             params = [SamplingParams(max_tokens=n, **options) for n in [17, 11, 7]]

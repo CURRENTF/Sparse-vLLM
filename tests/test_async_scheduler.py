@@ -42,7 +42,7 @@ def engine(depth=2, chunk=3):
         config=SimpleNamespace(async_max_inflight=depth), scheduler=scheduler,
         model_runner=executor, _release_preempted_sequences=lambda _: None,
         _step_sync=no_sync,
-        _throughput_logger=SimpleNamespace(record_step=lambda _: None),
+        _throughput_logger=SimpleNamespace(record_step=lambda _: None, record_state=lambda *args: None),
     )
     return result, AsyncScheduler(result)
 
@@ -141,3 +141,17 @@ def test_device_penalty_state_matches_independent_value_formula():
     expected[0, 2] -= .7
     torch.testing.assert_close(result, expected)
     assert torch.equal(logits, torch.tensor([[.1, -2., 3., 4., -1.]]))
+
+
+def test_sync_recovery_invalidates_feedback_only_after_all_results_retire():
+    state = object.__new__(AsyncExecution)
+    state.results = {7: object()}
+    state.last_tokens = {1: torch.tensor(17)}
+    state.penalties = {1: object()}
+    with pytest.raises(RuntimeError, match="all asynchronous results"):
+        state.prepare_synchronous_execution()
+    assert 1 in state.last_tokens
+    state.results.clear()
+    state.prepare_synchronous_execution()
+    assert not state.last_tokens
+    assert not state.penalties
