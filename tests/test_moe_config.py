@@ -44,3 +44,45 @@ def test_moe_config_rejects_unknown_stage():
 
     with pytest.raises(ValueError, match="stage"):
         resolve_moe_gemm_config(**arguments, stage="w3")
+
+
+@pytest.mark.parametrize("stage", ["w13", "w2"])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16])
+def test_h20_ep2_profile_accepts_measured_decode_capacities(stage, num_tokens):
+    from sparsevllm.kernels.triton.moe_config import (
+        MoeGemmShape,
+        _glm_sm90_tp2_ep2_config,
+    )
+
+    shape = MoeGemmShape("h20", (9, 0), torch.bfloat16, 4, 32, 2048, 1536)
+    config = _glm_sm90_tp2_ep2_config(shape, num_tokens=num_tokens, stage=stage)
+    assert config is not None
+    assert all(value > 0 for value in config.as_triton_kwargs().values())
+
+
+@pytest.mark.parametrize(
+    "change,num_tokens,stage",
+    [
+        ({}, 17, "w13"),
+        ({}, 32, "w2"),
+        ({}, 4, "gate_up_swiglu"),
+        ({"hardware": "unprofiled"}, 4, "w13"),
+        ({"capability": (8, 0)}, 4, "w13"),
+        ({"dtype": torch.float16}, 4, "w13"),
+        ({"num_local_experts": 64}, 4, "w13"),
+        ({"intermediate_size": 768}, 4, "w13"),
+        ({"top_k": 8}, 4, "w13"),
+    ],
+)
+def test_h20_ep2_profile_misses_preserve_portfolio(change, num_tokens, stage):
+    from dataclasses import replace
+
+    from sparsevllm.kernels.triton.moe_config import (
+        MoeGemmShape,
+        _glm_sm90_tp2_ep2_config,
+    )
+
+    shape = MoeGemmShape("h20", (9, 0), torch.bfloat16, 4, 32, 2048, 1536)
+    assert _glm_sm90_tp2_ep2_config(
+        replace(shape, **change), num_tokens=num_tokens, stage=stage
+    ) is None

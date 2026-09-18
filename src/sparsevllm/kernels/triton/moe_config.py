@@ -148,7 +148,7 @@ def _glm_h100_tp2_config(
     return _GLM_LARGE_BATCH
 
 
-def _glm_h100_tp2_ep2_config(
+def _glm_sm90_tp2_ep2_config(
     shape: MoeGemmShape,
     *,
     num_tokens: int,
@@ -157,7 +157,7 @@ def _glm_h100_tp2_ep2_config(
     """Return measured BF16 configs for the GLM outer-TP2/EP2 shape."""
 
     profiled_shape = MoeGemmShape(
-        "h100",
+        shape.hardware,
         (9, 0),
         torch.bfloat16,
         4,
@@ -165,8 +165,16 @@ def _glm_h100_tp2_ep2_config(
         2048,
         1536,
     )
-    if stage not in {"w13", "w2"} or shape != profiled_shape:
+    if (
+        shape.hardware not in {"h100", "h20"}
+        or stage not in {"w13", "w2"}
+        or shape != profiled_shape
+    ):
         return None
+    if shape.hardware == "h20":
+        if not 1 <= num_tokens <= 16:
+            return None
+        return _GLM_EP2_TINY_BATCH if num_tokens == 4 else _GLM_EP2_SMALL_BATCH
     if num_tokens <= 4:
         return _GLM_EP2_TINY_BATCH
     if num_tokens <= 128:
@@ -467,7 +475,7 @@ def _resolve_moe_gemm_config(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
     )
-    glm_config = _glm_h100_tp2_ep2_config(
+    glm_config = _glm_sm90_tp2_ep2_config(
         shape,
         num_tokens=num_tokens,
         stage=stage,
