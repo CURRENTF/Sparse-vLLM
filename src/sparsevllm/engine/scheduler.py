@@ -32,6 +32,8 @@ class Scheduler:
         memory_oracle: MemoryOracle,
         prefix_cache_hit_refresher: Callable[[Sequence], None] | None = None,
         decode_capacity_reclaimer: Callable[[Sequence], Sequence | None] | None = None,
+        *,
+        prefix_cache_hits_refresher: Callable[[list[Sequence]], None] | None = None,
     ):
         self.config = config
         self.max_num_seqs_in_batch = config.max_num_seqs_in_batch
@@ -60,6 +62,7 @@ class Scheduler:
         # 对多层异构预算，采用更保守的可用空间估计。
         self.memory_oracle = memory_oracle
         self.decode_capacity_reclaimer = decode_capacity_reclaimer
+        self.prefix_cache_hits_refresher = prefix_cache_hits_refresher
         self.prefix_cache_hit_refresher = (
             memory_oracle.refresh_prefix_cache_hit
             if prefix_cache_hit_refresher is None
@@ -117,7 +120,7 @@ class Scheduler:
 
     def _prefill_mode_order(self) -> list[tuple[str, object]]:
         replay_pending = any(seq.is_recompute_replay for seq in self.waiting)
-        modes: list[tuple[str, object]] = []
+        candidates: list[Sequence] = []
         for seq in self.waiting:
             if replay_pending and not seq.is_recompute_replay:
                 continue
@@ -125,7 +128,18 @@ class Scheduler:
             # an RPC to every TP rank. Blocked fresh prompts cannot run yet.
             if len(self.decoding) >= self.max_decoding_seqs and seq.num_prefilled_tokens == 0:
                 continue
-            self._refresh_prefill_metadata(seq)
+            candidates.append(seq)
+        if self.prefix_cache_hits_refresher is not None:
+            fresh = [
+                seq for seq in candidates
+                if seq.num_prefilled_tokens == 0 and seq.num_completion_tokens == 0
+            ]
+            if fresh:
+                self.prefix_cache_hits_refresher(fresh)
+        modes: list[tuple[str, object]] = []
+        for seq in candidates:
+            if self.prefix_cache_hits_refresher is None:
+                self._refresh_prefill_metadata(seq)
             batch_key = self._prefill_batch_key(seq)
             if batch_key not in modes:
                 modes.append(batch_key)

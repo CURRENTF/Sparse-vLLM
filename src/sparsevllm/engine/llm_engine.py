@@ -385,6 +385,11 @@ class LLMEngine:
                 if self.config.enable_prefix_caching
                 else None
             ),
+            prefix_cache_hits_refresher=(
+                self._refresh_prefix_cache_hits
+                if self.config.enable_prefix_caching
+                else None
+            ),
             decode_capacity_reclaimer=self._reclaim_idle_chains_for_decode,
         )
 
@@ -1042,6 +1047,10 @@ class LLMEngine:
 
     def _refresh_prefix_cache_hit(self, seq: Sequence) -> None:
         self.model_runner.call("refresh_prefix_cache_hit", seq)
+
+    def _refresh_prefix_cache_hits(self, seqs: list[Sequence]) -> None:
+        if seqs:
+            self.model_runner.call("refresh_prefix_cache_hits", seqs)
 
     def abort_request(self, seq_id: int, disposition: str = "invalidate"):
         """Abort a queued or running request and release any owned KV slots."""

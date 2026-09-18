@@ -1240,6 +1240,85 @@ class DeltaKVLessMemoryCudaGraphReserveTest(unittest.TestCase):
 
 
 class SchedulerPrefillPolicyTest(unittest.TestCase):
+    def test_batched_prefix_refresh_preserves_eligibility_and_classification(self):
+        oracle = FakeMemoryOracle(prefix_hit_len=4)
+        scheduler = make_scheduler_with_oracle(PREFILL_POLICY_ALL_CHUNKED, oracle)
+        fresh = seq_with_len(12)
+        partial = seq_with_len(12)
+        partial.num_prefilled_tokens = 2
+        scheduler.add(fresh)
+        scheduler.add(partial)
+        batches = []
+
+        def refresh(seqs):
+            batches.append(list(seqs))
+            for seq in seqs:
+                oracle.refresh_prefix_cache_hit(seq)
+
+        scheduler.prefix_cache_hits_refresher = refresh
+        scheduler.prefix_cache_hit_refresher = lambda _seq: self.fail("individual RPC")
+        scheduler._prefill_mode_order()
+        self.assertEqual(batches, [[fresh]])
+        self.assertEqual(fresh.prefix_cache_hit_len, 4)
+        self.assertEqual(partial.num_prefilled_tokens, 2)
+        scheduler.max_decoding_seqs = 0
+        scheduler._prefill_mode_order()
+        self.assertEqual(batches, [[fresh]])
+
+    def test_batched_prefix_refresh_skips_fresh_prompts_during_recompute(self):
+        scheduler = make_scheduler(PREFILL_POLICY_ALL_CHUNKED)
+        fresh = seq_with_len(12)
+        replay = seq_with_len(12)
+        replay.append_token(1)
+        replay.start_recompute_replay()
+        scheduler.add(fresh)
+        scheduler.add(replay)
+        scheduler.prefix_cache_hits_refresher = lambda _seqs: self.fail(
+            "fresh prompt must wait for recompute replay"
+        )
+        self.assertTrue(scheduler._prefill_mode_order())
+
+    def test_engine_wires_batch_rpc_only_when_prefix_cache_enabled(self):
+        from sparsevllm.engine.llm_engine import LLMEngine
+
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                engine = object.__new__(LLMEngine)
+                oracle = FakeMemoryOracle()
+                engine.config = make_scheduler(PREFILL_POLICY_ALL_CHUNKED).config
+                engine.config.enable_prefix_caching = enabled
+                calls = []
+                engine.model_runner = SimpleNamespace(
+                    runtime_state=oracle,
+                    call=lambda method, seqs: calls.append((method, seqs)),
+                )
+                scheduler = engine._create_scheduler()
+                seqs = [seq_with_len(8), seq_with_len(12)]
+                for seq in seqs:
+                    scheduler.add(seq)
+                scheduler._prefill_mode_order()
+                engine._refresh_prefix_cache_hits([])
+                self.assertEqual(calls, [("refresh_prefix_cache_hits", seqs)] if enabled else [])
+
+    def test_batched_prefix_refresh_matches_individual_schedule(self):
+        outcomes = []
+        for batched in (False, True):
+            oracle = FakeMemoryOracle(prefix_hit_len=4)
+            scheduler = make_scheduler_with_oracle(PREFILL_POLICY_ALL_CHUNKED, oracle)
+            if batched:
+                scheduler.prefix_cache_hits_refresher = lambda seqs: [
+                    oracle.refresh_prefix_cache_hit(seq) for seq in seqs
+                ]
+            seqs = [seq_with_len(n) for n in (12, 8, 15)]
+            for seq in seqs:
+                scheduler.add(seq)
+            scheduled, is_prefill, _ = scheduler.schedule()
+            outcomes.append((is_prefill, [
+                (seqs.index(seq), seq.num_prefilled_tokens, seq.current_chunk_size)
+                for seq in scheduled
+            ]))
+        self.assertEqual(outcomes[0], outcomes[1])
+
     def test_pyramid_modes_use_attached_residual_at_boundary(self):
         pyramid = object.__new__(SnapKVCacheManager)
         pyramid.config = SimpleNamespace(

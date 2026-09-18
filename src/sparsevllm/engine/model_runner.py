@@ -231,11 +231,16 @@ TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "free_multimodal",
     "log_operator_implementations",
     "refresh_prefix_cache_hit",
+    "refresh_prefix_cache_hits",
     "reset_after_warmup",
     "run",
     "register_multimodal_shared",
     "warmup_moe_workspace",
 } | DECODE_GRAPH_HOST_STATUS_SYNC_METHODS | STARTUP_HOST_STATUS_SYNC_METHODS
+
+
+class _RPCPayloadTooLarge(RuntimeError):
+    """The command was rejected before any worker was signalled."""
 
 
 def make_tp_shm_name() -> str:
@@ -824,7 +829,7 @@ class ModelRunner:
         n = len(data)
         command_capacity = len(self.shm.buf) - self.parallel_context.attn_tp_size
         if n + 4 > command_capacity:
-            raise RuntimeError(
+            raise _RPCPayloadTooLarge(
                 f"Shared memory command is too large: {n + 4} > {command_capacity}"
             )
         self.shm.buf[0:4] = n.to_bytes(4, "little")
@@ -853,11 +858,27 @@ class ModelRunner:
             # A status-synchronized RPC already waits for every worker before
             # the shared command buffer can be reused.  Let rank 0 begin its
             # local work immediately instead of polling for a separate read ACK.
-            self.write_shm(
-                method_name,
-                *args,
-                wait_for_read=not synchronizes_status,
-            )
+            try:
+                self.write_shm(
+                    method_name,
+                    *args,
+                    wait_for_read=not synchronizes_status,
+                )
+            except _RPCPayloadTooLarge:
+                # Split only an unpublished read-only lookup batch. Never retry
+                # a command that may have already run on any rank.
+                if method_name != "refresh_prefix_cache_hits":
+                    raise
+                seqs = args[0]
+                if len(seqs) == 1:
+                    return [self.call("refresh_prefix_cache_hit", seqs[0])]
+                if not seqs:
+                    raise
+                midpoint = len(seqs) // 2
+                return (
+                    self.call(method_name, seqs[:midpoint])
+                    + self.call(method_name, seqs[midpoint:])
+                )
         method = getattr(self, method_name, None)
         # Ensure *all* runner-side ops (including sparse post-processing like DeltaKV eviction)
         # run without autograd bookkeeping to avoid large activation graphs / OOM.
@@ -869,6 +890,9 @@ class ModelRunner:
                     result = method(*args)
             except BaseException as exc:
                 local_error = exc
+            if method_name == "refresh_prefix_cache_hits":
+                self._sync_prefix_cache_batch_result(result, local_error)
+                return result
             if method_name == "run" and self.config.decode_graph:
                 self._sync_tp_run_status(local_error)
             elif method_name in (
@@ -997,6 +1021,37 @@ class ModelRunner:
                 "Prefix-cache lookup diverged across attention TP ranks: "
                 f"results={results!r}."
             )
+
+    def _sync_prefix_cache_batch_result(
+        self,
+        result: list[dict[str, object]] | None,
+        local_error: BaseException | None,
+    ) -> None:
+        # Gather error status and ordered lookup results together. All ranks
+        # enter the same collective even if one failed partway through a batch.
+        if self.parallel_context.attn_tp_size > 1:
+            payload = (
+                None if local_error is None else f"{type(local_error).__name__}: {local_error}",
+                result,
+            )
+            results = [None] * self.parallel_context.attn_tp_size
+            dist.all_gather_object(
+                results, payload, group=self.parallel_context.attn_tp.process_group,
+            )
+            failures = [
+                (rank, value[0]) for rank, value in enumerate(results)
+                if value[0] is not None
+            ]
+            if failures:
+                if local_error is not None:
+                    raise local_error
+                raise RuntimeError(f"Attention TP prefix-cache batch lookup failed: {failures!r}.")
+            if any(value[1] != results[0][1] for value in results[1:]):
+                raise RuntimeError(
+                    f"Prefix-cache lookup diverged across attention TP ranks: results={results!r}."
+                )
+        if local_error is not None:
+            raise local_error
 
     def _sync_chain_cache_result(self, method_name: str, local_result) -> None:
         if self.parallel_context.attn_tp_size <= 1:
@@ -1258,6 +1313,9 @@ class ModelRunner:
             "block_size": int(seq.prefix_cache_block_size),
             "method": str(seq.prefix_cache_method),
         }
+
+    def refresh_prefix_cache_hits(self, seqs: list[Sequence]) -> list[dict[str, object]]:
+        return [self.refresh_prefix_cache_hit(seq) for seq in seqs]
 
     def prefix_cache_match(self, token_ids: list[int]) -> dict[str, object]:
         return self.runtime_state.prefix_cache_match(

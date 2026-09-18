@@ -948,3 +948,114 @@ def test_tp_worker_decode_skips_rank0_sampling_path():
     assert token_ids is None
     assert logprobs is None
     assert calls == ["decode", "sparse_post:False", "cache_post:False"]
+
+
+def test_prefix_batch_uses_one_combined_result_boundary():
+    runner = _runner()
+    calls = []
+    runner.refresh_prefix_cache_hit = lambda seq: calls.append(seq) or {"hit_len": seq}
+    runner._sync_prefix_cache_batch_result = lambda result, error: calls.append((result, error))
+    runner._sync_tp_rpc_status = lambda *_args: pytest.fail("redundant status collective")
+    assert runner.call("refresh_prefix_cache_hits", [3, 7]) == [{"hit_len": 3}, {"hit_len": 7}]
+    assert calls == [3, 7, ([{"hit_len": 3}, {"hit_len": 7}], None)]
+
+
+def test_prefix_batch_partial_failure_still_enters_result_boundary():
+    runner = _runner()
+    error = ValueError("lookup failed")
+    calls = []
+
+    def lookup(seq):
+        if seq == 2:
+            raise error
+        return {"hit_len": seq}
+
+    def check(result, local_error):
+        calls.append((result, local_error))
+        raise local_error
+
+    runner.refresh_prefix_cache_hit = lookup
+    runner._sync_prefix_cache_batch_result = check
+    with pytest.raises(ValueError, match="lookup failed"):
+        runner.call("refresh_prefix_cache_hits", [1, 2, 3])
+    assert calls == [(None, error)]
+
+
+def test_prefix_batch_splits_before_publishing_oversized_payload():
+    import pickle
+
+    runner = _runner()
+    runner.parallel_context = SimpleNamespace(attn_tp_size=2, attn_tp_rank=0)
+    runner.shm = SimpleNamespace(buf=bytearray(300))
+    signalled = []
+    command = SimpleNamespace(set=lambda: signalled.append(bytes(runner.shm.buf)))
+    completion = SimpleNamespace(clear=lambda: None)
+    runner.event = [(command, completion)]
+    runner.refresh_prefix_cache_hit = lambda seq: {"hit_len": seq[0]}
+    runner._sync_prefix_cache_batch_result = lambda *_args: None
+    seqs = [(i, bytes([i]) * 100) for i in range(6)]
+    assert runner.call("refresh_prefix_cache_hits", seqs) == [{"hit_len": i} for i in range(6)]
+    received = []
+    for buf in signalled:
+        n = int.from_bytes(buf[:4], "little")
+        name, batch = pickle.loads(buf[4:n + 4])
+        assert name == "refresh_prefix_cache_hits"
+        received.extend(batch)
+    assert received == seqs
+    assert 1 < len(signalled) <= len(seqs)
+
+
+def _prefix_batch_gloo_worker(rank, rendezvous, output):
+    from datetime import timedelta
+
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2,
+                            timeout=timedelta(seconds=20))
+    try:
+        runner = _runner()
+        runner.parallel_context = SimpleNamespace(
+            attn_tp_size=2, attn_tp_rank=rank,
+            attn_tp=SimpleNamespace(process_group=dist.group.WORLD),
+        )
+        outcomes = []
+        for case in ("success", "divergence", "failure"):
+            result = [{"hit_len": 8}, {"hit_len": 16}]
+            error = None
+            if case == "divergence" and rank == 1:
+                result[1]["hit_len"] = 0
+            if case == "failure" and rank == 1:
+                error = ValueError("worker lookup failed")
+                result = None
+            try:
+                runner._sync_prefix_cache_batch_result(result, error)
+                outcomes.append((case, "success"))
+            except (ValueError, RuntimeError) as exc:
+                outcomes.append((case, str(exc)))
+        output.put((rank, outcomes))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_prefix_batch_real_two_rank_result_and_failure_agreement(tmp_path):
+    ctx = get_context("spawn")
+    output = ctx.Queue()
+    rendezvous = (tmp_path / "gloo_init").as_uri()
+    workers = [ctx.Process(target=_prefix_batch_gloo_worker, args=(rank, rendezvous, output))
+               for rank in range(2)]
+    try:
+        for worker in workers:
+            worker.start()
+        outcomes = dict(output.get(timeout=40) for _ in workers)
+        for worker in workers:
+            worker.join(timeout=10)
+            assert worker.exitcode == 0
+        for rank in range(2):
+            results = dict(outcomes[rank])
+            assert results["success"] == "success"
+            assert "diverged" in results["divergence"]
+            assert "worker lookup failed" in results["failure"]
+    finally:
+        for worker in workers:
+            if worker.is_alive():
+                worker.terminate()
+                worker.join(timeout=5)
+        output.close()
