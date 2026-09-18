@@ -333,6 +333,9 @@ class LLMEngine:
         if os.getenv("SPARSEVLLM_PROFILER_RESET_AFTER_WARMUP", "0") == "1":
             profiler.reset()
         self._throughput_logger.start()
+        if config.async_scheduling:
+            from sparsevllm.engine.async_scheduler import AsyncScheduler
+            self._async_scheduler = AsyncScheduler(self)
 
     @staticmethod
     def _build_delimiter_token_ids(tokenizer) -> list[int]:
@@ -1061,6 +1064,9 @@ class LLMEngine:
                 "state cannot be retained safely, got "
                 f"{disposition!r}."
             )
+        if hasattr(self, "_async_scheduler"):
+            self._async_scheduler.abort(int(seq_id))
+            return
         chain_seq = self._active_chain_sequences.get(int(seq_id))
         multimodal = any(
             seq.seq_id == seq_id and seq.multimodal_digest is not None
@@ -1546,6 +1552,10 @@ class LLMEngine:
         self.model_runner.call("free_slots_batch", preempted_seq_ids)
 
     def step(self):
+        asynchronous = getattr(self, "_async_scheduler", None)
+        return asynchronous.step() if asynchronous is not None else self._step_sync()
+
+    def _step_sync(self):
         """
         执行单个推理步进（一个 Batch）。
         包含：调度、抢占处理、模型前向计算、状态更新、资源回收。
@@ -1746,7 +1756,8 @@ class LLMEngine:
 
     def is_finished(self):
         """检查是否所有请求都已处理完毕"""
-        return self.scheduler.is_finished()
+        pending = getattr(getattr(self, "_async_scheduler", None), "pending", ())
+        return not pending and self.scheduler.is_finished()
 
     def generate(
         self,

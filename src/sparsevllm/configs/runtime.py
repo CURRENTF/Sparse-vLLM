@@ -65,6 +65,8 @@ class Config(
     max_model_len_auto: bool = field(default=False, init=False)
     # None preserves the legacy shared batch limit. Set explicitly to allow
     # decode and prefill to use different per-step sequence limits.
+    async_scheduling: bool = False
+    async_max_inflight: int = 2
     decode_reservation_tokens: int = 1024
     max_decoding_seqs: int | None = None
     favor_min_decoding_seqs: int | None = None
@@ -168,6 +170,15 @@ class Config(
         validate_deltakv_runtime(self)
         resolve_auto_full_attention_layers(self)
         finalize_sparse_layout(self)
+        if self.async_scheduling:
+            if self.async_max_inflight < 2:
+                raise ValueError("async_max_inflight must be at least 2")
+            if (self.attn_dp_size != 1 or self.sparse_method or not self.decode_graph
+                    or self.enable_multimodal or self.enable_prefix_cache_offload
+                    or self.prefix_cache_mode == "chain" or self.prefill_sparse_method
+                    or self.runtime_layout.linear_attention_layer_indices):
+                raise ValueError("async_scheduling requires vanilla TP, decode_graph, "
+                                 "device-resident KV, radix/no prefix and text input")
 
         logger.info(
             "Runtime config: model={} sparse_method={} prefill_sparse_method={} "

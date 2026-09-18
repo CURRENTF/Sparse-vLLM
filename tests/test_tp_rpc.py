@@ -310,7 +310,7 @@ def test_operator_runtime_stats_gather_one_record_per_world_rank():
     assert sync_calls == [("operator_runtime_stats", None)]
     assert stats == [
         {"world_rank": 0, "bindings": [], "operators": {"MLA": []},
-         "moe_communication": {"provider": "test"}},
+         "moe_communication": {"provider": "test"}, "async_execution": None},
         {"world_rank": 1, "bindings": [], "operators": {}},
     ]
 

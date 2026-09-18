@@ -23,6 +23,19 @@ Common runtime parameters below can be passed to `LLM(model, **kwargs)` or `Conf
 | `mla_prefill_history_chunk_size` | int | `16384` | Maximum historical KV tokens processed at once during MLA prefill. Smaller values reduce history workspace memory. |
 | `decode_reservation_tokens` | int | `1024` | Maximum token window reserved for subsequent decode steps. Must be positive; this is not the total output limit. |
 
+## Asynchronous TP Execution
+
+`async_scheduling=true` enables experimental scheduling ahead of GPU completion;
+`async_max_inflight` bounds submitted, uncollected batches (default 2, minimum 2).
+The default remains synchronous. This path currently requires CUDA, vanilla full
+attention, decode Graphs, DP=1, text inputs, and device-resident KV with radix or
+no prefix cache. Sparse/recurrent models, independent sparse prefill, chain
+cache, multimodal inputs, and prefix offload are rejected at configuration time.
+Output publication remains ordered. EOS/cancellation can leave bounded already
+submitted work; its outputs are discarded and storage retires after its users
+complete. Capacity preemption drains outstanding work before synchronous
+recompute recovery. This option does not enable mixed prefill/decode batches.
+
 ## Sparse Methods and Shared Budgets
 
 | Parameter | Type | Default | Description |

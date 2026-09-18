@@ -326,6 +326,10 @@ class PrefixCacheMixin:
             return
         if not self.enable_prefix_caching or self.prefix_cache is None:
             return
+        pending = getattr(self, "_async_prefix_records", None)
+        if pending is not None:
+            pending.append((seq, list(token_ids), slots.clone()))
+            return
         if len(token_ids) != int(slots.numel()):
             raise RuntimeError(
                 f"{self._prefix_cache_materialization_subject()} token/slot mismatch: "

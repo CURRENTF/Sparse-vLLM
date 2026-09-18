@@ -26,6 +26,7 @@ from sparsevllm.distributed import (
 )
 from sparsevllm.engine.sparse_methods.base import AuxiliaryPrefillRequest
 from sparsevllm.engine.sequence import Sequence
+from sparsevllm.engine.async_execution import AsyncExecution, DeviceLogprobs
 from sparsevllm.models.qwen2 import Qwen2ForCausalLM
 from sparsevllm.models.llama import LlamaForCausalLM
 from sparsevllm.layers.sampler import Sampler
@@ -234,6 +235,9 @@ TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "refresh_prefix_cache_hits",
     "reset_after_warmup",
     "run",
+    "submit_async",
+    "collect_async",
+    "retire_async",
     "register_multimodal_shared",
     "warmup_moe_workspace",
 } | DECODE_GRAPH_HOST_STATUS_SYNC_METHODS | STARTUP_HOST_STATUS_SYNC_METHODS
@@ -890,6 +894,11 @@ class ModelRunner:
                     result = method(*args)
             except BaseException as exc:
                 local_error = exc
+            if method_name in {"submit_async", "collect_async", "retire_async"}:
+                self._sync_tp_host_status(method_name, local_error, synchronize=False)
+                if local_error is not None:
+                    raise local_error
+                return result
             if method_name == "refresh_prefix_cache_hits":
                 self._sync_prefix_cache_batch_result(result, local_error)
                 return result
@@ -931,12 +940,13 @@ class ModelRunner:
         self,
         method_name: str,
         local_error: BaseException | None,
+        *, synchronize: bool = True,
     ) -> None:
         if self.parallel_context.attn_tp_size <= 1:
             return
 
         sync_error: BaseException | None = None
-        if local_error is None:
+        if local_error is None and synchronize:
             try:
                 # Preserve the old all-reduce + item error boundary without
                 # launching a per-token NCCL collective.
@@ -1110,6 +1120,7 @@ class ModelRunner:
                 "bindings": operator_registry.operator_binding_reports(),
                 "operators": operator_registry.operator_runtime_stats(),
                 "moe_communication": self.collective_runtime.moe_transport_stats(),
+                "async_execution": self._async_execution.stats() if hasattr(self, "_async_execution") else None,
             }
         except BaseException as exc:
             local_error = exc
@@ -1141,6 +1152,8 @@ class ModelRunner:
                 before = self.cache_manager.free_slot_stats()
                 logger.info("model_runner.free_slots seq_id={} before={}", seq_id, before)
             self.runtime_state.free_seq(seq_id)
+            if hasattr(self, "_async_execution"):
+                self._async_execution.forget([seq_id])
             self.multimodal_runtime.free(seq_id)
             if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1":
                 after = self.cache_manager.free_slot_stats()
@@ -1157,6 +1170,8 @@ class ModelRunner:
                 logger.info("model_runner.free_slots_batch seq_ids={} before={}", seq_ids, before)
             for seq_id in seq_ids:
                 self.runtime_state.free_seq(seq_id)
+            if hasattr(self, "_async_execution"):
+                self._async_execution.forget(seq_ids)
             if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1":
                 after = self.cache_manager.free_slot_stats()
                 logger.info("model_runner.free_slots_batch seq_ids={} after={}", seq_ids, after)
@@ -1863,6 +1878,9 @@ class ModelRunner:
         size = len(seqs)
         buffers = getattr(self, "_sampling_buffers", None)
         upload_done = getattr(self, "_sampling_upload_done", None)
+        if getattr(self, "_async_submitting", False):
+            buffers = None
+            upload_done = None
         if upload_done is not None:
             upload_done.synchronize()
         if buffers is None or buffers[0].shape[1] < size:
@@ -1889,6 +1907,8 @@ class ModelRunner:
                 upload_done = torch.cuda.Event()
                 self._sampling_upload_done = upload_done
             upload_done.record(torch.cuda.current_stream(self.device))
+        if getattr(self, "_async_submitting", False):
+            self._async_execution.keepalive.extend(buffers)
         return device_float[0, :size], device_float[1, :size], device_int[:size]
 
     def _auto_capture_greedy_sampling(self, seqs: list[Sequence]) -> bool:
@@ -1918,6 +1938,8 @@ class ModelRunner:
         logits: torch.Tensor,
         seqs: list[Sequence],
     ) -> torch.Tensor:
+        if getattr(self, "_async_submitting", False):
+            return self._async_execution.apply_penalties(logits, seqs)
         if not any(self._has_sampling_penalty(seq) for seq in seqs):
             return logits
 
@@ -2033,6 +2055,8 @@ class ModelRunner:
     ):
         if outputs is None:
             return None
+        if isinstance(outputs, DeviceLogprobs):
+            return outputs
         token_logprobs, top_logprobs = outputs
         if token_logprobs is None or top_logprobs is None:
             return outputs
@@ -2090,6 +2114,20 @@ class ModelRunner:
         self.dp_idle_graphs[capacity] = self.decode_graph_runner.capture_idle_experts(
             self._forward_dp_idle, self.device
         )
+
+    def submit_async(self, ticket: int, seqs: list[Sequence], is_prefill: bool):
+        if not hasattr(self, "_async_execution"):
+            self._async_execution = AsyncExecution(self)
+        with profiler.record("async_submit"):
+            self._async_execution.submit(ticket, seqs, is_prefill)
+
+    def collect_async(self, ticket: int, discarded=()):
+        with profiler.record("async_collect"):
+            return self._async_execution.collect(ticket, discarded)
+
+    def retire_async(self, seq_ids):
+        self.finish_slots_batch(seq_ids)
+        self._async_execution.forget(seq_ids)
 
     def run_dp_idle(self, *, use_graph: bool) -> None:
         capacity = get_context().moe_token_capacity
@@ -2153,6 +2191,8 @@ class ModelRunner:
 
     @cpu_timing.timed
     def _post_sparse_forward(self, seqs: list[Sequence], is_prefill: bool) -> None:
+        if getattr(self, "_async_submitting", False):
+            return
         with profiler.record("model_sparse_post"):
             with profiler.record("sparse_post_forward"):
                 self.sparse_controller.post_forward(seqs, is_prefill)
@@ -2166,11 +2206,17 @@ class ModelRunner:
         seqs: list[Sequence],
     ) -> tuple[list[float | None], list[dict[int, float] | None]] | tuple[None, None]:
         if not any(seq.logprobs is not None for seq in seqs):
-            return None, None
+            return None if getattr(self, "_async_submitting", False) else (None, None)
 
         log_probs = torch.log_softmax(logits.float(), dim=-1)
         token_tensor = torch.as_tensor(token_ids, device=log_probs.device, dtype=torch.long)
         sampled = log_probs.gather(1, token_tensor.unsqueeze(1)).squeeze(1)
+        if getattr(self, "_async_submitting", False):
+            count = max(int(seq.logprobs or 0) for seq in seqs)
+            if count:
+                values, indices = torch.topk(log_probs, min(count, log_probs.shape[-1]), dim=-1)
+                return DeviceLogprobs(sampled, values, indices)
+            return DeviceLogprobs(sampled)
         sampled_logprobs: list[float | None] = sampled.detach().cpu().tolist()
 
         max_top_logprobs = max(int(seq.logprobs or 0) for seq in seqs)
@@ -2242,7 +2288,7 @@ class ModelRunner:
                         seqs,
                         self._collect_logprobs(sampling_logits, token_ids, seqs),
                     )
-                    return token_ids.tolist(), logprob_outputs
+                    return (token_ids if getattr(self, "_async_submitting", False) else token_ids.tolist()), logprob_outputs
                 finally:
                     reset_context()
 
@@ -2275,7 +2321,7 @@ class ModelRunner:
                 else None
             )
 
-            if token_ids is not None:
+            if token_ids is not None and not getattr(self, "_async_submitting", False):
                 token_ids = token_ids.tolist()
 
             # 5. 后置稀疏处理 (如 SnapKV 驱逐)

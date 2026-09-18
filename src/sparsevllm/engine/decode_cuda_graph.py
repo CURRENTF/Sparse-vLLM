@@ -220,10 +220,16 @@ class DecodeCudaGraphRunner:
         self.cache_manager.set_decode_static_max_context_len(
             int(state.capture_context_capacity)
         )
+        provider = getattr(self, "async_input_provider", None)
+        if provider is not None:
+            graph_state.inputs.host = provider.acquire_host_inputs(state.key.batch_size)
         input_ids, positions, _ = prepare_decode_graph_step(
             seqs,
             graph_state,
         )
+        provider = getattr(self, "async_input_provider", None)
+        if provider is not None:
+            provider.prepare_inputs(input_ids, seqs)
 
         set_context(
             False,

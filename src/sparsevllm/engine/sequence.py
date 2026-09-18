@@ -96,6 +96,7 @@ class Sequence:
         )
         self.last_token = token_ids[-1] if token_ids else None
         self.num_tokens = len(self.token_ids)
+        self.num_pending_outputs = 0
         self.num_prompt_tokens = len(self.token_ids)
         self.num_prefilled_tokens = 0
         self.current_chunk_size = None
@@ -403,6 +404,7 @@ class Sequence:
         )
 
     def __setstate__(self, state):
+        self.num_pending_outputs = 0
         (self.seq_id, self.status, self.num_tokens, self.num_prompt_tokens,
          self.num_prefilled_tokens, self.current_chunk_size, self.temperature,
          self.top_p, self.top_k, self.presence_penalty, self.repetition_penalty,

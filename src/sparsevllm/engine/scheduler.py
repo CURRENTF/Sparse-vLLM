@@ -303,6 +303,9 @@ class Scheduler:
         physical_free_count: int,
         reserved_prefill: int,
     ) -> tuple[list[Sequence], bool, list[Sequence]]:
+        if getattr(self, "_async_inflight", 0):
+            from sparsevllm.engine.async_execution import AsyncDrainRequired
+            raise AsyncDrainRequired("Preemption requires completed in-flight KV users")
         has_waiting_replay = any(
             seq.is_recompute_replay for seq in self.waiting
         )
@@ -384,6 +387,8 @@ class Scheduler:
         free = max(0, int(self.memory_oracle.decode_step_free_slots()))
         batch = []
         for seq in self.decoding:
+            if seq.num_completion_tokens + seq.num_pending_outputs >= seq.max_tokens:
+                continue
             cost = int(self.memory_oracle.decode_step_reservation_cost(seq))
             if min(free, int(self.memory_oracle.decode_step_free_slots_for(seq))) < cost:
                 if free <= 0:
@@ -748,6 +753,9 @@ class Scheduler:
         ):
             seq = self.decoding.popleft()
             decode_scan_budget -= 1
+            if seq.num_completion_tokens + seq.num_pending_outputs >= seq.max_tokens:
+                self.decoding.append(seq)
+                continue
 
             # 检查逻辑空间是否够塞下一个新 Token (Decode 步进)
             candidate_decode_free = min(
