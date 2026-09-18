@@ -5,7 +5,7 @@ import torch
 from sparsevllm.config import Config
 from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.sequence import Sequence
-from .rkv_scoring import rkv_head_scores
+from .rkv_scoring import rkv_head_scores, rkv_score_tiles
 
 from .snapkv import SnapKVCacheManager
 
@@ -105,10 +105,22 @@ class RKVCacheManager(SnapKVCacheManager):
         return int(query_elems * dtype_size + position_elems * position_dtype_size)
 
     def _get_available_slots_info(self) -> tuple[int, int]:
+        scoring_enabled = (self._is_rkv_query_cache_enabled()
+                           and getattr(self.config, "startup_cache_phase", "") != "profiling")
+        if scoring_enabled:
+            # A long prompt is still uncompressed at the first decode eviction.
+            # Reserving the configured bytes alone does not prove it can score
+            # that domain. Runtime scores one request at a time, not C requests.
+            rkv_score_tiles(
+                batch=1, heads=self.num_kv_heads, length=int(self.config.max_model_len),
+                dim=self.head_dim, groups=self._rkv_num_query_heads() // self.num_kv_heads,
+                window=int(self.config.rkv_observation_tokens),
+                element_size=torch.tensor([], dtype=self._rkv_query_cache_dtype()).element_size(),
+                workspace_bytes=int(self.config.rkv_score_chunk_mb) * 1024**2,
+            )
         available_memory, slot_bytes_per_layer = super()._get_available_slots_info()
         query_cache_bytes = self._rkv_query_cache_bytes()
-        if (self._is_rkv_query_cache_enabled()
-                and getattr(self.config, "startup_cache_phase", "") != "profiling"):
+        if scoring_enabled:
             # Startup profiling builds a small prefill-only cache. Scoring is
             # post-decode work and its reserve belongs to the serving pool.
             query_cache_bytes += int(self.config.rkv_score_chunk_mb) * 1024**2

@@ -127,7 +127,11 @@ boundary, rather than being compressed during prefill.
 
 `rkv_kernel_size` is the positive odd importance-pooling width (default 7).
 `rkv_alpha` weights importance in `alpha * importance - (1-alpha) * redundancy`.
-`rkv_score_chunk_mb` bounds scoring tiles (default 512 MiB); the cache allocator
+`rkv_score_chunk_mb` bounds scoring tiles (default 512 MiB); startup validates
+that it can score one request at `max_model_len`, including materialized keys
+and queries. The retention budget does not bound the full prompt before its
+first decode compression. Increase this workspace for long contexts if the
+startup check reports insufficient bytes; the cache allocator
 reserves this workspace separately. Increase it if even one scoring tile cannot
 fit. There is no automatic Full-KV fallback on scoring failure.
 

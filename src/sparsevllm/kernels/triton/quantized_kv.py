@@ -169,6 +169,13 @@ def _decode(Q, KD, VD, KS, KM, VS, VM, RK, RV, C, Slots, Rows, Lengths, MO, ML,
     batch, qhead, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     row, length = tl.load(Rows + batch), tl.load(Lengths + batch)
     d = tl.arange(0, D)
+    base = (batch * QH + qhead) * SPLITS + split
+    # Graphs reserve the full context grid. Inactive splits must not execute
+    # page dequantization, and must overwrite stale scratch on length shrink.
+    if split * N >= length:
+        tl.store(MO + base * D + d, 0.0)
+        tl.store(ML + base, -float("inf"))
+        return
     q = tl.load(Q + batch * Q0 + qhead * Q1 + d).to(tl.float32)
     # KIVI's per-channel affine metadata makes a full N x D dequantization
     # spill heavily. Bound live vectors without changing the 128-token split
@@ -192,7 +199,6 @@ def _decode(Q, KD, VD, KS, KM, VS, VM, RK, RV, C, Slots, Rows, Lengths, MO, ML,
         total = total * correction + tl.sum(prob, 0)
         maximum = next_maximum
     output = numerator / tl.maximum(total, 1.0e-30)
-    base = (batch * QH + qhead) * SPLITS + split
     tl.store(MO + base * D + d, output)
     tl.store(ML + base, tl.where(total > 0, tl.log(total) + maximum, -float("inf")))
 

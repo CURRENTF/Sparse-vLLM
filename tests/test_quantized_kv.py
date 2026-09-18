@@ -465,7 +465,7 @@ def test_gqa_head_shards_match_unsharded_quantization(kernel_device, method, bit
 @pytest.mark.parametrize("method,bits,d", [("kivi", 4, 64), ("kivi", 4, 128),
                                          ("kivi", 2, 256), ("turboquant", 3, 64), ("fp8_kv", 8, 64)])
 def test_provider_graph_replay_reads_live_lengths_and_rows(kernel_device, method, bits, d):
-    """Catch capture-time split truncation and stale rows across the 128-token split."""
+    """Catch stale inactive splits when a large captured grid changes live lengths."""
     from sparsevllm.operators.decode_attention import QuantizedPagesDecodeAttentionProvider
 
     if kernel_device.type != "cuda":
@@ -487,7 +487,7 @@ def test_provider_graph_replay_reads_live_lengths_and_rows(kernel_device, method
     q = torch.randn(3, qh, d, device=kernel_device, dtype=torch.bfloat16)
     spec = DecodeAttentionOpSpec(num_query_heads=qh, num_kv_heads=h, head_dim=d,
                                 activation_dtype=q.dtype, softmax_scale=d ** -0.5,
-                                max_batch_size=3, context_capacity=capacity,
+                                max_batch_size=3, context_capacity=40960,
                                 cuda_graph=True, kv_storage_format=method)
     provider = QuantizedPagesDecodeAttentionProvider()
     provider.prepare(spec, device_index=kernel_device.index)
@@ -502,13 +502,18 @@ def test_provider_graph_replay_reads_live_lengths_and_rows(kernel_device, method
     # Empty subtiles/splits must not introduce NaNs during online softmax;
     # D=128/256 also exercises the long-head decode used by real GQA models.
     for step, live in enumerate(([15, 17, 15], [31, 32, 31], [127, 129, 127],
-                                 [160, 159, 160], [1, 33, 1])):
+                                 [160, 159, 160], [1, 33, 1], [0, 33, 1])):
         row_ids = [step % 2, 1 - step % 2, step % 2]
         rows.copy_(torch.tensor(row_ids, device=kernel_device, dtype=torch.int32))
         lengths.copy_(torch.tensor(live, device=kernel_device, dtype=torch.int32))
         q.normal_()
+        provider.mid_o.fill_(float("nan"))
+        provider.mid_lse.fill_(float("nan"))
         graph.replay()
         for b, (row, length) in enumerate(zip(row_ids, live)):
+            if length == 0:
+                torch.testing.assert_close(actual[b], torch.zeros_like(actual[b]), atol=0, rtol=0)
+                continue
             full = length // g
             history = []
             for is_key in (True, False):

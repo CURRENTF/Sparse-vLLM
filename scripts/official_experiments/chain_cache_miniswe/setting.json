@@ -34,6 +34,13 @@
     "cost_limit": 0
   },
   "methods": {
+    "rkv-chain": {
+      "sparse_method": "rkv", "enable_prefix_caching": true,
+      "prefix_cache_mode": "chain", "sink_keep_tokens": 64,
+      "recent_keep_tokens": 512, "decode_keep_tokens": 15808,
+      "rkv_compression_interval": 128, "rkv_observation_tokens": 8,
+      "rkv_alpha": 0.1, "rkv_kernel_size": 7, "rkv_score_chunk_mb": 512
+    },
     "snapkv-chain": {
       "sparse_method": "snapkv", "enable_prefix_caching": true,
       "prefix_cache_mode": "chain", "sink_keep_tokens": 64,

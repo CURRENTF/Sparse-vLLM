@@ -124,7 +124,10 @@ query 数量，不包含 prompt queries。
 
 `rkv_kernel_size` 是重要性评分的正奇数 pooling 宽度，默认 7。
 `rkv_alpha` 对应 `alpha * importance - (1-alpha) * redundancy`。
-`rkv_score_chunk_mb` 限制评分分块工作区，默认 512 MiB，cache allocator 会单独
+`rkv_score_chunk_mb` 限制评分分块工作区，默认 512 MiB；启动时会检查它能否
+处理一个长度为 `max_model_len` 的请求，包括展开后的 K 和 query。
+保留预算不限制首次 decode 压缩前的完整 prompt 长度；长上下文若未通过
+工作区检查，需要按报错增加此参数。cache allocator 会单独
 预留。若一个评分分块都无法容纳，需要增大该参数；评分失败不会自动退回 Full-KV。
 
 旧近似算法的非零 `rkv_redundancy_window`、非空 `rkv_max_redundancy_tokens`、

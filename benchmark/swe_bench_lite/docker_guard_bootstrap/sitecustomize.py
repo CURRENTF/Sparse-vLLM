@@ -13,6 +13,9 @@ if int(os.environ.get("SPARSEVLLM_DOCKER_WRITABLE_LAYER_LIMIT_BYTES", "0")) > 0:
         minisweagent.environments._ENVIRONMENT_MAPPING[
             "docker"
         ] = "benchmark.swe_bench_lite.guarded_docker_environment.GuardedDockerEnvironment"
+        if int(os.environ.get("SPARSEVLLM_DOCKER_MEMORY_LIMIT_BYTES", "0")) > 0:
+            from benchmark.swe_bench_lite.docker_memory_guard import install_sdk_limits
+            install_sdk_limits()
     except Exception as exc:
         sys.stderr.write(f"Failed to install Docker writable-layer guard: {exc}\n")
         raise SystemExit(70) from exc

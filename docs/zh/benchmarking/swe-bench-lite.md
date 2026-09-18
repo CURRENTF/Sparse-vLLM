@@ -25,6 +25,24 @@ adapter 默认使用 cached/offline Hugging Face access，并要求所选 Docker
 
 所选 instance 和 image name 会写入 run directory 中的 `instances.txt` 与 `images.txt`，本地 image 检查失败时也会写入。
 
+## 容器内存隔离
+
+可写层限制管的是磁盘，不是内存。为避免某条样本 OOM 耗尽整个 worker，
+需同时设置单容器内存上限和本次运行的父 cgroup 总上限，协调进程放在该组之外；
+不必因此降低并发。
+
+可选的内存保护要求 Linux cgroup v2、本地 Docker daemon，以及已启用的可写层保护。
+导出 `SPARSEVLLM_DOCKER_MEMORY_LIMIT_BYTES`、`SPARSEVLLM_DOCKER_MEMORY_PARENT`
+和 `SPARSEVLLM_DOCKER_MEMORY_EVENTS`（OOM JSONL 路径）。在 MiniSWE 附加配置的
+`environment.run_args` 中设置匹配的 `--memory`、`--memory-swap` 和
+`--cgroup-parent`；memory 与 memory-swap 相等表示容器不使用 swap。
+不要加 `--rm`：检测失败前需要保留 Docker OOM 元数据，之后由保护逻辑显式清理容器。
+启动前先创建父 cgroup 并设置其总上限。
+
+生成容器发生 OOM 时抛出 `DockerMemoryLimitExceeded`，该样本记为失败，不重试，
+也不从评测分母中排除。官方评分容器同样施加内存上限，失败仍由上游评分器报告。
+内存限制会影响资源失败率，必须随实验记录。
+
 ## Sparse-vLLM Server
 
 以独立 long-running process 启动 `sparsevllm.entrypoints.openai.api_server`。典型命令：

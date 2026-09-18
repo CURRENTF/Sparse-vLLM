@@ -266,8 +266,41 @@ def test_decode_workspace_does_not_consume_small_prefill_profiling_pool(monkeypa
     monkeypatch.setattr(SnapKVCacheManager, "_get_available_slots_info", lambda self: (40 * 1024**2, 128))
     assert manager._get_available_slots_info() == (39 * 1024**2, 128)
     manager.config.startup_cache_phase = "serving"
+    manager.config.max_model_len = 128
+    manager.config.rkv_observation_tokens = 8
+    manager.num_kv_heads, manager.head_dim, manager.tp_size = 2, 16, 1
+    manager.hf_config = SimpleNamespace(dtype=torch.float32, num_attention_heads=4)
     with pytest.raises(RuntimeError, match="scoring workspace"):
         manager._get_available_slots_info()
+
+
+def test_long_prompt_workspace_rejected_before_cache_allocation(monkeypatch):
+    """A small retention budget must not hide an unscorable first long prompt."""
+    from sparsevllm.engine.cache_manager.methods.snapkv import SnapKVCacheManager
+    manager = object.__new__(RKVCacheManager)
+    manager.config = SimpleNamespace(startup_cache_phase="serving", max_model_len=4096,
+                                    rkv_observation_tokens=8, rkv_score_chunk_mb=1)
+    manager.num_kv_heads, manager.head_dim, manager.tp_size = 2, 32, 1
+    manager.hf_config = SimpleNamespace(dtype=torch.float32, num_attention_heads=4)
+    monkeypatch.setattr(SnapKVCacheManager, "_get_available_slots_info",
+                        lambda self: pytest.fail("must reject before allocating the cache pool"))
+    with pytest.raises(RuntimeError, match="length=4096.*retention budget"):
+        manager._get_available_slots_info()
+
+
+def test_workspace_plan_acceptance_executes_against_independent_oracle():
+    """The startup planner and execution must agree even at a tight tile budget."""
+    from sparsevllm.engine.cache_manager.methods.rkv_scoring import rkv_score_tiles
+    torch.manual_seed(7)
+    keys = torch.randn(1, 2, 23, 8)
+    queries = torch.randn(1, 4, 3, 8)
+    cap = 16384
+    units, rows = rkv_score_tiles(batch=1, heads=2, length=23, dim=8, groups=2,
+                                 window=3, element_size=4, workspace_bytes=cap)
+    assert 1 <= units <= 2 and 1 <= rows <= 23
+    actual = rkv_head_scores(keys, queries, window=3, kernel_size=3,
+                             alpha=0.1, workspace_bytes=cap)
+    torch.testing.assert_close(actual, reference_scores(keys, queries, 3, 3, 0.1))
 
 
 def test_recompute_discards_observations_and_reserves_uncompressed_growth():

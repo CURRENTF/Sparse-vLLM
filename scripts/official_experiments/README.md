@@ -11,6 +11,8 @@ Large logs, token outputs, and checkpoints remain outside Git.
 - [Sparse-vLLM vs Vortex](sparsevllm_vs_vortex/README.md): guarded single-card
   QuEST and H2O-like comparisons, full-residency decode timing, configs,
   recorded JSON data and plots.
+- [AIME 2024](aime/README.md): pass@1 across all 11 methods without auxiliary
+  checkpoints, using shared sampling and engine settings adapted from MiniSWE.
 
 Here “official” identifies the maintained experiment recipe, not universal
 performance guarantees or parity with an upstream method implementation.

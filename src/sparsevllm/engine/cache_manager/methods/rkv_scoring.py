@@ -11,6 +11,35 @@ import torch
 import torch.nn.functional as F
 
 
+def rkv_score_tiles(*, batch: int, heads: int, length: int, dim: int,
+                    groups: int, window: int, element_size: int,
+                    workspace_bytes: int) -> tuple[int, int]:
+    """Plan the same byte-bounded tiles at startup and before score allocation."""
+    elt = element_size
+    # Inputs may need a copy when flattening batch/head dimensions. Include
+    # gathered keys/queries, output, normalized keys and GQA intermediates.
+    resident_bytes = 2 * batch * heads * (length * dim + groups * window * dim) * elt
+    resident_bytes += batch * heads * (length - window) * elt
+    fixed_per_head = (4 * length * dim + 4 * groups * window * length) * max(elt, 4)
+    pair_row_bytes = 2 * (2 * elt + 5) * length
+    minimum = resident_bytes + fixed_per_head + pair_row_bytes
+    if workspace_bytes < minimum:
+        raise RuntimeError(
+            "R-KV scoring workspace is too small for one head/row: "
+            f"required_bytes={minimum}, configured_bytes={workspace_bytes}, "
+            f"batch={batch}, heads={heads}, length={length}, dim={dim}, "
+            f"groups={groups}, window={window}. "
+            f"Set rkv_score_chunk_mb >= {(minimum + 1024**2 - 1) // 1024**2} "
+            "or reduce max_model_len. The retention budget does not bound "
+            "the prompt length before the first decode compression."
+        )
+    available_bytes = workspace_bytes - resident_bytes
+    units = min(batch * heads, max(1, available_bytes //
+                                  (fixed_per_head + pair_row_bytes * length)))
+    row_tile = min(length, (available_bytes // units - fixed_per_head) // pair_row_bytes)
+    return units, row_tile
+
+
 @torch.no_grad()
 def rkv_head_scores(
     keys: torch.Tensor,
@@ -39,21 +68,10 @@ def rkv_head_scores(
     if keys.dtype != queries.dtype or keys.device != queries.device:
         raise ValueError("R-KV keys and queries must share dtype and device.")
     groups = queries.shape[1] // heads
-    elt = keys.element_size()
-    # Include normalized/gathered keys, GQA logits, probabilities, and output.
-    fixed_per_head = (4 * length * dim + 4 * groups * window * length) * max(elt, 4)
-    # Inputs are gathered by the cache manager; noncontiguous layouts may need
-    # a second copy when flattening batch/head dimensions. Account for both.
-    resident_bytes = 2 * (keys.numel() + queries.numel()) * elt
-    resident_bytes += batch * heads * (length - window) * elt
-    available_bytes = int(workspace_bytes) - resident_bytes
-    pair_row_bytes = 2 * (2 * elt + 5) * length
-    if available_bytes < fixed_per_head + pair_row_bytes:
-        raise RuntimeError("R-KV scoring workspace is too small for one head/row; "
-                           "increase rkv_score_chunk_mb or reduce the context.")
-    units = max(1, min(batch * heads, available_bytes //
-                      (fixed_per_head + pair_row_bytes * length)))
-    row_tile = min(length, (available_bytes // units - fixed_per_head) // pair_row_bytes)
+    units, row_tile = rkv_score_tiles(
+        batch=batch, heads=heads, length=length, dim=dim, groups=groups,
+        window=window, element_size=keys.element_size(), workspace_bytes=int(workspace_bytes),
+    )
     flat_keys = keys.reshape(batch * heads, length, dim)
     flat_queries = queries.reshape(batch * heads, groups, window, dim)
     result = torch.empty((batch * heads, length - window), dtype=keys.dtype, device=keys.device)

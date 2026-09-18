@@ -390,6 +390,35 @@ class SweBenchLiteRunnerTest(unittest.TestCase):
             ["success", "success"],
         )
 
+    def test_container_oom_is_failed_without_dropping_sample_or_peer(self):
+        """An isolated OOM must survive aggregation and stay in the score denominator."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            batch = run_dir / "batches" / "batch_000"
+            _write_json(batch / "preds.json", {
+                "oom": _prediction("oom", patch=""), "peer": _prediction("peer"),
+            })
+            _write_trajectory(batch, "oom", "DockerMemoryLimitExceeded")
+            _write_trajectory(batch, "peer", "Submitted")
+            predictions, generation = merge_batch_predictions(run_dir, [["oom", "peer"]])
+            rows, summary = normalize_results(
+                expected_ids=["oom", "peer"], predictions=predictions,
+                generation_rows=generation,
+                official_report={
+                    "total_instances": 2, "submitted_instances": 2,
+                    "completed_instances": 1, "resolved_instances": 1,
+                    "unresolved_instances": 0, "empty_patch_instances": 1,
+                    "error_instances": 0, "completed_ids": ["peer"],
+                    "resolved_ids": ["peer"], "unresolved_ids": [],
+                    "empty_patch_ids": ["oom"], "error_ids": [],
+                },
+            )
+        by_id = {row["instance_id"]: row for row in rows}
+        self.assertEqual(by_id["oom"]["status"], "model_failed")
+        self.assertEqual(by_id["oom"]["generation_exit_status"], "DockerMemoryLimitExceeded")
+        self.assertEqual(by_id["peer"]["status"], "success")
+        self.assertEqual(summary["score"], 0.5)
+
     def test_completed_batch_marker_must_match_predictions(self):
         with tempfile.TemporaryDirectory() as tmp:
             batch_dir = Path(tmp)

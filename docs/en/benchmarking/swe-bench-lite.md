@@ -39,6 +39,29 @@ dataset or hundreds of gigabytes of images. Use `--allow-dataset-download` or
 The selected instance and image names are written to `instances.txt` and
 `images.txt` in the run directory, including when the local-image check fails.
 
+## Container memory isolation
+
+The writable-layer guard limits disk usage, not RAM. To keep a sample OOM
+from exhausting the worker, configure both per-container memory limits and a
+bounded parent cgroup for the run; do not put the coordinator in that cgroup.
+Concurrency does not need to change.
+
+The opt-in memory guard requires Linux cgroup v2, a local Docker daemon, and
+the writable-layer guard enabled. Export
+`SPARSEVLLM_DOCKER_MEMORY_LIMIT_BYTES`, `SPARSEVLLM_DOCKER_MEMORY_PARENT`, and
+`SPARSEVLLM_DOCKER_MEMORY_EVENTS` (the OOM JSONL path). In the MiniSWE extra
+config, set `environment.run_args` to matching `--memory`, `--memory-swap`,
+and `--cgroup-parent` values. Set memory and memory-swap to the same size to
+disable container swap. Omit `--rm`: the guard needs Docker's OOM metadata
+until failure detection and explicitly removes its container afterward.
+Create and bound the parent cgroup before launching.
+
+A detected generation-container OOM raises `DockerMemoryLimitExceeded` and
+fails that sample without retrying it; the normal sample denominator is kept.
+The same memory limits are applied to official scorer containers, whose
+failures remain reported by the upstream scorer. Record these limits with the
+run, since resource failures affect the score.
+
 ## Sparse-vLLM Server
 
 Start `sparsevllm.entrypoints.openai.api_server` as a separate long-running

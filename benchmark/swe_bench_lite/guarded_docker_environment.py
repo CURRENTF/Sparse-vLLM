@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import threading
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from benchmark.swe_bench_lite.docker_writable_guard import (
     DockerWritableLayerGuard,
     GuardState,
 )
+from benchmark.swe_bench_lite.docker_memory_guard import DockerMemoryGuard
 
 
 _GUARD_LOCK = threading.Lock()
@@ -44,29 +46,43 @@ def _get_guard(executable: str) -> DockerWritableLayerGuard:
 
 
 class GuardedDockerEnvironment(DockerEnvironment):
-    """mini-SWE-agent Docker environment with a per-container disk limit."""
+    """mini-SWE-agent environment with disk limits and opt-in OOM detection."""
 
     def __init__(self, **kwargs):
         self._writable_guard: DockerWritableLayerGuard | None = None
         self._writable_guard_state: GuardState | None = None
+        self._memory_guard: DockerMemoryGuard | None = None
+        self._memory_enabled = int(os.getenv("SPARSEVLLM_DOCKER_MEMORY_LIMIT_BYTES", "0")) > 0
         super().__init__(**kwargs)
 
     def _start_container(self) -> None:
         super()._start_container()
         assert self.container_id is not None
         try:
+            if self._memory_enabled:
+                self._memory_guard = DockerMemoryGuard(
+                    self.config.executable, self.container_id, self.config.image
+                )
             self._writable_guard = _get_guard(self.config.executable)
             self._writable_guard_state = self._writable_guard.register(
                 self.container_id,
                 image=self.config.image,
             )
         except Exception:
-            super().cleanup()
+            self.cleanup()
             raise
 
     def _raise_if_guard_failed(self) -> None:
         if self._writable_guard_state is not None:
             self._writable_guard_state.raise_if_failed()
+        try:
+            if self._memory_guard is not None:
+                self._memory_guard.check()
+        finally:
+            # The disk monitor can kill the container during the memory check.
+            # Preserve its recorded cause if the cgroup disappears as a result.
+            if self._writable_guard_state is not None:
+                self._writable_guard_state.raise_if_failed()
 
     def execute(self, action: dict, cwd: str = "", *, timeout: int | None = None):
         self._raise_if_guard_failed()
@@ -75,9 +91,20 @@ class GuardedDockerEnvironment(DockerEnvironment):
         finally:
             self._raise_if_guard_failed()
 
+    def _check_finished(self, output: dict) -> None:
+        # Check before Submitted can turn an OOM-affected command into a solution.
+        self._raise_if_guard_failed()
+        super()._check_finished(output)
+
     def cleanup(self) -> None:
         container_id = getattr(self, "container_id", None)
         guard = getattr(self, "_writable_guard", None)
         if container_id is not None and guard is not None:
             guard.unregister(container_id)
+        if container_id is not None and getattr(self, "_memory_enabled", False):
+            # Keep metadata until the OOM check; then remove only this owned container.
+            subprocess.run([self.config.executable, "rm", "-f", container_id],
+                           check=True, capture_output=True, text=True, timeout=30)
+            self.container_id = None
+            return
         super().cleanup()
