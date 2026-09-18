@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 from sparsevllm.engine.decode_graph_staging import DecodeGraphHostInputs
+from sparsevllm.platforms import device_runtime
 
 
 class AsyncDrainRequired(RuntimeError):
@@ -41,10 +42,10 @@ class DeviceResult:
 
 class AsyncExecution:
     def __init__(self, runner):
-        if runner.device.type != "cuda":
+        if not device_runtime.supports_streams(runner.device):
             raise ValueError("Asynchronous execution currently requires CUDA")
         self.runner = runner
-        self.copy_stream = torch.cuda.Stream(device=runner.device)
+        self.copy_stream = device_runtime.new_stream(runner.device)
         self.results: dict[int, DeviceResult] = {}
         self.last_tokens: dict[int, torch.Tensor] = {}
         self.penalties: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -131,17 +132,17 @@ class AsyncExecution:
                     repeated[tokens[i]] = True
         # Snapshots are kept alive until DMA completes, including H2D staging.
         keepalive = [tokens, self.input_tokens, logprobs, *self.keepalive]
-        main = torch.cuda.current_stream(runner.device)
+        main = device_runtime.current_stream(runner.device)
         self.copy_stream.wait_stream(main)
         def copy_host(tensor):
             host = torch.empty_like(tensor, device='cpu', pin_memory=True)
             host.copy_(tensor, non_blocking=True)
             return host
-        with torch.cuda.stream(self.copy_stream):
+        with device_runtime.stream_context(self.copy_stream):
             host_tokens = copy_host(tokens)
             host_inputs = copy_host(self.input_tokens) if self.input_tokens is not None else None
             host_logprobs = logprobs.copy_with(copy_host) if logprobs is not None else None
-            event = torch.cuda.Event()
+            event = device_runtime.new_event(runner.device)
             event.record(self.copy_stream)
         self.results[ticket] = DeviceResult(seqs, is_prefill, event, host_tokens,
                                            host_inputs, host_logprobs, records, keepalive)
@@ -149,7 +150,7 @@ class AsyncExecution:
 
     def collect(self, ticket, discarded=()):
         result = self.results[ticket]
-        result.event.synchronize()  # Wait for this result, never the whole stream.
+        device_runtime.synchronize_event(result.event)  # This result, never the whole stream.
         ignored = set(discarded)
         input_tokens = result.inputs.tolist() if result.inputs is not None else None
         input_by_id = dict(zip((s.seq_id for s in result.seqs), input_tokens or []))

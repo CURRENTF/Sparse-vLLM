@@ -17,21 +17,24 @@ from sparsevllm import LLM, SamplingParams
 from sparsevllm.engine.async_scheduler import AsyncScheduler
 
 
-def run_case(llm, prompts, params, *, asynchronous, cancel_first=False, append_prompt=None):
+def run_case(llm, prompts, params, *, asynchronous, cancel_first=False, append_prompt=None, reset=True):
     assert llm.is_finished()
     if hasattr(llm, '_async_scheduler'):
         del llm._async_scheduler
-    llm.model_runner.call('reset_after_warmup')
+    if reset:
+        llm.model_runner.call('reset_after_warmup')
     if asynchronous:
         llm._async_scheduler = AsyncScheduler(llm)
     torch.manual_seed(123)
     ids = [llm.add_request(p, sp) for p, sp in zip(prompts, params)]
     results = {}
+    cached = {}
     steps = 0
     while not llm.is_finished():
         finished, _ = llm.step()
+        cached.update(llm.last_step_prompt_cache_hits)
         for seq_id, tokens, logprobs, tops in finished:
-            results[seq_id] = {'tokens': list(tokens), 'logprobs': list(logprobs), 'top_logprobs': tops}
+            results[seq_id] = {'tokens': list(tokens), 'logprobs': list(logprobs), 'top_logprobs': tops, 'cached_tokens': cached.get(seq_id, 0)}
         steps += 1
         if steps == 1:
             if cancel_first:
@@ -96,6 +99,17 @@ def main():
         got = run_case(llm, [prompts[0]], params, asynchronous=True)
         assert ref[0]['tokens'] == got[0]['tokens'] == [first]
         report['cases'].append({'name': 'eos', 'status': 'success', 'reference': ref, 'asynchronous': got})
+        extended = [[200+i % 31 for i in range(n)] for n in [384, 512]]
+        params = [SamplingParams(max_tokens=8, temperature=0., ignore_eos=True)] * 2
+        hot = []
+        for asynchronous in [False, True]:
+            run_case(llm, extended, params, asynchronous=asynchronous)
+            hot.append(run_case(llm, extended, params, asynchronous=asynchronous, reset=False))
+        assert all(row['cached_tokens'] >= 128 for rows in hot for row in rows)
+        assert [r['tokens'] for r in hot[0]] == [r['tokens'] for r in hot[1]]
+        report['cases'].append({'name': 'hot_radix_prefix', 'status': 'success',
+                                'reference': hot[0], 'asynchronous': hot[1]})
+        report['operator_stats'] = llm.operator_runtime_stats()
         report['status'] = 'success'
     except BaseException:
         report['status'] = 'failed'
