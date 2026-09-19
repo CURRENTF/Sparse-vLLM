@@ -116,7 +116,10 @@ def flashinfer_chunk_gated_delta_rule(
         beta=beta,
         initial_state=initial_state,
         output_final_state=True,
-        cu_seqlens=cu_seqlens,
+        # The public non-CP paths cast integer offsets, but the CP dispatcher
+        # in FlashInfer 0.6.18 passes them through to kernels requiring int64.
+        # Normalize here so both dispatch paths accept the engine's int32 view.
+        cu_seqlens=cu_seqlens.to(dtype=torch.int64).contiguous(),
         use_qk_l2norm_in_kernel=False,
         use_cp=use_cp,
     )

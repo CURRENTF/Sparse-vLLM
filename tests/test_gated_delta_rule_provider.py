@@ -237,6 +237,34 @@ def test_flashinfer_prefill_adapter_converts_log_gate_and_state_contract():
     assert call.args[6] is cu_seqlens
 
 
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("strided", [False, True])
+def test_flashinfer_adapter_normalizes_sequence_offsets(dtype, strided):
+    offsets = torch.tensor([0, 1, 3], dtype=dtype)
+    if strided:
+        offsets = torch.stack((offsets, offsets), dim=1)[:, 0]
+    q = torch.zeros(3, 2, 128, dtype=torch.bfloat16)
+    state = torch.zeros(2, 2, 128, 128, dtype=torch.float32)
+    gates = torch.ones(3, 2)
+    kernel = Mock(return_value=(q, state))
+    with (
+        patch("sparsevllm.kernels.external.flashinfer.gdn._gdn_prefill_op",
+              return_value=(kernel, "available")),
+        patch("sparsevllm.kernels.external.flashinfer.gdn.torch.cuda.get_device_capability",
+              return_value=(9, 0)),
+    ):
+        flashinfer_chunk_gated_delta_rule(q, q, q, gates, gates, state, offsets)
+    passed = kernel.call_args.kwargs["cu_seqlens"]
+    assert passed.dtype == torch.int64
+    assert passed.is_contiguous()
+    assert passed.device == offsets.device
+    assert passed.tolist() == offsets.tolist()
+    assert offsets.dtype == dtype
+    if dtype == torch.int64 and not strided:
+        assert passed is offsets
+    assert kernel.call_args.kwargs["use_cp"] == "auto"
+
+
 def test_flashinfer_prefill_adapter_rejects_non_fp32_final_state():
     q = torch.randn(1, 2, 128, dtype=torch.bfloat16)
     v = torch.randn(1, 4, 128, dtype=torch.bfloat16)
@@ -275,7 +303,9 @@ def test_flashinfer_prefill_adapter_rejects_non_fp32_final_state():
     not in {(9, 0), (10, 0), (10, 3), (12, 0), (12, 1)},
     reason="requires CUDA SM90, SM100, SM103, SM120, or SM121",
 )
-def test_flashinfer_prefill_matches_independent_triton_provider():
+@pytest.mark.parametrize("use_cp", [False, True, "auto"])
+@pytest.mark.parametrize("token_count", [48, 1057])
+def test_flashinfer_prefill_matches_independent_triton_provider(use_cp, token_count):
     supported, reason = flashinfer_gdn_prefill_support(
         torch.cuda.get_device_capability()
     )
@@ -283,7 +313,7 @@ def test_flashinfer_prefill_matches_independent_triton_provider():
         pytest.skip(reason)
 
     torch.manual_seed(20260824)
-    token_count, num_key_heads, num_value_heads, head_dim = 48, 2, 4, 128
+    num_key_heads, num_value_heads, head_dim = 2, 4, 128
     q = torch.randn(
         1,
         token_count,
@@ -331,18 +361,24 @@ def test_flashinfer_prefill_matches_independent_triton_provider():
         value_head_dim=head_dim,
     )
 
-    actual_output, actual_state = (
-        FlashInferGatedDeltaRuleProvider().run_prefill(
-            spec,
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            initial_state=initial_state.clone(),
-            cu_seqlens=cu_seqlens,
+    # Exercise both real upstream kernels, independent of the auto heuristic.
+    with patch(
+        "sparsevllm.operators.gated_delta_rule.flashinfer_chunk_gated_delta_rule",
+        side_effect=lambda *args, **kwargs: flashinfer_chunk_gated_delta_rule(
+            *args, **kwargs, use_cp=use_cp),
+    ):
+        actual_output, actual_state = (
+            FlashInferGatedDeltaRuleProvider().run_prefill(
+                spec,
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=initial_state.clone(),
+                cu_seqlens=cu_seqlens,
+            )
         )
-    )
     expected_output, expected_state = TritonGatedDeltaRuleProvider().run_prefill(
         spec,
         q=q,
