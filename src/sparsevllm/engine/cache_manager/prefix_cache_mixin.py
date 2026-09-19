@@ -403,7 +403,10 @@ class PrefixCacheMixin:
             state.pending_slots = []
 
     def on_forward_end(self, seqs: list[Sequence], is_prefill: bool):
-        del is_prefill
+        self.publish_pending_prefix_blocks(seqs)
+
+    def publish_pending_prefix_blocks(self, seqs: list[Sequence]):
+        """Publish materialized records without repeating forward lifecycle hooks."""
         if not self.enable_prefix_caching or self.prefix_cache is None:
             return
         with profiler.record(self._prefix_cache_materialize_profile_name()):

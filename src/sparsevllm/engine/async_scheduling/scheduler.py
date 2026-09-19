@@ -6,7 +6,7 @@ from collections.abc import Sequence as ReadOnlySequence
 from dataclasses import dataclass
 import time
 
-from sparsevllm.engine.async_execution import AsyncDrainRequired
+from sparsevllm.engine.async_scheduling.execution import AsyncDrainRequired
 from sparsevllm.engine.sequence import Sequence, SequenceStatus
 from sparsevllm.sampling_params import resolve_eos_token_ids
 from sparsevllm.utils.profiler import profiler
@@ -61,6 +61,9 @@ class AsyncScheduler:
         self.retiring: set[int] = set()
         self.discarded: set[int] = set()
         self.next_ticket = 0
+        controller = getattr(engine.model_runner, "sparse_controller", None)
+        self.requires_committed_token_history = bool(
+            getattr(controller, "requires_committed_token_history", False))
 
     def abort(self, seq_id):
         scheduler = self.engine.scheduler
@@ -91,6 +94,10 @@ class AsyncScheduler:
     def _submit(self):
         engine = self.engine
         scheduler = engine.scheduler
+        if self.requires_committed_token_history and any(
+            any(step.publishes) for step in self.pending
+        ):
+            return False
         # A request whose final output is in flight needs no further work.
         if not scheduler.waiting and not any(
             s.num_completion_tokens + s.num_pending_outputs < s.max_tokens

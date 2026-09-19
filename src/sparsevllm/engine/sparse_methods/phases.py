@@ -20,6 +20,11 @@ class PrefillOverrideRuntime(SparseMethodRuntime):
         self.sparse_method = decode.sparse_method
 
     @property
+    def requires_committed_token_history(self):
+        return (self.prefill.requires_committed_token_history
+                or self.decode.requires_committed_token_history)
+
+    @property
     def layer_batch_sparse_states(self):
         return self.active.layer_batch_sparse_states
 

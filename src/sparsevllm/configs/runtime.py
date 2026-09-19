@@ -65,7 +65,7 @@ class Config(
     max_model_len_auto: bool = field(default=False, init=False)
     # None preserves the legacy shared batch limit. Set explicitly to allow
     # decode and prefill to use different per-step sequence limits.
-    async_scheduling: bool = False
+    async_scheduling: bool | None = None
     async_max_inflight: int = 2
     decode_reservation_tokens: int = 1024
     max_decoding_seqs: int | None = None
@@ -170,22 +170,27 @@ class Config(
         validate_deltakv_runtime(self)
         resolve_auto_full_attention_layers(self)
         finalize_sparse_layout(self)
+        async_compatible = (
+            self.attn_dp_size == 1 and not self.enable_multimodal
+            and not self.enable_prefix_cache_offload and self.prefix_cache_mode != "chain"
+            and not self.runtime_layout.linear_attention_layer_indices
+        )
+        if self.async_scheduling is None:
+            from sparsevllm.platforms import device_runtime
+            self.async_scheduling = async_compatible and device_runtime.supports_streams()
         if self.async_scheduling:
             if self.async_max_inflight < 2:
                 raise ValueError("async_max_inflight must be at least 2")
-            if (self.attn_dp_size != 1 or self.sparse_method or not self.decode_graph
-                    or self.enable_multimodal or self.enable_prefix_cache_offload
-                    or self.prefix_cache_mode == "chain" or self.prefill_sparse_method
-                    or self.runtime_layout.linear_attention_layer_indices):
-                raise ValueError("async_scheduling requires vanilla TP, decode_graph, "
-                                 "device-resident KV, radix/no prefix and text input")
+            if not async_compatible:
+                raise ValueError("async_scheduling requires DP=1, radix/no prefix, "
+                                 "no prefix offload, and text-only non-recurrent models")
 
         logger.info(
             "Runtime config: model={} sparse_method={} prefill_sparse_method={} "
             "cache_method={} tp={} ep={} dp={} moe_backend={} "
             "max_model_len={} max_batched_tokens={} prefill_chunk={} "
             "max_prefill_batch={} max_decode_batch={} favor_min_decoding_seqs={} gpu_utilization={:.3f} "
-            "decode_graph={}.",
+            "decode_graph={} async_scheduling={}.",
             self.model,
             self.sparse_method or "vanilla",
             self.prefill_sparse_method or "none",
@@ -202,6 +207,7 @@ class Config(
             self.favor_min_decoding_seqs,
             self.gpu_memory_utilization,
             self.decode_graph,
+            self.async_scheduling,
         )
         logger.debug("Full runtime config: {}", str(self).replace("\n", " "))
         setattr(self.hf_config, "runtime_layout", self.runtime_layout)

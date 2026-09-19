@@ -313,6 +313,8 @@ class SparseMethodRuntime(ABC):
         token_scores[:, candidate_start:] = candidate_token_scores
         return token_scores
 
+    requires_committed_token_history = False
+
     def prepare_step(self, step: SparseStepContext) -> None:
         self._begin_prepare_step(step)
         for layer_idx in range(self.num_layers):

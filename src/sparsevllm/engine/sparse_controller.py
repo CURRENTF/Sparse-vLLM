@@ -64,6 +64,20 @@ class SparseController:
     def bind_auxiliary_prefill(self, executor) -> None:
         self.runtime.bind_auxiliary_prefill(executor)
 
+    @property
+    def requires_committed_token_history(self) -> bool:
+        return bool(self.runtime.requires_committed_token_history
+                    or self.activation_controller.requires_committed_token_history
+                    or self.cache_manager.requires_committed_token_history)
+
+    def prepare_decode_replay(self, seqs: list[Sequence]) -> None:
+        # Python activation policy is not replayed by a CUDA Graph. Refresh its
+        # real-row metadata and stable device inputs for every submission.
+        context = get_context()
+        context.sparse_controller = self
+        context.sparse_config = self.sparse_config if self.sparse_method else None
+        self.activation_controller.prepare_forward(seqs, False)
+
     def clear_decode_attn_score_buffers(self) -> None:
         self.runtime.clear_decode_attn_score_buffers()
 

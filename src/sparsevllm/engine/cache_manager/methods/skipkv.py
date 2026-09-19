@@ -35,6 +35,11 @@ class SkipKVSequenceState:
 class SkipKVCacheManager(SnapKVCacheManager):
     """SkipKV sentence-aware KV storage skipping."""
 
+    @property
+    def requires_committed_token_history(self):
+        return bool(self.config.skipkv_enable_sentence_scoring
+                    or self.config.skipkv_enable_activation_steering)
+
     def __init__(
         self,
         config: Config,

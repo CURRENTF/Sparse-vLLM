@@ -334,7 +334,7 @@ class LLMEngine:
             profiler.reset()
         self._throughput_logger.start()
         if config.async_scheduling:
-            from sparsevllm.engine.async_scheduler import AsyncScheduler
+            from sparsevllm.engine.async_scheduling.scheduler import AsyncScheduler
             self._async_scheduler = AsyncScheduler(self)
 
     @staticmethod

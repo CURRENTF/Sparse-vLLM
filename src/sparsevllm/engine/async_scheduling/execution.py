@@ -51,8 +51,17 @@ class AsyncExecution:
         self.penalties: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.input_tokens = None
         self.keepalive = []
-        self.submitted = self.completed = 0
+        self.submitted = self.completed = self.peak_inflight = 0
         self.host_input_pool: dict[int, list[DecodeGraphHostInputs]] = {}
+        self.host_tensor_pool: dict[tuple, list[torch.Tensor]] = {}
+
+    def acquire_host_tensor(self, template):
+        key = (tuple(template.shape), template.dtype, template.is_pinned())
+        pool = self.host_tensor_pool.setdefault(key, [])
+        tensor = pool.pop() if pool else torch.empty_like(
+            template, pin_memory=template.is_pinned())
+        self.keepalive.append(tensor)
+        return tensor
 
     def acquire_host_inputs(self, capacity):
         pool = self.host_input_pool.setdefault(capacity, [])
@@ -109,11 +118,13 @@ class AsyncExecution:
         records = []
         runner.cache_manager._async_prefix_records = records
         runner._async_submitting = True
+        runner.cache_manager._step_host_allocator = self
         runner.decode_graph_runner.async_input_provider = self
         try:
             tokens, logprobs = runner.run(seqs, is_prefill)
         finally:
             runner._async_submitting = False
+            runner.cache_manager._step_host_allocator = None
             runner.cache_manager._async_prefix_records = None
             runner.decode_graph_runner.async_input_provider = None
         # Every TP rank needs the same device feedback for its next embedding.
@@ -147,6 +158,7 @@ class AsyncExecution:
         self.results[ticket] = DeviceResult(seqs, is_prefill, event, host_tokens,
                                            host_inputs, host_logprobs, records, keepalive)
         self.submitted += 1
+        self.peak_inflight = max(self.peak_inflight, len(self.results))
 
     def collect(self, ticket, discarded=()):
         result = self.results[ticket]
@@ -160,9 +172,9 @@ class AsyncExecution:
                 if not result.is_prefill:
                     tokens = [input_by_id[seq.seq_id]]
                 cache._record_prefix_materialization(seq, tokens, slots)
-        live = [s for s in result.seqs if s.seq_id not in ignored]
-        if live:
-            self.runner._post_sparse_forward(live, result.is_prefill)
+        if result.prefix_records:
+            live = [s for s in result.seqs if s.seq_id not in ignored]
+            cache.publish_pending_prefix_blocks(live)
         tokens = result.tokens.tolist()
         logs = None
         if result.logprobs:
@@ -181,11 +193,15 @@ class AsyncExecution:
         for buffer in result.keepalive:
             if isinstance(buffer, DecodeGraphHostInputs):
                 self.host_input_pool[buffer.batch_capacity].append(buffer)
+            elif isinstance(buffer, torch.Tensor) and buffer.device.type == "cpu":
+                key = (tuple(buffer.shape), buffer.dtype, buffer.is_pinned())
+                self.host_tensor_pool.setdefault(key, []).append(buffer)
         return tokens, logs
 
     def stats(self):
         return {"submitted": self.submitted, "completed": self.completed,
-                "inflight": len(self.results), "device_feedback_requests": len(self.last_tokens),
+                "inflight": len(self.results), "peak_inflight": self.peak_inflight,
+                "device_feedback_requests": len(self.last_tokens),
                 "penalty_requests": len(self.penalties)}
 
     def prepare_synchronous_execution(self):

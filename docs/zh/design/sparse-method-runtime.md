@@ -229,6 +229,25 @@ QuEST 是一个典型例子。它的 Runtime 返回普通的完整逻辑选择�
 page metadata 长期跟随物理缓存，因此应留在 CacheManager，而不是复制到
 Runtime。
 
+## 有序提交与结果回收
+
+同步和异步执行使用相同的 attention、层和步骤 hook。`post_forward` 与 cache
+`on_forward_end` 在提交阶段执行，早于 forward context 清理和下一批准备。
+它们可以只提交 GPU 工作而不等待完成；依赖 CPU 读取结果的操作保留必要等待。
+Graph replay 在图外更新激活策略输入，已捕获的层内 hook 保持原有顺序。
+
+结果回收只处理已复制的 token/logprobs 和延迟的 prefix 记录发布，不能对当前批次的
+可变状态再次执行计算 hook。请求存储在所有未完成使用者退出后才释放。
+
+需要在 CPU 读取尚未确认 token 历史的 runtime、激活控制器或 cache manager 声明
+`requires_committed_token_history`。调度器在准备下一批之前收回待确认的 token。
+不产生输出 token 的中间 prefill 分块仍可连续提交。GPU 消费者使用有序的设备 token 接续。
+
+Cache 自有的可复用 CPU 上传区在写入前调用 `acquire_step_host_buffer`。
+异步提交借用独占区域，直到结果回收才归还；同步执行继续使用原缓冲区。
+GPU graph 地址保持固定。辅助队列的拥有者负责在依赖读取或空间复用前完成队列交接，
+包括步骤结束时的交接。
+
 ## Prefix Cache 和 CUDA Graph
 
 Prefix Cache 保存的是物理缓存状态，所以由 `CacheManager` 负责。与某段 KV

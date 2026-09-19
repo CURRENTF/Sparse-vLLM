@@ -242,6 +242,7 @@ class DecodeCudaGraphRunner:
             int(state.capture_context_capacity)
         )
 
+        self.sparse_controller.prepare_decode_replay(seqs)
         return input_ids, positions
 
     def graph_plan(self) -> dict[str, object]:

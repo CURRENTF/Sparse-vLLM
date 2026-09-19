@@ -1288,6 +1288,13 @@ class CacheManager(ABC):
         """Whether this method should bypass graph replay for diagnostics."""
         return False
 
+    requires_committed_token_history = False
+
+    def acquire_step_host_buffer(self, template: torch.Tensor) -> torch.Tensor:
+        """Keep CPU upload storage exclusive until the submission is retired."""
+        allocator = getattr(self, "_step_host_allocator", None)
+        return template if allocator is None else allocator.acquire_host_tensor(template)
+
     def on_forward_end(self, seqs: list[Sequence], is_prefill: bool):
         """Optional hook after all layers have stored KV for a forward step."""
         if is_prefill:

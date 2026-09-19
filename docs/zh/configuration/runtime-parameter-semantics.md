@@ -31,14 +31,20 @@ Prefill 保持串行；已有的 shared expert 融合路径继续使用融合。
 | `mla_prefill_history_chunk_size` | int | `16384` | MLA prefill 每次处理的历史 KV token 上限；调小可减少历史工作区显存。 |
 | `decode_reservation_tokens` | int | `1024` | 每次为后续 decode 预留的最大 token 窗口；须为正整数，不是总输出上限。 |
 
-## TP 异步执行
+## 异步执行
 
-`async_scheduling=true` 启用实验性异步调度，让 CPU 在 GPU 完成当前计算前提交后续工作。
-`async_max_inflight` 限制已提交但尚未取回结果的 batch 数，默认 2，最小 2；默认仍为同步执行。
-目前要求 CUDA、vanilla 全量注意力、decode CUDA Graph、DP=1、纯文本输入，以及 GPU 常驻 KV；
-支持 radix prefix cache 或关闭 prefix cache。稀疏或循环状态模型、独立稀疏 prefill、chain cache、
-多模态输入和 prefix offload 会在配置阶段报错。
+| 参数 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `async_scheduling` | bool / None | `None` | 对兼容的 CUDA 配置自动启用异步调度。`False` 使用同步执行；显式设为 `True` 时，不兼容的配置会报错。 |
+| `async_max_inflight` | int | `2` | 异步调度中已提交但尚未取回结果的 batch 数上限，最小为 `2`。 |
 
+异步调度支持 DP=1、没有循环注意力的纯文本模型，以及 radix prefix cache 或关闭 prefix cache，
+不支持 prefix offload。自动模式下，其他配置保留同步调度。稀疏 decode 和独立稀疏 prefill
+沿用原有生命周期 hook；方法、存储和 CUDA Graph 原有的兼容性约束仍然有效。
+Eager 和受支持的 decode Graph 路径都可使用异步调度。
+
+GPU 计算与 KV 更新保持顺序。需要 CPU 已确认 token 历史的方法会在相应依赖边界等待；
+异步调度不会取消必要的等待，也不会改变选择和压缩语义。
 输出仍按顺序发布。遇到 EOS 或取消时，已提交的少量后续计算可能继续执行，但不会发布其输出；
 相关存储在所有使用者完成后释放。容量抢占会先取回在途结果，再执行同步重算恢复。
 此开关不会启用 prefill/decode 混合 batch。

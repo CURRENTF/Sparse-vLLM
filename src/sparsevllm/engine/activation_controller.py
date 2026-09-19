@@ -32,6 +32,8 @@ class ActivationController(ABC):
     ):
         del delimiter_token_ids, non_execution_token_ids
 
+    requires_committed_token_history = False
+
     def prepare_forward(self, seqs: list[Sequence], is_prefill: bool):
         del seqs, is_prefill
 

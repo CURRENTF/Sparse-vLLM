@@ -33,14 +33,23 @@ model's gating, normalization, and reduction order are preserved.
 | `mla_prefill_history_chunk_size` | int | `16384` | Maximum historical KV tokens processed at once during MLA prefill. Smaller values reduce history workspace memory. |
 | `decode_reservation_tokens` | int | `1024` | Maximum token window reserved for subsequent decode steps. Must be positive; this is not the total output limit. |
 
-## Asynchronous TP Execution
+## Asynchronous Execution
 
-`async_scheduling=true` enables experimental scheduling ahead of GPU completion;
-`async_max_inflight` bounds submitted, uncollected batches (default 2, minimum 2).
-The default remains synchronous. This path currently requires CUDA, vanilla full
-attention, decode Graphs, DP=1, text inputs, and device-resident KV with radix or
-no prefix cache. Sparse/recurrent models, independent sparse prefill, chain
-cache, multimodal inputs, and prefix offload are rejected at configuration time.
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `async_scheduling` | bool / None | `None` | Automatically enable asynchronous scheduling for compatible CUDA configurations. `False` selects synchronous execution; explicit `True` rejects incompatible configurations. |
+| `async_max_inflight` | int | `2` | Maximum submitted, uncollected batches during asynchronous scheduling. Minimum: `2`. |
+
+Asynchronous scheduling supports DP=1 text-only models without recurrent
+attention, with radix or no prefix cache and no prefix offload. Other
+configurations retain synchronous scheduling in automatic mode. Sparse decode
+and independent sparse prefill use their existing lifecycle hooks; existing
+method, storage, and CUDA Graph compatibility rules still apply. Both eager and
+supported decode Graph execution can use asynchronous scheduling.
+
+GPU computation and KV updates remain ordered. Methods requiring committed CPU
+token history wait at that dependency boundary; enabling asynchronous scheduling
+does not remove required waits or change selection and compression semantics.
 Output publication remains ordered. EOS/cancellation can leave bounded already
 submitted work; its outputs are discarded and storage retires after its users
 complete. Capacity preemption drains outstanding work before synchronous

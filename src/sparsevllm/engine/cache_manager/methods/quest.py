@@ -1934,6 +1934,7 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
     ):
         inputs = state.inputs
         host = inputs.host
+        host_write_slots = self.acquire_step_host_buffer(state.host_write_slots)
         real_batch_size = len(seqs)
         graph_batch_size = int(inputs.batch_capacity)
         if real_batch_size <= 0 or real_batch_size > graph_batch_size:
@@ -1999,11 +2000,11 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             real_batch_size=real_batch_size,
             padding_active=bool(state.contract.padding.active),
         )
-        state.host_write_slots[:real_batch_size].copy_(
+        host_write_slots[:real_batch_size].copy_(
             torch.from_numpy(allocated_slots)
         )
         if graph_batch_size > real_batch_size:
-            state.host_write_slots[real_batch_size:].fill_(
+            host_write_slots[real_batch_size:].fill_(
                 int(state.contract.padding.write_slot)
             )
 
@@ -2014,8 +2015,8 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         inputs.request_indices.copy_(host.request_indices, non_blocking=non_blocking)
         inputs.active_mask.copy_(host.active_mask, non_blocking=non_blocking)
         inputs.write_slot_mapping.copy_(
-            state.host_write_slots,
-            non_blocking=bool(state.host_write_slots.is_pinned()),
+            host_write_slots,
+            non_blocking=bool(host_write_slots.is_pinned()),
         )
 
         self.layer_batch_state.slot_mapping = inputs.write_slot_mapping

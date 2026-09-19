@@ -304,7 +304,7 @@ class Scheduler:
         reserved_prefill: int,
     ) -> tuple[list[Sequence], bool, list[Sequence]]:
         if getattr(self, "_async_inflight", 0):
-            from sparsevllm.engine.async_execution import AsyncDrainRequired
+            from sparsevllm.engine.async_scheduling.execution import AsyncDrainRequired
             # Every caller removes the victim before entering this helper.
             # Draining must preserve its ownership and cancellation visibility.
             self.decoding.appendleft(victim)

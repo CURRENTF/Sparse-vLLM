@@ -256,6 +256,31 @@ logical selection, while `QuestCacheManager` and the selection provider use the
 current query to construct the native paged view. The runtime should not copy
 persistent page metadata merely to make the method look controller-owned.
 
+## Ordered Submission And Result Retirement
+
+Synchronous and asynchronous execution use the same attention, layer, and
+step hooks. `post_forward` and cache `on_forward_end` execute during submission,
+before resetting the forward context or preparing another batch. They may
+queue GPU work without waiting for completion. CPU-dependent decisions retain
+their required waits. Graph replay refreshes activation policy inputs outside
+the graph; captured layer hooks keep their existing order.
+
+Result retirement handles copied tokens/logprobs and publishes deferred prefix
+records. It must not re-run compute hooks against current-batch mutable state.
+Request storage retires only after every outstanding user completes.
+
+A runtime, activation controller, or cache manager that reads uncommitted token
+history on the CPU declares `requires_committed_token_history`. The scheduler
+retires pending token-producing submissions before scheduling the next batch.
+This requirement does not block pipelining intermediate prefill chunks that
+produce no output token. GPU-only consumers use ordered device token feedback.
+
+Cache-owned reusable CPU upload buffers use `acquire_step_host_buffer` before
+writing. Asynchronous submissions borrow exclusive storage until retirement;
+synchronous execution retains its original buffer. GPU graph addresses remain
+fixed. Auxiliary-stream owners must join their work before dependent reads or
+storage reuse, including the step-end handoff.
+
 ## Prefix Cache And CUDA Graph
 
 Prefix-cache support is a physical-state contract, not a controller feature.

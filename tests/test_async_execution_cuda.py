@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sparsevllm.engine.async_execution import AsyncExecution, DeviceLogprobs
+from sparsevllm.engine.async_scheduling.execution import AsyncExecution, DeviceLogprobs
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.sampling_params import SamplingParams
 
@@ -50,3 +50,27 @@ def test_device_feedback_survives_reorder_graph_output_reuse_and_async_copy():
     assert execution.collect(11)[0] == answers[-1]
     assert execution.submitted == execution.completed == 12
     assert not execution.results
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
+def test_private_host_metadata_is_not_overwritten_by_queued_steps():
+    device = torch.device('cuda:0')
+    runner = SimpleNamespace(device=device, cache_manager=SimpleNamespace(),
+                             decode_graph_runner=SimpleNamespace(),
+                             parallel_context=SimpleNamespace(attn_tp_rank=0, attn_tp_size=1))
+    execution = AsyncExecution(runner)
+    template = torch.empty(1, dtype=torch.long, pin_memory=True)
+    uploaded = torch.empty(1, dtype=torch.long, device=device)
+    seq = Sequence([1], SamplingParams())
+    def run(seqs, prefill):
+        host = execution.acquire_host_tensor(template)
+        host.fill_(seq.num_tokens)
+        uploaded.copy_(host, non_blocking=True)
+        return uploaded * 3, None
+    runner.run = run
+    for ticket in range(8):
+        seq.num_tokens = ticket + 1
+        execution.submit(ticket, [seq], False)
+    for ticket in range(8):
+        assert execution.collect(ticket)[0] == [3 * (ticket + 1)]
+    assert sum(map(len, execution.host_tensor_pool.values())) == 8

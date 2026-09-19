@@ -3446,6 +3446,8 @@ class SnapKVCacheManager(CacheManager):
     ):
         inputs = state.inputs
         host = inputs.host
+        host_facts = self.acquire_step_host_buffer(state.host_layer_fact_storage)
+        host_free_starts, host_active_count = host_facts[:-1], host_facts[-1:]
         real_batch_size = len(seqs)
         graph_batch_size = int(inputs.batch_capacity)
         layer_ids = tuple(self.kv_transformer_layer_indices())
@@ -3500,9 +3502,9 @@ class SnapKVCacheManager(CacheManager):
                 f"layers={layer_ids} pointers={free_ptrs}."
             )
 
-        state.host_active_count[0] = real_batch_size
+        host_active_count[0] = real_batch_size
         for layer_id, free_ptr in zip(layer_ids, free_ptrs):
-            state.host_layer_free_starts[layer_id] = free_ptr - real_batch_size
+            host_free_starts[layer_id] = free_ptr - real_batch_size
             self._num_free_slots[layer_id] -= real_batch_size
             self.row_seq_lens[layer_id][rows] += 1
 
@@ -3518,9 +3520,9 @@ class SnapKVCacheManager(CacheManager):
         inputs.context_lens.copy_(host.context_lens, non_blocking=non_blocking)
         inputs.request_indices.copy_(host.request_indices, non_blocking=non_blocking)
         inputs.active_mask.copy_(host.active_mask, non_blocking=non_blocking)
-        private_non_blocking = bool(state.host_layer_fact_storage.is_pinned())
+        private_non_blocking = bool(host_facts.is_pinned())
         state.layer_fact_storage.copy_(
-            state.host_layer_fact_storage,
+            host_facts,
             non_blocking=private_non_blocking,
         )
 

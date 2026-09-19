@@ -27,7 +27,7 @@ from sparsevllm.distributed import (
 from sparsevllm.distributed.topology import parallel_group_ranks
 from sparsevllm.engine.sparse_methods.base import AuxiliaryPrefillRequest
 from sparsevllm.engine.sequence import Sequence
-from sparsevllm.engine.async_execution import AsyncExecution, DeviceLogprobs
+from sparsevllm.engine.async_scheduling.execution import AsyncExecution, DeviceLogprobs
 from sparsevllm.models.qwen2 import Qwen2ForCausalLM
 from sparsevllm.models.llama import LlamaForCausalLM
 from sparsevllm.layers.sampler import Sampler
@@ -2206,8 +2206,8 @@ class ModelRunner:
 
     @cpu_timing.timed
     def _post_sparse_forward(self, seqs: list[Sequence], is_prefill: bool) -> None:
-        if getattr(self, "_async_submitting", False):
-            return
+        # State transitions belong to this submission, before another step can
+        # overwrite scores or prepare inputs from its KV allocation metadata.
         with profiler.record("model_sparse_post"):
             with profiler.record("sparse_post_forward"):
                 self.sparse_controller.post_forward(seqs, is_prefill)

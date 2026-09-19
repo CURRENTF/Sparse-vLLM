@@ -4,8 +4,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sparsevllm.engine.async_execution import AsyncDrainRequired, AsyncExecution
-from sparsevllm.engine.async_scheduler import AsyncScheduler, execution_snapshot
+from sparsevllm.engine.async_scheduling.execution import AsyncDrainRequired, AsyncExecution
+from sparsevllm.engine.async_scheduling.scheduler import AsyncScheduler, execution_snapshot
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.sampling_params import SamplingParams
 from test_prefill_schedule_policy import FakeMemoryOracle, make_scheduler
@@ -185,3 +185,68 @@ def test_inflight_preemption_preserves_every_request_for_drain_and_abort(reserva
     for seq in seqs:
         assert scheduler.abort(seq.seq_id)
     assert scheduler.is_finished()
+
+
+def test_cpu_token_dependency_retires_before_snapshotting_next_input():
+    e, driver = engine(depth=3)
+    driver.requires_committed_token_history = True
+    seq = request(2, 4, ignore_eos=True)
+    e.scheduler.add(seq)
+    for _ in range(4):
+        driver.step()
+        assert not driver.pending
+    submissions = [args for method, args in e.model_runner.calls if method == 'submit_async']
+    # The next input is the actually committed predecessor, not a placeholder
+    # plus an advanced position. All steps still use the same submit/collect API.
+    for previous, current in zip(submissions, submissions[1:]):
+        prev = previous[1][0]
+        expected = 1000 + (prev.num_prompt_tokens if previous[2] else prev.num_tokens)
+        assert current[1][0].decode_input_token == expected
+
+
+def test_async_submission_runs_state_transitions_before_context_is_reset():
+    from sparsevllm.engine.model_runner import ModelRunner
+    from sparsevllm.utils.context import get_context, reset_context, set_context
+    calls = []
+    runner = SimpleNamespace(
+        _async_submitting=True,
+        sparse_controller=SimpleNamespace(post_forward=lambda seqs, pf: calls.append(
+            ('sparse', get_context().seqs, pf))),
+        runtime_state=SimpleNamespace(on_forward_end=lambda seqs, pf: calls.append(
+            ('cache', get_context().seqs, pf))),
+    )
+    seqs = [request(3, 2)]
+    try:
+        set_context(True, seqs=seqs)
+        ModelRunner._post_sparse_forward(runner, seqs, True)
+        assert calls == [('sparse', seqs, True), ('cache', seqs, True)]
+    finally:
+        reset_context()
+
+
+def test_cpu_history_boundary_allows_nonpublishing_prefill_chunks():
+    e, driver = engine(depth=3, chunk=2)
+    driver.requires_committed_token_history = True
+    seq = request(9, 2, ignore_eos=True)
+    e.scheduler.add(seq)
+    driver.step()
+    submits = [args for method, args in e.model_runner.calls if method == 'submit_async']
+    assert len(submits) == 3
+    assert all(not args[1][0].is_last_chunk_prefill for args in submits)
+
+
+@pytest.mark.parametrize('requested,streams,expected', [
+    (None, True, True), (None, False, False), (False, True, False), (True, True, True),
+])
+def test_async_configuration_resolves_automatic_and_explicit_execution(tmp_path, monkeypatch,
+                                                                       requested, streams, expected):
+    from transformers import Qwen3Config
+    from sparsevllm.config import Config
+    from sparsevllm.platforms import device_runtime
+    Qwen3Config(hidden_size=128, intermediate_size=256, num_hidden_layers=2,
+                num_attention_heads=4, num_key_value_heads=2, head_dim=32,
+                vocab_size=256, max_position_embeddings=1024).save_pretrained(tmp_path)
+    monkeypatch.setattr(device_runtime, 'supports_streams', lambda *args: streams)
+    config = Config(str(tmp_path), async_scheduling=requested, decode_graph=False,
+                    max_model_len=512, max_num_seqs_in_batch=2)
+    assert config.async_scheduling is expected
