@@ -451,7 +451,7 @@ class ModelRunner:
         from sparsevllm.operators.moe_execution import prepare_model_moe_execution
 
         self.moe_aux_stream = prepare_model_moe_execution(
-            self.model, self.device, overlap=config.moe_shared_expert_overlap,
+            self.model, self.device,
         )
         self.multimodal_runtime = MultiModalRuntime(self.model, self.device)
         self._prefill_inputs_embeds = None

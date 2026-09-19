@@ -13,9 +13,6 @@ def normalize_platform(config) -> None:
     config.data_parallel_size = int(config.data_parallel_size)
     config.weight_loading_workers = int(config.weight_loading_workers)
     config.async_scheduling = _coerce_bool_config("async_scheduling", config.async_scheduling)
-    config.moe_shared_expert_overlap = _coerce_bool_config(
-        "moe_shared_expert_overlap", config.moe_shared_expert_overlap
-    )
     config.async_max_inflight = int(config.async_max_inflight)
     if not 1 <= config.tensor_parallel_size <= 8:
         raise ValueError(f"tensor_parallel_size must be in [1, 8], got {config.tensor_parallel_size}.")

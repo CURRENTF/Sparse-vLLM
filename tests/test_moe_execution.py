@@ -62,7 +62,7 @@ def test_parallel_eager_and_shared_pool_graphs_against_reference(dtype):
             shared=lambda x: torch.sigmoid(x @ c) @ d,
             communication=AllReduceMoeCommunication(lambda x: x), chunk_size=32)
         model.add_module(str(i), layer)
-    stream = prepare_model_moe_execution(model, device, overlap=True)
+    stream = prepare_model_moe_execution(model, device)
     assert stream is not None
     plans = [m.moe_execution for m in model.children()]
     assert plans[0].stream is plans[1].stream
@@ -100,11 +100,11 @@ def test_parallel_eager_and_shared_pool_graphs_against_reference(dtype):
                 torch.testing.assert_close(output.float(), expected, atol=tolerance, rtol=tolerance)
 
 
-def test_workspace_incompatible_branch_stays_serial_and_plan_cannot_rebind():
+def test_serial_reference_and_plan_cannot_rebind():
     plan = MoeExecutionPlan(routed=lambda x: x, shared=lambda x: x,
                             communication=AllReduceMoeCommunication(lambda x: x),
-                            chunk_size=2, overlap_compatible=False)
-    plan.prepare(object())
+                            chunk_size=2)
+    plan.prepare(None)
     assert plan.stream is None
     torch.testing.assert_close(plan(torch.ones(2, 3), is_prefill=False), torch.full((2, 3), 2.))
     with pytest.raises(RuntimeError, match="once"):

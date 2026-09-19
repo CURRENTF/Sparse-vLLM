@@ -12,20 +12,15 @@ Common runtime parameters below can be passed to `LLM(model, **kwargs)` or `Conf
 | `tensor_parallel_size` | int | `1` | Attention tensor parallel size. |
 | `decode_graph` | bool | `True` | Enable decode CUDA Graphs. Set to `False` for eager execution or methods without graph support. |
 
-## Shared Expert Overlap
+Shared and routed MoE branches run concurrently by default during DP=1 decode
+in GLM-4.7-Flash, Qwen3.5/3.6 MoE, and Gemma 4 MoE (its dense MLP branch),
+including supported FP8 configurations. Prefill remains serial; existing fused
+shared-expert paths remain fused. Qwen3 MoE and MiniMax M2 have no shared branch
+and are unaffected.
 
-`moe_shared_expert_overlap=true` (default) enables concurrent shared and routed
-branches during decode. Set it to `false` for serial execution.
-
-`moe_shared_expert_overlap` applies to DP=1 decode in GLM-4.7-Flash,
-Qwen3.5/3.6 MoE, and Gemma 4 MoE (its dense MLP branch), including supported
-FP8 configurations. Prefill remains serial; existing fused shared-expert paths
-remain fused.
-Qwen3 MoE and MiniMax M2 have no shared branch and are unaffected.
-
-This option is independent of `async_scheduling`. Supported decode CUDA Graphs
-capture the branch dependencies. Request scheduling and each model's gating,
-normalization, and reduction order are preserved.
+This optimization is automatic and independent of `async_scheduling`. Supported
+decode CUDA Graphs capture the branch dependencies. Request scheduling and each
+model's gating, normalization, and reduction order are preserved.
 
 ## Scheduling and Token Budgets
 

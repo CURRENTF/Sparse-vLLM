@@ -12,17 +12,12 @@
 | `tensor_parallel_size` | int | `1` | Attention 张量并行度。 |
 | `decode_graph` | bool | `True` | 启用 decode CUDA Graph；需要 eager 执行或方法不支持时设为 `False`。 |
 
-## Shared Expert 并行
-
-`moe_shared_expert_overlap=true`（默认）在 decode 中并行执行 shared 和 routed
-分支；设置为 `false` 使用串行执行。
-
-`moe_shared_expert_overlap` 适用于 GLM-4.7-Flash、Qwen3.5/3.6 MoE 和
-Gemma 4 MoE（稠密 MLP 分支）的 DP=1 decode 路径，包括已支持的 FP8 配置。
+GLM-4.7-Flash、Qwen3.5/3.6 MoE 和 Gemma 4 MoE（稠密 MLP 分支）的
+DP=1 decode 默认并行执行 shared 和 routed 分支，包括已支持的 FP8 配置。
 Prefill 保持串行；已有的 shared expert 融合路径继续使用融合。Qwen3 MoE 与 MiniMax M2
-没有共享分支，不受此选项影响。
+没有共享分支，不受该优化影响。
 
-该选项独立于 `async_scheduling`。支持的 decode CUDA Graph 会捕获分支依赖，
+该优化自动启用，独立于 `async_scheduling`。支持的 decode CUDA Graph 会捕获分支依赖，
 不改变请求调度，以及各模型的门控、归一化和规约顺序。
 
 ## 调度与 Token 预算

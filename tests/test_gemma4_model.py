@@ -645,7 +645,7 @@ def test_gemma4_moe_parallel_eager_and_graph_match_independent_dense_reference(t
                     projection.weight_scale_inv.fill_(1)
                     projection.quant_provider.prepare_weights(projection.weight, projection.weight_scale_inv)
         assert not layer.mlp.down_proj.reduce_results
-        prepare_model_moe_execution(layer, torch.device("cuda"), overlap=True)
+        prepare_model_moe_execution(layer, torch.device("cuda"))
         assert layer.moe_execution.stream is not None
         def norm(x, module):
             x = x.float()

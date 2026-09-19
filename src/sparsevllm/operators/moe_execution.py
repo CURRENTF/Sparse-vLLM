@@ -21,7 +21,6 @@ class MoeExecutionPlan:
         fuse_prefill: bool = False, fuse_decode: bool = False,
         fusion_token_limit: int | None = None,
         reduce_decode_branches_separately: bool = False,
-        overlap_compatible: bool = True,
         shared_modules: tuple[torch.nn.Module, ...] = (),
         finish: Callable | None = None,
     ):
@@ -39,7 +38,6 @@ class MoeExecutionPlan:
         self.fuse_decode = fuse_decode
         self.fusion_token_limit = fusion_token_limit
         self.reduce_decode_branches_separately = reduce_decode_branches_separately
-        self.overlap_compatible = overlap_compatible
         self.shared_modules = shared_modules
         self._prepared = False
         self.stream = None
@@ -51,8 +49,7 @@ class MoeExecutionPlan:
         if self._prepared:
             raise RuntimeError("MoE execution must be prepared once before graph capture")
         self._prepared = True
-        self.stream = stream if self.overlap_compatible else None
-        stream = self.stream
+        self.stream = stream
         # One lane for all sequential shared branches, not one allocation per layer.
         if stream is not None:
             for module in self.shared_modules:
@@ -101,7 +98,7 @@ class MoeExecutionPlan:
         )
 
 
-def prepare_model_moe_execution(model, device, *, overlap: bool):
+def prepare_model_moe_execution(model, device):
     """Share one auxiliary stream across a worker's sequential MoE layers.
 
     Layer-owned events are captured with each graph. Every branch rejoins the
@@ -111,7 +108,7 @@ def prepare_model_moe_execution(model, device, *, overlap: bool):
     plans = [m.moe_execution for m in model.modules()
              if isinstance(getattr(m, "moe_execution", None), MoeExecutionPlan)]
     stream = (device_runtime.new_stream(device)
-              if plans and overlap and device_runtime.supports_streams(device) else None)
+              if plans and device_runtime.supports_streams(device) else None)
     for plan in plans:
         plan.prepare(stream)
     return stream

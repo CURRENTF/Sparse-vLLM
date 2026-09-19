@@ -11,7 +11,7 @@ from sparsevllm.operators.fp8_linear import (
     _sm120_activation_buffers,
 )
 from sparsevllm.operators.moe_execution import prepare_model_moe_execution
-from sparsevllm.operators.workspace import bind_module_workspace_lane
+from sparsevllm.operators.workspace import bind_module_workspace_lane, close_workspace_manager
 
 
 def test_activation_scratch_reuses_within_lane_but_not_across_branches():
@@ -108,7 +108,7 @@ def test_quantized_model_branches_overlap_eager_and_graph(tmp_path, model_kind, 
                 experts.provider.prepare_shared_expert(
                     experts.op_spec, experts.w13_weight[idx], experts.w2_weight[idx],
                     experts.w13_scale_inv[idx], experts.w2_scale_inv[idx])
-        prepare_model_moe_execution(block, torch.device("cuda"), overlap=True)
+        prepare_model_moe_execution(block, torch.device("cuda"))
         assert block.moe_execution.stream is not None
         record_property("device", torch.cuda.get_device_name())
         record_property("routed_provider", block.experts.provider.name)
@@ -191,6 +191,7 @@ def test_quantized_model_branches_overlap_eager_and_graph(tmp_path, model_kind, 
                     assert F.cosine_similarity(output.float().flatten(), expected.flatten(), dim=0) > .998
                 graph.reset()
     finally:
+        close_workspace_manager()
         reset_parallel_context()
         torch.distributed.destroy_process_group()
 
@@ -221,7 +222,7 @@ def test_branch_scratch_isolation_across_streams_and_graph_replays():
     model.moe_execution = MoeExecutionPlan(
         routed=model.routed, shared=model.shared, shared_modules=(model.shared,),
         communication=AllReduceMoeCommunication(lambda x: x), chunk_size=None)
-    prepare_model_moe_execution(model, torch.device("cuda"), overlap=True)
+    prepare_model_moe_execution(model, torch.device("cuda"))
     with torch.inference_mode():
         for batch in (1, 7):
             x = torch.randn(batch, 256, device="cuda", dtype=torch.bfloat16)
