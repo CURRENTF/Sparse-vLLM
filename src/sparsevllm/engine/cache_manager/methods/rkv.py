@@ -5,6 +5,7 @@ import torch
 from sparsevllm.config import Config
 from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.sequence import Sequence
+from sparsevllm.operators.rkv_similarity import prepare_rkv_similarity_provider
 from .rkv_scoring import rkv_head_scores, rkv_score_tiles
 
 from .snapkv import SnapKVCacheManager
@@ -29,6 +30,10 @@ class RKVCacheManager(SnapKVCacheManager):
         self._rkv_observation_tokens = int(config.rkv_observation_tokens)
         self._rkv_query_cache = []
         self._rkv_query_positions = []
+        self._rkv_similarity_provider = (
+            prepare_rkv_similarity_provider(self._rkv_query_cache_dtype(), device=self.device)
+            if self._rkv_query_cache_enabled else None
+        )
         if self._rkv_query_cache_enabled:
             kv_layer_set = set(self.kv_transformer_layer_indices())
             self._rkv_query_cache = [
@@ -308,4 +313,5 @@ class RKVCacheManager(SnapKVCacheManager):
             keys, queries, window=self._rkv_observation_tokens,
             kernel_size=int(self.config.rkv_kernel_size), alpha=float(self.config.rkv_alpha),
             workspace_bytes=int(self.config.rkv_score_chunk_mb) * 1024**2,
+            similarity_provider=getattr(self, "_rkv_similarity_provider", None),
         ).mean(dim=1)

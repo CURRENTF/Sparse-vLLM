@@ -10,6 +10,8 @@ import math
 import torch
 import torch.nn.functional as F
 
+from sparsevllm.operators.rkv_similarity import prepare_rkv_similarity_provider
+
 
 def rkv_score_tiles(*, batch: int, heads: int, length: int, dim: int,
                     groups: int, window: int, element_size: int,
@@ -49,6 +51,7 @@ def rkv_head_scores(
     kernel_size: int,
     alpha: float,
     workspace_bytes: int,
+    similarity_provider=None,
 ) -> torch.Tensor:
     """Return [batch, kv_heads, length-window] joint scores from BHLD keys/Q.
 
@@ -75,7 +78,9 @@ def rkv_head_scores(
     flat_keys = keys.reshape(batch * heads, length, dim)
     flat_queries = queries.reshape(batch * heads, groups, window, dim)
     result = torch.empty((batch * heads, length - window), dtype=keys.dtype, device=keys.device)
-    columns = torch.arange(length, device=keys.device)
+    if similarity_provider is None:
+        # Direct scorer callers (tests/probes); serving binds at cache startup.
+        similarity_provider = prepare_rkv_similarity_provider(keys.dtype, device=keys.device)
     for start in range(0, batch * heads, units):
         end = min(start + units, batch * heads)
         k = flat_keys[start:end]
@@ -94,17 +99,9 @@ def rkv_head_scores(
         for row_start in range(0, length, row_tile):
             row_end = min(row_start + row_tile, length)
             sim = torch.matmul(normalized[:, row_start:row_end], normalized.transpose(-1, -2))
-            rows = torch.arange(row_start, row_end, device=k.device)
-            sim[:, torch.arange(row_end - row_start, device=k.device), rows] = 0
-            representatives = torch.where(sim > 0.5, columns, 0).amax(dim=-1)
-            sim.scatter_(-1, representatives.unsqueeze(-1), 0)
-            if row_tile == length:
-                redundancy_mean = sim.mean(dim=-2)
-            else:
-                partial = sim.float().sum(dim=-2)
-                column_sum = partial if column_sum is None else column_sum + partial
-        if row_tile != length:
-            redundancy_mean = (column_sum / length).to(k.dtype)
+            partial = similarity_provider.column_sums(sim, row_start)
+            column_sum = partial if column_sum is None else column_sum + partial
+        redundancy_mean = (column_sum / length).to(k.dtype)
         redundancy = redundancy_mean.softmax(dim=-1)[..., :-window]
         result[start:end] = alpha * importance - (1.0 - alpha) * redundancy
     return result.view(batch, heads, length - window)

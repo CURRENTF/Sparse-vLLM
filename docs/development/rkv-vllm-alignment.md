@@ -54,7 +54,22 @@ storage. Existing `prefill_score_fwd` reduces heads after softmax and lacks the
 required pooling, so it cannot implement this score unchanged. Inspected the
 pinned vLLM and SGLang RKV Torch scorers: neither requires a dedicated external
 kernel; importing an entire engine or sgl-kernel adds no matching primitive.
-No attention provider dispatch or custom GPU kernel is changed.
+
+The similarity postprocessing provider is bound at cache-manager construction.
+On Triton GPUs it finds each row's last above-threshold column without a dense
+int64 index matrix, then masks that representative and the global diagonal
+while reducing columns in FP32. No-match rows still remove column zero;
+below-threshold similarities remain in the sum. The input similarity tile is
+not modified. Partial column sums are merged deterministically without atomic
+adds or a dense FP32 cast. CPU fixtures retain an explicit Torch provider;
+GPU compilation/execution failures do not silently switch to Torch.
+
+Matmul, score combination, request/layer ordering, and the conservative workspace
+planner are unchanged. Kernel row counts, resident lengths, and offsets are
+runtime arguments rather than per-length JIT specializations. Scoring remains
+outside decode CUDA Graph capture. This changes neither attention providers nor
+the retention/trigger policy; numerical equivalence is tolerance-based because
+the FP32 reduction tree can differ.
 
 ## Validation
 
