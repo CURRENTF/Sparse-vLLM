@@ -50,14 +50,19 @@ class SparseController:
         self,
         *,
         delimiter_token_ids: list[int] | set[int] | tuple[int, ...] | None = None,
+        auxiliary_prefill_token_ids: list[int] | None = None,
         non_execution_token_ids: (
             list[int] | set[int] | tuple[int, ...] | None
         ) = None,
     ) -> None:
+        self.runtime.set_auxiliary_prefill_prompt(auxiliary_prefill_token_ids or [])
         self.activation_controller.set_tokenizer_metadata(
             delimiter_token_ids=delimiter_token_ids,
             non_execution_token_ids=non_execution_token_ids,
         )
+
+    def bind_auxiliary_prefill(self, executor) -> None:
+        self.runtime.bind_auxiliary_prefill(executor)
 
     def clear_decode_attn_score_buffers(self) -> None:
         self.runtime.clear_decode_attn_score_buffers()

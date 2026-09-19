@@ -10,6 +10,7 @@ from sparsevllm.method_registry import (
 from .base import SparseMethodRuntime
 from .dynamic import DeltaKVRuntime, OmniKVRuntime
 from .h2o import H2ORuntime
+from .kvzip import KVzipRuntime
 from .joint import SkipKVRuntime
 from .rkv import RKVRuntime
 from .passthrough import PassThroughRuntime
@@ -24,6 +25,7 @@ RUNTIME_BINDINGS: dict[str, type[SparseMethodRuntime]] = {
     "": PassThroughRuntime,
     "streamingllm": StreamingLLMRuntime,
     "snapkv": SnapKVRuntime,
+    "kvzip": KVzipRuntime,
     "h2o": H2ORuntime,
     "pyramidkv": PyramidKVRuntime,
     "omnikv": OmniKVRuntime,

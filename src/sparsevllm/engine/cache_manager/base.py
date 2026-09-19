@@ -474,6 +474,10 @@ class CacheManager(ABC):
             from .methods.snapkv import SnapKVCacheManager
 
             return create_manager(SnapKVCacheManager)
+        if sparse_method == "kvzip":
+            from .methods.kvzip import KVzipCacheManager
+
+            return create_manager(KVzipCacheManager)
         if sparse_method == "h2o":
             from .methods.h2o import H2OCacheManager
 

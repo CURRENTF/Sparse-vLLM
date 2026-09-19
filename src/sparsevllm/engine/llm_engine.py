@@ -25,7 +25,10 @@ from sparsevllm.kernels.external.required import (
     validate_required_cuda_kernel_metadata,
 )
 from sparsevllm.kernels.external.flashinfer.jit_cache import resolve_trtllm_cache_root
-from sparsevllm.method_registry import decode_graph_path_id
+from sparsevllm.method_registry import (
+    SPARSE_AUXILIARY_PREFILL_PROMPTS,
+    decode_graph_path_id,
+)
 from sparsevllm.platforms.interface import PlatformEnum
 from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.engine.sequence import Sequence
@@ -289,10 +292,14 @@ class LLMEngine:
             config.model, config.hf_config, self.tokenizer.eos_token_id
         )
         config.eos = config.eos_token_ids[0] if config.eos_token_ids else -1
+        auxiliary_prompt = SPARSE_AUXILIARY_PREFILL_PROMPTS.get(config.sparse_method)
         self.model_runner.call(
             "set_tokenizer_metadata",
             self._build_delimiter_token_ids(self.tokenizer),
             self._build_non_execution_token_ids(self.tokenizer),
+            self.tokenizer.encode(
+                auxiliary_prompt, add_special_tokens=False,
+            ) if auxiliary_prompt else [],
         )
         
         # 4. 初始化调度器

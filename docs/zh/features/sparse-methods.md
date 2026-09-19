@@ -12,6 +12,7 @@ Sparse-vLLM 围绕 cache-manager-first sparse runtime 构建。engine 支持 phy
 | `streamingllm` | Physical eviction | StreamingLLM 风格的固定 sink 加 recent-window cache。保留 prefix/tail 策略之外的 token 会从 active KV cache 中被物理淘汰。 | `sink_keep_tokens`, `recent_keep_tokens` |
 | `attention-sink` | Physical eviction | attention-sink alias policy，使用相同的 sink-token 和 recent-window 保留模型。适合将 sink-window 行为与其他 physical eviction 方法对比。 | `sink_keep_tokens`, `recent_keep_tokens` |
 | `snapkv` | Physical eviction | SnapKV 风格的 token selection 使用 prompt 末尾的 observation window，在生成前选出并保留紧凑的重要 prompt KV。当前与论文对齐的 decode 路径不再评分，也不会再次执行 SnapKV selection，只追加生成 token。 | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
+| `kvzip` | Physical eviction | 仓库现有的 token 共享 KVzip 重建打分，在 prefill 完成后统一压缩 prompt KV。 | `kvzip_token_budget`, `kvzip_score_chunk_size`, `kvzip_prev_postfix_size` |
 | `h2o` | Physical eviction | 中间 prefill chunk 可压缩到 `h2o_prefill_budget`，最终 prompt 压缩到 `h2o_decode_budget`。默认 decode 不评分或驱逐，物理 row 随生成 token 增长；开启 `h2o_decode_eviction` 后逐步累计概率分数并周期驱逐。 | `h2o_decode_eviction`, `h2o_decode_budget`, `h2o_decode_eviction_interval`, `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window`, `sparse_prefill_score_mode` |
 | `pyramidkv` | Physical eviction | PyramidKV 风格、依赖 layer 的 KV 保留方式。它在 layer 之间分配 sparse budget，并物理存储选中的 context token。 | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
 | `omnikv` | Logical masking，可选 offload | 跨层共享 token 选择；可将稀疏层完整历史保存在 pinned CPU 内存，decode 精确取回当前选择的 KV。 | `full_attention_layers`, `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `enable_omnikv_offload` |
@@ -19,6 +20,30 @@ Sparse-vLLM 围绕 cache-manager-first sparse runtime 构建。engine 支持 phy
 | `deltakv` | Hybrid compression | 依赖 compressor 的精简 DeltaKV runtime。旧配置中的 `deltakv-less-memory*` 名称会规范到此方法，但实际 benchmark run 仍需要匹配的 compressor checkpoint。 | `deltakv_checkpoint_path`, `deltakv_latent_dim`, `deltakv_center_ratio`, `deltakv_neighbor_count`, `deltakv_latent_quant_bits`, `full_layer_kv_quant_bits` |
 
 Sparse-vLLM 在 public command、`LLM(...)`、runtime config 与内部消费者中统一使用 `sparse_method`。
+
+
+
+## KVzip
+
+使用 `LLM(model, sparse_method="kvzip", kvzip_token_budget=4096)`，
+在上下文重建后最多保留 4096 个 prompt token。较短的 prompt 保留完整 KV。
+首个输出 token 来自原始 dense prefill；后续 decode 读取保留的 prompt KV
+和全部生成 token 的 KV。
+
+这是仓库 `kvzip_global` 的 token 共享变体，与原论文逐 head 非均匀淘汰不同。
+各层、各 head 和 attention TP rank 共享选中的 token 位置，无需额外 checkpoint。
+`kvzip_token_budget` 是完整的 prompt 保留预算；`sink_keep_tokens`、
+`recent_keep_tokens`、`decode_keep_tokens` 不额外增加保护区域。
+
+支持显式 KV 存储的 Qwen2、Qwen3 和 Llama，可使用分块 prefill、批量请求、
+tensor parallel、eager decode 与 decode CUDA Graph。当前拒绝 radix/chain
+prefix cache、offload、稀疏 prefill 组合，以及 recurrent、MLA、共享 KV 和 MoE 模型。
+
+`kvzip_score_chunk_size` 控制每次重建的原文 token 数（默认 2048），
+`kvzip_prev_postfix_size` 控制附带的前文 token 数（默认 64）。重建指令、
+前文与当前 chunk 的总长度必须不超过 `engine_prefill_chunk_size`；完整 prompt
+加重建输入必须不超过 `max_model_len`，需预留额外容量。重建会增加 prefill 开销，
+物理压缩生效不等于已证明性能提升。
 
 
 ## OmniKV KV offload

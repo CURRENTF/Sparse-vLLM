@@ -57,6 +57,10 @@ class SparseMethodConfig:
     snapkv_num_full_layers: int = 0
     sparse_prefill_score_mode: str | None = None
 
+    kvzip_token_budget: int = 4096
+    kvzip_score_chunk_size: int = 2048
+    kvzip_prev_postfix_size: int = 64
+
     h2o_decode_budget: int = 4096
     h2o_decode_eviction: bool = False
     h2o_decode_score_fusion: bool = True

@@ -51,6 +51,16 @@ Token 数预算须为非负整数，不接受比例。QuEST 的总选择预算�
 
 `flashprefill_v2` 仅支持显式 KV 模型；`omnikv_prefill` 不支持 radix 前缀复用。组合限制见[稀疏方法](../features/sparse-methods.md)，FlashPrefill 调参见 [FlashPrefill V2](../features/flashprefill-v2.md)。
 
+## KVzip
+
+| 参数 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `kvzip_token_budget` | int | `4096` | 重建后保留的 prompt token 总数，必须为正。生成 token 继续追加，不再次淘汰。 |
+| `kvzip_score_chunk_size` | int | `2048` | 每次前向重建的原文 token 数，必须为正。 |
+| `kvzip_prev_postfix_size` | int | `64` | 重建输入中附带的前文 token 上限，必须非负。 |
+
+重建临时容量和与原论文逐 head KVzip 的差异见 [KVzip 说明](../features/sparse-methods.md#kvzip)。
+
 ## H2O
 
 | 参数 | 类型 | 默认值 | 说明 |

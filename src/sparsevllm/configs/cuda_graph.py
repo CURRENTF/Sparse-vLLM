@@ -245,7 +245,7 @@ def normalize_decode_cuda_graph(config) -> None:
                 "decode_graph with tensor_parallel_size > 1 supports these methods only: "
                 f"'', {supported}. DeltaKV is not supported."
             )
-        if config.sparse_method and config.sparse_method != "rkv":
+        if config.sparse_method and config.sparse_method not in {"rkv", "kvzip"}:
             log_once(
                 "decode_graph with tensor_parallel_size > 1 uses TP-local sparse selection: "
                 "each rank selects sparse tokens from its local heads/KV heads without cross-rank "

@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import os
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
@@ -46,6 +46,15 @@ class LayerBatchSparseState:
     active_compressed_indices: torch.Tensor | None = None
     global_req_indices: torch.Tensor | None = None
     deltakv_free_temp_slots: bool = False
+
+
+@dataclass(frozen=True)
+class AuxiliaryPrefillRequest:
+    """Unsampled teacher-forced tokens appended to an existing cache row."""
+
+    seq: Sequence
+    token_ids: tuple[int, ...]
+    prefix_len: int
 
 
 @dataclass(frozen=True)
@@ -144,6 +153,15 @@ class SparseMethodRuntime(ABC):
             "full_attention_layers": self.config.full_attention_layers,
             "dynamic_deltakv_topk_tiebreak": self.dynamic_deltakv_topk_tiebreak,
         }
+
+    def bind_auxiliary_prefill(
+        self, executor: Callable[[AuxiliaryPrefillRequest], None],
+    ) -> None:
+        self.auxiliary_prefill = executor
+
+    def set_auxiliary_prefill_prompt(self, token_ids: list[int]) -> None:
+        if token_ids:
+            raise ValueError("This sparse runtime does not accept an auxiliary prefill prompt.")
 
     def _is_kv_layer(self, layer_idx: int) -> bool:
         runtime_layout = getattr(self.config, "runtime_layout", None)

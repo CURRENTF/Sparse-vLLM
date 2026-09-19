@@ -49,6 +49,17 @@ Token-count budgets must be nonnegative integers, not ratios. QuEST derives its 
 
 `flashprefill_v2` requires explicit KV models; `omnikv_prefill` does not support radix prefix reuse. See [Sparse Methods](../features/sparse-methods.md) for compatible combinations and [FlashPrefill V2](../features/flashprefill-v2.md) for tuning.
 
+## KVzip
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `kvzip_token_budget` | int | `4096` | Total prompt tokens retained after reconstruction; positive. Generated tokens append without further eviction. |
+| `kvzip_score_chunk_size` | int | `2048` | Original-context tokens reconstructed per forward; positive. |
+| `kvzip_prev_postfix_size` | int | `64` | Maximum preceding context tokens included in each replay; nonnegative. |
+
+See [KVzip constraints](../features/sparse-methods.md#kvzip) for reconstruction
+headroom and the distinction from original per-head KVzip.
+
 ## H2O
 
 | Parameter | Type | Default | Description |

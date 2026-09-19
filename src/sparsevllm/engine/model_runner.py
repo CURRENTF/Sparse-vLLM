@@ -24,6 +24,7 @@ from sparsevllm.distributed import (
     init_parallel_context,
     reset_parallel_context,
 )
+from sparsevllm.engine.sparse_methods.base import AuxiliaryPrefillRequest
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.models.qwen2 import Qwen2ForCausalLM
 from sparsevllm.models.llama import LlamaForCausalLM
@@ -552,6 +553,7 @@ class ModelRunner:
         )
 
         self.sparse_controller = SparseController(runtime_config, self.cache_manager)
+        self.sparse_controller.bind_auxiliary_prefill(self._run_auxiliary_prefill)
         self._restore_tokenizer_metadata()
         if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
             self.model.model.sparse_controller = self.sparse_controller
@@ -1188,7 +1190,9 @@ class ModelRunner:
         self,
         delimiter_token_ids: list[int],
         non_execution_token_ids: list[int] | None = None,
+        auxiliary_prefill_token_ids: list[int] | None = None,
     ):
+        self._auxiliary_prefill_token_ids = list(auxiliary_prefill_token_ids or [])
         self._tokenizer_metadata = (
             tuple(int(x) for x in delimiter_token_ids),
             (
@@ -1207,6 +1211,7 @@ class ModelRunner:
         if setter is not None:
             delimiter_token_ids, non_execution_token_ids = metadata
             setter(
+                auxiliary_prefill_token_ids=getattr(self, "_auxiliary_prefill_token_ids", []),
                 delimiter_token_ids=list(delimiter_token_ids),
                 non_execution_token_ids=(
                     None
@@ -1214,6 +1219,24 @@ class ModelRunner:
                     else list(non_execution_token_ids)
                 ),
             )
+
+    def _run_auxiliary_prefill(self, request: AuxiliaryPrefillRequest) -> None:
+        # Keep business sampling, token history and completion state untouched.
+        seq = copy.copy(request.seq)
+        seq.token_ids = list(request.token_ids)
+        seq.num_tokens = seq.num_prompt_tokens = request.prefix_len + len(seq.token_ids)
+        seq.num_prefilled_tokens = int(request.prefix_len)
+        seq.current_chunk_size = len(request.token_ids)
+        context = get_context()
+        saved_context = vars(context).copy()
+        try:
+            input_ids, positions = self.prepare_step([seq], True)
+            context.sparse_controller = self.sparse_controller
+            self.sparse_controller.prepare_forward([seq], True)
+            self.model(input_ids, positions)
+        finally:
+            vars(context).clear()
+            vars(context).update(saved_context)
 
     def prefix_cache_inspect(
         self,

@@ -101,14 +101,18 @@ def profiling_kv_slots(config) -> int:
         batch_slots(prefill_lengths, 2),
         batch_slots((1,) * int(config.max_decoding_seqs), 2),
     )
-    if not bool(config.decode_graph_startup_capture):
-        return required
+    if bool(config.decode_graph_startup_capture):
+        for batch_size, _ in build_decode_cuda_graph_startup_plan(config):
+            required = max(
+                required,
+                startup_graph_family_kv_slots(config, batch_size),
+            )
+    if method == "kvzip":
+        from sparsevllm.engine.cache_manager.methods.kvzip import kvzip_reconstruction_slot_reserve
 
-    for batch_size, _ in build_decode_cuda_graph_startup_plan(config):
-        required = max(
-            required,
-            startup_graph_family_kv_slots(config, batch_size),
-        )
+        # The allocator excludes replay scratch from every admission budget,
+        # including the temporary runtime used for startup profiling.
+        required += kvzip_reconstruction_slot_reserve(config)
     return required
 
 
@@ -236,8 +240,8 @@ def profiling_kv_budget_bytes(config, num_slots: int) -> int:
         )
         return plan.budget(num_slots)
     if method != "quest":
-        if method in {"snapkv", "h2o"}:
-            # SnapKV and H2O share an allocator with one KV payload,
+        if method in {"snapkv", "h2o", "kvzip"}:
+            # These methods share an allocator with one KV payload,
             # one free-slot vector per layer, and layer-local row-slot maps.
             # Doubling the payload can exhaust VRAM before workspace profiling.
             int32_bytes = torch.empty((), dtype=torch.int32).element_size()

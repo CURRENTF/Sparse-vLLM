@@ -18,6 +18,7 @@ from sparsevllm.method_registry import (
     resolve_sparse_prefill_score_mode,
 )
 from sparsevllm.utils.log import log_once, logger
+from sparsevllm.models.layout import resolve_attention_qk_head_dim
 
 
 def normalize_sparse_method_name(config) -> None:
@@ -378,7 +379,26 @@ def _validate_prefill_sparse_method_model_compatibility(config) -> None:
         )
 
 
+def _normalize_kvzip(config) -> None:
+    if config.sparse_method != "kvzip":
+        return
+    for name in ("kvzip_token_budget", "kvzip_score_chunk_size", "kvzip_prev_postfix_size"):
+        value = getattr(config, name)
+        minimum = 0 if name == "kvzip_prev_postfix_size" else 1
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(f"{name} must be an integer >= {minimum}.")
+    if config.attention_cache_layout != "explicit_kv":
+        raise NotImplementedError("KVzip requires explicit KV storage.")
+    if resolve_attention_qk_head_dim(config.hf_config) not in {16, 32, 64, 128, 256}:
+        raise NotImplementedError("KVzip scoring requires head dimension 16, 32, 64, 128 or 256.")
+    if config.sparse_attn_score_dtype != "float32":
+        raise ValueError("KVzip requires sparse_attn_score_dtype='float32'.")
+    if config.kvzip_score_chunk_size > config.engine_prefill_chunk_size:
+        raise ValueError("kvzip_score_chunk_size must be <= engine_prefill_chunk_size.")
+
+
 def normalize_sparse_methods(config) -> None:
+    _normalize_kvzip(config)
     _validate_prefill_sparse_method_model_compatibility(config)
     if (
         getattr(config.hf_config, "model_type", "") == "gemma4_text"

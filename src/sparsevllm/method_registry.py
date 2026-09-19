@@ -34,12 +34,20 @@ METHOD_ALIASES = {
     "deltakv_less_memory_cudagraph": "deltakv",
 }
 
+SPARSE_AUXILIARY_PREFILL_PROMPTS = {
+    "kvzip": "\nReconstruct the following context span exactly:\n",
+}
+SPARSE_METHOD_MODEL_TYPES = {
+    "kvzip": frozenset({"qwen2", "qwen3", "llama"}),
+}
+
 QUANTIZED_KV_METHODS = frozenset({"kivi", "turboquant", "fp8_kv"})
 
 CANONICAL_SPARSE_METHODS = {
     "",
     "streamingllm",
     "snapkv",
+    "kvzip",
     "h2o",
     "pyramidkv",
     "omnikv",
@@ -219,6 +227,7 @@ _PREFILL_LAYER_VARYING_PAGE_TABLE = {
     "": False,
     "streamingllm": True,
     "snapkv": True,
+    "kvzip": True,
     "h2o": True,
     "pyramidkv": True,
     "omnikv": False,
@@ -449,6 +458,7 @@ MODEL_RUNTIME_COMPATIBILITY = {
 
 DECODE_CUDA_GRAPH_SUPPORTED_METHODS = set(CANONICAL_SPARSE_METHODS)
 TP_DECODE_CUDA_GRAPH_SUPPORTED_METHODS = {
+    "kvzip",
     *QUANTIZED_KV_METHODS,
     "",
     "streamingllm",
@@ -472,6 +482,7 @@ _DEFAULT_PREFILL_POLICY_BY_METHOD = {
     "": PREFILL_POLICY_ALL_CHUNKED,
     "streamingllm": PREFILL_POLICY_ALL_CHUNKED,
     "snapkv": PREFILL_POLICY_ALL_CHUNKED,
+    "kvzip": PREFILL_POLICY_ALL_CHUNKED,
     "h2o": PREFILL_POLICY_ALL_CHUNKED,
     "pyramidkv": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
     "omnikv": PREFILL_POLICY_ALL_CHUNKED,
@@ -542,6 +553,12 @@ def validate_model_runtime_compatibility(
     decode_method = normalize_sparse_method(
         sparse_method if decode_sparse_method is None else decode_sparse_method
     )
+    model_types = SPARSE_METHOD_MODEL_TYPES.get(method)
+    if model_types is not None and model_type not in model_types:
+        raise NotImplementedError(
+            f"{method} requires one of {sorted(model_types)}; "
+            f"the auxiliary reconstruction lifecycle for {model_type!r} is not implemented."
+        )
     compatibility = MODEL_RUNTIME_COMPATIBILITY.get(model_type)
     if model_type == "qwen3_moe" and topology.attn_tp_size > 1:
         compatibility = QWEN3_MOE_TP_EP_COMPATIBILITY

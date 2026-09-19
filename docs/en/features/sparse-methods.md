@@ -14,6 +14,7 @@ Set `sparse_method` to one of the following method names.
 | `streamingllm` | Physical eviction | StreamingLLM-style fixed sink plus recent-window cache. Tokens outside the retained prefix/tail policy are physically evicted from the active KV cache. | `sink_keep_tokens`, `recent_keep_tokens` |
 | `attention-sink` | Physical eviction | Alias-style attention-sink policy with the same sink-token and recent-window retention model. It is useful for comparing sink-window behavior against other physical eviction methods. | `sink_keep_tokens`, `recent_keep_tokens` |
 | `snapkv` | Physical eviction | SnapKV-style token selection uses an end-of-prompt observation window to keep a compact set of important prompt KV positions before generation. The current paper-aligned decode path is score-free and appends generated tokens without another SnapKV selection pass. | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
+| `kvzip` | Physical eviction | Repository token-shared KVzip reconstruction scoring, followed by one global prompt-token compaction. | `kvzip_token_budget`, `kvzip_score_chunk_size`, `kvzip_prev_postfix_size` |
 | `h2o` | Physical eviction | Intermediate prefill chunks can be compacted to `h2o_prefill_budget`; the final prompt is compacted to `h2o_decode_budget`. Decode is score-free by default and grows with generated tokens. Optional `h2o_decode_eviction` accumulates decode probabilities and periodically evicts physical KV. | `h2o_decode_eviction`, `h2o_decode_budget`, `h2o_decode_eviction_interval`, `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window`, `sparse_prefill_score_mode` |
 | `pyramidkv` | Physical eviction | PyramidKV-style layer-dependent KV retention. It allocates sparse budgets across layers and physically stores the selected context tokens. | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
 | `omnikv` | Logical masking with optional offload | Cross-layer token selection; optionally keep sparse-layer history in pinned CPU memory and fetch the exact selected KV for decode. | `full_attention_layers`, `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `enable_omnikv_offload` |
@@ -22,6 +23,33 @@ Set `sparse_method` to one of the following method names.
 
 Sparse-vLLM uses `sparse_method` unchanged in public commands, `LLM(...)`, the
 runtime config, and internal consumers.
+
+
+
+## KVzip
+
+Use `LLM(model, sparse_method="kvzip", kvzip_token_budget=4096)` to retain
+at most 4096 prompt tokens after context reconstruction. Shorter prompts retain
+all KV. The first output token comes from the original dense prefill; subsequent
+decode attends to retained prompt KV and all generated KV.
+
+This is the repository's `kvzip_global` token-shared variant, not the original
+paper's non-uniform per-head eviction. Scores and retained positions are shared
+across layers, heads and attention TP ranks. No additional checkpoint is needed.
+`kvzip_token_budget` is the complete prompt budget; `sink_keep_tokens`,
+`recent_keep_tokens` and `decode_keep_tokens` do not add protected regions.
+
+Supported models are Qwen2, Qwen3 and Llama with explicit KV storage. Chunked
+prefill, batched requests, tensor parallelism, eager decode and decode CUDA Graph
+use the same physical cache. Prefix caching (radix or chain), offload, sparse
+prefill overrides, recurrent/MLA/shared-KV models and MoE are rejected.
+
+Reconstruction uses teacher-forced chunks of `kvzip_score_chunk_size` tokens
+(default 2048), with up to `kvzip_prev_postfix_size` preceding tokens (default 64).
+The replay instruction, preceding tokens and chunk must fit
+`engine_prefill_chunk_size`; the full prompt plus replay must fit
+`max_model_len`. Allow this extra capacity when selecting prompt lengths.
+Reconstruction adds prefill work; compression alone does not establish a speedup.
 
 
 ## OmniKV KV offload

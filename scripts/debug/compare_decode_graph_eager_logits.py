@@ -20,6 +20,7 @@ METHOD_CHOICES = (
     "attention-sink",
     "attention_sink",
     "snapkv",
+    "kvzip",
     "pyramidkv",
     "h2o",
     "rkv",
@@ -479,13 +480,13 @@ def _build_method_trigger_evidence(
     positive_calls = {key: int(value) for key, value in method_calls.items() if int(value) > 0}
     evidence: dict[str, Any] = {
         "method": method,
-        "required": method in GLM_GRAPH_METHODS - {"vanilla"},
+        "required": method in (GLM_GRAPH_METHODS | {"kvzip"}) - {"vanilla"},
         "triggered": method == "vanilla",
         "trigger_kind": "dense_baseline" if method == "vanilla" else "",
         "physical_compaction": physical_compaction,
         "method_calls": positive_calls,
     }
-    if method in {"streamingllm", "snapkv"}:
+    if method in {"streamingllm", "snapkv", "kvzip"}:
         compaction_calls = sum(
             count
             for name, count in positive_calls.items()
@@ -645,7 +646,9 @@ def _run_decode_logits(
     engine_kwargs = {
         **hyper_params,
         **_sparse_kwargs(method),
-        "max_model_len": max(map(max, rounds)) + max_tokens + 100,
+        "max_model_len": int(hyper_params.get(
+            "max_model_len", max(map(max, rounds)) + max_tokens + 100,
+        )),
         "max_num_seqs_in_batch": batch_size,
         "max_decoding_seqs": decode_capacity,
         "decode_graph": construct_with_graph,
