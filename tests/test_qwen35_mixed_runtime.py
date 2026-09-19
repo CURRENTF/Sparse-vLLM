@@ -310,6 +310,11 @@ def test_qwen35_moe_reduces_routed_and_shared_outputs_together():
         "sparsevllm.models.qwen3_5_moe.gated_shared_add",
         side_effect=lambda routed, shared, gate: routed + shared * gate.sigmoid(),
     ):
+        from sparsevllm.distributed.moe_communication import AllReduceMoeCommunication
+        block.mlp_chunk_size = 16
+        block.experts.fp8_enabled = False
+        block.moe_communication = AllReduceMoeCommunication(block.parallel_context.world.all_reduce)
+        block.moe_execution = block._create_moe_execution()
         actual = block._forward_chunk(hidden_states)
 
     packed = block.parallel_context.world.all_reduce.call_args.args[0]
@@ -342,6 +347,11 @@ def test_qwen35_moe_skips_single_rank_output_packing():
         "sparsevllm.models.qwen3_5_moe.gated_shared_add",
         side_effect=lambda routed, shared, gate: routed + shared * gate.sigmoid(),
     ):
+        from sparsevllm.distributed.moe_communication import AllReduceMoeCommunication
+        block.mlp_chunk_size = 16
+        block.experts.fp8_enabled = False
+        block.moe_communication = AllReduceMoeCommunication(block.parallel_context.world.all_reduce)
+        block.moe_execution = block._create_moe_execution()
         actual = block._forward_chunk(hidden_states)
 
     block.parallel_context.world.all_reduce.assert_not_called()

@@ -16,16 +16,18 @@ from sparsevllm.platforms import device_runtime
 class MoeExecutionPlan:
     def __init__(
         self, *, routed: Callable, shared: Callable, communication,
-        chunk_size: int, fused: Callable | None = None,
+        chunk_size: int | None, fused: Callable | None = None,
         fuse_prefill: bool = False, fuse_decode: bool = False,
         fusion_token_limit: int | None = None,
         reduce_decode_branches_separately: bool = False,
         overlap_compatible: bool = True,
+        finish: Callable | None = None,
     ):
-        if chunk_size <= 0:
+        if chunk_size is not None and chunk_size <= 0:
             raise ValueError("MoE chunk_size must be positive")
         if (fuse_prefill or fuse_decode) and fused is None:
             raise ValueError("Fused MoE execution requires a fused callable")
+        self.finish = finish
         self.routed = routed
         self.shared = shared
         self.communication = communication
@@ -52,9 +54,12 @@ class MoeExecutionPlan:
         self.shared_ready = device_runtime.new_event() if stream is not None else None
 
     def _chunked(self, branch, hidden_states):
-        if hidden_states.shape[0] <= self.chunk_size:
+        if self.chunk_size is None or hidden_states.shape[0] <= self.chunk_size:
             return branch(hidden_states)
-        return torch.cat([branch(x) for x in hidden_states.split(self.chunk_size)], dim=0)
+        parts = [branch(x) for x in hidden_states.split(self.chunk_size)]
+        if isinstance(parts[0], tuple):
+            return tuple(torch.cat(items, dim=0) for items in zip(*parts))
+        return torch.cat(parts, dim=0)
 
     def __call__(self, hidden_states, *, is_prefill: bool):
         fused = self.fuse_prefill if is_prefill else self.fuse_decode
@@ -79,6 +84,10 @@ class MoeExecutionPlan:
         else:
             routed = self._chunked(self.routed, hidden_states)
             shared = self.shared(hidden_states)
+        if self.finish is not None:
+            # Model semantics may require gates or normalization after reduction.
+            # This callback runs only after both local branches have joined.
+            return self.finish(routed, shared)
         return self.communication.combine_local_branches(
             routed, shared,
             reduce_separately=(not is_prefill and self.reduce_decode_branches_separately),

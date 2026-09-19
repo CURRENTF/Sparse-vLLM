@@ -583,3 +583,94 @@ def test_gemma4_shared_kv_rejects_per_layer_streaming_eviction():
     )
     with pytest.raises(NotImplementedError, match="KV-sharing"):
         normalize_sparse_methods(config)
+
+
+def test_gemma4_parallel_branches_keep_reduction_before_each_norm():
+    from sparsevllm.models.gemma4 import Gemma4DecoderLayer
+    from sparsevllm.distributed.moe_communication import AllReduceMoeCommunication
+
+    layer = Gemma4DecoderLayer.__new__(Gemma4DecoderLayer)
+    torch.nn.Module.__init__(layer)
+    calls = []
+    def reduce_shared(x):
+        calls.append("shared")
+        return (x * 1.3).round()
+    def reduce_routed(x):
+        calls.append("routed")
+        return (x * 1.7).round()
+    layer.parallel_context = SimpleNamespace(attn_tp=SimpleNamespace(all_reduce=reduce_shared))
+    layer.moe_communication = AllReduceMoeCommunication(reduce_routed)
+    layer.post_feedforward_layernorm_1 = torch.nn.LayerNorm(3)
+    layer.post_feedforward_layernorm_2 = torch.nn.LayerNorm(3)
+    shared, routed = torch.tensor([[.4, .8, 2.1]]), torch.tensor([[.7, 1.1, -.2]])
+    expected = (layer.post_feedforward_layernorm_1(reduce_shared(shared))
+                + layer.post_feedforward_layernorm_2(reduce_routed(routed)))
+    calls.clear()
+    torch.testing.assert_close(layer._finish_moe_branches(routed, shared), expected)
+    assert calls == ["shared", "routed"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_gemma4_moe_parallel_eager_and_graph_match_independent_dense_reference(tmp_path):
+    from sparsevllm.models.gemma4 import Gemma4DecoderLayer
+    from sparsevllm.operators.moe_execution import prepare_model_moe_execution
+    from sparsevllm.distributed import init_parallel_context, reset_parallel_context, ParallelTopology
+    import torch.nn.functional as F
+
+    config = _config(hidden_size=256, intermediate_size=512, moe_intermediate_size=128,
+                     enable_moe_block=True, num_experts=4, top_k_experts=2,
+                     dtype=torch.bfloat16, decode_graph=True)
+    torch.distributed.init_process_group("gloo", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1)
+    init_parallel_context(topology=ParallelTopology(1, 1, 1))
+    from sparsevllm.quantization.config import QuantizationConfig
+    config.quantization_config = QuantizationConfig.disabled()
+    try:
+        # Test the actual MoE sublayer; attention is outside this change.
+        with torch.device("cuda"), patch("sparsevllm.models.gemma4.Gemma4Attention", return_value=torch.nn.Identity()):
+            layer = Gemma4DecoderLayer(config, 0, TritonGemma4OperatorProvider(),
+                                       TritonGemma4RouterProvider(), None).to(dtype=torch.bfloat16)
+        torch.manual_seed(72)
+        with torch.no_grad():
+            for name, p in layer.named_parameters():
+                p.normal_(1 if p.ndim == 1 else 0, .03)
+        assert not layer.mlp.down_proj.reduce_results
+        prepare_model_moe_execution(layer, torch.device("cuda"), overlap=True)
+        assert layer.moe_execution.stream is not None
+        def norm(x, module):
+            x = x.float()
+            return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + module.eps) * module.weight.float()
+        def reference(x):
+            dense = norm(x, layer.pre_feedforward_layernorm)
+            gate, up = F.linear(dense, layer.mlp.gate_up_proj.weight.float()).chunk(2, -1)
+            shared = F.linear(F.gelu(gate, approximate="tanh") * up, layer.mlp.down_proj.weight.float())
+            router = layer.router
+            ri = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + router.norm.eps)
+            ri = ri * router.scale.float() * router.root_size
+            probs = F.linear(ri, router.proj.weight.float()).softmax(-1)
+            weights, ids = probs.topk(router.top_k, -1)
+            weights = weights / weights.sum(-1, keepdim=True) * router.per_expert_scale.float()[ids]
+            expert_input = norm(x, layer.pre_feedforward_layernorm_2)
+            routed = torch.zeros_like(expert_input)
+            for expert in range(config.num_experts):
+                rows, slots = torch.where(ids == expert)
+                gate, up = F.linear(expert_input[rows], layer.experts.w13_weight[expert].float()).chunk(2, -1)
+                y = F.linear(F.gelu(gate, approximate="tanh") * up, layer.experts.w2_weight[expert].float())
+                routed.index_add_(0, rows, y * weights[rows, slots, None])
+            return norm(shared, layer.post_feedforward_layernorm_1) + norm(routed, layer.post_feedforward_layernorm_2)
+        with torch.inference_mode():
+            for batch in (1, 7):
+                x = torch.randn(batch, 256, device="cuda", dtype=torch.bfloat16)
+                for _ in range(3):
+                    y = layer.moe_execution(x, is_prefill=False)
+                torch.testing.assert_close(y.float(), reference(x), atol=.06, rtol=.04)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    y = layer.moe_execution(x, is_prefill=False)
+                for scale in (.8, 1.2):
+                    x.mul_(scale)
+                    graph.replay()
+                    torch.testing.assert_close(y.float(), reference(x), atol=.06, rtol=.04)
+                graph.reset()
+    finally:
+        reset_parallel_context()
+        torch.distributed.destroy_process_group()

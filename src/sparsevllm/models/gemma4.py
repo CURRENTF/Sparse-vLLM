@@ -9,6 +9,7 @@ from torch import nn
 from transformers import Gemma4TextConfig
 
 from sparsevllm.distributed import get_parallel_context
+from sparsevllm.distributed.moe_communication import AllReduceMoeCommunication
 from sparsevllm.layers.attention import Attention
 from sparsevllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from sparsevllm.layers.gemma4_rmsnorm import Gemma4RMSNorm
@@ -33,6 +34,7 @@ from sparsevllm.operators.gemma4_router import (
 )
 from sparsevllm.operators.gemma4_moe import Gemma4PackedExperts
 from sparsevllm.operators.moe import model_activation_dtype
+from sparsevllm.operators.moe_execution import MoeExecutionPlan
 from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.config import config_get, config_layer_get
@@ -279,6 +281,8 @@ class Gemma4MLP(nn.Module):
         config: Gemma4TextConfig,
         layer_idx: int,
         operator_provider: Gemma4OperatorProvider,
+        *,
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         shared_start = int(config.num_hidden_layers) - int(config.num_kv_shared_layers)
@@ -295,6 +299,7 @@ class Gemma4MLP(nn.Module):
         self.down_proj = RowParallelLinear(
             width,
             config.hidden_size,
+            reduce_results=reduce_results,
             quantization=getattr(config, "quantization_config", None),
         )
         self._ops = operator_provider
@@ -353,7 +358,10 @@ class Gemma4DecoderLayer(nn.Module):
             operator_provider,
         )
         self._ops = operator_provider
-        self.mlp = Gemma4MLP(config, layer_idx, operator_provider)
+        self.mlp = Gemma4MLP(
+            config, layer_idx, operator_provider,
+            reduce_results=not bool(config.enable_moe_block),
+        )
         self.input_layernorm = Gemma4RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, provider=operator_provider
         )
@@ -403,7 +411,38 @@ class Gemma4DecoderLayer(nn.Module):
                 eps=config.rms_norm_eps,
                 provider=operator_provider,
             )
+            # The common executor owns stream dependencies; collectives stay
+            # on the caller stream, before each branch's normalization.
+            self.moe_communication = AllReduceMoeCommunication(
+                self.parallel_context.world.all_reduce
+            )
+            self.moe_execution = self._create_moe_execution()
         self.layer_scalar = nn.Parameter(torch.ones(1), requires_grad=False)
+
+    def _create_moe_execution(self):
+        return MoeExecutionPlan(
+            routed=self._routed_moe_branch, shared=self._dense_moe_branch,
+            communication=self.moe_communication,
+            chunk_size=None,
+            finish=self._finish_moe_branches,
+            overlap_compatible=(
+                not self.mlp.gate_up_proj.quantized and not self.mlp.down_proj.quantized
+            ),
+        )
+
+    def _dense_moe_branch(self, hidden_states):
+        return self.mlp(self.pre_feedforward_layernorm(hidden_states))
+
+    def _routed_moe_branch(self, hidden_states):
+        weights, ids = self.router(hidden_states)
+        return self.experts(self.pre_feedforward_layernorm_2(hidden_states), ids, weights)
+
+    def _finish_moe_branches(self, routed, shared):
+        # Preserve two independent reductions and nonlinear post-normalizations.
+        shared = self.parallel_context.attn_tp.all_reduce(shared)
+        routed = self.moe_communication.combine(routed)
+        return (self.post_feedforward_layernorm_1(shared)
+                + self.post_feedforward_layernorm_2(routed))
 
     def forward(
         self,
@@ -420,16 +459,10 @@ class Gemma4DecoderLayer(nn.Module):
             self.post_attention_layernorm.eps,
         )
         residual = hidden_states
-        dense_input = self.pre_feedforward_layernorm(hidden_states)
-        hidden_states = self.mlp(dense_input)
         if self.enable_moe_block:
-            weights, ids = self.router(residual)
-            expert_output = self.parallel_context.world.all_reduce(
-                self.experts(self.pre_feedforward_layernorm_2(residual), ids, weights)
-            )
-            hidden_states = self.post_feedforward_layernorm_1(
-                hidden_states
-            ) + self.post_feedforward_layernorm_2(expert_output)
+            hidden_states = self.moe_execution(residual, is_prefill=get_context().is_prefill)
+        else:
+            hidden_states = self.mlp(self.pre_feedforward_layernorm(hidden_states))
         hidden_states = self._ops.rmsnorm_residual(
             hidden_states,
             self.post_feedforward_layernorm.weight,

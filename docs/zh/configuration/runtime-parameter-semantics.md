@@ -14,13 +14,16 @@
 
 ## Shared Expert 并行
 
-`moe_shared_expert_overlap=true`（默认）允许已接入的 MoE 执行计划在 decode
-中并行计算相互独立的 shared 和 routed 分支。目前 GLM 接入了 DP=1 的非量化
-TP 路径；prefill、量化分支及已融合 shared expert 的 provider 保留原执行方式。
-可设置为 `false` 进行串行对照。
+`moe_shared_expert_overlap=true`（默认）在 decode 中并行执行 shared 和 routed
+分支；设置为 `false` 使用串行执行。
+
+`moe_shared_expert_overlap` 适用于 GLM-4.7-Flash、Qwen3.5/3.6 MoE 和
+Gemma 4 MoE（稠密 MLP 分支）的 DP=1 非量化 decode 路径。Prefill 和量化分支
+保持串行；已有的 shared expert 融合路径继续使用融合。Qwen3 MoE 与 MiniMax M2
+没有共享分支，不受此选项影响。
 
 该选项独立于 `async_scheduling`。支持的 decode CUDA Graph 会捕获分支依赖，
-不改变请求调度或相加与规约顺序。其他模型需要接入公共执行计划后才受此选项影响。
+不改变请求调度，以及各模型的门控、归一化和规约顺序。
 
 ## 调度与 Token 预算
 

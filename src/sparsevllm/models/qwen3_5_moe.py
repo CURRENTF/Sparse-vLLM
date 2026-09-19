@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sparsevllm.distributed import get_parallel_context
+from sparsevllm.distributed.moe_communication import AllReduceMoeCommunication
 from sparsevllm.engine.recurrent_state_manager import (
     RecurrentStateSpec,
     RecurrentTensorSpec,
@@ -27,11 +28,13 @@ from sparsevllm.operators.gated_delta_rule import PreparedGatedDeltaRuleOp
 from sparsevllm.models.qwen3_moe import Qwen3MoePackedExperts
 from sparsevllm.operators.gated_shared_add import gated_shared_add
 from sparsevllm.operators.moe import model_activation_dtype
+from sparsevllm.operators.moe_execution import MoeExecutionPlan
 from sparsevllm.operators.moe_router import (
     MoeRouterOpSpec,
     resolve_moe_router_provider,
 )
 from sparsevllm.platforms import device_runtime
+from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger
 from sparsevllm.utils.weight_target import WeightTarget
 
@@ -271,19 +274,34 @@ class Qwen35MoeSparseMoeBlock(nn.Module):
             reduce_results=False,
         )
 
-    def _forward_chunk(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        shared_output = self.shared_expert(hidden_states)
-        topk_weights, topk_ids, shared_gate_logits = self.gate(hidden_states)
-        local_output = self.experts(hidden_states, topk_ids, topk_weights)
+        self.moe_communication = AllReduceMoeCommunication(
+            self.parallel_context.world.all_reduce
+        )
+        self.moe_execution = self._create_moe_execution()
+
+    def _create_moe_execution(self):
+        return MoeExecutionPlan(
+            routed=self._routed_chunk, shared=self.shared_expert,
+            communication=self.moe_communication, chunk_size=self.mlp_chunk_size,
+            finish=self._finish_branches,
+            overlap_compatible=not self.experts.fp8_enabled,
+        )
+
+    def _routed_chunk(self, hidden_states):
+        weights, ids, shared_gate_logits = self.gate(hidden_states)
+        return self.experts(hidden_states, ids, weights), shared_gate_logits
+
+    def _finish_branches(self, routed, shared_output):
+        local_output, shared_gate_logits = routed
         if self.parallel_context.world.size > 1:
-            # This model currently requires DP=1: both outputs are world partials.
-            local_output, shared_output = self.parallel_context.world.all_reduce(
+            # Keep the gate after reduction, including the original BF16 rounding.
+            local_output, shared_output = self.moe_communication.combine(
                 torch.stack((local_output, shared_output))
             )
         return gated_shared_add(local_output, shared_output, shared_gate_logits)
+
+    def _forward_chunk(self, hidden_states):
+        return self.moe_execution(hidden_states, is_prefill=get_context().is_prefill)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.dim() != 2:

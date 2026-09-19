@@ -14,16 +14,17 @@ Common runtime parameters below can be passed to `LLM(model, **kwargs)` or `Conf
 
 ## Shared Expert Overlap
 
-`moe_shared_expert_overlap=true` (default) allows integrated MoE execution plans
-to run independent shared and routed branches concurrently during decode. GLM
-currently integrates this for unquantized TP execution with DP=1. Prefill,
-quantized branches, and providers that already fuse shared experts retain their
-existing execution paths. Set it to `false` for a serial comparison.
+`moe_shared_expert_overlap=true` (default) enables concurrent shared and routed
+branches during decode. Set it to `false` for serial execution.
+
+`moe_shared_expert_overlap` applies to unquantized DP=1 decode in GLM-4.7-Flash,
+Qwen3.5/3.6 MoE, and Gemma 4 MoE (its dense MLP branch). Prefill and quantized
+branches remain serial; existing fused shared-expert paths remain fused.
+Qwen3 MoE and MiniMax M2 have no shared branch and are unaffected.
 
 This option is independent of `async_scheduling`. Supported decode CUDA Graphs
-capture the branch dependencies; it does not change request scheduling or the
-addition/reduction order. Other models must integrate the common execution plan
-before this option affects their execution.
+capture the branch dependencies. Request scheduling and each model's gating,
+normalization, and reduction order are preserved.
 
 ## Scheduling and Token Budgets
 

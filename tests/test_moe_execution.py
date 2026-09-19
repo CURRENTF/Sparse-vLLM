@@ -109,3 +109,16 @@ def test_workspace_incompatible_branch_stays_serial_and_plan_cannot_rebind():
     torch.testing.assert_close(plan(torch.ones(2, 3), is_prefill=False), torch.full((2, 3), 2.))
     with pytest.raises(RuntimeError, match="once"):
         plan.prepare(None)
+
+
+def test_finish_receives_chunked_routing_metadata_and_local_shared_branch():
+    x = torch.arange(15.).reshape(5, 3)
+    communication = Mock()
+    finish = Mock(side_effect=lambda routed, shared: routed[0] + shared * routed[1])
+    plan = MoeExecutionPlan(
+        routed=lambda x: (x * 2, x[:, :1]), shared=lambda x: x * 3,
+        communication=communication, chunk_size=2, finish=finish,
+    )
+    torch.testing.assert_close(plan(x, is_prefill=False), x * 2 + x * 3 * x[:, :1])
+    communication.combine_local_branches.assert_not_called()
+    assert finish.call_count == 1
