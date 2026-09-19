@@ -766,6 +766,7 @@ def test_model_runner_runtime_rebuild_resolves_graph_shapes_locally():
         sparse_method="vanilla",
     )
     graph_kwargs = {}
+    auxiliary_executors = []
 
     with (
         patch(
@@ -775,7 +776,7 @@ def test_model_runner_runtime_rebuild_resolves_graph_shapes_locally():
         patch("sparsevllm.engine.model_runner.RuntimeState", return_value=object()),
         patch(
             "sparsevllm.engine.model_runner.SparseController",
-            return_value=SimpleNamespace(),
+            return_value=SimpleNamespace(bind_auxiliary_prefill=auxiliary_executors.append),
         ),
         patch(
             "sparsevllm.engine.model_runner.collect_decode_graph_participants",
@@ -814,6 +815,7 @@ def test_model_runner_runtime_rebuild_resolves_graph_shapes_locally():
 
     assert graph_kwargs["capture_sizes"] == (1, 8)
     assert graph_kwargs["method"] == "vanilla"
+    assert auxiliary_executors == [runner._run_auxiliary_prefill]
     assert runner.cache_runtime_build_measurement == CacheRuntimeBuildMeasurement(
         manager_consumed_bytes=200,
         manager_budget_overflow_bytes=0,
