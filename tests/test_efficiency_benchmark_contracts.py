@@ -37,6 +37,15 @@ from benchmark.long_bench.prompt_budget import encode_prompt_with_generation_bud
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_zero_jitter_keeps_every_request_at_the_requested_length():
+    """Multi-request capacity runs previously shortened prompts despite jitter=0."""
+    traces = build_request_trace(seed=42, request_count=7,
+        nominal_prompt_len=101, nominal_output_len=17, vocab_size=1000,
+        prompt_jitter_fraction=0, output_jitter_fraction=0,
+        vary_output_lengths=True)
+    assert all(trace.prompt_len == 101 and trace.output_len == 17 for trace in traces)
+
+
 def test_fork_constructor_options_cannot_change_matched_workload(monkeypatch, tmp_path):
     """Catch a fork config silently enabling prefix hits or changing concurrency."""
     monkeypatch.setattr(sys, "argv", ["probe", "--model-path", "model",

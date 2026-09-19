@@ -77,6 +77,38 @@ new `plot_data.json` preserves this layout without the presentation argument.
 
 ## Boundary-sync rerun
 
+For a context-length scan with request metrics at each method's verified maximum,
+use `run_context_capacity.py --config CONFIG --repo CHECKOUT --gpus GPU_IDS`.
+The configuration extends the boundary-sync template with `model_id`, `input_lens`
+and `lanes`. It runs the existing integer capacity search for each length, then
+the canonical request probe at every successfully verified maximum. The output
+root must be new; failed or incomplete capacity searches do not produce a maximum.
+Request failures remain separate from the successful decode capacity evidence.
+Configuration paths use the same environment-variable expansion as the sweep.
+Request probes reuse each measured case's resolved token budget; omitting the
+campaign override retains the sweep default. Tangram request probes use its
+configured environment and fork arguments. HiSparse/Vortex currently have only
+decode-only adapters and are rejected by this entrypoint before a campaign starts.
+Request timeouts stop the affected process and continue to the remaining cases,
+with a failed final queue status. Loss of the GPU reservation or external
+contention aborts the campaign and prevents acceptance of the affected result.
+
+To measure one conservative KV-slot estimate instead of searching, provide
+`conservative_candidates_by_length`, keyed by input length and lane. Each entry
+contains `concurrency`, a validated BS1 `reference_artifact`, and the slot-budget
+calculation evidence. The reference replaces an extra smoke; the candidate still
+must pass full measurement validation. Each lane runs one candidate, with no
+binary search, max+1 probe, or automatic retry. Results report
+`verified_concurrency`, `maximum_verified: false`, and `max_concurrency: null`.
+
+Set `max_num_batched_tokens` and `engine_prefill_chunk_size` explicitly to override
+the sweep's historical 8192-token defaults. `native_admission` maps method names
+to `wave_size` and `decode_gap_steps`; `wave_size: 0` disables staged admission.
+Without an override, the historical SnapKV wave size/gap of 1 remains unchanged.
+H2O is available as `svllm-h2o`, with its explicit parameters in `methods.h2o`.
+Zero jitter request traces now preserve the exact requested length at every batch
+size (`random-varlen-v2`); old multi-request traces could vary by one token.
+
 Use `config.boundary-sync.json` for new paper curves. It routes the existing
 capacity sweep through `benchmark/efficiency/bench_probe.py`, which reuses the
 microbench adapters. Historical configurations below retain step-sync semantics;

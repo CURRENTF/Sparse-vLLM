@@ -42,6 +42,23 @@ def write(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
+def load_campaign_config(path):
+    config_text = os.path.expandvars(path.read_text())
+    unresolved = re.findall(r"\$\{[^}]+\}", config_text)
+    if unresolved:
+        raise ValueError(f"Set these environment variables first: {sorted(set(unresolved))}")
+    return json.loads(config_text)
+
+
+def resolve_lane(config, lane):
+    external = config.get("external_lanes", {}).get(lane)
+    if external:
+        return external["engine"], external["method"], external
+    engine, method = (("vllm", "vanilla") if lane == "vllm-vanilla"
+                      else ("sparsevllm", lane.removeprefix("svllm-")))
+    return engine, method, None
+
+
 def probe_capacity_boundary(attempts):
     """Require observed powers, the integer maximum, and explicit max+1 failure."""
     successes = {a["concurrency"] for a in attempts if a["status"] == "success"}
@@ -181,11 +198,7 @@ def main():
     from benchmark.efficiency import metrics
     if Path(metrics.__file__).resolve() != REPO / "benchmark/efficiency/metrics.py":
         raise RuntimeError("Measurement statistics were imported from a different benchmark checkout")
-    config_text = os.path.expandvars(args.config.read_text())
-    unresolved = re.findall(r"\$\{[^}]+\}", config_text)
-    if unresolved:
-        raise ValueError(f"Set these environment variables first: {sorted(set(unresolved))}")
-    config = json.loads(config_text)
+    config = load_campaign_config(args.config)
     protocol = config.get("measurement_protocol", "step_sync_v1")
     if protocol not in ("step_sync_v1", "boundary_sync_v2"):
         raise ValueError(f"Unknown measurement protocol: {protocol}")
@@ -266,10 +279,8 @@ def main():
         case = root / lane / ("smoke" if smoke else f"bs{batch}")
         if case.exists():
             raise FileExistsError(f"Refusing to overwrite existing attempt: {case}")
-        engine, method = ("vllm", "vanilla") if lane == "vllm-vanilla" else ("sparsevllm", lane.removeprefix("svllm-"))
-        external = config.get("external_lanes", {}).get(lane)
+        engine, method, external = resolve_lane(config, lane)
         if external:
-            engine, method = external["engine"], external["method"]
             for key, value in external.get("environment", {}).items():
                 if key in ("CUDA_VISIBLE_DEVICES", "PYTHONPATH"):
                     raise ValueError(f"External environment cannot override {key}")
@@ -278,7 +289,8 @@ def main():
                 *external.get("pythonpath", [])])
         hp = dict(tensor_parallel_size=model["tp"], expert_parallel_size=model["ep"],
                   data_parallel_size=1, decode_graph=True, gpu_memory_utilization=config["gpu_memory_utilization"],
-                  max_num_batched_tokens=8192, engine_prefill_chunk_size=8192,
+                  max_num_batched_tokens=config.get("max_num_batched_tokens", 8192),
+                  engine_prefill_chunk_size=config.get("engine_prefill_chunk_size", 8192),
                   enable_prefix_caching=False)
         if external:
             chunk = external.get("max_num_batched_tokens", 8192)
@@ -367,9 +379,11 @@ def main():
                 env["VIRTUAL_ENV"] = str(prefix)
             command += ["--engine-kwargs" if window_mode else "--engine_kwargs", "@" + str(case / "engine_kwargs.json"),
                         "--backend-label" if window_mode else "--backend_label", external["backend_label"]]
-        if method == "snapkv" and engine == "sparsevllm":
-            command += ["--prefill-wave-size" if window_mode else "--admission_wave_size", "1",
-                        "--wave-decode-gap-steps" if window_mode else "--wave_decode_gap_steps", "1"]
+        admission = config.get("native_admission", {}).get(method,
+            {"wave_size": 1, "decode_gap_steps": 1} if method == "snapkv" else {})
+        if engine == "sparsevllm" and admission.get("wave_size", 0):
+            command += ["--prefill-wave-size" if window_mode else "--admission_wave_size", str(admission["wave_size"]),
+                        "--wave-decode-gap-steps" if window_mode else "--wave_decode_gap_steps", str(admission.get("decode_gap_steps", 0))]
         if available and not smoke and window_mode:
             previous = available[0]
             reuse_identity = validate_boundary_reuse(previous, config, hp, command, args.gpus,
@@ -518,6 +532,14 @@ def main():
                 time.sleep(1)
         lanes = args.lanes.split(",")
         def smoke_lane(lane):
+            candidate = config.get("conservative_candidates", {}).get(lane)
+            if candidate:
+                from plot_decode_capacity import validate_measurement
+                artifact = Path(candidate["reference_artifact"])
+                validate_measurement(artifact, 1, config)
+                status(lane + "/smoke", "reference_validated", artifact=str(artifact),
+                       note="Candidate run validates the new concurrency; no extra smoke probe")
+                return
             if args.reuse_smoke_from:
                 previous = args.reuse_smoke_from / lane / "smoke" / "performance.jsonl"
                 if previous.exists() and json.loads(previous.read_text().splitlines()[0]).get("status") == "success":
@@ -543,6 +565,22 @@ def main():
                     time.sleep(5)
                 released = True
             attempts = []
+            candidate = config.get("conservative_candidates", {}).get(lane)
+            if candidate:
+                batch = int(candidate["concurrency"])
+                if not 1 <= batch <= config["safety_concurrency_limit"]:
+                    raise LaneFailure("Conservative candidate exceeds configured limits")
+                result = run_case(lane, batch)
+                evidence = dict(status="completed" if result["status"] == "success" else "failed",
+                    model=args.model, lane=lane, max_concurrency=None,
+                    verified_concurrency=batch if result["status"] == "success" else None,
+                    first_failed_concurrency=None, maximum_verified=False,
+                    selection="conservative_kv_slots", estimate=candidate, attempts=[result])
+                write(root / lane / "capacity.json", evidence)
+                if result["status"] != "success":
+                    raise LaneFailure("Conservative candidate failed; no automatic search or retry")
+                status(lane, "completed", verified_concurrency=batch, maximum_verified=False)
+                return
             if args.probe_concurrency and lane == lanes[0]:
                 probes = [run_case(lane, args.probe_concurrency)]
                 if args.probe_only:

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 
-TRACE_GENERATOR_VERSION = "random-varlen-v1"
+TRACE_GENERATOR_VERSION = "random-varlen-v2"
 
 
 @dataclass(frozen=True)
@@ -77,7 +77,7 @@ def _jittered_lengths(
         raise ValueError(
             f"jitter_fraction must be in [0, 1), got {jitter_fraction}."
         )
-    if not vary or count == 1:
+    if not vary or count == 1 or jitter_fraction == 0:
         return [target_len] * count
 
     jitter_tokens = max(1, int(round(target_len * jitter_fraction)))

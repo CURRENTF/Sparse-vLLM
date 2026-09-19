@@ -28,6 +28,7 @@ LANES = {
     "vllm-vanilla": ("vLLM (Vanilla)", "o"),
     "svllm-vanilla": ("SVLLM (Vanilla)", "s"),
     "svllm-snapkv": ("SVLLM (SnapKV)", "D"),
+    "svllm-h2o": ("SVLLM (H2O)", "h"),
     "svllm-quest": ("SVLLM (QuEST)", "^"),
     "svllm-omnikv": ("SVLLM (OmniKV)", "P"),
 }
