@@ -226,7 +226,20 @@ def close_workspace_manager() -> None:
         manager.close()
 
 
+def bind_module_workspace_lane(module: torch.nn.Module, lane: str) -> None:
+    """Bind scratch ownership once, before warmup and graph capture.
+
+    Only modules with reusable scratch implement this hook. Layers executed
+    sequentially may use the same lane; concurrent branches must not.
+    """
+    for child in module.modules():
+        bind = getattr(child, "bind_workspace_lane", None)
+        if callable(bind):
+            bind(lane)
+
+
 __all__ = [
+    "bind_module_workspace_lane",
     "ReusableWorkspaceManager",
     "WorkspaceLease",
     "close_workspace_manager",

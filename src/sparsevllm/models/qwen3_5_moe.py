@@ -284,7 +284,7 @@ class Qwen35MoeSparseMoeBlock(nn.Module):
             routed=self._routed_chunk, shared=self.shared_expert,
             communication=self.moe_communication, chunk_size=self.mlp_chunk_size,
             finish=self._finish_branches,
-            overlap_compatible=not self.experts.fp8_enabled,
+            shared_modules=(self.shared_expert,),
         )
 
     def _routed_chunk(self, hidden_states):

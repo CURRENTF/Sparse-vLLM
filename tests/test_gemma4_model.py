@@ -611,7 +611,8 @@ def test_gemma4_parallel_branches_keep_reduction_before_each_norm():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_gemma4_moe_parallel_eager_and_graph_match_independent_dense_reference(tmp_path):
+@pytest.mark.parametrize("quantized", [False, True])
+def test_gemma4_moe_parallel_eager_and_graph_match_independent_dense_reference(tmp_path, quantized):
     from sparsevllm.models.gemma4 import Gemma4DecoderLayer
     from sparsevllm.operators.moe_execution import prepare_model_moe_execution
     from sparsevllm.distributed import init_parallel_context, reset_parallel_context, ParallelTopology
@@ -623,16 +624,26 @@ def test_gemma4_moe_parallel_eager_and_graph_match_independent_dense_reference(t
     torch.distributed.init_process_group("gloo", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1)
     init_parallel_context(topology=ParallelTopology(1, 1, 1))
     from sparsevllm.quantization.config import QuantizationConfig
-    config.quantization_config = QuantizationConfig.disabled()
+    config.quantization_config = (QuantizationConfig.from_hf_config({
+        "quant_method": "fp8", "activation_scheme": "dynamic", "weight_block_size": [128, 128],
+    }) if quantized else QuantizationConfig.disabled())
     try:
         # Test the actual MoE sublayer; attention is outside this change.
         with torch.device("cuda"), patch("sparsevllm.models.gemma4.Gemma4Attention", return_value=torch.nn.Identity()):
             layer = Gemma4DecoderLayer(config, 0, TritonGemma4OperatorProvider(),
-                                       TritonGemma4RouterProvider(), None).to(dtype=torch.bfloat16)
+                                       TritonGemma4RouterProvider(), None)
+        # Preserve FP8 weights while converting the unquantized model parameters.
+        for p in layer.parameters():
+            if p.dtype != torch.float8_e4m3fn:
+                p.data = p.data.bfloat16()
         torch.manual_seed(72)
         with torch.no_grad():
             for name, p in layer.named_parameters():
-                p.normal_(1 if p.ndim == 1 else 0, .03)
+                p.copy_(torch.randn_like(p, dtype=torch.float32).mul_(.03).add_(1 if p.ndim == 1 else 0).to(p.dtype))
+            if quantized:
+                for projection in (layer.mlp.gate_up_proj, layer.mlp.down_proj):
+                    projection.weight_scale_inv.fill_(1)
+                    projection.quant_provider.prepare_weights(projection.weight, projection.weight_scale_inv)
         assert not layer.mlp.down_proj.reduce_results
         prepare_model_moe_execution(layer, torch.device("cuda"), overlap=True)
         assert layer.moe_execution.stream is not None
@@ -641,8 +652,14 @@ def test_gemma4_moe_parallel_eager_and_graph_match_independent_dense_reference(t
             return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + module.eps) * module.weight.float()
         def reference(x):
             dense = norm(x, layer.pre_feedforward_layernorm)
-            gate, up = F.linear(dense, layer.mlp.gate_up_proj.weight.float()).chunk(2, -1)
-            shared = F.linear(F.gelu(gate, approximate="tanh") * up, layer.mlp.down_proj.weight.float())
+            def project(x, linear):
+                if linear.quantized:
+                    from sparsevllm.quantization.fp8 import fp8_blockwise_linear_reference
+                    return fp8_blockwise_linear_reference(
+                        x.bfloat16(), linear.weight, linear.weight_scale_inv).float()
+                return F.linear(x, linear.weight.float())
+            gate, up = project(dense, layer.mlp.gate_up_proj).chunk(2, -1)
+            shared = project(F.gelu(gate, approximate="tanh") * up, layer.mlp.down_proj)
             router = layer.router
             ri = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + router.norm.eps)
             ri = ri * router.scale.float() * router.root_size
@@ -657,19 +674,33 @@ def test_gemma4_moe_parallel_eager_and_graph_match_independent_dense_reference(t
                 y = F.linear(F.gelu(gate, approximate="tanh") * up, layer.experts.w2_weight[expert].float())
                 routed.index_add_(0, rows, y * weights[rows, slots, None])
             return norm(shared, layer.post_feedforward_layernorm_1) + norm(routed, layer.post_feedforward_layernorm_2)
+        def check(x, actual):
+            serial = layer._finish_moe_branches(
+                layer._routed_moe_branch(x), layer._dense_moe_branch(x))
+            torch.testing.assert_close(actual, serial, rtol=0, atol=0)
+            expected = reference(x)
+            if quantized:
+                # FP8 rounding followed by separate branch normalization makes
+                # pointwise relative errors near cancellation uninformative.
+                relative_l2 = (actual.float() - expected).norm() / expected.norm()
+                assert relative_l2 < .025
+                assert F.cosine_similarity(actual.float().flatten(), expected.flatten(), dim=0) > .9998
+            else:
+                torch.testing.assert_close(actual.float(), expected, atol=.06, rtol=.04)
+
         with torch.inference_mode():
             for batch in (1, 7):
                 x = torch.randn(batch, 256, device="cuda", dtype=torch.bfloat16)
                 for _ in range(3):
                     y = layer.moe_execution(x, is_prefill=False)
-                torch.testing.assert_close(y.float(), reference(x), atol=.06, rtol=.04)
+                check(x, y)
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     y = layer.moe_execution(x, is_prefill=False)
                 for scale in (.8, 1.2):
                     x.mul_(scale)
                     graph.replay()
-                    torch.testing.assert_close(y.float(), reference(x), atol=.06, rtol=.04)
+                    check(x, y)
                 graph.reset()
     finally:
         reset_parallel_context()

@@ -425,9 +425,7 @@ class Gemma4DecoderLayer(nn.Module):
             communication=self.moe_communication,
             chunk_size=None,
             finish=self._finish_moe_branches,
-            overlap_compatible=(
-                not self.mlp.gate_up_proj.quantized and not self.mlp.down_proj.quantized
-            ),
+            shared_modules=(self.mlp,),
         )
 
     def _dense_moe_branch(self, hidden_states):

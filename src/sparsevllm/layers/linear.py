@@ -60,6 +60,10 @@ class LinearBase(nn.Module):
         else:
             self.register_parameter("bias", None)
 
+    def bind_workspace_lane(self, lane: str) -> None:
+        if self.quant_provider is not None:
+            self.quant_provider.bind_workspace_lane(lane)
+
     @staticmethod
     def _scale_shape_for_weight_shape(shape: tuple[int, int]) -> tuple[int, int]:
         out_features, in_features = int(shape[0]), int(shape[1])

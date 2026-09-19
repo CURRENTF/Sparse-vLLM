@@ -596,6 +596,7 @@ def test_glm_tp1_prefill_uses_fused_routed_and_shared_path() -> None:
         fuses_shared_decode=True,
         shared_fusion_token_limit=None,
     )
+    block.shared_experts = None
     block._routed_and_shared_chunk = lambda hidden_states: hidden_states * 3
     block._routed_chunk = Mock(side_effect=AssertionError("routed-only path used"))
     block._shared_chunk = Mock(side_effect=AssertionError("shared path used"))

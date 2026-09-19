@@ -21,6 +21,10 @@ from sparsevllm.quantization.fp8_tp import Fp8ExpertTpShard
 class PackedMoeExperts(PackedExpertWeightLoader, nn.Module):
     """Shared packed expert storage, execution, and checkpoint loading."""
 
+    def bind_workspace_lane(self, lane: str) -> None:
+        # Standalone shared projections can live inside a packed expert owner.
+        self.provider.bind_workspace_lane(lane)
+
     checkpoint_projection_map = {
         "gate_proj": "gate",
         "up_proj": "up",

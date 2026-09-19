@@ -10,6 +10,7 @@ from collections.abc import Callable
 
 import torch
 
+from sparsevllm.operators.workspace import bind_module_workspace_lane
 from sparsevllm.platforms import device_runtime
 
 
@@ -21,6 +22,7 @@ class MoeExecutionPlan:
         fusion_token_limit: int | None = None,
         reduce_decode_branches_separately: bool = False,
         overlap_compatible: bool = True,
+        shared_modules: tuple[torch.nn.Module, ...] = (),
         finish: Callable | None = None,
     ):
         if chunk_size is not None and chunk_size <= 0:
@@ -38,6 +40,7 @@ class MoeExecutionPlan:
         self.fusion_token_limit = fusion_token_limit
         self.reduce_decode_branches_separately = reduce_decode_branches_separately
         self.overlap_compatible = overlap_compatible
+        self.shared_modules = shared_modules
         self._prepared = False
         self.stream = None
         self.input_ready = None
@@ -50,6 +53,10 @@ class MoeExecutionPlan:
         self._prepared = True
         self.stream = stream if self.overlap_compatible else None
         stream = self.stream
+        # One lane for all sequential shared branches, not one allocation per layer.
+        if stream is not None:
+            for module in self.shared_modules:
+                bind_module_workspace_lane(module, "moe_shared")
         self.input_ready = device_runtime.new_event() if stream is not None else None
         self.shared_ready = device_runtime.new_event() if stream is not None else None
 

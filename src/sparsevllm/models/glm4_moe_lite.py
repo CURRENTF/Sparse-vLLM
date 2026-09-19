@@ -552,9 +552,9 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             fuse_decode=getattr(experts, "fuses_shared_decode", False),
             fusion_token_limit=getattr(experts, "shared_fusion_token_limit", None),
             reduce_decode_branches_separately=self.parallel_context.moe_ep_size == 1,
-            # Quantized providers can share activation workspaces across calls.
-            # Keep them serial until those workspaces have branch ownership.
-            overlap_compatible=not getattr(experts, "fp8_enabled", False),
+            shared_modules=(
+                self.shared_experts if self.shared_experts is not None else experts,
+            ),
         )
 
     def _route(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

@@ -18,8 +18,8 @@
 分支；设置为 `false` 使用串行执行。
 
 `moe_shared_expert_overlap` 适用于 GLM-4.7-Flash、Qwen3.5/3.6 MoE 和
-Gemma 4 MoE（稠密 MLP 分支）的 DP=1 非量化 decode 路径。Prefill 和量化分支
-保持串行；已有的 shared expert 融合路径继续使用融合。Qwen3 MoE 与 MiniMax M2
+Gemma 4 MoE（稠密 MLP 分支）的 DP=1 decode 路径，包括已支持的 FP8 配置。
+Prefill 保持串行；已有的 shared expert 融合路径继续使用融合。Qwen3 MoE 与 MiniMax M2
 没有共享分支，不受此选项影响。
 
 该选项独立于 `async_scheduling`。支持的 decode CUDA Graph 会捕获分支依赖，

@@ -98,6 +98,11 @@ class MoeProvider:
     name = ""
     gate_up_order = "gate_up"
 
+    def bind_workspace_lane(self, lane: str) -> None:
+        """Bind standalone shared projections; routed scratch stays on its lane."""
+        for provider, _, _ in getattr(self, "_shared_projections", ()):
+            provider.bind_workspace_lane(lane)
+
     def prepare_shared_expert(self, spec, w13, w2, scale13, scale2):
         """Bind standalone projections over a packed tensor-FP8 expert's views."""
         if spec.weight_dtype != torch.float8_e4m3fn or spec.block_shape is not None:

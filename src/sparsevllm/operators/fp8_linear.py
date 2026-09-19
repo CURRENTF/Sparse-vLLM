@@ -53,6 +53,8 @@ class Fp8LinearProvider:
     ) -> None:
         self.spec = spec
         self.caps = caps
+        self.workspace_lane = "default"
+        self._workspace_used = False
 
     @classmethod
     def bind(
@@ -69,6 +71,11 @@ class Fp8LinearProvider:
                 self.spec.weight_layout_id if self.spec is not None else "unknown"
             ),
         }
+
+    def bind_workspace_lane(self, lane: str) -> None:
+        if self._workspace_used:
+            raise RuntimeError("FP8 workspace lane must be bound before warmup/capture")
+        self.workspace_lane = lane
 
     def prepare_weights(self, weight: torch.Tensor, scales: torch.Tensor) -> None:
         """Prepare provider-owned derived layouts after all logical shards load."""
@@ -210,8 +217,10 @@ class _Sm120ActivationWorkspace:
     scales: torch.Tensor
 
 
+# Keep shape buckets stable across graph captures. Sequential layers share a
+# lane; the auxiliary MoE branch is bound to a separate lane before warmup.
 _SM120_ACTIVATION_WORKSPACES: dict[
-    tuple[str, int | None, int, int], _Sm120ActivationWorkspace
+    tuple[str, str, int | None, int, int], _Sm120ActivationWorkspace
 ] = {}
 _SM120_ACTIVATION_WORKSPACE_LOCK = Lock()
 
@@ -220,13 +229,14 @@ def _sm120_activation_buffers(
     inputs: torch.Tensor,
     *,
     rows: int | None = None,
+    lane: str = "default",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     input_rows, features = map(int, inputs.shape)
     rows = input_rows if rows is None else int(rows)
     if rows <= 0:
         raise ValueError("SM120 FP8 Linear requires at least one activation row.")
     capacity = 1 << max(rows - 1, 0).bit_length()
-    key = (inputs.device.type, inputs.device.index, features, capacity)
+    key = (lane, inputs.device.type, inputs.device.index, features, capacity)
     workspace = _SM120_ACTIVATION_WORKSPACES.get(key)
     if workspace is None:
         if device_runtime.is_stream_capturing():
@@ -562,7 +572,8 @@ class FlashInferGroupwiseSm120Fp8LinearProvider(Fp8LinearProvider):
             "gemm": "flashinfer:gemm_fp8_nt_groupwise",
             "activation_scale_layout": "K-major_per_token_group128",
             "weight_scale_layout": "K-major_block128x128",
-            "activation_workspace": "shared_geometric_warmup_cache",
+            "activation_workspace": "lane_geometric_warmup_cache",
+            "workspace_lane": self.workspace_lane,
         }
 
     def __call__(self, x, weight, weight_scale_inv, bias=None):
@@ -583,9 +594,11 @@ class FlashInferGroupwiseSm120Fp8LinearProvider(Fp8LinearProvider):
         inputs = x.reshape(-1, x.shape[-1]).contiguous()
         rows = int(inputs.shape[0])
         kernel_rows = (rows + 3) & ~3
+        self._workspace_used = True
         padded_inputs, quantized, scales = _sm120_activation_buffers(
             inputs,
             rows=kernel_rows,
+            lane=self.workspace_lane,
         )
         if kernel_rows != rows:
             padded_inputs.zero_()
@@ -705,6 +718,11 @@ class Sm120Fp8LinearDispatchPlan(Fp8LinearProvider):
             ),
         )
         self._runtime_kernel_path_counts: dict[str, dict[str, int]] = {}
+
+    def bind_workspace_lane(self, lane: str) -> None:
+        super().bind_workspace_lane(lane)
+        for route in self.routes:
+            route.provider.bind_workspace_lane(lane)
 
     @classmethod
     def atomic_provider_names(cls, spec: Fp8LinearSpec) -> tuple[str, ...]:
