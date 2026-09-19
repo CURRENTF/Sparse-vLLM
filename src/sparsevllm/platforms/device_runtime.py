@@ -128,3 +128,9 @@ def synchronize_stream(stream: Any) -> None:
         synchronize()
         return
     stream.synchronize()
+
+
+def record_tensor_stream(tensor: torch.Tensor, stream: Any) -> None:
+    """Protect storage allocated on another stream until this consumer finishes."""
+    if stream is not None:
+        tensor.record_stream(stream)

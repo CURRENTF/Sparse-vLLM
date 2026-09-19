@@ -12,6 +12,19 @@ Common runtime parameters below can be passed to `LLM(model, **kwargs)` or `Conf
 | `tensor_parallel_size` | int | `1` | Attention tensor parallel size. |
 | `decode_graph` | bool | `True` | Enable decode CUDA Graphs. Set to `False` for eager execution or methods without graph support. |
 
+## Shared Expert Overlap
+
+`moe_shared_expert_overlap=true` (default) allows integrated MoE execution plans
+to run independent shared and routed branches concurrently during decode. GLM
+currently integrates this for unquantized TP execution with DP=1. Prefill,
+quantized branches, and providers that already fuse shared experts retain their
+existing execution paths. Set it to `false` for a serial comparison.
+
+This option is independent of `async_scheduling`. Supported decode CUDA Graphs
+capture the branch dependencies; it does not change request scheduling or the
+addition/reduction order. Other models must integrate the common execution plan
+before this option affects their execution.
+
 ## Scheduling and Token Budgets
 
 | Parameter | Type | Default | Description |

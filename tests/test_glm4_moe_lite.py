@@ -528,6 +528,7 @@ def test_glm_sparse_moe_reduces_routed_and_shared_partials_over_world(ep_size: i
     block.mlp_chunk_size = 8
     block.shared_experts = nn.Identity()
     block._routed_chunk = lambda hidden_states: hidden_states.clone()
+    block.moe_execution = block._create_moe_execution()
     hidden_states = torch.arange(8, dtype=torch.float32).reshape(2, 4)
 
     with patch.object(dist, "all_reduce") as all_reduce:
@@ -562,6 +563,7 @@ def test_glm_sparse_moe_reduces_pure_tp_over_world(
     block.mlp_chunk_size = 8
     block.shared_experts = nn.Identity()
     block._routed_chunk = lambda hidden_states: hidden_states.clone()
+    block.moe_execution = block._create_moe_execution()
     hidden_states = torch.arange(8, dtype=torch.float32).reshape(2, 4)
 
     with (
@@ -597,6 +599,7 @@ def test_glm_tp1_prefill_uses_fused_routed_and_shared_path() -> None:
     block._routed_and_shared_chunk = lambda hidden_states: hidden_states * 3
     block._routed_chunk = Mock(side_effect=AssertionError("routed-only path used"))
     block._shared_chunk = Mock(side_effect=AssertionError("shared path used"))
+    block.moe_execution = block._create_moe_execution()
     hidden_states = torch.arange(8, dtype=torch.float32).reshape(2, 4)
 
     with patch(
@@ -627,6 +630,7 @@ def test_glm_sparse_moe_reduces_hybrid_tp_ep_shards_over_outer_world() -> None:
     block.mlp_chunk_size = 8
     block.shared_experts = nn.Identity()
     block._routed_chunk = lambda hidden_states: hidden_states.clone()
+    block.moe_execution = block._create_moe_execution()
     hidden_states = torch.arange(8, dtype=torch.float32).reshape(2, 4)
 
     with patch.object(dist, "all_reduce") as all_reduce:
@@ -691,6 +695,7 @@ def test_glm_moe_debug_contract_populates_model_runner_summaries(reduced_scale) 
     block.gate = _Gate()
     block.experts = _Experts()
     block.shared_experts = nn.Identity()
+    block.moe_execution = block._create_moe_execution()
     hidden_states = torch.arange(8, dtype=torch.float32).reshape(2, 4)
 
     with (

@@ -12,6 +12,16 @@
 | `tensor_parallel_size` | int | `1` | Attention 张量并行度。 |
 | `decode_graph` | bool | `True` | 启用 decode CUDA Graph；需要 eager 执行或方法不支持时设为 `False`。 |
 
+## Shared Expert 并行
+
+`moe_shared_expert_overlap=true`（默认）允许已接入的 MoE 执行计划在 decode
+中并行计算相互独立的 shared 和 routed 分支。目前 GLM 接入了 DP=1 的非量化
+TP 路径；prefill、量化分支及已融合 shared expert 的 provider 保留原执行方式。
+可设置为 `false` 进行串行对照。
+
+该选项独立于 `async_scheduling`。支持的 decode CUDA Graph 会捕获分支依赖，
+不改变请求调度或相加与规约顺序。其他模型需要接入公共执行计划后才受此选项影响。
+
 ## 调度与 Token 预算
 
 | 参数 | 类型 | 默认值 | 说明 |

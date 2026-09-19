@@ -81,6 +81,13 @@ class AllReduceMoeCommunication(MoeCommunication):
     ) -> torch.Tensor:
         return self._reduce(output)
 
+    def combine_local_branches(self, routed, shared, *, reduce_separately=False):
+        """Compose token-aligned world partials without changing BF16 order."""
+        if reduce_separately:
+            partials = self.combine(torch.stack((routed, shared), dim=0))
+            return partials[0] + partials[1]
+        return self.combine(routed + shared)
+
 
 class AllGatherReduceScatterMoeCommunication(MoeCommunication):
     """Gather DP tokens per TP lane, scatter partials, then complete the TP sum.

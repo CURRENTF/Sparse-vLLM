@@ -65,6 +65,7 @@ class Config(
     max_model_len_auto: bool = field(default=False, init=False)
     # None preserves the legacy shared batch limit. Set explicitly to allow
     # decode and prefill to use different per-step sequence limits.
+    moe_shared_expert_overlap: bool = True
     async_scheduling: bool = False
     async_max_inflight: int = 2
     decode_reservation_tokens: int = 1024

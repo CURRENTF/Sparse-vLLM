@@ -48,6 +48,7 @@ from sparsevllm.operators.moe import (
     use_packed_shared_experts,
     use_packed_shared_experts_in_prefill,
 )
+from sparsevllm.operators.moe_execution import MoeExecutionPlan
 from sparsevllm.operators.moe_router import (
     MoeRouterOpSpec,
     resolve_moe_router_provider,
@@ -536,6 +537,26 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             )
         )
 
+        self.moe_execution = (
+            self._create_moe_execution()
+            if self.parallel_context.attn_dp_size == 1 else None
+        )
+
+    def _create_moe_execution(self):
+        experts = getattr(self, "experts", None)
+        return MoeExecutionPlan(
+            routed=self._routed_chunk, shared=self._shared_chunk,
+            fused=self._routed_and_shared_chunk,
+            communication=self.moe_communication, chunk_size=self.mlp_chunk_size,
+            fuse_prefill=getattr(experts, "fuses_shared_prefill", False),
+            fuse_decode=getattr(experts, "fuses_shared_decode", False),
+            fusion_token_limit=getattr(experts, "shared_fusion_token_limit", None),
+            reduce_decode_branches_separately=self.parallel_context.moe_ep_size == 1,
+            # Quantized providers can share activation workspaces across calls.
+            # Keep them serial until those workspaces have branch ownership.
+            overlap_compatible=not getattr(experts, "fp8_enabled", False),
+        )
+
     def _route(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         _, topk_weights, topk_ids = self.gate(hidden_states)
         return topk_ids, topk_weights
@@ -571,48 +592,9 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         debug_enabled = os.getenv("SPARSEVLLM_DEBUG_MOE", "0") == "1"
         if debug_enabled:
             self.debug_last_input = hidden_states.detach().clone()
-        context = get_context()
-        experts = getattr(self, "experts", None)
-        fuse_shared_for_phase = getattr(
-            experts,
-            "fuses_shared_prefill" if context.is_prefill else "fuses_shared_decode",
-            False,
-        )
-        if (
-            not debug_enabled
-            and fuse_shared_for_phase
-            and (experts.shared_fusion_token_limit is None
-                 or hidden_states.shape[0] <= experts.shared_fusion_token_limit)
-        ):
-            if int(hidden_states.shape[0]) <= self.mlp_chunk_size:
-                local_output = self._routed_and_shared_chunk(hidden_states)
-            else:
-                local_output = torch.cat(
-                    [
-                        self._routed_and_shared_chunk(chunk)
-                        for chunk in hidden_states.split(
-                            self.mlp_chunk_size,
-                            dim=0,
-                        )
-                    ],
-                    dim=0,
-                )
-            return self.moe_communication.combine(local_output)
         if not debug_enabled:
-            if int(hidden_states.shape[0]) <= self.mlp_chunk_size:
-                routed = self._routed_chunk(hidden_states)
-            else:
-                routed = torch.cat(
-                    [
-                        self._routed_chunk(chunk)
-                        for chunk in hidden_states.split(
-                            self.mlp_chunk_size,
-                            dim=0,
-                        )
-                    ],
-                    dim=0,
-                )
-        elif int(hidden_states.shape[0]) <= self.mlp_chunk_size:
+            return self.moe_execution(hidden_states, is_prefill=get_context().is_prefill)
+        if int(hidden_states.shape[0]) <= self.mlp_chunk_size:
             router_logits, topk_weights, topk_ids = self.gate(hidden_states)
             routed = self.experts(hidden_states, topk_ids, topk_weights)
         else:
@@ -646,33 +628,13 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 if device_runtime.is_stream_capturing()
                 else int(local_hit_count.item())
             )
-        if debug_enabled:
-            # Preserve the general EP composition and routed-only debug
-            # evidence while keeping shared-expert reductions explicit.
-            routed = self.moe_communication.combine(routed)
-            self.debug_last_routed_output = routed.detach().clone()
-            shared = self._shared_chunk(hidden_states)
-            if self.parallel_context.attn_tp_size > 1:
-                shared = self.parallel_context.attn_tp.all_reduce(shared)
-            output = routed + shared
-        elif self.parallel_context.moe_ep_size > 1:
-            # With DP=1 both routed and shared branches are partial over world.
-            local_output = routed + self._shared_chunk(hidden_states)
-            output = self.moe_communication.combine(local_output)
-        else:
-            shared_local = self._shared_chunk(hidden_states)
-            if context.is_prefill:
-                # Both branches are TP partials. Compose them locally so the
-                # full MoE block needs one collective, matching the fused-MoE
-                # communication contract used by the reference runtime.
-                output = self.moe_communication.combine(routed + shared_local)
-            else:
-                # Decode tensors are small. Pack both partials into one
-                # collective, then add the independently reduced rows. This
-                # preserves the original BF16 reduction/addition order.
-                partials = torch.stack((routed, shared_local), dim=0)
-                partials = self.moe_communication.combine(partials)
-                output = partials[0] + partials[1]
+        # Debug evidence intentionally keeps routed/shared reductions explicit.
+        routed = self.moe_communication.combine(routed)
+        self.debug_last_routed_output = routed.detach().clone()
+        shared = self._shared_chunk(hidden_states)
+        if self.parallel_context.attn_tp_size > 1:
+            shared = self.parallel_context.attn_tp.all_reduce(shared)
+        output = routed + shared
         if debug_enabled:
             # ModelRunner's cross-rank evidence contract consumes the final
             # MoE block output, including both the synced routed experts and
