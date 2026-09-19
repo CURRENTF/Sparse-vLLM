@@ -49,7 +49,10 @@ Prioritize:
 - OpenAI-compatible request lifecycle, streaming, cancellation, and sampling contracts
 - research reproducibility and fail-fast behavior
 - public docs hygiene: stable user-facing docs must not contain local experiment ledgers, internal development notes, private paths, GPU occupancy notes, `scripts/tmp` launchers, uncommitted-worktree details, or agent/Codex workflow instructions
-- hot-path performance and tests
+- hot-path performance and tests, including CUDA Graph/JIT specialization,
+  host synchronization, scheduler and prefix-cache RPC overhead, sparse
+  scoring/selection, offload copies, LRU work, workspace allocation, and
+  provider dispatch
 
 ### Step 4: Report
 
@@ -86,4 +89,18 @@ End with:
   correctness. Flag free-form priority changes that mix atomic eligibility,
   upstream default policy, and exact performance routing.
 - Do not treat benchmark results as trustworthy if method, policy, config, command, checkpoint, sample status, or outputs are missing.
+- Require evidence for the claimed metric and measurement boundary. Do not
+  present component microbenchmarks, CPU-only timings, isolated kernel medians,
+  stage logs, or profiler timelines as matched serving TTFT, TPOT, or throughput.
+  Serving comparisons require the metric definition (including numerator and
+  denominator for rates), timing boundary, matched workload, model, hardware,
+  topology, concurrency, graph mode, cache budget, and failure count. Component
+  comparisons require relevant shapes, dtypes, callable and timing boundaries,
+  environment, and failure count; mark inapplicable serving fields as N/A.
+  For paper efficiency comparisons, apply
+  [`paper-efficiency`](../paper-efficiency/SKILL.md): a validated continuous
+  decode window can support decode-window throughput, but not serving TPOT or
+  full-workload throughput.
+- Do not assume the cause of a performance regression is the scheduler, CPU, or
+  a specific kernel without evidence from the changed workload boundary.
 - If no issues are found, say so clearly and mention residual test or benchmark risk.

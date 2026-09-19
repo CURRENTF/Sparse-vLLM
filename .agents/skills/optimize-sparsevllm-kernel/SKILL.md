@@ -23,6 +23,14 @@ Do not assume that a kernel rewrite is useful before locating its contribution
 to the requested workload. If the user already specifies a kernel, proceed but
 state whether end-to-end hotspot evidence exists.
 
+Sparse-vLLM performance regressions often come from runtime shape variability,
+host synchronization, control-plane work, metadata movement, or provider
+routing rather than from the arithmetic kernel itself. Before rewriting a
+kernel, check for CUDA Graph recapture, JIT compile-key growth, request-length
+specialization, `.item()` or CPU-GPU round trips, prefix-cache RPCs, scheduler
+scans, decode-reservation loops, sparse selection/top-k overhead, offload host
+copies, LRU work, workspace allocation, and provider dispatch overhead.
+
 ## Load the Relevant Guidance
 
 Read [benchmark-protocol.md](references/benchmark-protocol.md) before running
@@ -74,6 +82,11 @@ Profile a representative end-to-end workload. Separate prefill, decode,
 sampling, communication, host overhead, graph replay, and compilation. Rank
 hotspots by total contribution rather than kernel latency alone. Record fusion
 and overlap opportunities, but treat them as hypotheses until measured.
+
+When the workload uses sparse methods, account for scoring, selection,
+eviction, slot metadata, prefix-cache refresh, and host-offload transfer time
+as first-class costs. Do not preselect "scheduler", "CPU bottleneck", or
+"kernel bottleneck" as the explanation before measuring the relevant boundary.
 
 ### 3. Choose the Implementation Path
 
@@ -161,6 +174,9 @@ Repeat the original workload with the same model, request trace, concurrency,
 context/output lengths, TP/EP topology, cache state, graph mode, and metric
 window. Report kernel latency improvement separately from end-to-end latency,
 throughput, TTFT, or TPOT. A faster microbenchmark is not an end-to-end win.
+Stage logs, component microbenchmarks, and Nsight timelines are diagnostic
+evidence; they do not establish serving throughput unless the matched workload
+is rerun with the same request and timing contract.
 
 ## Acceptance Gates
 
